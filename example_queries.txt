@@ -1,0 +1,27 @@
+rate(tcp_echo_rtt_seconds_sum[5m])
+/
+rate(tcp_echo_rtt_seconds_count[5m])
+
+
+###
+
+(rate(tcp_echo_timeouts_total{job="prometheus.scrape.local_2113_metrics"}[5m])
+/
+rate(tcp_echo_rtt_seconds_count[5m]))
+
+* 1000
+
+
+Commands
+
+# Client
+./tcp-echo-metrics -mode=client -tcp="192.168.1.71:4000" -interval=10ms -timeout=20ms -metrics=":2113" -window=100
+
+# Server
+./tcp-echo-metrics -mode=server -tcp="192.168.1.71:4000" -metrics=":2112"
+
+
+
+# Building
+
+go build -o ./build/tcp-echo-metrics .
