@@ -12,10 +12,12 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/kardianos/service"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -151,45 +153,183 @@ func (lt *lossTracker) computeLossPercentLocked() float64 {
 // To preserve the same CLI behaviour as before, main constructs the HTTP metrics
 // server, parses flags, and dispatches to the server or client mode.
 func main() {
-	mode := flag.String("mode", "server", "server or client")
-	tcpAddr := flag.String("tcp", ":4000", "TCP address to listen on (server) or connect to (client)")
+	mode := flag.String("mode", "server", "server, client or both")
+	listenAddr := flag.String("listen", ":4000", "TCP address to listen on (server)")
+	targetAddr := flag.String("target", ":4000", "TCP address to connect to (client)")
 	metricsAddr := flag.String("metrics", ":2112", "HTTP address for Prometheus /metrics")
 	interval := flag.Duration("interval", 200*time.Millisecond, "Client: probe interval")
 	timeout := flag.Duration("timeout", 800*time.Millisecond, "Client: per-probe timeout (considered loss)")
 	window := flag.Int("window", 100, "Client: sliding window size for loss percentage")
+	// Service control flag: install/uninstall/start/stop/run
+	svcAction := flag.String("svc", "", "service action: install | uninstall | start | stop | run")
 	flag.Parse()
 
+	// resolved addresses
+	serverAddr := *listenAddr
+	clientAddr := *targetAddr
+
+	// If a service action was requested, use kardianos/service to handle it.
+	if *svcAction != "" {
+		svcConfig := &service.Config{
+			Name:        "tcp_ping_prometheus",
+			DisplayName: "TCP Ping Prometheus",
+			Description: "TCP echo probe exporter with Prometheus metrics.",
+		}
+		prg := &program{
+			mode:        *mode,
+			metricsAddr: *metricsAddr,
+			interval:    *interval,
+			timeout:     *timeout,
+			window:      *window,
+			// set resolved addresses
+			serverAddr: serverAddr,
+			clientAddr: clientAddr,
+		}
+		svc, err := service.New(prg, svcConfig)
+		if err != nil {
+			log.Fatalf("service setup error: %v", err)
+		}
+		// On Windows, some actions map differently; control supports install/uninstall/start/stop.
+		switch *svcAction {
+		case "install":
+			if err := svc.Install(); err != nil {
+				log.Fatalf("service install failed: %v", err)
+			}
+			log.Printf("service installed")
+			return
+		case "uninstall":
+			if err := svc.Uninstall(); err != nil {
+				log.Fatalf("service uninstall failed: %v", err)
+			}
+			log.Printf("service uninstalled")
+			return
+		case "start":
+			if err := svc.Start(); err != nil {
+				log.Fatalf("service start failed: %v", err)
+			}
+			log.Printf("service started")
+			return
+		case "stop":
+			if err := svc.Stop(); err != nil {
+				log.Fatalf("service stop failed: %v", err)
+			}
+			log.Printf("service stopped")
+			return
+		case "run":
+			// Run blocks and uses the program's Start/Stop to manage lifecycle.
+			if runtime.GOOS == "windows" {
+				// On Windows, run should call Run to attach to the service manager.
+				if err := svc.Run(); err != nil {
+					log.Fatalf("service run error: %v", err)
+				}
+				return
+			}
+			// On Linux, running as a service via Run works as well; Run will call Start.
+			if err := svc.Run(); err != nil {
+				log.Fatalf("service run error: %v", err)
+			}
+			return
+		default:
+			log.Fatalf("unknown svc action: %s", *svcAction)
+		}
+	}
+
+	// Normal foreground execution
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := runApp(ctx, *mode, serverAddr, clientAddr, *metricsAddr, *interval, *timeout, *window); err != nil && !errors.Is(err, context.Canceled) {
+		log.Fatalf("error: %v", err)
+	}
+}
+
+// program implements service.Interface for kardianos/service.
+type program struct {
+	// configuration captured at creation-time
+	mode string
+	// retained for compatibility in this patch but no longer used directly
+	tcpAddr     string
+	serverAddr  string
+	clientAddr  string
+	metricsAddr string
+	interval    time.Duration
+	timeout     time.Duration
+	window      int
+
+	ctx    context.Context
+	cancel context.CancelFunc
+	done   sync.WaitGroup
+}
+
+func (p *program) Start(s service.Service) error {
+	// Start should not block. Launch the run in a goroutine.
+	p.ctx, p.cancel = context.WithCancel(context.Background())
+	p.done.Add(1)
+	go func() {
+		defer p.done.Done()
+		// use resolved server/client addrs
+		if err := runApp(p.ctx, p.mode, p.serverAddr, p.clientAddr, p.metricsAddr, p.interval, p.timeout, p.window); err != nil && !errors.Is(err, context.Canceled) {
+			// Log errors; service manager will see exit code.
+			log.Printf("service run error: %v", err)
+		}
+	}()
+	return nil
+}
+
+func (p *program) Stop(s service.Service) error {
+	// Stop should signal the goroutine to stop and wait for it.
+	if p.cancel != nil {
+		p.cancel()
+	}
+	p.done.Wait()
+	return nil
+}
+
+// runApp contains the previous main logic that starts the metrics server and
+// dispatches to server/client/both modes. This is reused for normal and service runs.
+func runApp(ctx context.Context, mode, serverAddr, clientAddr, metricsAddr string, interval, timeout time.Duration, window int) error {
 	// Start HTTP metrics endpoint
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
-	httpSrv := &http.Server{Addr: *metricsAddr, Handler: mux}
+	httpSrv := &http.Server{Addr: metricsAddr, Handler: mux}
 	go func() {
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("metrics server error: %v", err)
 		}
 	}()
 
-	// Graceful shutdown on SIGINT/SIGTERM
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	switch *mode {
+	// Graceful shutdown on ctx cancellation is handled by callers.
+	switch mode {
 	case "server":
-		if err := runServer(ctx, *tcpAddr); err != nil {
-			log.Fatalf("server error: %v", err)
+		if err := runServer(ctx, serverAddr); err != nil {
+			return fmt.Errorf("server error: %w", err)
 		}
 	case "client":
-		if err := runClient(ctx, *tcpAddr, *interval, *timeout, *window); err != nil {
-			log.Fatalf("client error: %v", err)
+		if err := runClient(ctx, clientAddr, interval, timeout, window); err != nil {
+			return fmt.Errorf("client error: %w", err)
+		}
+	case "both":
+		serverErrCh := make(chan error, 1)
+		go func() {
+			serverErrCh <- runServer(ctx, serverAddr)
+		}()
+
+		if err := runClient(ctx, clientAddr, interval, timeout, window); err != nil && !errors.Is(err, context.Canceled) {
+			return fmt.Errorf("client error: %w", err)
+		}
+
+		if serr := <-serverErrCh; serr != nil && !errors.Is(serr, context.Canceled) {
+			return fmt.Errorf("server error: %w", serr)
 		}
 	default:
-		log.Fatalf("unknown mode: %s", *mode)
+		return fmt.Errorf("unknown mode: %s", mode)
 	}
 
 	// Shutdown metrics server gracefully
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	_ = httpSrv.Shutdown(shutdownCtx)
+	return nil
 }
 
 // runServer runs a simple TCP echo server. It accepts connections and echoes
