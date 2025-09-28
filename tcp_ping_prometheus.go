@@ -20,25 +20,42 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// wire format: 16 bytes
-// [0:8)  = seq (uint64, LE)
-// [8:16) = sent_unix_nano (int64, LE)
+/*
+tcp_ping_prometheus.go
+
+A small TCP "echo" probe with Prometheus metrics.
+
+Wire format for each probe/echo is 16 bytes:
+- bytes [0:8)   = sequence number (uint64, little-endian)
+- bytes [8:16)  = sent timestamp (int64 unix-nanoseconds, little-endian)
+
+Modes:
+- server: accept TCP connections and echo back 16-byte payloads unchanged.
+- client: repeatedly connect and send probes; measure RTT based on echoed payload.
+
+This file contains:
+- Prometheus metric definitions and registration
+- A sliding-window loss tracker (lossTracker)
+- runServer: TCP echo server
+- runClient: client that maintains a connection and probes the server
+- pump: handles send/receive/timeout bookkeeping on an established connection
+*/
 
 var (
-	// metrics
-	sentTotal = prometheus.NewCounter(prometheus.CounterOpts{
+	// Prometheus metrics (names kept the same as original)
+	sentCounter = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "tcp_echo_sent_total",
 		Help: "Number of echo requests sent.",
 	})
-	recvTotal = prometheus.NewCounter(prometheus.CounterOpts{
+	recvCounter = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "tcp_echo_received_total",
 		Help: "Number of echo responses received.",
 	})
-	timeoutTotal = prometheus.NewCounter(prometheus.CounterOpts{
+	timeoutCounter = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "tcp_echo_timeouts_total",
 		Help: "Number of echo requests that timed out (treated as loss).",
 	})
-	connectsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+	connectsCounter = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "tcp_echo_connects_total",
 		Help: "Number of TCP connect attempts (successful).",
 	})
@@ -50,53 +67,71 @@ var (
 		Name: "tcp_echo_up",
 		Help: "Exporter health indicator (1 = up).",
 	})
-	rttHist = prometheus.NewHistogram(prometheus.HistogramOpts{
+	rttHistogram = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name:    "tcp_echo_rtt_seconds",
 		Help:    "Round-trip latency measured over the TCP echo path.",
-		Buckets: prometheus.ExponentialBuckets(0.0001, 1.8, 20), // 100µs .. ~6s TODO: FIX TIMING
+		Buckets: prometheus.ExponentialBuckets(0.0001, 1.8, 20), // 100µs .. ~6s
 	})
-	lastRTTGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+	lastRttGauge = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "tcp_echo_last_rtt_seconds",
 		Help: "Last observed RTT in seconds.",
 	})
-	lossGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+	lossPercentGauge = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "tcp_echo_loss_percent",
 		Help: "Echo loss percentage over the sliding window (timeouts considered loss).",
 	})
 )
 
 func init() {
-	prometheus.MustRegister(sentTotal, recvTotal, timeoutTotal, connectsTotal, connectedGauge, upGauge, rttHist, lastRTTGauge, lossGauge)
+	prometheus.MustRegister(
+		sentCounter,
+		recvCounter,
+		timeoutCounter,
+		connectsCounter,
+		connectedGauge,
+		upGauge,
+		rttHistogram,
+		lastRttGauge,
+		lossPercentGauge,
+	)
+	// Mark exporter as up unless init fails later.
 	upGauge.Set(1)
 }
 
-// lossTracker keeps a rolling window of outcomes.
+// lossTracker maintains a fixed-size circular buffer of recent probe outcomes.
+// true indicates success, false indicates loss. It exposes a method to compute
+// the current loss percentage for a sliding window and updates the loss gauge.
 type lossTracker struct {
 	mu     sync.Mutex
-	buf    []bool // true = success, false = loss
-	idx    int
-	filled bool
+	buf    []bool // circular buffer of outcomes
+	idx    int    // next write index
+	filled bool   // true once we've wrapped at least once
 }
 
-func newLossTracker(n int) *lossTracker {
-	if n < 1 {
-		n = 1
+func newLossTracker(size int) *lossTracker {
+	if size < 1 {
+		size = 1
 	}
-	return &lossTracker{buf: make([]bool, n)}
+	return &lossTracker{buf: make([]bool, size)}
 }
 
+// record appends an outcome (true=success, false=loss) and updates the Prometheus gauge.
 func (lt *lossTracker) record(ok bool) {
 	lt.mu.Lock()
-	defer lt.mu.Unlock()
 	lt.buf[lt.idx] = ok
 	lt.idx = (lt.idx + 1) % len(lt.buf)
 	if lt.idx == 0 {
 		lt.filled = true
 	}
-	lossGauge.Set(lt.lossPercent())
+	currentLoss := lt.computeLossPercentLocked()
+	lt.mu.Unlock()
+
+	// update Prometheus metric outside of the locked region in case Set blocks
+	lossPercentGauge.Set(currentLoss)
 }
 
-func (lt *lossTracker) lossPercent() float64 {
+// computeLossPercentLocked calculates loss percent. Caller must hold lt.mu.
+func (lt *lossTracker) computeLossPercentLocked() float64 {
 	total := len(lt.buf)
 	if !lt.filled {
 		total = lt.idx
@@ -113,6 +148,8 @@ func (lt *lossTracker) lossPercent() float64 {
 	return 100.0 * float64(fail) / float64(total)
 }
 
+// To preserve the same CLI behaviour as before, main constructs the HTTP metrics
+// server, parses flags, and dispatches to the server or client mode.
 func main() {
 	mode := flag.String("mode", "server", "server or client")
 	tcpAddr := flag.String("tcp", ":4000", "TCP address to listen on (server) or connect to (client)")
@@ -122,7 +159,7 @@ func main() {
 	window := flag.Int("window", 100, "Client: sliding window size for loss percentage")
 	flag.Parse()
 
-	// HTTP metrics server
+	// Start HTTP metrics endpoint
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
 	httpSrv := &http.Server{Addr: *metricsAddr, Handler: mux}
@@ -132,6 +169,7 @@ func main() {
 		}
 	}()
 
+	// Graceful shutdown on SIGINT/SIGTERM
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -148,11 +186,15 @@ func main() {
 		log.Fatalf("unknown mode: %s", *mode)
 	}
 
+	// Shutdown metrics server gracefully
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	_ = httpSrv.Shutdown(shutdownCtx)
 }
 
+// runServer runs a simple TCP echo server. It accepts connections and echoes
+// back any 16-byte payload unchanged. The server periodically times out Accept
+// to allow checking the context for shutdown.
 func runServer(ctx context.Context, addr string) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -163,9 +205,11 @@ func runServer(ctx context.Context, addr string) error {
 
 	var wg sync.WaitGroup
 	for {
+		// set a deadline so we can break out when context is canceled
 		ln.(*net.TCPListener).SetDeadline(time.Now().Add(1 * time.Second))
 		conn, err := ln.Accept()
 		if err != nil {
+			// handle timeout from SetDeadline
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				if ctx.Err() != nil {
 					break
@@ -175,18 +219,24 @@ func runServer(ctx context.Context, addr string) error {
 			log.Printf("accept error: %v", err)
 			continue
 		}
+
 		wg.Add(1)
 		go func(c net.Conn) {
 			defer wg.Done()
 			defer c.Close()
-			_ = c.(*net.TCPConn).SetKeepAlive(true)
-			_ = c.(*net.TCPConn).SetKeepAlivePeriod(30 * time.Second)
+			// Try to set keep-alive for long-lived connections; ignore errors.
+			if tcpConn, ok := c.(*net.TCPConn); ok {
+				_ = tcpConn.SetKeepAlive(true)
+				_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
+			}
+
 			reader := bufio.NewReaderSize(c, 64)
 			buf := make([]byte, 16)
 			for {
 				if ctx.Err() != nil {
 					return
 				}
+				// Make read deadline not too long so we can also detect ctx cancellation.
 				c.SetReadDeadline(time.Now().Add(30 * time.Second))
 				_, err := ioReadFull(reader, buf)
 				if err != nil {
@@ -195,7 +245,7 @@ func runServer(ctx context.Context, addr string) error {
 					}
 					return
 				}
-				// echo back exactly
+				// Echo payload back unchanged; error breaks loop.
 				c.SetWriteDeadline(time.Now().Add(5 * time.Second))
 				if _, err := c.Write(buf); err != nil {
 					return
@@ -203,18 +253,21 @@ func runServer(ctx context.Context, addr string) error {
 			}
 		}(conn)
 	}
+
 	wg.Wait()
 	return nil
 }
 
+// runClient repeatedly connects to addr and probes via pump. On connection loss
+// it reconnects with exponential backoff (capped).
 func runClient(ctx context.Context, addr string, interval, timeout time.Duration, window int) error {
 	log.Printf("client probing %s every %s (timeout %s)", addr, interval, timeout)
-	lt := newLossTracker(window)
+	lTracker := newLossTracker(window)
 	var seq uint64
 
 	retryDelay := 500 * time.Millisecond
 	for ctx.Err() == nil {
-		c, err := dial(addr)
+		conn, err := dial(addr)
 		if err != nil {
 			log.Printf("dial error: %v", err)
 			time.Sleep(retryDelay)
@@ -222,12 +275,12 @@ func runClient(ctx context.Context, addr string, interval, timeout time.Duration
 			continue
 		}
 		retryDelay = 500 * time.Millisecond
-		connectsTotal.Inc()
+		connectsCounter.Inc()
 		connectedGauge.Set(1)
 
-		if err := pump(ctx, c, interval, timeout, &seq, lt); err != nil {
+		if err := pump(ctx, conn, interval, timeout, &seq, lTracker); err != nil {
 			connectedGauge.Set(0)
-			c.Close()
+			conn.Close()
 			if ctx.Err() == nil {
 				log.Printf("connection dropped: %v", err)
 			}
@@ -236,31 +289,33 @@ func runClient(ctx context.Context, addr string, interval, timeout time.Duration
 	return ctx.Err()
 }
 
-func pump(ctx context.Context, c net.Conn, interval, timeout time.Duration, seq *uint64, lt *lossTracker) error {
-	defer c.Close()
-	writer := bufio.NewWriterSize(c, 64)
-	reader := bufio.NewReaderSize(c, 64)
+// pump manages the probe send/receive loop for a single established connection.
+// It spawns a reader goroutine that pushes received responses into respCh
+// and the main loop sends probes on a ticker and expires outstanding probes.
+func pump(ctx context.Context, conn net.Conn, interval, timeout time.Duration, seq *uint64, lt *lossTracker) error {
+	defer conn.Close()
+	writer := bufio.NewWriterSize(conn, 64)
+	reader := bufio.NewReaderSize(conn, 64)
 
-	// Channels for reader goroutine
-	type resp struct {
+	type response struct {
 		seq  uint64
 		when time.Time
 	}
-	respCh := make(chan resp, 128)
+	respCh := make(chan response, 128)
 	errCh := make(chan error, 1)
 
-	// outstanding sends
+	// outstanding maps sequence -> send time for matching responses and timeout checks.
 	var mu sync.Mutex
 	outstanding := make(map[uint64]time.Time)
 
-	// start reader goroutine that continuously reads 16-byte echoes
+	// Reader goroutine: continuously read 16-byte echoes and forward seq+receive-time.
 	go func() {
 		buf := make([]byte, 16)
 		for {
-			_ = c.SetReadDeadline(time.Now().Add(timeout))
+			_ = conn.SetReadDeadline(time.Now().Add(timeout))
 			_, err := ioReadFull(reader, buf)
 			if err != nil {
-				// treat timeout as non-fatal; other errors are reported
+				// treat timeout as non-fatal; other errors are reported to pump
 				if ne, ok := err.(net.Error); ok && ne.Timeout() {
 					continue
 				}
@@ -270,9 +325,9 @@ func pump(ctx context.Context, c net.Conn, interval, timeout time.Duration, seq 
 				}
 				return
 			}
-			seq := binary.LittleEndian.Uint64(buf[0:8])
+			seqNum := binary.LittleEndian.Uint64(buf[0:8])
 			select {
-			case respCh <- resp{seq: seq, when: time.Now()}:
+			case respCh <- response{seq: seqNum, when: time.Now()}:
 			case <-ctx.Done():
 				return
 			}
@@ -289,47 +344,48 @@ func pump(ctx context.Context, c net.Conn, interval, timeout time.Duration, seq 
 		case <-ctx.Done():
 			return ctx.Err()
 		case err := <-errCh:
-			// reader reported a non-temporary error -> connection broken
+			// non-temporary reader error -> terminate connection
 			return err
 		case r := <-respCh:
-			// match response to outstanding
+			// match response to outstanding sends
 			mu.Lock()
-			st, ok := outstanding[r.seq]
+			sendTime, ok := outstanding[r.seq]
 			if ok {
 				delete(outstanding, r.seq)
 			}
 			mu.Unlock()
 			if !ok {
-				// stale / unknown reply -> ignore
+				// Unknown or stale reply; ignore
 				continue
 			}
-			rtt := r.when.Sub(st)
+			rtt := r.when.Sub(sendTime)
 			if rtt < 0 {
 				rtt = 0
 			}
-			// if reply arrived after timeout, flip prior timeout to success but don't record RTT histogram
+			// If reply arrived after the configured timeout, treat it as late:
+			// consider the probe successful for loss stats but do not record RTT.
 			if rtt > timeout {
 				lt.record(true)
 				continue
 			}
-			recvTotal.Inc()
-			lastRTTGauge.Set(rtt.Seconds())
-			rttHist.Observe(rtt.Seconds())
+			recvCounter.Inc()
+			lastRttGauge.Set(rtt.Seconds())
+			rttHistogram.Observe(rtt.Seconds())
 			lt.record(true)
 		case <-sendTicker.C:
 			// prepare and send next probe
-			cand := (*seq) + 1
+			nextSeq := (*seq) + 1
 			now := time.Now()
 			payload := make([]byte, 16)
-			binary.LittleEndian.PutUint64(payload[0:8], cand)
+			binary.LittleEndian.PutUint64(payload[0:8], nextSeq)
 			binary.LittleEndian.PutUint64(payload[8:16], uint64(now.UnixNano()))
 
-			_ = c.SetWriteDeadline(time.Now().Add(timeout))
+			_ = conn.SetWriteDeadline(time.Now().Add(timeout))
 			if _, err := writer.Write(payload); err != nil {
 				// write failed: mark this probe lost and decide whether to continue or abort
 				lt.record(false)
-				timeoutTotal.Inc()
-				// if temporary (including timeout), continue; otherwise return to let caller reconnect
+				timeoutCounter.Inc()
+				// if temporary (including timeout), continue; otherwise return to reconnect
 				if ne, ok := err.(net.Error); ok && (ne.Timeout() || ne.Temporary()) {
 					continue
 				}
@@ -337,21 +393,21 @@ func pump(ctx context.Context, c net.Conn, interval, timeout time.Duration, seq 
 			}
 			if err := writer.Flush(); err != nil {
 				lt.record(false)
-				timeoutTotal.Inc()
+				timeoutCounter.Inc()
 				if ne, ok := err.(net.Error); ok && (ne.Timeout() || ne.Temporary()) {
 					continue
 				}
 				return err
 			}
 
-			// commit seq and track outstanding
-			*seq = cand
-			sentTotal.Inc()
+			// commit seq and track outstanding send time
+			*seq = nextSeq
+			sentCounter.Inc()
 			mu.Lock()
-			outstanding[cand] = now
+			outstanding[nextSeq] = now
 			mu.Unlock()
 		case <-cleanupTicker.C:
-			// expire outstanding entries older than timeout -> consider them lost
+			// expire outstanding entries older than timeout -> record as lost
 			now := time.Now()
 			var expired []uint64
 			mu.Lock()
@@ -366,24 +422,28 @@ func pump(ctx context.Context, c net.Conn, interval, timeout time.Duration, seq 
 			mu.Unlock()
 			for range expired {
 				lt.record(false)
-				timeoutTotal.Inc()
+				timeoutCounter.Inc()
 			}
 		}
 	}
 }
 
+// dial connects to addr with a short timeout and enables TCP_NODELAY.
 func dial(addr string) (net.Conn, error) {
 	d := &net.Dialer{Timeout: 3 * time.Second, KeepAlive: 30 * time.Second}
 	c, err := d.Dial("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
-	_ = c.(*net.TCPConn).SetNoDelay(true)
+	if tcpConn, ok := c.(*net.TCPConn); ok {
+		_ = tcpConn.SetNoDelay(true)
+	}
 	return c, nil
 }
 
+// ioReadFull reads len(buf) bytes from a bufio.Reader. It's similar to io.ReadFull
+// but specialised to work with bufio.Reader to avoid an import and be efficient.
 func ioReadFull(r *bufio.Reader, buf []byte) (int, error) {
-	// optimized read full into fixed buffer
 	n := 0
 	for n < len(buf) {
 		m, err := r.Read(buf[n:])
@@ -401,18 +461,3 @@ func minDuration(a, b time.Duration) time.Duration {
 	}
 	return b
 }
-
-// --- Prometheus example queries ---
-// rate(tcp_echo_timeouts_total[5m])
-// histogram_quantile(0.99, rate(tcp_echo_rtt_seconds_bucket[5m]))
-// avg_over_time(tcp_echo_loss_percent[5m])
-
-// Build & Run:
-//  go mod init example.com/tcp-echo-metrics
-//  go mod tidy
-//  go build -o tcp-echo-metrics .
-//  # terminal 1 (server)
-//  ./tcp-echo-metrics -mode=server -tcp=":4000" -metrics=":2112"
-//  # terminal 2 (client)
-//  ./tcp-echo-metrics -mode=client -tcp="127.0.0.1:4000" -interval=200ms -timeout=800ms -metrics=":2113"
-//  # scrape http://localhost:2113/metrics
