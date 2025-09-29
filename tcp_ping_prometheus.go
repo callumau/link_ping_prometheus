@@ -448,12 +448,15 @@ func pump(ctx context.Context, conn net.Conn, interval, timeout time.Duration, s
 	var mu sync.Mutex
 	outstanding := make(map[uint64]time.Time)
 
+	// allocate reusable buffers to avoid per-iteration GC pressure
+	readerBuf := make([]byte, 16)
+	payloadBuf := make([]byte, 16)
+
 	// Reader goroutine: continuously read 16-byte echoes and forward seq+receive-time.
 	go func() {
-		buf := make([]byte, 16)
 		for {
 			_ = conn.SetReadDeadline(time.Now().Add(timeout))
-			_, err := ioReadFull(reader, buf)
+			_, err := ioReadFull(reader, readerBuf)
 			if err != nil {
 				// treat timeout as non-fatal; other errors are reported to pump
 				if ne, ok := err.(net.Error); ok && ne.Timeout() {
@@ -465,7 +468,7 @@ func pump(ctx context.Context, conn net.Conn, interval, timeout time.Duration, s
 				}
 				return
 			}
-			seqNum := binary.LittleEndian.Uint64(buf[0:8])
+			seqNum := binary.LittleEndian.Uint64(readerBuf[0:8])
 			select {
 			case respCh <- response{seq: seqNum, when: time.Now()}:
 			case <-ctx.Done():
@@ -476,8 +479,10 @@ func pump(ctx context.Context, conn net.Conn, interval, timeout time.Duration, s
 
 	sendTicker := time.NewTicker(interval)
 	defer sendTicker.Stop()
-	cleanupTicker := time.NewTicker(50 * time.Millisecond)
-	defer cleanupTicker.Stop()
+
+	// perform cleanup every N sends to avoid scanning map on every tick
+	const cleanupEvery = 5
+	sendCounter := 0
 
 	for {
 		select {
@@ -493,7 +498,25 @@ func pump(ctx context.Context, conn net.Conn, interval, timeout time.Duration, s
 			if ok {
 				delete(outstanding, r.seq)
 			}
+			// Also expire any other timed-out entries opportunistically
+			now := time.Now()
+			var expired []uint64
+			for s, t := range outstanding {
+				if now.Sub(t) > timeout {
+					expired = append(expired, s)
+				}
+			}
+			for _, s := range expired {
+				delete(outstanding, s)
+			}
 			mu.Unlock()
+
+			// account for expirations as losses
+			for range expired {
+				lt.record(false)
+				timeoutCounter.Inc()
+			}
+
 			if !ok {
 				// Unknown or stale reply; ignore
 				continue
@@ -513,20 +536,22 @@ func pump(ctx context.Context, conn net.Conn, interval, timeout time.Duration, s
 			rttHistogram.Observe(rtt.Seconds())
 			lt.record(true)
 		case <-sendTicker.C:
-			// prepare and send next probe
+			// prepare and send next probe (reuse payloadBuf)
 			nextSeq := (*seq) + 1
 			now := time.Now()
-			payload := make([]byte, 16)
-			binary.LittleEndian.PutUint64(payload[0:8], nextSeq)
-			binary.LittleEndian.PutUint64(payload[8:16], uint64(now.UnixNano()))
+			binary.LittleEndian.PutUint64(payloadBuf[0:8], nextSeq)
+			binary.LittleEndian.PutUint64(payloadBuf[8:16], uint64(now.UnixNano()))
 
 			_ = conn.SetWriteDeadline(time.Now().Add(timeout))
-			if _, err := writer.Write(payload); err != nil {
+			if _, err := writer.Write(payloadBuf); err != nil {
 				// write failed: mark this probe lost and decide whether to continue or abort
 				lt.record(false)
 				timeoutCounter.Inc()
 				// if temporary (including timeout), continue; otherwise return to reconnect
 				if ne, ok := err.(net.Error); ok && (ne.Timeout() || ne.Temporary()) {
+					// still increment seq so sequence numbers remain monotonic
+					*seq = nextSeq
+					sentCounter.Inc()
 					continue
 				}
 				return err
@@ -535,6 +560,8 @@ func pump(ctx context.Context, conn net.Conn, interval, timeout time.Duration, s
 				lt.record(false)
 				timeoutCounter.Inc()
 				if ne, ok := err.(net.Error); ok && (ne.Timeout() || ne.Temporary()) {
+					*seq = nextSeq
+					sentCounter.Inc()
 					continue
 				}
 				return err
@@ -545,24 +572,27 @@ func pump(ctx context.Context, conn net.Conn, interval, timeout time.Duration, s
 			sentCounter.Inc()
 			mu.Lock()
 			outstanding[nextSeq] = now
-			mu.Unlock()
-		case <-cleanupTicker.C:
-			// expire outstanding entries older than timeout -> record as lost
-			now := time.Now()
-			var expired []uint64
-			mu.Lock()
-			for s, t := range outstanding {
-				if now.Sub(t) > timeout {
-					expired = append(expired, s)
+			// do periodic cleanup every cleanupEvery sends to expire old outstanding entries
+			sendCounter++
+			if sendCounter >= cleanupEvery {
+				sendCounter = 0
+				now2 := time.Now()
+				var expired []uint64
+				for s, t := range outstanding {
+					if now2.Sub(t) > timeout {
+						expired = append(expired, s)
+					}
 				}
-			}
-			for _, s := range expired {
-				delete(outstanding, s)
-			}
-			mu.Unlock()
-			for range expired {
-				lt.record(false)
-				timeoutCounter.Inc()
+				for _, s := range expired {
+					delete(outstanding, s)
+				}
+				mu.Unlock()
+				for range expired {
+					lt.record(false)
+					timeoutCounter.Inc()
+				}
+			} else {
+				mu.Unlock()
 			}
 		}
 	}
