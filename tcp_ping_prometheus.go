@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -31,10 +32,6 @@ Wire format for each probe/echo is 16 bytes:
 - bytes [0:8)   = sequence number (uint64, little-endian)
 - bytes [8:16)  = sent timestamp (int64 unix-nanoseconds, little-endian)
 
-Modes:
-- server: accept TCP connections and echo back 16-byte payloads unchanged.
-- client: repeatedly connect and send probes; measure RTT based on echoed payload.
-
 This file contains:
 - Prometheus metric definitions and registration
 - A sliding-window loss tracker (lossTracker)
@@ -44,7 +41,7 @@ This file contains:
 */
 
 var (
-	// Prometheus metrics (names kept the same as original)
+	// Prometheus metrics
 	sentCounter = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "tcp_echo_sent_total",
 		Help: "Number of echo requests sent.",
@@ -72,7 +69,7 @@ var (
 	rttHistogram = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name:    "tcp_echo_rtt_seconds",
 		Help:    "Round-trip latency measured over the TCP echo path.",
-		Buckets: prometheus.ExponentialBuckets(0.0001, 1.8, 20), // 100µs .. ~6s
+		Buckets: prometheus.ExponentialBuckets(0.0001, 2, 15), // 100µs .. ~2s
 	})
 	lastRttGauge = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "tcp_echo_last_rtt_seconds",
@@ -150,8 +147,6 @@ func (lt *lossTracker) computeLossPercentLocked() float64 {
 	return 100.0 * float64(fail) / float64(total)
 }
 
-// To preserve the same CLI behaviour as before, main constructs the HTTP metrics
-// server, parses flags, and dispatches to the server or client mode.
 func main() {
 	mode := flag.String("mode", "server", "server, client or both")
 	listenAddr := flag.String("listen", ":4000", "TCP address to listen on (server)")
@@ -175,6 +170,23 @@ func main() {
 			DisplayName: "TCP Ping Prometheus",
 			Description: "TCP echo probe exporter with Prometheus metrics.",
 		}
+
+		// When installing, record the command-line arguments the service should
+		// be started with. This ensures flags passed to `-svc=install` are used
+		// when the service runs (Windows installs need explicit args).
+		if *svcAction == "install" {
+			svcConfig.Arguments = []string{
+				"-svc", "run",
+				"-mode", *mode,
+				"-listen", serverAddr,
+				"-target", clientAddr,
+				"-metrics", *metricsAddr,
+				"-interval", interval.String(),
+				"-timeout", timeout.String(),
+				"-window", strconv.Itoa(*window),
+			}
+		}
+
 		prg := &program{
 			mode:        *mode,
 			metricsAddr: *metricsAddr,
@@ -246,9 +258,7 @@ func main() {
 // program implements service.Interface for kardianos/service.
 type program struct {
 	// configuration captured at creation-time
-	mode string
-	// retained for compatibility in this patch but no longer used directly
-	tcpAddr     string
+	mode        string
 	serverAddr  string
 	clientAddr  string
 	metricsAddr string
@@ -344,6 +354,22 @@ func runServer(ctx context.Context, addr string) error {
 	defer ln.Close()
 
 	var wg sync.WaitGroup
+
+	// track active connections so we can close them on shutdown
+	var connsMu sync.Mutex
+	conns := make(map[net.Conn]struct{})
+
+	// close listener and active connections immediately on context cancel
+	go func() {
+		<-ctx.Done()
+		_ = ln.Close()
+		connsMu.Lock()
+		for c := range conns {
+			_ = c.Close()
+		}
+		connsMu.Unlock()
+	}()
+
 	for {
 		// set a deadline so we can break out when context is canceled
 		ln.(*net.TCPListener).SetDeadline(time.Now().Add(1 * time.Second))
@@ -356,14 +382,30 @@ func runServer(ctx context.Context, addr string) error {
 				}
 				continue
 			}
+			// if context was cancelled, break out
+			if ctx.Err() != nil {
+				break
+			}
 			log.Printf("accept error: %v", err)
 			continue
 		}
+
+		// record active connection
+		connsMu.Lock()
+		conns[conn] = struct{}{}
+		connsMu.Unlock()
 
 		wg.Add(1)
 		go func(c net.Conn) {
 			defer wg.Done()
 			defer c.Close()
+			// remove from active set on exit
+			defer func() {
+				connsMu.Lock()
+				delete(conns, c)
+				connsMu.Unlock()
+			}()
+
 			// Try to set keep-alive for long-lived connections; ignore errors.
 			if tcpConn, ok := c.(*net.TCPConn); ok {
 				_ = tcpConn.SetKeepAlive(true)
@@ -376,8 +418,8 @@ func runServer(ctx context.Context, addr string) error {
 				if ctx.Err() != nil {
 					return
 				}
-				// Make read deadline not too long so we can also detect ctx cancellation.
-				c.SetReadDeadline(time.Now().Add(30 * time.Second))
+				// Make read deadline shorter so shutdown is more responsive.
+				c.SetReadDeadline(time.Now().Add(5 * time.Second))
 				_, err := ioReadFull(reader, buf)
 				if err != nil {
 					if ne, ok := err.(net.Error); ok && ne.Timeout() {
