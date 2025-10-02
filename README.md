@@ -70,6 +70,8 @@ The exporter serves Prometheus metrics at /metrics on the address given by `-met
 
 Prebuilt Grafana Dashboard [grafana-dashboard.json](grafana-dashboard.json).
 
+[![Grafana dashboard screenshot](.docs/screenshot01.png)](.docs/screenshot01.png)
+
 Key functions and types
 -----------------------
 - [`runClient`](tcp_ping_prometheus.go) — main client loop that reconnects and probes.
