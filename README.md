@@ -24,7 +24,7 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o build/tcp-echo-metrics.exe .
 Download
 -----
 
-Release binaries for Linux, macOS (darwin) and Windows - [Releases](.github/releases)
+Release binaries for Linux, macOS (darwin) and Windows - [Latest Release](releases/latest)
 
 Usage
 -----
