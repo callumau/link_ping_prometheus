@@ -1,2 +1,4 @@
 tcp-echo-metrics
 build/*
+example_queries.txt
+*.log
