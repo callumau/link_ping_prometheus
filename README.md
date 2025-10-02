@@ -24,7 +24,7 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o build/tcp-echo-metrics.exe .
 Download
 -----
 
-Release binaries for Linux, macOS (darwin) and Windows - [Latest Release](releases/latest)
+Release binaries for Linux, macOS (darwin) and Windows - [Latest Release](https://github.com/callumau/tcp_ping_prometheus/releases/latest)
 
 Usage
 -----
