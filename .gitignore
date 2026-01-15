@@ -2,3 +2,4 @@ tcp-echo-metrics
 build/*
 example_queries.txt
 *.log
+tcp_ping_prometheus
