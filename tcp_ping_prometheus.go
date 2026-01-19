@@ -404,6 +404,12 @@ func (a *AdaptiveStats) update(rttSeconds float64) {
 	a.rto = a.srtt + 4*a.rttvar
 }
 
+func (a *AdaptiveStats) backoff() {
+	// Simple exponential backoff: double the current RTO
+	// We update the internal 'rto' which is then clamped by currentRTO if needed
+	a.rto = a.rto * 2
+}
+
 func (a *AdaptiveStats) currentRTO() time.Duration {
 	// Clamp RTO
 	val := a.rto
@@ -442,15 +448,9 @@ func probeTarget(ctx context.Context, t Target) {
 	// Helper to get interval
 	getInterval := func() time.Duration {
 		if *flAdaptive {
-			// Interval is max(base, 1.5 * RTO) to prevent saturation if link is extremely slow
-			// But usually interval > RTT is enough.
-			// Let's stick to BaseInterval unless RTO is huge?
-			// The user said "auto interval based on link".
-			// A simple logic: Interval should be >= Timeout to avoid pileup
-			rto := adaptive.currentRTO()
-			if *flBaseInterval < rto {
-				return rto
-			}
+			// Decouple interval from RTO to allow pipelining and faster adaptation.
+			// We might want to avoid flooding if RTO is very large (dead link),
+			// but for now strict base interval is better for responsiveness.
 			return *flBaseInterval
 		}
 		return *flBaseInterval
@@ -644,15 +644,18 @@ func runEchoLoop(
 
 		// 2. Check for Timeouts in pending
 		now := time.Now()
+		var timeoutOccurred bool
 		for s, sentTime := range pending {
 			if now.Sub(sentTime) > timeout {
 				// logger.Info("Debug: Timeout", "seq", s, "elapsed", now.Sub(sentTime))
 				metricTimeout.WithLabelValues(t.Name, t.Address).Inc()
 				delete(pending, s)
-				// Note: We don't necessarily kill the connection on a single packet loss,
-				// but TCP will handle retransmissions.
-				// The higher level logic deems this a "timeout" for metrics.
+				timeoutOccurred = true
 			}
+		}
+
+		if timeoutOccurred && *flAdaptive {
+			stats.backoff()
 		}
 
 		// 3. Send Ping
