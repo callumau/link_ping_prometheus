@@ -8,12 +8,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -23,275 +23,194 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// Wire format constants.
+// ==========================================
+// Constants & Configuration
+// ==========================================
+
 const (
 	payloadSize = 16 // 8 bytes seq + 8 bytes timestamp
+	// Default adaptive constants (RFC 6298 inspired)
+	defaultAlpha  = 0.125
+	defaultBeta   = 0.25
+	defaultMinRTO = 100 * time.Millisecond
+	defaultMaxRTO = 3 * time.Second
 )
-
-// Target represents a remote endpoint to probe.
-type Target struct {
-	Name    string `json:"name"`
-	Address string `json:"address"`
-}
 
 var (
-	// Prometheus metrics.
-	sentCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "tcp_echo_sent_total",
-		Help: "Number of echo requests sent.",
-	}, []string{"target"})
-	recvCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "tcp_echo_received_total",
-		Help: "Number of echo responses received.",
-	}, []string{"target"})
-	timeoutCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "tcp_echo_timeouts_total",
-		Help: "Number of echo requests that timed out (treated as loss).",
-	}, []string{"target"})
-	connectsCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "tcp_echo_connects_total",
-		Help: "Number of TCP connect attempts (successful).",
-	}, []string{"target"})
-	connectedGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "tcp_echo_connected",
-		Help: "1 if the client is currently connected to the server, else 0.",
-	}, []string{"target"})
-	upGauge = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "tcp_echo_up",
-		Help: "Exporter health indicator (1 = up).",
-	})
-	rttHistogram = prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Name:    "tcp_echo_rtt_seconds",
-		Help:    "Round-trip latency measured over the TCP echo path.",
-		Buckets: prometheus.ExponentialBuckets(0.0001, 2, 15), // 100µs .. ~2s
-	}, []string{"target"})
-	lastRttGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "tcp_echo_last_rtt_seconds",
-		Help: "Last observed RTT in seconds.",
-	}, []string{"target"})
-	lossPercentGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "tcp_echo_loss_percent",
-		Help: "Echo loss percentage over the sliding window (timeouts considered loss).",
-	}, []string{"target"})
+	// CLI Flags
+	flMode     = flag.String("mode", "server", "Mode: server, client, both")
+	flListen   = flag.String("listen", ":4000", "Server: Listen address")
+	flTarget   = flag.String("target", "", "Client: Single target address")
+	flTargets  = flag.String("targets", "", "Client: JSON file path with targets")
+	flMetrics  = flag.String("metrics", ":2112", "Metrics: Listen address")
+	flSvc      = flag.String("svc", "", "Service: install, uninstall, start, stop, run")
+	flJSONLogs = flag.Bool("json-logs", false, "Log in JSON format")
+
+	// Adaptive flags
+	flAdaptive     = flag.Bool("adaptive", true, "Client: Use adaptive timeout/interval based on link quality")
+	flBaseInterval = flag.Duration("interval", 500*time.Millisecond, "Client: Base probe interval (min interval if adaptive)")
+	flBaseTimeout  = flag.Duration("timeout", 1*time.Second, "Client: Base/Initial timeout")
 )
 
-func init() {
-	prometheus.MustRegister(
-		sentCounter,
-		recvCounter,
-		timeoutCounter,
-		connectsCounter,
-		connectedGauge,
-		upGauge,
-		rttHistogram,
-		lastRttGauge,
-		lossPercentGauge,
-	)
-	upGauge.Set(1)
+// ==========================================
+// Metrics
+// ==========================================
+
+var (
+	metricSent = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "tcp_echo_sent_total",
+		Help: "Total echo requests sent (attempts).",
+	}, []string{"target", "address"})
+	metricRecv = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "tcp_echo_received_total",
+		Help: "Total echo responses received.",
+	}, []string{"target", "address"})
+	metricTimeout = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "tcp_echo_timeouts_total",
+		Help: "Total echo requests that timed out.",
+	}, []string{"target", "address"})
+	metricDrop = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "tcp_echo_dropped_total",
+		Help: "Total connections dropped/failed.",
+	}, []string{"target", "address"})
+	metricRTT = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "tcp_echo_rtt_seconds",
+		Help:    "Round-trip time in seconds.",
+		Buckets: prometheus.ExponentialBuckets(0.0005, 2, 14), // 500us to ~8s
+	}, []string{"target", "address"})
+	metricLastRTT = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "tcp_echo_last_rtt_seconds",
+		Help: "Most recent RTT in seconds.",
+	}, []string{"target", "address"})
+	metricUp = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "tcp_echo_connected",
+		Help: "1 if currently connected, 0 otherwise.",
+	}, []string{"target", "address"})
+	// Estimate metrics
+	metricRTO = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "tcp_echo_estimated_timeout_seconds",
+		Help: "Current adaptive timeout (RTO) being used.",
+	}, []string{"target", "address"})
+)
+
+var registerOnce sync.Once
+
+func initMetrics() {
+	registerOnce.Do(func() {
+		prometheus.MustRegister(metricSent, metricRecv, metricTimeout, metricDrop, metricRTT, metricLastRTT, metricUp, metricRTO)
+	})
 }
 
-// lossTracker maintains a circular buffer of recent probe outcomes to calculate loss percentage.
-type lossTracker struct {
-	mu     sync.Mutex
-	buf    []bool // Circular buffer: true = success, false = failure.
-	idx    int    // Current insertion index.
-	filled bool   // Whether the buffer has been filled at least once.
-	name   string // Target name for metrics.
-}
-
-func newLossTracker(size int, name string) *lossTracker {
-	if size < 1 {
-		size = 1
-	}
-	return &lossTracker{
-		buf:  make([]bool, size),
-		name: name,
-	}
-}
-
-// record records the outcome of a probe and updates the loss percentage gauge.
-func (lt *lossTracker) record(success bool) {
-	lt.mu.Lock()
-	defer lt.mu.Unlock()
-
-	lt.buf[lt.idx] = success
-	lt.idx = (lt.idx + 1) % len(lt.buf)
-	if lt.idx == 0 {
-		lt.filled = true
-	}
-
-	// Update gauge immediately.
-	lossPercentGauge.WithLabelValues(lt.name).Set(lt.computeLossPercent())
-}
-
-// computeLossPercent returns the percentage of failures in the current window.
-// It assumes the lock is held by the caller if called internally, but sticking to
-// keeping the calculation simple within record or locking here.
-// Since we call it from record which holds the lock, we'll inline the logic there or separate it.
-// To satisfy the refactoring plan (simpler), we merge the logic or keep it as a helper.
-func (lt *lossTracker) computeLossPercent() float64 {
-	count := len(lt.buf)
-	if !lt.filled {
-		count = lt.idx
-		if count == 0 {
-			return 0
-		}
-	}
-
-	failures := 0
-	for i := 0; i < count; i++ {
-		if !lt.buf[i] {
-			failures++
-		}
-	}
-	return 100.0 * float64(failures) / float64(count)
-}
-
-// loadTargets reads the target list from a JSON file.
-func loadTargets(path string) ([]Target, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var targets []Target
-	if err := json.Unmarshal(data, &targets); err != nil {
-		return nil, err
-	}
-	return targets, nil
-}
+// ==========================================
+// Main Entry
+// ==========================================
 
 func main() {
-	mode := flag.String("mode", "server", "server, client or both")
-	listenAddr := flag.String("listen", ":4000", "TCP address to listen on (server)")
-	targetAddr := flag.String("target", ":4000", "TCP address to connect to (client)")
-	targetsFlag := flag.String("targets", "", "JSON file with list of targets (client)")
-	metricsAddr := flag.String("metrics", ":2112", "HTTP address for Prometheus /metrics")
-	interval := flag.Duration("interval", 200*time.Millisecond, "Client: probe interval")
-	timeout := flag.Duration("timeout", 800*time.Millisecond, "Client: per-probe timeout (considered loss)")
-	window := flag.Int("window", 100, "Client: sliding window size for loss percentage")
-	svcAction := flag.String("svc", "", "service action: install | uninstall | start | stop | run")
 	flag.Parse()
+	setupLogger(*flJSONLogs)
 
-	// Initial target setup.
-	var targets []Target
-	if *targetsFlag != "" {
-		var err error
-		targets, err = loadTargets(*targetsFlag)
-		if err != nil {
-			log.Fatalf("Error loading targets: %v", err)
-		}
-	} else {
-		targets = []Target{{Name: "default", Address: *targetAddr}}
-	}
-
-	// Service management instructions.
-	if *svcAction != "" {
-		runServiceAction(*svcAction, *mode, *listenAddr, *metricsAddr, *targetsFlag, *targetAddr, *interval, *timeout, *window, targets)
+	// If service command
+	if *flSvc != "" {
+		handleService(*flSvc)
 		return
 	}
 
-	// Standard run (foreground).
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	// Normal run
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
 
-	if err := runApp(ctx, *mode, *listenAddr, targets, *metricsAddr, *interval, *timeout, *window); err != nil && !errors.Is(err, context.Canceled) {
-		log.Fatalf("Error: %v", err)
+	prg := &program{
+		ctx: ctx,
+	}
+	if err := prg.run(); err != nil {
+		slog.Error("Program exited with error", "err", err)
+		os.Exit(1)
 	}
 }
 
-// runServiceAction handles the service lifecycle actions (install, start, etc.).
-func runServiceAction(action, mode, listenAddr, metricsAddr, targetsFlag, targetAddr string, interval, timeout time.Duration, window int, targets []Target) {
+// ==========================================
+// Service Wrappers
+// ==========================================
+
+func handleService(action string) {
 	svcConfig := &service.Config{
 		Name:        "tcp_ping_prometheus",
 		DisplayName: "TCP Ping Prometheus",
-		Description: "TCP echo probe exporter with Prometheus metrics.",
+		Description: "Monitoring agent for TCP Echo latency.",
+		Arguments:   []string{}, // We'll reconstruct args during install
 	}
 
+	// Helper to reconstruct arguments for install.
+	// Note: simplified. Production apps might copy os.Args or be smarter.
 	if action == "install" {
-		args := []string{
-			"-svc", "run",
-			"-mode", mode,
-			"-listen", listenAddr,
-			"-metrics", metricsAddr,
-			"-interval", interval.String(),
-			"-timeout", timeout.String(),
-			"-window", strconv.Itoa(window),
-		}
-		if targetsFlag != "" {
-			args = append(args, "-targets", targetsFlag)
-		} else {
-			args = append(args, "-target", targetAddr)
-		}
+		exePath, _ := os.Executable()
+		// Reconstruct flags based on current execution
+		var args []string
+		flag.Visit(func(f *flag.Flag) {
+			if f.Name != "svc" {
+				args = append(args, fmt.Sprintf("-%s=%s", f.Name, f.Value.String()))
+			}
+		})
+		args = append(args, "-svc=run")
 		svcConfig.Arguments = args
+		svcConfig.Executable = exePath
 	}
 
-	prg := &program{
-		mode:        mode,
-		metricsAddr: metricsAddr,
-		interval:    interval,
-		timeout:     timeout,
-		window:      window,
-		serverAddr:  listenAddr,
-		targets:     targets,
-	}
+	prg := &program{ctx: context.Background()} // Placeholder context, will be replaced in Start
 
-	svc, err := service.New(prg, svcConfig)
+	s, err := service.New(prg, svcConfig)
 	if err != nil {
-		log.Fatalf("Service setup error: %v", err)
+		slog.Error("Failed to init service", "err", err)
+		os.Exit(1)
 	}
 
 	switch action {
 	case "install":
-		if err := svc.Install(); err != nil {
-			log.Fatalf("Service install failed: %v", err)
+		if err := s.Install(); err != nil {
+			slog.Error("Install failed", "err", err)
+			os.Exit(1)
 		}
-		log.Println("Service installed")
+		fmt.Println("Service installed.")
 	case "uninstall":
-		if err := svc.Uninstall(); err != nil {
-			log.Fatalf("Service uninstall failed: %v", err)
+		if err := s.Uninstall(); err != nil {
+			slog.Error("Uninstall failed", "err", err)
+			os.Exit(1)
 		}
-		log.Println("Service uninstalled")
+		fmt.Println("Service uninstalled.")
 	case "start":
-		if err := svc.Start(); err != nil {
-			log.Fatalf("Service start failed: %v", err)
+		if err := s.Start(); err != nil {
+			slog.Error("Start failed", "err", err)
+			os.Exit(1)
 		}
-		log.Println("Service started")
+		fmt.Println("Service started.")
 	case "stop":
-		if err := svc.Stop(); err != nil {
-			log.Fatalf("Service stop failed: %v", err)
+		if err := s.Stop(); err != nil {
+			slog.Error("Stop failed", "err", err)
+			os.Exit(1)
 		}
-		log.Println("Service stopped")
+		fmt.Println("Service stopped.")
 	case "run":
-		if err := svc.Run(); err != nil {
-			log.Fatalf("Service run error: %v", err)
+		if err := s.Run(); err != nil {
+			slog.Error("Run failed", "err", err)
+			os.Exit(1)
 		}
 	default:
-		log.Fatalf("Unknown service action: %s", action)
+		slog.Error("Unknown action", "action", action)
 	}
 }
 
-// program implements service.Interface.
+// program implements service.Interface
 type program struct {
-	mode        string
-	serverAddr  string
-	targets     []Target
-	metricsAddr string
-	interval    time.Duration
-	timeout     time.Duration
-	window      int
-
 	ctx    context.Context
 	cancel context.CancelFunc
-	done   sync.WaitGroup
+	wg     sync.WaitGroup
 }
 
 func (p *program) Start(s service.Service) error {
 	p.ctx, p.cancel = context.WithCancel(context.Background())
-	p.done.Add(1)
 	go func() {
-		defer p.done.Done()
-		if err := runApp(p.ctx, p.mode, p.serverAddr, p.targets, p.metricsAddr, p.interval, p.timeout, p.window); err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("Service run error: %v", err)
+		if err := p.run(); err != nil {
+			slog.Error("Service run error", "err", err)
 		}
 	}()
 	return nil
@@ -301,331 +220,470 @@ func (p *program) Stop(s service.Service) error {
 	if p.cancel != nil {
 		p.cancel()
 	}
-	p.done.Wait()
+	p.wg.Wait()
 	return nil
 }
 
-// runApp initializes the metrics server and starts the main application logic (server/client).
-func runApp(ctx context.Context, mode, serverAddr string, targets []Target, metricsAddr string, interval, timeout time.Duration, window int) error {
-	// Start metrics server.
-	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.Handler())
-	httpSrv := &http.Server{Addr: metricsAddr, Handler: mux}
+func (p *program) run() error {
+	initMetrics()
 
+	// Start Metrics Server
 	go func() {
-		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Printf("Metrics server error: %v", err)
+		mx := http.NewServeMux()
+		mx.Handle("/metrics", promhttp.Handler())
+		slog.Info("Starting metrics server", "addr", *flMetrics)
+		srv := &http.Server{Addr: *flMetrics, Handler: mx}
+
+		go func() {
+			<-p.ctx.Done()
+			srv.Shutdown(context.Background())
+		}()
+
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("Metrics server error", "err", err)
 		}
 	}()
 
-	var err error
+	mode := *flMode
 	switch mode {
 	case "server":
-		err = runServer(ctx, serverAddr)
+		return runServer(p.ctx, *flListen)
 	case "client":
-		err = runClients(ctx, targets, interval, timeout, window)
+		return runClient(p.ctx)
 	case "both":
-		// Run server in a goroutine, client in main blocking.
-		serverErrCh := make(chan error, 1)
+		p.wg.Add(1)
 		go func() {
-			serverErrCh <- runServer(ctx, serverAddr)
+			defer p.wg.Done()
+			runServer(p.ctx, *flListen)
 		}()
-
-		if clientErr := runClients(ctx, targets, interval, timeout, window); clientErr != nil && !errors.Is(clientErr, context.Canceled) {
-			err = clientErr
-		}
-
-		// If client finishes (e.g. error or ctx done), check if server had error.
-		select {
-		case sErr := <-serverErrCh:
-			if sErr != nil && !errors.Is(sErr, context.Canceled) {
-				if err == nil {
-					err = sErr
-				} else {
-					err = fmt.Errorf("client: %v, server: %v", err, sErr)
-				}
-			}
-		default:
-		}
+		return runClient(p.ctx)
 	default:
-		err = fmt.Errorf("unknown mode: %s", mode)
+		return fmt.Errorf("unknown mode: %s", mode)
 	}
-
-	// Shutdown metrics server.
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	_ = httpSrv.Shutdown(shutdownCtx)
-
-	return err
 }
 
-// runServer runs the TCP echo server.
+// ==========================================
+// Server Logic
+// ==========================================
+
 func runServer(ctx context.Context, addr string) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		return fmt.Errorf("listen %s: %w", addr, err)
+		return err
 	}
-	log.Printf("Echo server listening on %s", addr)
-	defer ln.Close()
+	slog.Info("Echo server listening", "addr", addr)
 
-	var wg sync.WaitGroup
-
-	// Monitor context cancellation to close listener.
 	go func() {
 		<-ctx.Done()
-		_ = ln.Close()
+		ln.Close()
 	}()
 
 	for {
-		// Check context before accepting.
-		if ctx.Err() != nil {
-			break
-		}
-
 		conn, err := ln.Accept()
 		if err != nil {
-			// Check if it's a closed network connection due to context cancellation.
 			if ctx.Err() != nil {
-				break
+				return nil // shutdown
 			}
-			log.Printf("Accept error: %v", err)
+			slog.Warn("Accept error", "err", err)
 			continue
 		}
 
-		wg.Add(1)
-		go func(c net.Conn) {
-			defer wg.Done()
-			defer c.Close()
-			handleConnection(ctx, c)
-		}(conn)
+		go handleServerConn(ctx, conn)
 	}
-
-	wg.Wait()
-	return nil
 }
 
-// handleConnection echoes data back to the client.
-func handleConnection(ctx context.Context, c net.Conn) {
-	if tcpConn, ok := c.(*net.TCPConn); ok {
-		_ = tcpConn.SetKeepAlive(true)
-		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
+func handleServerConn(ctx context.Context, c net.Conn) {
+	defer c.Close()
+	// Optionally set keepalive
+	if tcp, ok := c.(*net.TCPConn); ok {
+		tcp.SetKeepAlive(true)
+		tcp.SetKeepAlivePeriod(30 * time.Second)
 	}
 
-	// Use a buffer with the exact payload size for simplicity, or 64 to be safe.
 	buf := make([]byte, payloadSize)
 	for {
-		if ctx.Err() != nil {
-			return
-		}
+		// Set a reasonable read deadline to invoke cleanup of dead idle connections
+		c.SetReadDeadline(time.Now().Add(60 * time.Second))
 
-		// Set read deadline to ensure we don't block forever if client disappears.
-		_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
-		// Use io.ReadFull for guaranteed full payload reading.
 		if _, err := io.ReadFull(c, buf); err != nil {
+			// Normal EOF or timeout
 			return
 		}
 
-		// Echo back.
-		_ = c.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		// Echo back immediately
+		c.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		if _, err := c.Write(buf); err != nil {
 			return
 		}
 	}
 }
 
-// runClients starts probe loops for all targets.
-func runClients(ctx context.Context, targets []Target, interval, timeout time.Duration, window int) error {
-	if len(targets) == 0 {
-		return nil
-	}
+// ==========================================
+// Client Logic
+// ==========================================
 
-	gCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+type Target struct {
+	Name    string `json:"name"`
+	Address string `json:"address"`
+}
 
-	var wg sync.WaitGroup
-	errCh := make(chan error, len(targets))
+func runClient(ctx context.Context) error {
+	var targets []Target
+	var err error
 
-	for _, t := range targets {
-		wg.Add(1)
-		go func(target Target) {
-			defer wg.Done()
-			if err := runClientProbe(gCtx, target.Name, target.Address, interval, timeout, window); err != nil {
-				errCh <- fmt.Errorf("%s: %w", target.Name, err)
-			}
-		}(t)
-	}
-
-	// Wait for all to finish or context cancellation.
-	// Since runClientProbe only returns on fatal error or context cancel,
-	// we just wait.
-	wg.Wait()
-	close(errCh)
-
-	// Return the first error if any.
-	for err := range errCh {
-		if err != nil && !errors.Is(err, context.Canceled) {
+	// Load targets
+	if *flTargets != "" {
+		targets, err = loadTargets(*flTargets)
+		if err != nil {
 			return err
 		}
+	} else if *flTarget != "" {
+		targets = []Target{{Name: "default", Address: *flTarget}}
+	} else {
+		return errors.New("no targets specified (use -target or -targets)")
 	}
+
+	return startProbing(ctx, targets)
+}
+
+func loadTargets(path string) ([]Target, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read targets file: %w", err)
+	}
+	var targets []Target
+	if err := json.Unmarshal(data, &targets); err != nil {
+		return nil, fmt.Errorf("parse targets json: %w", err)
+	}
+	return targets, nil
+}
+
+func startProbing(ctx context.Context, targets []Target) error {
+	slog.Info("Starting probing", "targets_count", len(targets), "adaptive", *flAdaptive)
+
+	var wg sync.WaitGroup
+	for _, t := range targets {
+		wg.Add(1)
+		go func(tg Target) {
+			defer wg.Done()
+			probeTarget(ctx, tg)
+		}(t)
+	}
+	wg.Wait()
 	return nil
 }
 
-// runClientProbe manages the connection and probing loop for a single target.
-func runClientProbe(ctx context.Context, name, addr string, interval, timeout time.Duration, window int) error {
-	log.Printf("Client probing %s (%s) every %s", name, addr, interval)
-
-	// Track packet loss.
-	lTracker := newLossTracker(window, name)
-	var seq uint64
-
-	// Retry loop for connection.
-	backoff := 500 * time.Millisecond
-	maxBackoff := 5 * time.Second
-
-	for ctx.Err() == nil {
-		conn, err := dial(addr)
-		if err != nil {
-			log.Printf("Dial error %s: %v", name, err)
-
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(backoff):
-			}
-
-			backoff *= 2
-			if backoff > maxBackoff {
-				backoff = maxBackoff
-			}
-			continue
-		}
-
-		// Connected. Reset backoff.
-		backoff = 500 * time.Millisecond
-		connectsCounter.WithLabelValues(name).Inc()
-		connectedGauge.WithLabelValues(name).Set(1)
-
-		err = probeLoop(ctx, conn, interval, timeout, &seq, lTracker, name)
-
-		connectedGauge.WithLabelValues(name).Set(0)
-		_ = conn.Close()
-
-		if err != nil {
-			// standard log if dropped
-			if ctx.Err() == nil {
-				log.Printf("Connection dropped %s: %v", name, err)
-			}
-		}
-	}
-	return ctx.Err()
+type AdaptiveStats struct {
+	srtt   float64 // smoothed RTT in seconds
+	rttvar float64 // RTT variation in seconds
+	rto    float64 // Retransmission Timeout (current timeout)
 }
 
-// probeLoop sends echoes and processes responses.
-func probeLoop(ctx context.Context, conn net.Conn, interval, timeout time.Duration, seq *uint64, lt *lossTracker, name string) error {
-	// Channels for responses and errors from the reader goroutine.
+func newAdaptiveStats() *AdaptiveStats {
+	// Initialize with defaults
+	return &AdaptiveStats{
+		srtt:   0.0,
+		rttvar: 0.0,
+		rto:    (*flBaseTimeout).Seconds(),
+	}
+}
+
+// update calculates new RTO using RFC 6298 logic
+func (a *AdaptiveStats) update(rttSeconds float64) {
+	if a.srtt == 0 {
+		// First measurement
+		a.srtt = rttSeconds
+		a.rttvar = rttSeconds / 2
+	} else {
+		// RTTVAR = (1 - beta) * RTTVAR + beta * |SRTT - R|
+		a.rttvar = (1-defaultBeta)*a.rttvar + defaultBeta*math.Abs(a.srtt-rttSeconds)
+		// SRTT = (1 - alpha) * SRTT + alpha * R
+		a.srtt = (1-defaultAlpha)*a.srtt + defaultAlpha*rttSeconds
+	}
+	// RTO = SRTT + 4 * RTTVAR
+	a.rto = a.srtt + 4*a.rttvar
+}
+
+func (a *AdaptiveStats) currentRTO() time.Duration {
+	// Clamp RTO
+	val := a.rto
+	min := defaultMinRTO.Seconds()
+	max := defaultMaxRTO.Seconds()
+
+	if val < min {
+		val = min
+	}
+	if val > max {
+		val = max
+	}
+	return time.Duration(val * float64(time.Second))
+}
+
+func probeTarget(ctx context.Context, t Target) {
+	logger := slog.With("target", t.Name, "address", t.Address)
+
+	// Recover from panics to keep other probes alive
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("Panic in probe loop", "panic", r)
+		}
+	}()
+
+	adaptive := newAdaptiveStats()
+
+	// Helper to get timeout
+	getTimeout := func() time.Duration {
+		if *flAdaptive {
+			return adaptive.currentRTO()
+		}
+		return *flBaseTimeout
+	}
+
+	// Helper to get interval
+	getInterval := func() time.Duration {
+		if *flAdaptive {
+			// Interval is max(base, 1.5 * RTO) to prevent saturation if link is extremely slow
+			// But usually interval > RTT is enough.
+			// Let's stick to BaseInterval unless RTO is huge?
+			// The user said "auto interval based on link".
+			// A simple logic: Interval should be >= Timeout to avoid pileup
+			rto := adaptive.currentRTO()
+			if *flBaseInterval < rto {
+				return rto
+			}
+			return *flBaseInterval
+		}
+		return *flBaseInterval
+	}
+
+	// Connection loop
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		conn, err := net.DialTimeout("tcp", t.Address, 5*time.Second)
+		if err != nil {
+			metricDrop.WithLabelValues(t.Name, t.Address).Inc()
+			// Treat connection failure as a lost packet for "packet loss" calculations
+			metricTimeout.WithLabelValues(t.Name, t.Address).Inc()
+			metricSent.WithLabelValues(t.Name, t.Address).Inc()
+			metricUp.WithLabelValues(t.Name, t.Address).Set(0)
+
+			// Backoff on connection failure
+			logger.Warn("Connect failed", "err", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(2 * time.Second): // Fixed connect retry backoff
+				continue
+			}
+		}
+
+		logger.Info("Connected")
+		metricUp.WithLabelValues(t.Name, t.Address).Set(1)
+
+		if tcp, ok := conn.(*net.TCPConn); ok {
+			tcp.SetNoDelay(true)
+		}
+
+		// Probe Loop
+		err = runEchoLoop(ctx, conn, t, adaptive, getTimeout, getInterval, logger)
+		conn.Close()
+		metricUp.WithLabelValues(t.Name, t.Address).Set(0)
+
+		if err != nil {
+			logger.Warn("Connection lost", "err", err)
+		}
+
+		// Wait a bit before reconnecting if not canceled
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+func runEchoLoop(
+	ctx context.Context,
+	conn net.Conn,
+	t Target,
+	stats *AdaptiveStats,
+	getTimeout func() time.Duration,
+	getInterval func() time.Duration,
+	logger *slog.Logger,
+) error {
+
+	// Channels for coordinating the reader goroutine
 	type response struct {
 		seq  uint64
 		recv time.Time
 	}
-	respCh := make(chan response, 64)
-	readErrCh := make(chan error, 1)
 
-	// Reader goroutine.
+	// 100 buffered to handle bursts/jitter without blocking reader
+	respCh := make(chan response, 100)
+	errCh := make(chan error, 1)
+
+	// Ensure we shut down reader
+	readerCtx, cancelReader := context.WithCancel(ctx)
+	defer cancelReader()
+
+	// Start Reader
 	go func() {
+		defer close(errCh)
 		buf := make([]byte, payloadSize)
 		for {
-			_ = conn.SetReadDeadline(time.Now().Add(timeout + 500*time.Millisecond)) // slightly looser deadline for reading
+			if readerCtx.Err() != nil {
+				return
+			}
+			// Important: Reader needs a deadline too, otherwise it hangs forever on broken link
+			// We update this deadline based on expected activity?
+			// Actually, just set a loose deadline relative to MAX timeout + Buffer
+			// Or update it per ping? Updating per ping is safer.
+			// But we don't know the timeout here easily without locking.
+			// We'll trust the writer loop to kill the specific connection if it times out
+			// Here we just wait. If writer closes conn, we error.
+
+			// We can set a deadline of "Forever" -> relying on conn.Close(),
+			// OR we set a deadline of e.g. 10s and loop.
+			conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+
 			_, err := io.ReadFull(conn, buf)
 			if err != nil {
-				readErrCh <- err
+				// If error, send to errCh.
+				// Do not close errCh here, let defer handle it, but we need to ensure main loop sees it.
+				// Actually proper pattern: send err, then return.
+				// Filter timeout errors if we just haven't received anything but link might be idle?
+				// But we are pinging constantly.
+				// If we timeout here, it means we haven't received ANY data for 10s.
+				if errors.Is(err, os.ErrDeadlineExceeded) {
+					// Check if we should actually be receiving?
+					// For now, treat as error to force reconnect
+				}
+				select {
+				case errCh <- err:
+				case <-readerCtx.Done():
+				}
 				return
 			}
 
-			// Parse response.
-			seqNum := binary.LittleEndian.Uint64(buf[0:8])
+			seq := binary.LittleEndian.Uint64(buf[0:8])
+			// logger.Info("Debug: Reader received", "seq", seq)
+
 			select {
-			case respCh <- response{seq: seqNum, recv: time.Now()}:
-			case <-ctx.Done():
+			case respCh <- response{seq: seq, recv: time.Now()}:
+			case <-readerCtx.Done():
 				return
 			}
 		}
 	}()
 
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	seq := uint64(0)
+	buf := make([]byte, payloadSize)
 
-	// Map to track sent times: seq -> sentTime
-	outstanding := make(map[uint64]time.Time)
-	sendBuf := make([]byte, payloadSize)
+	// Map of pending requests: seq -> sendTime
+	pending := make(map[uint64]time.Time)
+
+	// Ensure any pending packets at exit are counted as timeouts
+	defer func() {
+		count := float64(len(pending))
+		if count > 0 {
+			// logger.Info("Cleaning up pending packets as timeouts", "count", count)
+			metricTimeout.WithLabelValues(t.Name, t.Address).Add(count)
+		}
+	}()
 
 	for {
+		interval := getInterval()
+		timeout := getTimeout()
+
+		metricRTO.WithLabelValues(t.Name, t.Address).Set(timeout.Seconds())
+
+		// TICKER: wait for next interval
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-
-		case err := <-readErrCh:
-			return err
-
-		case resp := <-respCh:
-			sentTime, ok := outstanding[resp.seq]
+		case err, ok := <-errCh:
 			if !ok {
-				// Old or unknown sequence number. Ignore.
-				continue
+				return errors.New("reader closed unexpectedly")
 			}
-			delete(outstanding, resp.seq)
-
-			rtt := resp.recv.Sub(sentTime)
-			if rtt > timeout {
-				// Late response. Count as success for connectivity but maybe log?
-				// For now, treat as success.
-				lt.record(true)
-			} else {
-				recvCounter.WithLabelValues(name).Inc()
-				lastRttGauge.WithLabelValues(name).Set(rtt.Seconds())
-				rttHistogram.WithLabelValues(name).Observe(rtt.Seconds())
-				lt.record(true)
-			}
-
-		case <-ticker.C:
-			// Prune timed-out requests from map and count as loss.
-			now := time.Now()
-			for s, t := range outstanding {
-				if now.Sub(t) > timeout {
-					delete(outstanding, s)
-					lt.record(false)
-					timeoutCounter.WithLabelValues(name).Inc()
-				}
-			}
-
-			// Send new probe.
-			nextSeq := *seq + 1
-			*seq = nextSeq
-
-			binary.LittleEndian.PutUint64(sendBuf[0:8], nextSeq)
-			binary.LittleEndian.PutUint64(sendBuf[8:16], uint64(now.UnixNano()))
-
-			_ = conn.SetWriteDeadline(now.Add(timeout))
-			if _, err := conn.Write(sendBuf); err != nil {
-				lt.record(false)
-				timeoutCounter.WithLabelValues(name).Inc()
-				return err
-			}
-
-			outstanding[nextSeq] = now
-			sentCounter.WithLabelValues(name).Inc()
+			return err
+		case <-time.After(interval):
+			// Proceed to send
 		}
+
+		// 1. Read Responses (non-blocking drain)
+	Drain:
+		for {
+			select {
+			case resp := <-respCh:
+				sentTime, ok := pending[resp.seq]
+				if ok {
+					rtt := resp.recv.Sub(sentTime)
+					delete(pending, resp.seq)
+
+					rttSec := rtt.Seconds()
+					// logger.Info("Debug: Recv matched", "seq", resp.seq, "rtt", rttSec)
+
+					metricRecv.WithLabelValues(t.Name, t.Address).Inc()
+					metricRTT.WithLabelValues(t.Name, t.Address).Observe(rttSec)
+					metricLastRTT.WithLabelValues(t.Name, t.Address).Set(rttSec)
+
+					// Update adaptive stats
+					if *flAdaptive {
+						stats.update(rttSec)
+					}
+				} else {
+					// logger.Info("Debug: Recv unmatched (duplicate or timed out)", "seq", resp.seq)
+				}
+			default:
+				break Drain
+			}
+		}
+
+		// 2. Check for Timeouts in pending
+		now := time.Now()
+		for s, sentTime := range pending {
+			if now.Sub(sentTime) > timeout {
+				// logger.Info("Debug: Timeout", "seq", s, "elapsed", now.Sub(sentTime))
+				metricTimeout.WithLabelValues(t.Name, t.Address).Inc()
+				delete(pending, s)
+				// Note: We don't necessarily kill the connection on a single packet loss,
+				// but TCP will handle retransmissions.
+				// The higher level logic deems this a "timeout" for metrics.
+			}
+		}
+
+		// 3. Send Ping
+		seq++
+		binary.LittleEndian.PutUint64(buf[0:8], seq)
+		binary.LittleEndian.PutUint64(buf[8:16], uint64(now.UnixNano()))
+
+		// logger.Info("Debug: Sending", "seq", seq)
+		conn.SetWriteDeadline(now.Add(timeout))
+		if _, err := conn.Write(buf); err != nil {
+			return err // reconnect on write failure
+		}
+
+		pending[seq] = now
+		metricSent.WithLabelValues(t.Name, t.Address).Inc()
 	}
 }
 
-// dial helper with shorter timeout and NODELAY.
-func dial(addr string) (net.Conn, error) {
-	d := &net.Dialer{Timeout: 3 * time.Second, KeepAlive: 30 * time.Second}
-	c, err := d.Dial("tcp", addr)
-	if err != nil {
-		return nil, err
+// ==========================================
+// Logging Setup
+// ==========================================
+
+func setupLogger(jsonFormat bool) {
+	opts := &slog.HandlerOptions{
+		Level: slog.LevelInfo,
 	}
-	if tcpConn, ok := c.(*net.TCPConn); ok {
-		_ = tcpConn.SetNoDelay(true)
+	var handler slog.Handler
+	if jsonFormat {
+		handler = slog.NewJSONHandler(os.Stdout, opts)
+	} else {
+		handler = slog.NewTextHandler(os.Stdout, opts)
 	}
-	return c, nil
+	slog.SetDefault(slog.New(handler))
 }

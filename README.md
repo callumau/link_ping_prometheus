@@ -1,9 +1,9 @@
 # tcp_ping_prometheus
 
-This program can run as a TCP echo server, a client that continuously probes one or more servers, or both. It records:
 - RTT histogram and last RTT (tcp_echo_rtt_seconds{target="name"}, tcp_echo_last_rtt_seconds{target="name"}),
 - Sent/received counters and timeouts (tcp_echo_sent_total{target="name"}, tcp_echo_received_total{target="name"}, tcp_echo_timeouts_total{target="name"}),
-- Connection/connect metrics and a sliding-window loss percentage gauge (tcp_echo_connects_total{target="name"}, tcp_echo_connected{target="name"}, tcp_echo_loss_percent{target="name"}).
+- Connection status (tcp_echo_connected{target="name"}),
+- Adaptive RTO estimation (tcp_echo_estimated_timeout_seconds{target="name"}).
 
 See the implementation in [tcp_ping_prometheus.go](tcp_ping_prometheus.go).
 
@@ -28,16 +28,15 @@ Release binaries for Linux, macOS (darwin) and Windows - [Latest Release](https:
 
 Usage
 -----
-Flags:
-
 - -mode: server | client | both (default "server")
 - -listen: server listen address (default ":4000")
 - -target: client target address (default ":4000") - use -targets for multiple
 - -targets: JSON file with list of targets (client)
 - -metrics: HTTP address for Prometheus /metrics (default ":2112")
-- -interval: probe interval (default 200ms)
-- -timeout: per-probe timeout (default 800ms)
-- -window: sliding window size for loss percentage (default 100)
+- -interval: Base probe interval (min interval if adaptive) (default 500ms)
+- -timeout: Base/Initial timeout (default 1s)
+- -adaptive: Enable adaptive timeout/interval based on link quality (default true)
+- -json-logs: Log in JSON format instead of text
 - -svc: service action: install | uninstall | start | stop | run (uses kardianos/service on Windows)
 
 JSON Targets Format:
@@ -75,12 +74,42 @@ Both:
 ./tcp-echo-metrics -mode=both -targets=targets.json -interval=10ms -timeout=20ms -metrics=":2113" -window=100
 ```
 
-Service (Windows)
------------------
+Service
+-------
+
+### Windows
+
 Use the `-svc` flag to install/uninstall/start/stop/run the service. When installing, the tool records the runtime flags to ensure the service starts with the same configuration.
 
 ```
 tcp-echo-metrics.exe -mode=both -targets=targets.json -interval=10ms -timeout=20ms -metrics=":2113" -window=100 -svc=install
+```
+
+### Linux
+
+To run as a systemd service, create a file at `/etc/systemd/system/tcp-echo-metrics.service`:
+
+```ini
+[Unit]
+Description=TCP Echo Metrics
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/tcp-echo-metrics -mode=server -listen=":4000" -metrics=":2112"
+Restart=always
+User=nobody
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**Note regarding targets.json**: If running in client or both mode, ensure you provide the **absolute path** to the targets file in the `-targets` flag (e.g., `-targets=/etc/tcp-echo-metrics/targets.json`) and that the designated `User` has read permissions for the file.
+
+Reload systemd and start the service:
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now tcp-echo-metrics
 ```
 
 Metrics

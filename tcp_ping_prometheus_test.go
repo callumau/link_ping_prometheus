@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net"
 	"os"
 	"testing"
@@ -11,70 +12,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 )
-
-func TestLossTracker(t *testing.T) {
-	tests := []struct {
-		name     string
-		size     int
-		inputs   []bool // true for success, false for failure
-		wantLoss float64
-	}{
-		{
-			name:     "empty buffer",
-			size:     10,
-			inputs:   []bool{},
-			wantLoss: 0.0,
-		},
-		{
-			name:     "partial filled - 0% loss",
-			size:     10,
-			inputs:   []bool{true, true, true},
-			wantLoss: 0.0,
-		},
-		{
-			name:     "partial filled - 50% loss",
-			size:     10,
-			inputs:   []bool{true, false, true, false},
-			wantLoss: 50.0,
-		},
-		{
-			name:     "partial filled - 100% loss",
-			size:     10,
-			inputs:   []bool{false, false, false},
-			wantLoss: 100.0,
-		},
-		{
-			name:     "full filled - overwrite with success",
-			size:     3,
-			inputs:   []bool{false, false, false, true, true, true}, // initially all loss, replaced by all success
-			wantLoss: 0.0,
-		},
-		{
-			name:     "full filled - mixed overwrite",
-			size:     4,
-			inputs:   []bool{true, true, true, true, false, false}, // 4 success -> 2 failures overwrite 2 successes -> expected [T, T, F, F] -> 50%
-			wantLoss: 50.0,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			lt := newLossTracker(tt.size, "test_target")
-			for _, input := range tt.inputs {
-				lt.record(input)
-			}
-
-			// We need to access the internal computation indirectly via the gauge or expose it.
-			// Since computeLossPercent is unexported but record updates the gauge using it,
-			// strictly speaking we are testing `computeLossPercent` logic.
-			// However, since `computeLossPercent` is a method on *lossTracker, we can call it if it's in the same package (which it is, `package main`).
-			got := lt.computeLossPercent()
-			if got != tt.wantLoss {
-				t.Errorf("computeLossPercent() = %v, want %v", got, tt.wantLoss)
-			}
-		})
-	}
-}
 
 func TestLoadTargets(t *testing.T) {
 	// Create a temporary file
@@ -127,6 +64,8 @@ func TestLoadTargets(t *testing.T) {
 }
 
 func TestMultiTargetProbing(t *testing.T) {
+	initMetrics()
+
 	// Start two echo servers
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -139,20 +78,127 @@ func TestMultiTargetProbing(t *testing.T) {
 		{Name: "target2", Address: addr2},
 	}
 
+	interval := 50 * time.Millisecond
+	timeout := 200 * time.Millisecond
+
+	*flAdaptive = false
+	*flBaseInterval = interval
+	*flBaseTimeout = timeout
+
 	// Run clients in a background goroutine
-	// Use short interval for quick testing
 	go func() {
-		_ = runClients(ctx, targets, 50*time.Millisecond, 200*time.Millisecond, 10)
+		_ = startProbing(ctx, targets)
 	}()
 
 	// Wait for some probes to happen
 	time.Sleep(500 * time.Millisecond)
 
 	// Verify metrics for both targets
-	verifyMetric(t, sentCounter, "target1")
-	verifyMetric(t, recvCounter, "target1")
-	verifyMetric(t, sentCounter, "target2")
-	verifyMetric(t, recvCounter, "target2")
+	verifyMetric(t, metricSent, "target1", addr1)
+	verifyMetric(t, metricRecv, "target1", addr1)
+	verifyMetric(t, metricSent, "target2", addr2)
+	verifyMetric(t, metricRecv, "target2", addr2)
+}
+
+func TestServerDropout(t *testing.T) {
+	initMetrics()
+
+	// 1. Setup global flags
+	// We use a short interval to ensure we send packets quickly
+	interval := 50 * time.Millisecond
+	*flAdaptive = false
+	*flBaseInterval = interval
+	*flBaseTimeout = 1 * time.Second
+
+	// 2. Start a custom "flaky" server
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen error: %v", err)
+	}
+	serverAddr := ln.Addr().String()
+
+	serverCtx, serverCancel := context.WithCancel(context.Background())
+	defer serverCancel()
+
+	// Control channel to tell server when to close connection
+	closeConnCh := make(chan struct{})
+	// Control channel to tell server to stop echoing (simulate packet loss/hang)
+	stopEchoCh := make(chan struct{})
+
+	go func() {
+		defer ln.Close()
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		buf := make([]byte, payloadSize)
+		for {
+			select {
+			case <-closeConnCh:
+				return // Close connection
+			case <-serverCtx.Done():
+				return
+			default:
+				// Read
+				conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+				_, err := io.ReadFull(conn, buf)
+				if err != nil {
+					return
+				}
+
+				// Decide whether to echo
+				select {
+				case <-stopEchoCh:
+					// Don't echo, just consume
+					continue
+				default:
+					// Echo back
+					conn.Write(buf)
+				}
+			}
+		}
+	}()
+
+	// 3. Start Client Prober
+	targetName := "dropout_test"
+	targets := []Target{{Name: targetName, Address: serverAddr}}
+
+	clientCtx, clientCancel := context.WithCancel(context.Background())
+	defer clientCancel()
+
+	// Initial timeout count
+	initialTimeouts := getCounterValue(metricTimeout, targetName, serverAddr)
+
+	go func() {
+		startProbing(clientCtx, targets)
+	}()
+
+	// 4. Let it run normally for a bit
+	time.Sleep(200 * time.Millisecond)
+
+	// 5. Tell server to stop echoing (packets will be pending)
+	close(stopEchoCh)
+
+	// Let client send a few more packets that won't get responses
+	time.Sleep(190 * time.Millisecond)
+
+	// 6. Kill the connection
+	close(closeConnCh)
+
+	// Wait for client to detect error and run cleanup
+	time.Sleep(500 * time.Millisecond)
+
+	// 7. Check metrics
+	finalTimeouts := getCounterValue(metricTimeout, targetName, serverAddr)
+	diff := finalTimeouts - initialTimeouts
+
+	t.Logf("Timeouts: initial=%v, final=%v, diff=%v", initialTimeouts, finalTimeouts, diff)
+
+	if diff == 0 {
+		t.Errorf("Expected timeouts to increase after dropout, got 0 increase")
+	}
 }
 
 func startEchoServer(ctx context.Context, t *testing.T) string {
@@ -174,24 +220,74 @@ func startEchoServer(ctx context.Context, t *testing.T) string {
 			if err != nil {
 				return
 			}
-			go handleConnection(ctx, conn)
+			go handleServerConn(ctx, conn)
 		}
 	}()
 
 	return ln.Addr().String()
 }
 
-func verifyMetric(t *testing.T, vec *prometheus.CounterVec, label string) {
-	val := getCounterValue(vec, label)
+func verifyMetric(t *testing.T, vec *prometheus.CounterVec, targetName, address string) {
+	val := getCounterValue(vec, targetName, address)
 	if val <= 0 {
-		t.Errorf("expected metric value > 0 for label %s, got %v", label, val)
+		t.Errorf("expected metric value > 0 for target %s (addr %s), got %v", targetName, address, val)
 	}
 }
 
-func getCounterValue(vec *prometheus.CounterVec, label string) float64 {
+func getCounterValue(vec *prometheus.CounterVec, targetName, address string) float64 {
 	var m dto.Metric
-	if err := vec.WithLabelValues(label).Write(&m); err != nil {
+	if err := vec.WithLabelValues(targetName, address).Write(&m); err != nil {
 		return 0
 	}
 	return m.GetCounter().GetValue()
+}
+
+func TestConnectionRefusedMetrics(t *testing.T) {
+	initMetrics()
+
+	// Pick a random port that is likely closed
+	// or use a listener to get a free port, then close it immediately
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	ln.Close() // Close immediately so connection gets refused
+
+	targets := []Target{
+		{Name: "refused_test", Address: addr},
+	}
+
+	// Set short interval/timeouts for test speed
+	*flAdaptive = false
+	*flBaseInterval = 100 * time.Millisecond
+	*flBaseTimeout = 100 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	initialSent := getCounterValue(metricSent, "refused_test", addr)
+	initialTimeouts := getCounterValue(metricTimeout, "refused_test", addr)
+
+	go startProbing(ctx, targets)
+
+	// Wait for a few "probes" (connection attempts)
+	// The code currently has a 2s backoff on connection failure.
+	// We matched 2s hardcoded in the source.
+	// To test this effectively without waiting 2s per inc, we might need to sleep > 2s
+	// or rely on the initial failure incrementing at least once.
+	// Since we sleep 2s, let's wait 100ms. We should see at least 1 increment immediately on the first attempt.
+	time.Sleep(500 * time.Millisecond)
+
+	finalSent := getCounterValue(metricSent, "refused_test", addr)
+	finalTimeouts := getCounterValue(metricTimeout, "refused_test", addr)
+
+	if finalSent <= initialSent {
+		t.Errorf("Expected sent count to increase on connection refused, got %v -> %v", initialSent, finalSent)
+	}
+	if finalTimeouts <= initialTimeouts {
+		t.Errorf("Expected timeout count to increase on connection refused, got %v -> %v", initialTimeouts, finalTimeouts)
+	}
+
+	cancel()
 }
