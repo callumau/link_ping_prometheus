@@ -21,8 +21,15 @@ Cross-compile for Windows (example):
 CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o build/tcp-echo-metrics.exe .
 ```
 
-Download
+Test
 -----
+
+Run the test suite:
+
+```sh
+go test -v ./...
+```
+
 
 Release binaries for Linux, macOS (darwin) and Windows - [Latest Release](https://github.com/callumau/tcp_ping_prometheus/releases/latest)
 
@@ -129,8 +136,8 @@ Key functions and types
 
 Notes
 -----
-- Wire format: 16 bytes per probe (8-byte sequence, 8-byte Unix-ns timestamp). See [tcp_ping_prometheus.go](tcp_ping_prometheus.go).
+- Wire format: 24 bytes per probe (8-byte magic header "TCPPING\x00", 8-byte sequence, 8-byte Unix-ns timestamp). See [tcp_ping_prometheus.go](tcp_ping_prometheus.go).
 - Histogram buckets chosen for 100µs .. ~2s RTTs.
 - The release workflow produces binaries for linux, windows, and darwin and packages each artifact (see [.github/workflows/new-release-build.yml](.github/workflows/new-release-build.yml)).
-- Security: This tool is intended for internal network monitoring. The TCP echo server accepts connections from any source and echoes back data, which could be exploited if exposed publicly. Ensure the server is not accessible from untrusted networks. The metrics endpoint serves data without authentication; protect it accordingly.
+- Security: This tool is intended for internal network monitoring. The TCP echo server validates a magic header ("TCPPING\x00") before echoing data to prevent arbitrary payload reflection, but it is still recommended to restrict access to trusted networks. The metrics endpoint serves data without authentication; protect it accordingly.
 

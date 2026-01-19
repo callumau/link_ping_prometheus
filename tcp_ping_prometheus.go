@@ -28,7 +28,8 @@ import (
 // ==========================================
 
 const (
-	payloadSize = 16 // 8 bytes seq + 8 bytes timestamp
+	magicBytes  = "TCPPING\x00"
+	payloadSize = 24 // 8 bytes magic + 8 bytes seq + 8 bytes timestamp
 	// Default adaptive constants (RFC 6298 inspired)
 	defaultAlpha  = 0.125
 	defaultBeta   = 0.25
@@ -310,6 +311,11 @@ func handleServerConn(ctx context.Context, c net.Conn) {
 			return
 		}
 
+		if string(buf[0:8]) != magicBytes {
+			slog.Warn("Invalid magic header", "addr", c.RemoteAddr())
+			return
+		}
+
 		// Echo back immediately
 		c.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		if _, err := c.Write(buf); err != nil {
@@ -568,7 +574,12 @@ func runEchoLoop(
 				return
 			}
 
-			seq := binary.LittleEndian.Uint64(buf[0:8])
+			if string(buf[0:8]) != magicBytes {
+				// Invalid header, ignore
+				continue
+			}
+
+			seq := binary.LittleEndian.Uint64(buf[8:16])
 			// logger.Info("Debug: Reader received", "seq", seq)
 
 			select {
@@ -660,8 +671,9 @@ func runEchoLoop(
 
 		// 3. Send Ping
 		seq++
-		binary.LittleEndian.PutUint64(buf[0:8], seq)
-		binary.LittleEndian.PutUint64(buf[8:16], uint64(now.UnixNano()))
+		copy(buf[0:8], magicBytes)
+		binary.LittleEndian.PutUint64(buf[8:16], seq)
+		binary.LittleEndian.PutUint64(buf[16:24], uint64(now.UnixNano()))
 
 		// logger.Info("Debug: Sending", "seq", seq)
 		conn.SetWriteDeadline(now.Add(timeout))

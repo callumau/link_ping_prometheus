@@ -858,3 +858,102 @@ func getMetricValue(vec *prometheus.GaugeVec, targetName, address string) float6
 	}
 	return m.GetGauge().GetValue()
 }
+
+// TestServer_EnforceSizeAndHeader verifies server disconnects if payload doesn't align or is invalid
+func TestServer_EnforceSizeAndHeader(t *testing.T) {
+	initMetrics()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Start real server
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go handleServerConn(ctx, conn)
+		}
+	}()
+
+	addr := ln.Addr().String()
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// 1. Send Valid packet + Garbage attached (Total > 24 bytes)
+	// We send 24 bytes valid + 10 bytes garbage = 34 bytes
+	buf := make([]byte, 34)
+	copy(buf[0:8], magicBytes) // Valid Header
+	// .. rest is zeros (valid seq/ts)
+	// last 10 bytes are zeros which is NOT a valid header for the 2nd chunk
+
+	_, err = conn.Write(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. We expect to read EXACTLY 24 bytes back (the first valid packet)
+	reply := make([]byte, 24)
+	// Set a deadline
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, err = io.ReadFull(conn, reply)
+	if err != nil {
+		t.Fatalf("Should have received echo for first valid part: %v", err)
+	}
+
+	// 3. Verify magic bytes on reply
+	if string(reply[0:8]) != magicBytes {
+		t.Errorf("Reply header invalid")
+	}
+
+	// 4. Try to read again. Server should have tried to read the next chunk (the 10 bytes + waiting 14 bytes OR just 10 bytes if it was full garbage?).
+	// Actually, the server loop:
+	// - Reads 24 bytes.
+	// - Next iteration: Reads 24 bytes.
+	// Our client sent 34 bytes.
+	// Server read 24.
+	// Server tries to read next 24. It has 10 bytes in buffer. It waits for 14 more.
+	// BUT, we want to prove it validates the header.
+	// Let's send 48 bytes (2 packets). 1st valid, 2nd invalid header.
+
+	// Close and Reset for cleaner test
+	conn.Close()
+	conn, err = net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// Send 48 bytes: [Valid Packet (24)] + [Invalid Packet (24)]
+	buf = make([]byte, 48)
+	copy(buf[0:8], magicBytes)   // 1st Header OK
+	copy(buf[24:32], "BADHEADR") // 2nd Header BAD
+
+	conn.Write(buf)
+
+	// Read 1st reply
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, err = io.ReadFull(conn, reply)
+	if err != nil {
+		t.Fatalf("Should get 1st reply: %v", err)
+	}
+
+	// Read 2nd reply -> Should FAIL (EOF or Closed)
+	// Server should have read 2nd chunk, seen BADHEADR, and returned/closed.
+	// So this ReadFull should fail.
+	_, err = io.ReadFull(conn, reply)
+	if err == nil {
+		t.Errorf("Expected server to close connection on invalid 2nd packet header, but got reply")
+	} else {
+		// Expecting error (EOF or connection reset)
+		t.Logf("Got expected error on 2nd packet: %v", err)
+	}
+}
