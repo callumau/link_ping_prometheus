@@ -12,13 +12,13 @@ Build
 Build locally:
 
 ```sh
-go build -o ./build/tcp-echo-metrics .
+go build -o ./build/tcp_ping_prometheus .
 ```
 
 Cross-compile for Windows (example):
 
 ```sh
-CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o build/tcp-echo-metrics.exe .
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o build/tcp_ping_prometheus.exe .
 ```
 
 Test
@@ -63,22 +63,22 @@ Examples (also in [example_queries.txt](example_queries.txt)):
 
 Client (single target):
 ```
-./tcp-echo-metrics -mode=client -target="192.168.1.71:4000" -interval=10ms -timeout=20ms -metrics=":2113" -window=100
+./tcp_ping_prometheus -mode=client -target="192.168.1.71:4000" -interval=10ms -timeout=20ms -metrics=":2113" -window=100
 ```
 
 Client (multiple targets):
 ```
-./tcp-echo-metrics -mode=client -targets=targets.json -interval=10ms -timeout=20ms -metrics=":2113" -window=100
+./tcp_ping_prometheus -mode=client -targets=targets.json -interval=10ms -timeout=20ms -metrics=":2113" -window=100
 ```
 
 Server:
 ```
-./tcp-echo-metrics -mode=server -listen=":4000" -metrics=":2112"
+./tcp_ping_prometheus -mode=server -listen=":4000" -metrics=":2112"
 ```
 
 Both:
 ```
-./tcp-echo-metrics -mode=both -targets=targets.json -interval=10ms -timeout=20ms -metrics=":2113" -window=100
+./tcp_ping_prometheus -mode=both -targets=targets.json -interval=10ms -timeout=20ms -metrics=":2113" -window=100
 ```
 
 Service
@@ -89,12 +89,12 @@ Service
 Use the `-svc` flag to install/uninstall/start/stop/run the service. When installing, the tool records the runtime flags to ensure the service starts with the same configuration.
 
 ```
-tcp-echo-metrics.exe -mode=both -targets=targets.json -interval=10ms -timeout=20ms -metrics=":2113" -window=100 -svc=install
+tcp_ping_prometheus.exe -mode=both -targets=targets.json -interval=10ms -timeout=20ms -metrics=":2113" -window=100 -svc=install
 ```
 
 ### Linux
 
-To run as a systemd service, create a file at `/etc/systemd/system/tcp-echo-metrics.service`:
+To run as a systemd service, create a file at `/etc/systemd/system/tcp_ping_prometheus.service`:
 
 ```ini
 [Unit]
@@ -102,7 +102,7 @@ Description=TCP Echo Metrics
 After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/tcp-echo-metrics -mode=server -listen=":4000" -metrics=":2112"
+ExecStart=/usr/local/bin/tcp_ping_prometheus -mode=server -listen=":4000" -metrics=":2112"
 Restart=always
 User=nobody
 
@@ -110,13 +110,13 @@ User=nobody
 WantedBy=multi-user.target
 ```
 
-**Note regarding targets.json**: If running in client or both mode, ensure you provide the **absolute path** to the targets file in the `-targets` flag (e.g., `-targets=/etc/tcp-echo-metrics/targets.json`) and that the designated `User` has read permissions for the file.
+**Note regarding targets.json**: If running in client or both mode, ensure you provide the **absolute path** to the targets file in the `-targets` flag (e.g., `-targets=/etc/tcp_ping_prometheus/targets.json`) and that the designated `User` has read permissions for the file.
 
 Reload systemd and start the service:
 
 ```sh
 sudo systemctl daemon-reload
-sudo systemctl enable --now tcp-echo-metrics
+sudo systemctl enable --now tcp_ping_prometheus
 ```
 
 Metrics
