@@ -1,11 +1,55 @@
-# tcp_ping_prometheus
+# TCP Ping Prometheus Exporter
 
-- RTT histogram and last RTT (tcp_echo_rtt_seconds{target="name"}, tcp_echo_last_rtt_seconds{target="name"}),
-- Sent/received counters and timeouts (tcp_echo_sent_total{target="name"}, tcp_echo_received_total{target="name"}, tcp_echo_timeouts_total{target="name"}),
-- Connection status (tcp_echo_connected{target="name"}),
-- Adaptive RTO estimation (tcp_echo_estimated_timeout_seconds{target="name"}).
+A high-performance TCP ping exporter for Prometheus written in Go. It measures latency (RTT), packet loss, and connection stability by sending active TCP probes to target servers. It supports both client (prober) and server (echo) modes, with adaptive timeout capabilities to handle varying network conditions.
 
-See the implementation in [tcp_ping_prometheus.go](tcp_ping_prometheus.go).
+## Metrics
+
+The exporter exposes the following metrics at `/metrics` (default port 2112).
+
+| Metric Name | Type | Labels | Description |
+|---|---|---|---|
+| `tcp_echo_sent_total` | Counter | `target`, `address` | Total number of TCP echo requests sent. |
+| `tcp_echo_received_total` | Counter | `target`, `address` | Total number of TCP echo responses received. |
+| `tcp_echo_timeouts_total` | Counter | `target`, `address` | Total number of requests that timed out. Packet loss can be calculated from this. |
+| `tcp_echo_dropped_total` | Counter | `target`, `address` | Total number of connection drops/failures. |
+| `tcp_echo_rtt_seconds` | Histogram | `target`, `address` | Histogram of Round-Trip Times (RTT) in seconds. |
+| `tcp_echo_last_rtt_seconds` | Gauge | `target`, `address` | The most recent RTT measurement in seconds. Useful for instant status. |
+| `tcp_echo_connected` | Gauge | `target`, `address` | Connection status: `1` = Connected, `0` = Disconnected/Reconnecting. |
+| `tcp_echo_estimated_timeout_seconds` | Gauge | `target`, `address` | Current adaptive Retransmission Timeout (RTO) being used. |
+
+## PromQL Examples
+
+Here are some common queries to monitor your TCP targets:
+
+### Packet Loss Rate (%)
+Calculate the percentage of lost packets over the last 5 minutes.
+```promql
+rate(tcp_echo_timeouts_total[5m]) / rate(tcp_echo_sent_total[5m]) * 100
+```
+
+### Average Latency (RTT)
+Calculate the average round-trip time over the last 5 minutes.
+```promql
+rate(tcp_echo_rtt_seconds_sum[5m]) / rate(tcp_echo_rtt_seconds_count[5m])
+```
+
+### Connection Dropped Rate
+Rate of connection drops (reconnections needed) per second.
+```promql
+rate(tcp_echo_dropped_total[5m])
+```
+
+### 99th Percentile Latency
+Estimated P99 latency.
+```promql
+histogram_quantile(0.99, rate(tcp_echo_rtt_seconds_bucket[5m]))
+```
+
+### Connection Status
+Check if the probe is currently connected (1) or down (0).
+```promql
+tcp_echo_connected
+```
 
 Build
 -----
@@ -129,10 +173,11 @@ Prebuilt Grafana Dashboard [grafana-dashboard.json](grafana-dashboard.json).
 
 Key functions and types
 -----------------------
-- [`runClient`](tcp_ping_prometheus.go) — main client loop that reconnects and probes.
+- [`runClient`](tcp_ping_prometheus.go) — load targets and start probing.
 - [`runServer`](tcp_ping_prometheus.go) — TCP echo server.
-- [`pump`](tcp_ping_prometheus.go) — per-connection probe send/receive/timeout handling.
-- [`lossTracker`](tcp_ping_prometheus.go) — sliding-window loss tracker that updates the gauge.
+- [`probeTarget`](tcp_ping_prometheus.go) — handles the connection lifecycle for a single target.
+- [`runEchoLoop`](tcp_ping_prometheus.go) — main loop for sending/receiving probes and handling timeouts.
+- [`AdaptiveStats`](tcp_ping_prometheus.go) — implements RFC 6298-inspired RTO calculation.
 
 Notes
 -----
