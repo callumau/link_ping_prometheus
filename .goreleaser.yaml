@@ -9,6 +9,8 @@ builds:
       - linux
       - windows
       - darwin
+    ldflags:
+      - -s -w
 
 archives:
   - formats: ['tar.gz']
