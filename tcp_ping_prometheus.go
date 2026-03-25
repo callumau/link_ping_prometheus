@@ -307,7 +307,9 @@ func handleServerConn(ctx context.Context, c net.Conn) {
 		c.SetReadDeadline(time.Now().Add(60 * time.Second))
 
 		if _, err := io.ReadFull(c, buf); err != nil {
-			// Normal EOF or timeout
+			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) && !errors.Is(err, os.ErrDeadlineExceeded) {
+				slog.Debug("Server read error", "addr", c.RemoteAddr(), "err", err)
+			}
 			return
 		}
 
@@ -543,33 +545,19 @@ func runEchoLoop(
 			if readerCtx.Err() != nil {
 				return
 			}
-			// Important: Reader needs a deadline too, otherwise it hangs forever on broken link
-			// We update this deadline based on expected activity?
-			// Actually, just set a loose deadline relative to MAX timeout + Buffer
-			// Or update it per ping? Updating per ping is safer.
-			// But we don't know the timeout here easily without locking.
-			// We'll trust the writer loop to kill the specific connection if it times out
-			// Here we just wait. If writer closes conn, we error.
-
-			// We can set a deadline of "Forever" -> relying on conn.Close(),
-			// OR we set a deadline of e.g. 10s and loop.
-			conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+			// Use a periodic deadline to check for context cancellation
+			conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 
 			_, err := io.ReadFull(conn, buf)
 			if err != nil {
-				// If error, send to errCh.
-				// Do not close errCh here, let defer handle it, but we need to ensure main loop sees it.
-				// Actually proper pattern: send err, then return.
-				// Filter timeout errors if we just haven't received anything but link might be idle?
-				// But we are pinging constantly.
-				// If we timeout here, it means we haven't received ANY data for 10s.
 				if errors.Is(err, os.ErrDeadlineExceeded) {
-					// Check if we should actually be receiving?
-					// For now, treat as error to force reconnect
+					continue // Just a periodic check
 				}
-				select {
-				case errCh <- err:
-				case <-readerCtx.Done():
+				if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+					select {
+					case errCh <- err:
+					case <-readerCtx.Done():
+					}
 				}
 				return
 			}
@@ -605,11 +593,23 @@ func runEchoLoop(
 		}
 	}()
 
+	intervalTimer := time.NewTimer(0)
+	defer intervalTimer.Stop()
+
 	for {
 		interval := getInterval()
 		timeout := getTimeout()
 
 		metricRTO.WithLabelValues(t.Name, t.Address).Set(timeout.Seconds())
+
+		// Reset timer for next interval
+		if !intervalTimer.Stop() {
+			select {
+			case <-intervalTimer.C:
+			default:
+			}
+		}
+		intervalTimer.Reset(interval)
 
 		// TICKER: wait for next interval
 		select {
@@ -620,7 +620,7 @@ func runEchoLoop(
 				return errors.New("reader closed unexpectedly")
 			}
 			return err
-		case <-time.After(interval):
+		case <-intervalTimer.C:
 			// Proceed to send
 		}
 
@@ -656,12 +656,14 @@ func runEchoLoop(
 		// 2. Check for Timeouts in pending
 		now := time.Now()
 		var timeoutOccurred bool
-		for s, sentTime := range pending {
-			if now.Sub(sentTime) > timeout {
-				// logger.Info("Debug: Timeout", "seq", s, "elapsed", now.Sub(sentTime))
-				metricTimeout.WithLabelValues(t.Name, t.Address).Inc()
-				delete(pending, s)
-				timeoutOccurred = true
+		if len(pending) > 0 {
+			for s, sentTime := range pending {
+				if now.Sub(sentTime) > timeout {
+					// logger.Info("Debug: Timeout", "seq", s, "elapsed", now.Sub(sentTime))
+					metricTimeout.WithLabelValues(t.Name, t.Address).Inc()
+					delete(pending, s)
+					timeoutOccurred = true
+				}
 			}
 		}
 
