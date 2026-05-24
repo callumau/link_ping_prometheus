@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -14,9 +15,12 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 
 	"github.com/kardianos/service"
 	"github.com/prometheus/client_golang/prometheus"
@@ -31,10 +35,12 @@ const (
 	magicBytes  = "TCPPING\x00"
 	payloadSize = 24 // 8 bytes magic + 8 bytes seq + 8 bytes timestamp
 	// Default adaptive constants (RFC 6298 inspired)
-	defaultAlpha  = 0.125
-	defaultBeta   = 0.25
-	defaultMinRTO = 100 * time.Millisecond
-	defaultMaxRTO = 3 * time.Second
+	defaultAlpha       = 0.125
+	defaultBeta        = 0.25
+	defaultMinRTO      = 100 * time.Millisecond
+	defaultMaxRTO      = 3 * time.Second
+	maxTargetsFileSize = 1 << 20 // 1MB max targets file
+	maxTargetsCount    = 1000    // Maximum number of targets
 )
 
 var (
@@ -51,6 +57,15 @@ var (
 	flAdaptive     = flag.Bool("adaptive", true, "Client: Use adaptive timeout/interval based on link quality")
 	flBaseInterval = flag.Duration("interval", 500*time.Millisecond, "Client: Base probe interval (min interval if adaptive)")
 	flBaseTimeout  = flag.Duration("timeout", 1*time.Second, "Client: Base/Initial timeout")
+
+	// Metrics endpoint security
+	flMetricsBasicAuthUser = flag.String("metrics-user", "", "Metrics: Basic auth username (empty disables auth)")
+	flMetricsBasicAuthPass = flag.String("metrics-pass", "", "Metrics: Basic auth password")
+
+	// Sensitive flags that shouldn't be logged/stored in service config
+	sensitiveFlags = map[string]bool{
+		"metrics-pass": true,
+	}
 )
 
 // ==========================================
@@ -148,7 +163,7 @@ func handleService(action string) {
 		// Reconstruct flags based on current execution
 		var args []string
 		flag.Visit(func(f *flag.Flag) {
-			if f.Name != "svc" {
+			if f.Name != "svc" && !sensitiveFlags[f.Name] {
 				args = append(args, fmt.Sprintf("-%s=%s", f.Name, f.Value.String()))
 			}
 		})
@@ -231,9 +246,15 @@ func (p *program) run() error {
 	// Start Metrics Server
 	go func() {
 		mx := http.NewServeMux()
-		mx.Handle("/metrics", promhttp.Handler())
+		mx.Handle("/metrics", metricsAuth(promhttp.Handler()))
 		slog.Info("Starting metrics server", "addr", *flMetrics)
-		srv := &http.Server{Addr: *flMetrics, Handler: mx}
+		srv := &http.Server{
+			Addr:         *flMetrics,
+			Handler:      mx,
+			ReadTimeout:  10 * time.Second,
+			WriteTimeout: 10 * time.Second,
+			IdleTimeout:  60 * time.Second,
+		}
 
 		go func() {
 			<-p.ctx.Done()
@@ -261,6 +282,69 @@ func (p *program) run() error {
 	default:
 		return fmt.Errorf("unknown mode: %s", mode)
 	}
+}
+
+// ==========================================
+// Metrics Middleware
+// ==========================================
+
+func metricsAuth(next http.Handler) http.Handler {
+	if *flMetricsBasicAuthUser == "" {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, pass, ok := r.BasicAuth()
+		if !ok || subtle.ConstantTimeCompare([]byte(user), []byte(*flMetricsBasicAuthUser)) != 1 || subtle.ConstantTimeCompare([]byte(pass), []byte(*flMetricsBasicAuthPass)) != 1 {
+			w.Header().Set("WWW-Authenticate", `Basic realm="metrics"`)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// ==========================================
+// Validation Helpers
+// ==========================================
+
+func validateTarget(address string) error {
+	if address == "" {
+		return errors.New("target address is empty")
+	}
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("invalid target address %q: %w", address, err)
+	}
+	if host == "" {
+		return fmt.Errorf("target address %q has no host", address)
+	}
+	if port == "" {
+		return fmt.Errorf("target address %q has no port", address)
+	}
+	if !isValidHost(host) {
+		return fmt.Errorf("target address %q has invalid host", address)
+	}
+	return nil
+}
+
+func isValidHost(host string) bool {
+	if ip := net.ParseIP(host); ip != nil {
+		return true
+	}
+	if len(host) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if len(label) == 0 || len(label) > 63 {
+			return false
+		}
+		for _, c := range []byte(label) {
+			if !unicode.IsLetter(rune(c)) && !unicode.IsNumber(rune(c)) && c != '-' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // ==========================================
@@ -346,6 +430,9 @@ func runClient(ctx context.Context) error {
 			return err
 		}
 	} else if *flTarget != "" {
+		if err := validateTarget(*flTarget); err != nil {
+			return err
+		}
 		targets = []Target{{Name: "default", Address: *flTarget}}
 	} else {
 		return errors.New("no targets specified (use -target or -targets)")
@@ -355,6 +442,25 @@ func runClient(ctx context.Context) error {
 }
 
 func loadTargets(path string) ([]Target, error) {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("invalid targets path: %w", err)
+	}
+	if !filepath.IsAbs(absPath) {
+		return nil, fmt.Errorf("targets path must be absolute: %s", path)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("read targets file: %w", err)
+	}
+	if info.Size() > maxTargetsFileSize {
+		return nil, fmt.Errorf("targets file too large: %d bytes (max %d)", info.Size(), maxTargetsFileSize)
+	}
+	if info.Mode().IsDir() {
+		return nil, fmt.Errorf("targets path is a directory, not a file")
+	}
+
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read targets file: %w", err)
@@ -362,6 +468,14 @@ func loadTargets(path string) ([]Target, error) {
 	var targets []Target
 	if err := json.Unmarshal(data, &targets); err != nil {
 		return nil, fmt.Errorf("parse targets json: %w", err)
+	}
+	if len(targets) > maxTargetsCount {
+		return nil, fmt.Errorf("too many targets: %d (max %d)", len(targets), maxTargetsCount)
+	}
+	for i, t := range targets {
+		if err := validateTarget(t.Address); err != nil {
+			return nil, fmt.Errorf("target %d (%q): %w", i, t.Name, err)
+		}
 	}
 	return targets, nil
 }
@@ -455,12 +569,6 @@ func probeTarget(ctx context.Context, t Target) {
 
 	// Helper to get interval
 	getInterval := func() time.Duration {
-		if *flAdaptive {
-			// Decouple interval from RTO to allow pipelining and faster adaptation.
-			// We might want to avoid flooding if RTO is very large (dead link),
-			// but for now strict base interval is better for responsiveness.
-			return *flBaseInterval
-		}
 		return *flBaseInterval
 	}
 
