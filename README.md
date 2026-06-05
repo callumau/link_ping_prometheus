@@ -1,6 +1,6 @@
 # TCP Ping Prometheus Exporter
 
-A high-performance TCP ping exporter for Prometheus written in Go. It measures latency (RTT), packet loss, and connection stability by sending active TCP probes to target servers. It supports both client (prober) and server (echo) modes, with adaptive timeout capabilities to handle varying network conditions.
+A high-performance TCP ping exporter for Prometheus written in Go. It measures latency (RTT), packet loss, and connection stability by sending active TCP probes to target servers. Supports client (prober), server (echo), and combined modes with adaptive timeout capabilities (RFC 6298).
 
 ## Metrics
 
@@ -8,93 +8,94 @@ The exporter exposes the following metrics at `/metrics` (default port 2112).
 
 | Metric Name | Type | Labels | Description |
 |---|---|---|---|
-| `tcp_echo_sent_total` | Counter | `target`, `address` | Total number of TCP echo requests sent. |
-| `tcp_echo_received_total` | Counter | `target`, `address` | Total number of TCP echo responses received. |
-| `tcp_echo_timeouts_total` | Counter | `target`, `address` | Total number of requests that timed out. Packet loss can be calculated from this. |
-| `tcp_echo_dropped_total` | Counter | `target`, `address` | Total number of connection drops/failures. |
-| `tcp_echo_rtt_seconds` | Histogram | `target`, `address` | Histogram of Round-Trip Times (RTT) in seconds. |
-| `tcp_echo_last_rtt_seconds` | Gauge | `target`, `address` | The most recent RTT measurement in seconds. Useful for instant status. |
-| `tcp_echo_connected` | Gauge | `target`, `address` | Connection status: `1` = Connected, `0` = Disconnected/Reconnecting. |
-| `tcp_echo_estimated_timeout_seconds` | Gauge | `target`, `address` | Current adaptive Retransmission Timeout (RTO) being used. |
+| `tcp_echo_sent_total` | Counter | `target`, `address` | Total echo requests sent. |
+| `tcp_echo_received_total` | Counter | `target`, `address` | Total echo responses received. |
+| `tcp_echo_timeouts_total` | Counter | `target`, `address` | Total requests that timed out. Packet loss = timeouts / sent. |
+| `tcp_echo_dropped_total` | Counter | `target`, `address` | Total connection drops/failures. |
+| `tcp_echo_rtt_seconds` | Histogram | `target`, `address` | Histogram of RTT in seconds (buckets: 500 µs – ~8 s). |
+| `tcp_echo_rtt_recent_seconds` | Summary | `target`, `address` | Sliding-window RTT percentiles over 10 min (p50, p90, p99). |
+| `tcp_echo_last_rtt_seconds` | Gauge | `target`, `address` | Most recent RTT measurement. |
+| `tcp_echo_connected` | Gauge | `target`, `address` | 1 = connected, 0 = disconnected/reconnecting. |
+| `tcp_echo_estimated_timeout_seconds` | Gauge | `target`, `address` | Current adaptive RTO in use. |
 
 ## PromQL Examples
 
-Here are some common queries to monitor your TCP targets:
-
 ### Packet Loss Rate (%)
-Calculate the percentage of lost packets over the last 5 minutes.
-```promql
+
+```
 rate(tcp_echo_timeouts_total[5m]) / rate(tcp_echo_sent_total[5m]) * 100
 ```
 
 ### Average Latency (RTT)
-Calculate the average round-trip time over the last 5 minutes.
-```promql
+
+```
 rate(tcp_echo_rtt_seconds_sum[5m]) / rate(tcp_echo_rtt_seconds_count[5m])
 ```
 
-### Connection Dropped Rate
-Rate of connection drops (reconnections needed) per second.
-```promql
-rate(tcp_echo_dropped_total[5m])
-```
+### 99th Percentile Latency (Histogram)
 
-### 99th Percentile Latency
-Estimated P99 latency.
-```promql
+```
 histogram_quantile(0.99, rate(tcp_echo_rtt_seconds_bucket[5m]))
 ```
 
+### 99th Percentile Latency (Sliding Window)
+
+```
+tcp_echo_rtt_recent_seconds{quantile="0.99"}
+```
+
 ### Connection Status
-Check if the probe is currently connected (1) or down (0).
-```promql
+
+```
 tcp_echo_connected
 ```
 
-Build
------
-Build locally:
+## Build
 
 ```sh
 go build -o ./build/tcp_ping_prometheus .
 ```
 
-Cross-compile for Windows (example):
+Cross-compile for Windows:
 
 ```sh
 CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o build/tcp_ping_prometheus.exe .
 ```
 
-Test
------
-
-Run the test suite:
+## Test
 
 ```sh
-go test -v ./...
+go test -count=1 ./test/...
 ```
 
+Release binaries for Linux, macOS, Windows at [Latest Release](https://github.com/callumau/tcp_ping_prometheus/releases/latest).
 
-Release binaries for Linux, macOS (darwin) and Windows - [Latest Release](https://github.com/callumau/tcp_ping_prometheus/releases/latest)
+## Usage
 
-Usage
------
-- -mode: server | client | both (default "server")
-- -listen: server listen address (default ":4000")
-- -target: client target address (default ":4000") - use -targets for multiple
-- -targets: JSON file with list of targets (client)
-- -metrics: HTTP address for Prometheus /metrics (default ":2112")
-- -interval: Base probe interval (min interval if adaptive) (default 500ms)
-- -timeout: Base/Initial timeout (default 1s)
-- -adaptive: Enable adaptive timeout/interval based on link quality (default true)
-- -json-logs: Log in JSON format instead of text
-- -svc: service action: install | uninstall | start | stop | run (uses kardianos/service on Windows)
+```
+tcp_ping_prometheus -mode=<mode> [flags]
+```
 
-JSON Targets Format:
+### Flags
 
-The -targets flag expects a JSON file containing an array of objects, each with "name" and "address" fields.
+| Flag | Default | Description |
+|---|---|---|
+| `-mode` | `server` | Operation mode: `server`, `client`, `both` |
+| `-listen` | `:4000` | Server listen address |
+| `-target` | `""` | Client: single target `host:port` |
+| `-targets` | `""` | Client: path to JSON targets file |
+| `-metrics` | `:2112` | Prometheus metrics HTTP listen address |
+| `-interval` | `500ms` | Base probe interval (minimum when adaptive) |
+| `-timeout` | `1s` | Base/initial probe timeout |
+| `-adaptive` | `true` | Enable adaptive RTO based on link quality |
+| `-metrics-user` | `""` | Basic auth username for /metrics (empty = disabled) |
+| `-metrics-pass` | `""` | Basic auth password for /metrics |
+| `-json-logs` | `false` | Output logs in JSON format |
+| `-svc` | `""` | Windows service action: `install`, `uninstall`, `start`, `stop`, `run` |
 
-Example targets.json:
+### Targets File
+
+JSON file with an array of `{"name": "...", "address": "host:port"}` objects:
 
 ```json
 [
@@ -103,46 +104,51 @@ Example targets.json:
 ]
 ```
 
-Examples (also in [example_queries.txt](example_queries.txt)):
+Max 1000 targets, max file size 1 MB.
+
+### Examples
 
 Client (single target):
-```
-./tcp_ping_prometheus -mode=client -target="192.168.1.71:4000" -interval=10ms -timeout=20ms -metrics=":2113" -window=100
+
+```sh
+./tcp_ping_prometheus -mode=client -target="192.168.1.71:4000" -interval=10ms -timeout=20ms -metrics=":2113"
 ```
 
 Client (multiple targets):
-```
-./tcp_ping_prometheus -mode=client -targets=targets.json -interval=10ms -timeout=20ms -metrics=":2113" -window=100
+
+```sh
+./tcp_ping_prometheus -mode=client -targets=targets.json -interval=10ms -timeout=20ms -metrics=":2113"
 ```
 
 Server:
-```
+
+```sh
 ./tcp_ping_prometheus -mode=server -listen=":4000" -metrics=":2112"
 ```
 
 Both:
-```
-./tcp_ping_prometheus -mode=both -targets=targets.json -interval=10ms -timeout=20ms -metrics=":2113" -window=100
+
+```sh
+./tcp_ping_prometheus -mode=both -targets=targets.json -interval=10ms -timeout=20ms -metrics=":2113"
 ```
 
-Service
--------
+## Service
 
 ### Windows
 
-Use the `-svc` flag to install/uninstall/start/stop/run the service. When installing, the tool records the runtime flags to ensure the service starts with the same configuration.
+Use `-svc` to install/uninstall/start/stop/run. The tool records runtime flags at install time (excluding `-svc` and `-metrics-pass`).
 
 ```
-tcp_ping_prometheus.exe -mode=both -targets=targets.json -interval=10ms -timeout=20ms -metrics=":2113" -window=100 -svc=install
+tcp_ping_prometheus.exe -mode=both -targets=targets.json -interval=10ms -timeout=20ms -metrics=":2113" -svc=install
 ```
 
-### Linux
+### Linux (systemd)
 
-To run as a systemd service, create a file at `/etc/systemd/system/tcp_ping_prometheus.service`:
+Create `/etc/systemd/system/tcp_ping_prometheus.service`:
 
 ```ini
 [Unit]
-Description=TCP Echo Metrics
+Description=TCP Ping Prometheus
 After=network.target
 
 [Service]
@@ -154,35 +160,54 @@ User=nobody
 WantedBy=multi-user.target
 ```
 
-**Note regarding targets.json**: If running in client or both mode, ensure you provide the **absolute path** to the targets file in the `-targets` flag (e.g., `-targets=/etc/tcp_ping_prometheus/targets.json`) and that the designated `User` has read permissions for the file.
-
-Reload systemd and start the service:
+Note: In client/both mode, use an absolute path for `-targets` (e.g., `-targets=/etc/tcp_ping_prometheus/targets.json`).
 
 ```sh
 sudo systemctl daemon-reload
 sudo systemctl enable --now tcp_ping_prometheus
 ```
 
-Metrics
--------
-The exporter serves Prometheus metrics at /metrics on the address given by `-metrics` (default :2112). 
+## Grafana Dashboard
 
-Prebuilt Grafana Dashboard [grafana-dashboard.json](grafana-dashboard.json).
+Prebuilt dashboard at [grafana-dashboard.json](grafana-dashboard.json).
 
 [![Grafana dashboard screenshot](.docs/screenshot01.png)](.docs/screenshot01.png)
 
-Key functions and types
------------------------
-- [`runClient`](tcp_ping_prometheus.go) — load targets and start probing.
-- [`runServer`](tcp_ping_prometheus.go) — TCP echo server.
-- [`probeTarget`](tcp_ping_prometheus.go) — handles the connection lifecycle for a single target.
-- [`runEchoLoop`](tcp_ping_prometheus.go) — main loop for sending/receiving probes and handling timeouts.
-- [`AdaptiveStats`](tcp_ping_prometheus.go) — implements RFC 6298-inspired RTO calculation.
+## Code Structure
 
-Notes
------
-- Wire format: 24 bytes per probe (8-byte magic header "TCPPING\x00", 8-byte sequence, 8-byte Unix-ns timestamp). See [tcp_ping_prometheus.go](tcp_ping_prometheus.go).
-- Histogram buckets chosen for 100µs .. ~2s RTTs.
-- The release workflow produces binaries for linux, windows, and darwin and packages each artifact (see [.github/workflows/new-release-build.yml](.github/workflows/new-release-build.yml)).
-- Security: This tool is intended for internal network monitoring. The TCP echo server validates a magic header ("TCPPING\x00") before echoing data to prevent arbitrary payload reflection, but it is still recommended to restrict access to trusted networks. The metrics endpoint serves data without authentication; protect it accordingly.
+```
+main.go                     — CLI wrapper, flag parsing, service lifecycle
+internal/prober/
+  prober.go                 — Config, protocol constants
+  adaptive.go               — RFC 6298 RTO estimation (AdaptiveStats)
+  client.go                 — Target, LoadTargets, RunClient, probe loop
+  server.go                 — RunServer, ServeListener, connection handler
+  metrics.go                — Prometheus metric vars, InitMetrics, MetricsAuth
+  validate.go               — Target address validation (ValidateTarget)
+  pool.go                   — sync.Pool for probe buffer reuse
+test/
+  helpers_test.go           — Test utilities (metric inspectors, echo server)
+  adaptive_test.go          — AdaptiveStats logic and jitter adaptation
+  validation_test.go        — LoadTargets and target parsing
+  server_test.go            — Server garbage handling, header enforcement
+  client_test.go            — Robustness: packet loss, latency, corruption, stalls, duplicates
+  integration_test.go       — Multi-target, server dropout, stress (10 targets)
+```
 
+## Wire Protocol
+
+24 bytes per probe:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 8 | Magic header `TCPPING\x00` |
+| 8 | 8 | Sequence number (little-endian uint64) |
+| 16 | 8 | Client timestamp (Unix ns, little-endian uint64) |
+
+The server validates the magic header before echoing; invalid data closes the connection immediately. The server enforces a maximum of 1000 concurrent connections; excess connections are dropped. Read deadlines (10 s) and write deadlines (5 s) prevent resource starvation.
+
+## Security
+
+- The TCP echo server validates a magic header before echoing to prevent arbitrary payload reflection.
+- The `/metrics` endpoint can be protected with HTTP Basic Auth (`-metrics-user` / `-metrics-pass`) using constant-time comparison.
+- No TLS — this tool is intended for internal network monitoring. The wire protocol carries no sensitive data (sequence numbers and wall-clock timestamps only). Restrict access with a firewall for untrusted networks.
