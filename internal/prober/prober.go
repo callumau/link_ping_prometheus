@@ -10,6 +10,7 @@ package prober
 
 import (
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -39,10 +40,21 @@ func (c Config) Validate() error {
 	if len(c.Targets) == 0 {
 		return errors.New("no targets specified")
 	}
+	if c.BaseInterval <= 0 {
+		return fmt.Errorf("probe interval must be positive, got %v", c.BaseInterval)
+	}
+	if c.BaseTimeout <= 0 {
+		return fmt.Errorf("probe timeout must be positive, got %v", c.BaseTimeout)
+	}
+	seen := make(map[string]struct{}, len(c.Targets))
 	for _, t := range c.Targets {
 		if err := ValidateTarget(t.Address); err != nil {
 			return err
 		}
+		if _, dup := seen[t.Name]; dup {
+			return fmt.Errorf("duplicate target name %q: metric labels would be ambiguous", t.Name)
+		}
+		seen[t.Name] = struct{}{}
 	}
 	return nil
 }

@@ -23,17 +23,18 @@ type Target struct {
 // LoadTargets reads and validates a JSON file containing an array of
 // Target objects. Each target address is verified via ValidateTarget.
 // The file must be ≤ MaxTargetsFileSize (1 MB) and contain ≤ MaxTargetsCount
-// (1000) entries.
+// (1000) entries. Target names must be unique: they are Prometheus label
+// values, and duplicates would produce ambiguous metric series.
 func LoadTargets(path string) ([]Target, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, fmt.Errorf("read targets file: %w", err)
 	}
-	if info.Size() > MaxTargetsFileSize {
-		return nil, fmt.Errorf("targets file too large: %d bytes (max %d)", info.Size(), MaxTargetsFileSize)
-	}
 	if info.Mode().IsDir() {
 		return nil, fmt.Errorf("targets path is a directory, not a file")
+	}
+	if info.Size() > MaxTargetsFileSize {
+		return nil, fmt.Errorf("targets file too large: %d bytes (max %d)", info.Size(), MaxTargetsFileSize)
 	}
 
 	data, err := os.ReadFile(path)
@@ -47,17 +48,21 @@ func LoadTargets(path string) ([]Target, error) {
 	if len(targets) > MaxTargetsCount {
 		return nil, fmt.Errorf("too many targets: %d (max %d)", len(targets), MaxTargetsCount)
 	}
+	seen := make(map[string]struct{}, len(targets))
 	for i, t := range targets {
 		if err := ValidateTarget(t.Address); err != nil {
 			return nil, fmt.Errorf("target %d (%q): %w", i, t.Name, err)
 		}
+		if _, dup := seen[t.Name]; dup {
+			return nil, fmt.Errorf("target %d: duplicate name %q", i, t.Name)
+		}
+		seen[t.Name] = struct{}{}
 	}
 	return targets, nil
 }
 
 // RunClient starts probe loops for every target in cfg.Targets. Each
-// target is probed in its own goroutine. Blocks until ctx is cancelled
-// or all targets permanently fail.
+// target is probed in its own goroutine. Blocks until ctx is cancelled.
 func RunClient(ctx context.Context, cfg Config) error {
 	if err := cfg.Validate(); err != nil {
 		return err
@@ -89,44 +94,34 @@ func startProbing(ctx context.Context, cfg Config) error {
 	return nil
 }
 
+// dialTarget opens a TCP connection, honouring ctx cancellation so
+// shutdown is not blocked by an in-flight dial.
+func dialTarget(ctx context.Context, address string) (net.Conn, error) {
+	d := &net.Dialer{Timeout: 5 * time.Second}
+	return d.DialContext(ctx, "tcp", address)
+}
+
 // probeTarget manages the connection lifecycle for a single target.
-// On connection failure it backs off 2 seconds; on disconnect it
-// waits 500 ms before reconnecting. A panic recovery keeps other
-// targets alive.
+// Dial failures back off 2 seconds; lost connections wait 500 ms before
+// reconnecting. A panic in the echo loop is recovered and treated as a
+// connection loss — the target keeps being probed.
 func probeTarget(ctx context.Context, t Target, cfg Config) {
 	logger := slog.With("target", t.Name, "address", t.Address)
 
-	defer func() {
-		if r := recover(); r != nil {
-			logger.Error("Panic in probe loop", "panic", r)
-		}
-	}()
-
-	adaptive := NewAdaptiveStats(cfg.BaseTimeout)
-
-	getTimeout := func() time.Duration {
-		if cfg.Adaptive {
-			return adaptive.CurrentRTO()
-		}
-		return cfg.BaseTimeout
-	}
-
-	getInterval := func() time.Duration {
-		return cfg.BaseInterval
-	}
+	stats := NewAdaptiveStats(cfg.BaseTimeout)
 
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 
-		conn, err := net.DialTimeout("tcp", t.Address, 5*time.Second)
+		conn, err := dialTarget(ctx, t.Address)
 		if err != nil {
-			DropTotal.WithLabelValues(t.Name, t.Address).Inc()
-			TimeoutTotal.WithLabelValues(t.Name, t.Address).Inc()
-			SentTotal.WithLabelValues(t.Name, t.Address).Inc()
+			if ctx.Err() != nil {
+				return
+			}
+			ConnectFailuresTotal.WithLabelValues(t.Name, t.Address).Inc()
 			Connected.WithLabelValues(t.Name, t.Address).Set(0)
-
 			logger.Warn("Connect failed", "err", err)
 			select {
 			case <-ctx.Done():
@@ -143,10 +138,11 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 			tcp.SetNoDelay(true)
 		}
 
-		err = runEchoLoop(ctx, conn, t, cfg, adaptive, getTimeout, getInterval, logger)
+		err = runEchoLoopGuarded(ctx, conn, t, cfg, stats, logger)
 		Connected.WithLabelValues(t.Name, t.Address).Set(0)
 
 		if err != nil {
+			DropTotal.WithLabelValues(t.Name, t.Address).Inc()
 			logger.Warn("Connection lost", "err", err)
 		}
 
@@ -156,6 +152,20 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
+}
+
+// runEchoLoopGuarded recovers panics from runEchoLoop so a single
+// target's failure can never kill its probe loop (or the process).
+// A panic is converted to an error, which the caller treats as a
+// connection drop followed by a reconnect.
+func runEchoLoopGuarded(ctx context.Context, conn net.Conn, t Target, cfg Config, stats *AdaptiveStats, logger *slog.Logger) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("Panic in echo loop; reconnecting", "panic", r)
+			err = fmt.Errorf("panic in echo loop: %v", r)
+		}
+	}()
+	return runEchoLoop(ctx, conn, t, cfg, stats, logger)
 }
 
 // resetTimer safely stops and resets a time.Timer. It handles the
@@ -175,7 +185,10 @@ func resetTimer(t *time.Timer, d time.Duration) {
 //
 // At each interval it:
 //  1. Drains buffered responses from the reader goroutine and matches
-//     them against pending sequence numbers.
+//     them against pending sequence numbers. The echoed timestamp must
+//     exactly equal the timestamp written into the request payload;
+//     mismatches (corruption, replay, spoofing) are ignored and the
+//     probe is left to time out as a loss.
 //  2. Checks for timeouts among in-flight probes.
 //  3. Sends a new probe with the next sequence number.
 //
@@ -183,19 +196,23 @@ func resetTimer(t *time.Timer, d time.Duration) {
 // that also serves as a periodic context-cancellation check. On context
 // cancellation the connection is closed immediately via deferred close,
 // which unblocks the reader.
+//
+// A nil return means clean context cancellation; in-flight probes are
+// NOT counted as timeouts in that case. Any non-nil return (reader
+// error, write error, panic via the guard) flushes in-flight probes to
+// TimeoutTotal because the connection state is no longer trustworthy.
 func runEchoLoop(
 	ctx context.Context,
 	conn net.Conn,
 	t Target,
 	cfg Config,
 	stats *AdaptiveStats,
-	getTimeout func() time.Duration,
-	getInterval func() time.Duration,
 	logger *slog.Logger,
-) error {
+) (retErr error) {
 
 	type response struct {
 		seq  uint64
+		ts   uint64
 		recv time.Time
 	}
 
@@ -236,9 +253,10 @@ func runEchoLoop(
 			}
 
 			seq := binary.LittleEndian.Uint64(buf[8:16])
+			ts := binary.LittleEndian.Uint64(buf[16:24])
 
 			select {
-			case respCh <- response{seq: seq, recv: time.Now()}:
+			case respCh <- response{seq: seq, ts: ts, recv: time.Now()}:
 			case <-readerCtx.Done():
 				return
 			}
@@ -253,6 +271,9 @@ func runEchoLoop(
 	pending := make(map[uint64]time.Time)
 
 	defer func() {
+		if retErr == nil {
+			return
+		}
 		count := float64(len(pending))
 		if count > 0 {
 			TimeoutTotal.WithLabelValues(t.Name, t.Address).Add(count)
@@ -263,8 +284,11 @@ func runEchoLoop(
 	defer intervalTimer.Stop()
 
 	for {
-		interval := getInterval()
-		timeout := getTimeout()
+		interval := cfg.BaseInterval
+		timeout := cfg.BaseTimeout
+		if cfg.Adaptive {
+			timeout = stats.CurrentRTO()
+		}
 
 		RTOEstimate.WithLabelValues(t.Name, t.Address).Set(timeout.Seconds())
 
@@ -272,7 +296,7 @@ func runEchoLoop(
 
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return nil
 		case err, ok := <-errCh:
 			if !ok {
 				return errors.New("reader closed unexpectedly")
@@ -286,20 +310,27 @@ func runEchoLoop(
 			select {
 			case resp := <-respCh:
 				sentTime, ok := pending[resp.seq]
-				if ok {
-					rtt := resp.recv.Sub(sentTime)
-					delete(pending, resp.seq)
+				if !ok {
+					continue
+				}
+				if resp.ts != uint64(sentTime.UnixNano()) {
+					// Echoed payload does not match what we sent:
+					// corruption, replay, or spoofing. Leave the probe
+					// pending so it is counted as a loss on timeout.
+					logger.Debug("Rejected response with mismatched timestamp", "seq", resp.seq)
+					continue
+				}
+				delete(pending, resp.seq)
 
-					rttSec := rtt.Seconds()
+				rttSec := resp.recv.Sub(sentTime).Seconds()
 
-					ReceivedTotal.WithLabelValues(t.Name, t.Address).Inc()
-					RTTSeconds.WithLabelValues(t.Name, t.Address).Observe(rttSec)
-					RTTSecondsRecent.WithLabelValues(t.Name, t.Address).Observe(rttSec)
-					LastRTTSeconds.WithLabelValues(t.Name, t.Address).Set(rttSec)
+				ReceivedTotal.WithLabelValues(t.Name, t.Address).Inc()
+				RTTSeconds.WithLabelValues(t.Name, t.Address).Observe(rttSec)
+				RTTSecondsRecent.WithLabelValues(t.Name, t.Address).Observe(rttSec)
+				LastRTTSeconds.WithLabelValues(t.Name, t.Address).Set(rttSec)
 
-					if cfg.Adaptive {
-						stats.Update(rttSec)
-					}
+				if cfg.Adaptive {
+					stats.Update(rttSec)
 				}
 			default:
 				break Drain
@@ -332,7 +363,7 @@ func runEchoLoop(
 			return err
 		}
 
-		pending[seq] = time.Now()
+		pending[seq] = now
 		SentTotal.WithLabelValues(t.Name, t.Address).Inc()
 	}
 }

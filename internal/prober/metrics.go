@@ -1,6 +1,7 @@
 package prober
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
 	"net/http"
 	"sync"
@@ -13,7 +14,7 @@ import (
 var (
 	SentTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "tcp_echo_sent_total",
-		Help: "Total echo requests sent (attempts).",
+		Help: "Total echo requests sent on established connections (dial failures excluded).",
 	}, []string{"target", "address"})
 	ReceivedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "tcp_echo_received_total",
@@ -25,7 +26,11 @@ var (
 	}, []string{"target", "address"})
 	DropTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "tcp_echo_dropped_total",
-		Help: "Total connections dropped/failed.",
+		Help: "Total established connections that were lost mid-probing.",
+	}, []string{"target", "address"})
+	ConnectFailuresTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "tcp_echo_connect_failures_total",
+		Help: "Total failed connection attempts (dial errors). Not counted in sent/timeout totals.",
 	}, []string{"target", "address"})
 	RTTSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "tcp_echo_rtt_seconds",
@@ -59,15 +64,24 @@ var registerOnce sync.Once
 // Safe to call multiple times; registration happens exactly once.
 func InitMetrics() {
 	registerOnce.Do(func() {
-		prometheus.MustRegister(SentTotal, ReceivedTotal, TimeoutTotal, DropTotal, RTTSeconds, RTTSecondsRecent, LastRTTSeconds, Connected, RTOEstimate)
+		prometheus.MustRegister(SentTotal, ReceivedTotal, TimeoutTotal, DropTotal, ConnectFailuresTotal, RTTSeconds, RTTSecondsRecent, LastRTTSeconds, Connected, RTOEstimate)
 	})
 }
 
-// SeedMetrics initialises counters to 0 for each target so they surface
-// in /metrics output even before first event.
+// SeedMetrics initialises every metric series for each target so they all
+// surface in /metrics output even before the first event.
 func SeedMetrics(targets []Target) {
 	for _, t := range targets {
+		SentTotal.WithLabelValues(t.Name, t.Address).Add(0)
+		ReceivedTotal.WithLabelValues(t.Name, t.Address).Add(0)
 		TimeoutTotal.WithLabelValues(t.Name, t.Address).Add(0)
+		DropTotal.WithLabelValues(t.Name, t.Address).Add(0)
+		ConnectFailuresTotal.WithLabelValues(t.Name, t.Address).Add(0)
+		Connected.WithLabelValues(t.Name, t.Address).Set(0)
+		LastRTTSeconds.WithLabelValues(t.Name, t.Address).Set(0)
+		RTOEstimate.WithLabelValues(t.Name, t.Address).Set(0)
+		RTTSeconds.WithLabelValues(t.Name, t.Address)
+		RTTSecondsRecent.WithLabelValues(t.Name, t.Address)
 	}
 }
 
@@ -79,7 +93,11 @@ func MetricsAuth(user, pass string, next http.Handler) http.Handler {
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		u, p, ok := r.BasicAuth()
-		if !ok || subtle.ConstantTimeCompare([]byte(u), []byte(user)) != 1 || subtle.ConstantTimeCompare([]byte(p), []byte(pass)) != 1 {
+		// Hash before comparing: ConstantTimeCompare returns immediately on
+		// length mismatch, which would otherwise leak credential length.
+		uh, ph := sha256.Sum256([]byte(u)), sha256.Sum256([]byte(p))
+		uhRef, phRef := sha256.Sum256([]byte(user)), sha256.Sum256([]byte(pass))
+		if !ok || subtle.ConstantTimeCompare(uh[:], uhRef[:]) != 1 || subtle.ConstantTimeCompare(ph[:], phRef[:]) != 1 {
 			w.Header().Set("WWW-Authenticate", `Basic realm="metrics"`)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return

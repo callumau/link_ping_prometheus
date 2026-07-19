@@ -8,11 +8,12 @@ The exporter exposes the following metrics at `/metrics` (default port 2112).
 
 | Metric Name | Type | Labels | Description |
 |---|---|---|---|
-| `tcp_echo_sent_total` | Counter | `target`, `address` | Total echo requests sent. |
-| `tcp_echo_received_total` | Counter | `target`, `address` | Total echo responses received. |
+| `tcp_echo_sent_total` | Counter | `target`, `address` | Total echo requests sent on established connections (dial failures excluded). |
+| `tcp_echo_received_total` | Counter | `target`, `address` | Total echo responses received and validated. |
 | `tcp_echo_timeouts_total` | Counter | `target`, `address` | Total requests that timed out. Packet loss = timeouts / sent. |
-| `tcp_echo_dropped_total` | Counter | `target`, `address` | Total connection drops/failures. |
-| `tcp_echo_rtt_seconds` | Histogram | `target`, `address` | Histogram of RTT in seconds (buckets: 500 µs – ~8 s). |
+| `tcp_echo_dropped_total` | Counter | `target`, `address` | Total established connections lost mid-probing. |
+| `tcp_echo_connect_failures_total` | Counter | `target`, `address` | Total failed connection attempts (dial errors). Not counted in sent/timeout totals. |
+| `tcp_echo_rtt_seconds` | Histogram | `target`, `address` | Histogram of RTT in seconds (buckets: 500 µs – ~4 s). |
 | `tcp_echo_rtt_recent_seconds` | Summary | `target`, `address` | Sliding-window RTT percentiles over 10 min (p50, p90, p99). |
 | `tcp_echo_last_rtt_seconds` | Gauge | `target`, `address` | Most recent RTT measurement. |
 | `tcp_echo_connected` | Gauge | `target`, `address` | 1 = connected, 0 = disconnected/reconnecting. |
@@ -21,6 +22,11 @@ The exporter exposes the following metrics at `/metrics` (default port 2112).
 ## PromQL Examples
 
 ### Packet Loss Rate (%)
+
+Dial failures are excluded from `sent_total`/`timeouts_total` — while the
+client cannot connect, this ratio is undefined rather than pinned at 100%;
+alert on `tcp_echo_connected == 0` or `rate(tcp_echo_connect_failures_total[5m]) > 0`
+for that condition.
 
 ```
 rate(tcp_echo_timeouts_total[5m]) / rate(tcp_echo_sent_total[5m]) * 100
@@ -85,11 +91,14 @@ tcp_ping_prometheus -mode=<mode> [flags]
 | `-target` | `""` | Client: single target `host:port` |
 | `-targets` | `""` | Client: path to JSON targets file |
 | `-metrics` | `:2112` | Prometheus metrics HTTP listen address |
-| `-interval` | `500ms` | Base probe interval (minimum when adaptive) |
-| `-timeout` | `1s` | Base/initial probe timeout |
+| `-interval` | `500ms` | Client: probe interval (must stay well below server `-read-timeout`) |
+| `-timeout` | `1s` | Client: Base/initial probe timeout |
 | `-adaptive` | `true` | Enable adaptive RTO based on link quality |
-| `-metrics-user` | `""` | Basic auth username for /metrics (empty = disabled) |
-| `-metrics-pass` | `""` | Basic auth password for /metrics |
+| `-read-timeout` | `10s` | Server: idle read deadline per connection |
+| `-metrics-user` | `""` | Basic auth username for /metrics (empty = disabled; env `TCP_PING_METRICS_USER`) |
+| `-metrics-pass` | `""` | Basic auth password for /metrics (env `TCP_PING_METRICS_PASS`; prefer env over CLI to avoid `ps` exposure) |
+| `-metrics-tls-cert` | `""` | TLS certificate file for /metrics (requires `-metrics-tls-key`) |
+| `-metrics-tls-key` | `""` | TLS private key file for /metrics (requires `-metrics-tls-cert`) |
 | `-json-logs` | `false` | Output logs in JSON format |
 | `-svc` | `""` | Windows service action: `install`, `uninstall`, `start`, `stop`, `run` |
 
@@ -136,7 +145,7 @@ Both:
 
 ### Windows
 
-Use `-svc` to install/uninstall/start/stop/run. The tool records runtime flags at install time (excluding `-svc` and `-metrics-pass`).
+Use `-svc` to install/uninstall/start/stop/run. The tool records runtime flags at install time (excluding `-svc`, `-metrics-user`, and `-metrics-pass`). Metrics auth credentials are **not** persisted into the service configuration; set `TCP_PING_METRICS_USER` / `TCP_PING_METRICS_PASS` in the service environment instead (a warning is printed at install time).
 
 ```
 tcp_ping_prometheus.exe -mode=both -targets=targets.json -interval=10ms -timeout=20ms -metrics=":2113" -svc=install
@@ -177,6 +186,7 @@ Prebuilt dashboard at [grafana-dashboard.json](grafana-dashboard.json).
 
 ```
 main.go                     — CLI wrapper, flag parsing, service lifecycle
+main_test.go                — lifecycle race, auth/TLS flag validation tests
 internal/prober/
   prober.go                 — Config, protocol constants
   adaptive.go               — RFC 6298 RTO estimation (AdaptiveStats)
@@ -188,9 +198,10 @@ internal/prober/
 test/
   helpers_test.go           — Test utilities (metric inspectors, echo server)
   adaptive_test.go          — AdaptiveStats logic and jitter adaptation
-  validation_test.go        — LoadTargets and target parsing
-  server_test.go            — Server garbage handling, header enforcement
-  client_test.go            — Robustness: packet loss, latency, corruption, stalls, duplicates
+  validation_test.go        — LoadTargets, target parsing, Config validation
+  server_test.go            — Server garbage handling, limits, shutdown
+  client_test.go            — Robustness: loss, latency, corruption, spoofing, stalls, duplicates
+  metrics_test.go           — Basic auth handler, metric seeding
   integration_test.go       — Multi-target, server dropout, stress (10 targets)
 ```
 
@@ -204,10 +215,15 @@ test/
 | 8 | 8 | Sequence number (little-endian uint64) |
 | 16 | 8 | Client timestamp (Unix ns, little-endian uint64) |
 
-The server validates the magic header before echoing; invalid data closes the connection immediately. The server enforces a maximum of 1000 concurrent connections; excess connections are dropped. Read deadlines (10 s) and write deadlines (5 s) prevent resource starvation.
+The server validates the magic header before echoing; invalid data closes the connection immediately. The client additionally requires the echoed timestamp to exactly match the value it sent — corrupted, replayed, or spoofed responses are discarded and counted as loss on timeout, protecting RTT samples from poisoning.
+
+The server enforces a maximum of 1000 concurrent connections globally and 128 per remote IP; excess connections are dropped. Per-connection read deadlines (`-read-timeout`, default 10 s) and write deadlines (5 s) prevent resource starvation; transient accept errors back off exponentially. Client `-interval` must stay well below the server's read deadline or connections will be closed for idleness.
 
 ## Security
 
-- The TCP echo server validates a magic header before echoing to prevent arbitrary payload reflection.
-- The `/metrics` endpoint can be protected with HTTP Basic Auth (`-metrics-user` / `-metrics-pass`) using constant-time comparison.
-- No TLS — this tool is intended for internal network monitoring. The wire protocol carries no sensitive data (sequence numbers and wall-clock timestamps only). Restrict access with a firewall for untrusted networks.
+- The TCP echo server validates a magic header before echoing to prevent arbitrary payload reflection, and caps connections globally and per source IP.
+- Echoed timestamps are validated exactly (see Wire Protocol), so off-path corruption and replays cannot fabricate RTT samples.
+- The `/metrics` endpoint supports HTTP Basic Auth (`-metrics-user` / `-metrics-pass`) with constant-time comparison over hashed credentials. Both must be set together; the process refuses to start with only one.
+- Prefer the `TCP_PING_METRICS_USER` / `TCP_PING_METRICS_PASS` environment variables over CLI flags — flag values are visible in `ps` to other local users.
+- Basic Auth without TLS sends credentials as base64 on the wire; a startup warning is logged in that configuration. Use `-metrics-tls-cert` / `-metrics-tls-key` to serve `/metrics` over HTTPS.
+- The wire protocol carries no sensitive data (sequence numbers and wall-clock timestamps only) and has no TLS — intended for internal network monitoring. Restrict access with a firewall on untrusted networks.

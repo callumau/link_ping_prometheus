@@ -28,6 +28,8 @@ func TestConnectionRefusedMetrics(t *testing.T) {
 
 	initialSent := getCounterValue(prober.SentTotal, "refused_test", addr)
 	initialTimeouts := getCounterValue(prober.TimeoutTotal, "refused_test", addr)
+	initialConnectFails := getCounterValue(prober.ConnectFailuresTotal, "refused_test", addr)
+	initialDrops := getCounterValue(prober.DropTotal, "refused_test", addr)
 
 	go prober.RunClient(ctx, cfg)
 
@@ -35,12 +37,20 @@ func TestConnectionRefusedMetrics(t *testing.T) {
 
 	finalSent := getCounterValue(prober.SentTotal, "refused_test", addr)
 	finalTimeouts := getCounterValue(prober.TimeoutTotal, "refused_test", addr)
+	finalConnectFails := getCounterValue(prober.ConnectFailuresTotal, "refused_test", addr)
+	finalDrops := getCounterValue(prober.DropTotal, "refused_test", addr)
 
-	if finalSent <= initialSent {
-		t.Errorf("Expected sent count to increase on connection refused, got %v -> %v", initialSent, finalSent)
+	if finalConnectFails <= initialConnectFails {
+		t.Errorf("Expected connect failures to increase on connection refused, got %v -> %v", initialConnectFails, finalConnectFails)
 	}
-	if finalTimeouts <= initialTimeouts {
-		t.Errorf("Expected timeout count to increase on connection refused, got %v -> %v", initialTimeouts, finalTimeouts)
+	if finalSent != initialSent {
+		t.Errorf("Dial failures must not count as sent probes, got %v -> %v", initialSent, finalSent)
+	}
+	if finalTimeouts != initialTimeouts {
+		t.Errorf("Dial failures must not count as probe timeouts, got %v -> %v", initialTimeouts, finalTimeouts)
+	}
+	if finalDrops != initialDrops {
+		t.Errorf("Dial failures must not count as mid-connection drops, got %v -> %v", initialDrops, finalDrops)
 	}
 }
 
@@ -306,6 +316,11 @@ func TestAccuracy_KnownLatencyAndLoss(t *testing.T) {
 
 	delay := 17 * time.Millisecond
 	dropMod := 4
+	// Drop every 4th of the first dropWindow packets, echo everything
+	// after that. All drops then age past the client timeout well before
+	// measurement, so the expected count is exact and independent of
+	// cancel-time in-flight state.
+	dropWindow := 24
 
 	go func() {
 		defer ln.Close()
@@ -321,7 +336,7 @@ func TestAccuracy_KnownLatencyAndLoss(t *testing.T) {
 				return
 			}
 			count++
-			if count%dropMod == 0 {
+			if count <= dropWindow && count%dropMod == 0 {
 				continue
 			}
 			time.Sleep(delay)
@@ -339,7 +354,9 @@ func TestAccuracy_KnownLatencyAndLoss(t *testing.T) {
 	startTimeout := getCounterValue(prober.TimeoutTotal, targetName, addr)
 
 	go prober.RunClient(ctx, cfg)
-	time.Sleep(2 * time.Second)
+	// dropWindow packets take ~1.2s; their drops are all swept by ~1.7s.
+	// 2.5s leaves ample margin under CI load.
+	time.Sleep(2500 * time.Millisecond)
 	cancel()
 	time.Sleep(200 * time.Millisecond)
 
@@ -350,9 +367,13 @@ func TestAccuracy_KnownLatencyAndLoss(t *testing.T) {
 	sentCount := endSent - startSent
 	timeoutCount := endTimeout - startTimeout
 
-	expectedDrops := int(sentCount) / dropMod
-	if math.Abs(timeoutCount-float64(expectedDrops)) > 1.5 {
-		t.Errorf("Loss accuracy mismatch: expected ~%d timeouts (sent %d, 1/%d), got %v", expectedDrops, int(sentCount), dropMod, timeoutCount)
+	if sentCount < float64(dropWindow) {
+		t.Fatalf("Sent fewer probes (%v) than the drop window (%d) — cpu load?", sentCount, dropWindow)
+	}
+
+	expectedDrops := dropWindow / dropMod
+	if math.Abs(timeoutCount-float64(expectedDrops)) > 0.5 {
+		t.Errorf("Loss accuracy mismatch: expected exactly %d timeouts (1/%d of first %d), got %v", expectedDrops, dropMod, dropWindow, timeoutCount)
 	}
 
 	if rttVal < delay.Seconds()-0.003 || rttVal > delay.Seconds()+0.015 {
@@ -407,5 +428,139 @@ func TestDuplicateResponse(t *testing.T) {
 
 	if recvDelta > sentDelta+1 {
 		t.Errorf("Duplicate responses counted! Sent %v, Recv %v", sentDelta, recvDelta)
+	}
+}
+
+// TestRobustness_TimestampSpoof: responses with a valid seq but a tampered
+// payload timestamp must be rejected (left to time out as loss), guarding
+// RTT samples against corruption/replay/spoofing.
+func TestRobustness_TimestampSpoof(t *testing.T) {
+	prober.InitMetrics()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	addr := ln.Addr().String()
+
+	go func() {
+		defer ln.Close()
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, prober.PayloadSize)
+		for {
+			if _, err := io.ReadFull(conn, buf); err != nil {
+				return
+			}
+			buf[16] ^= 0xFF // tamper with the echoed timestamp
+			conn.Write(buf)
+		}
+	}()
+
+	targetName := "spoof_ts_test"
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := cfgWith(false, 50*time.Millisecond, 100*time.Millisecond, prober.Target{Name: targetName, Address: addr})
+
+	startRecv := getCounterValue(prober.ReceivedTotal, targetName, addr)
+	startTimeout := getCounterValue(prober.TimeoutTotal, targetName, addr)
+
+	go prober.RunClient(ctx, cfg)
+	time.Sleep(500 * time.Millisecond)
+	cancel()
+	time.Sleep(100 * time.Millisecond)
+
+	endRecv := getCounterValue(prober.ReceivedTotal, targetName, addr)
+	endTimeout := getCounterValue(prober.TimeoutTotal, targetName, addr)
+
+	if endRecv > startRecv {
+		t.Errorf("Client accepted responses with tampered timestamps: Recv increased by %v", endRecv-startRecv)
+	}
+	if endTimeout <= startTimeout {
+		t.Errorf("Tampered responses should time out as loss, but Timeout did not increase")
+	}
+}
+
+// TestGracefulShutdown_NoPhantomTimeouts: probes still in flight when the
+// context is cancelled must NOT be flushed into TimeoutTotal — otherwise
+// every deploy/restart injects phantom packet loss.
+func TestGracefulShutdown_NoPhantomTimeouts(t *testing.T) {
+	prober.InitMetrics()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	addr := ln.Addr().String()
+
+	// Echo only after 1s — far beyond the test window — so probes stay
+	// in flight at cancel time without ever timing out (client timeout 5s).
+	go func() {
+		defer ln.Close()
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, prober.PayloadSize)
+		for {
+			if _, err := io.ReadFull(conn, buf); err != nil {
+				return
+			}
+			time.Sleep(1 * time.Second)
+			conn.Write(buf)
+		}
+	}()
+
+	targetName := "graceful_test"
+	ctx, cancel := context.WithCancel(context.Background())
+
+	cfg := cfgWith(false, 50*time.Millisecond, 5*time.Second, prober.Target{Name: targetName, Address: addr})
+
+	startSent := getCounterValue(prober.SentTotal, targetName, addr)
+	startTimeout := getCounterValue(prober.TimeoutTotal, targetName, addr)
+
+	go prober.RunClient(ctx, cfg)
+	time.Sleep(300 * time.Millisecond)
+	cancel()
+	time.Sleep(300 * time.Millisecond)
+
+	endSent := getCounterValue(prober.SentTotal, targetName, addr)
+	endTimeout := getCounterValue(prober.TimeoutTotal, targetName, addr)
+
+	if endSent <= startSent {
+		t.Fatalf("Expected probes to be sent, got %v -> %v", startSent, endSent)
+	}
+	if endTimeout != startTimeout {
+		t.Errorf("Graceful shutdown must not flush in-flight probes to timeouts: %v -> %v", startTimeout, endTimeout)
+	}
+}
+
+// TestDialHonoursCancellation: a dial to an unresponsive address must abort
+// promptly on context cancellation, not block for the full dial timeout.
+// 192.0.2.1 is TEST-NET-1 (RFC 5737) — SYNs go nowhere.
+func TestDialHonoursCancellation(t *testing.T) {
+	prober.InitMetrics()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cfg := cfgWith(false, 50*time.Millisecond, 100*time.Millisecond, prober.Target{Name: "dial_cancel_test", Address: "192.0.2.1:4000"})
+
+	done := make(chan struct{})
+	go func() {
+		prober.RunClient(ctx, cfg)
+		close(done)
+	}()
+
+	time.Sleep(200 * time.Millisecond) // let the dial get stuck
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("RunClient did not return within 3s of cancel — dial ignored context")
 	}
 }

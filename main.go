@@ -12,6 +12,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -38,16 +39,21 @@ var (
 	flSvc      = flag.String("svc", "", "Service: install, uninstall, start, stop, run")
 	flJSONLogs = flag.Bool("json-logs", false, "Log in JSON format")
 
-	flAdaptive     = flag.Bool("adaptive", true, "Client: Use adaptive timeout/interval based on link quality")
-	flBaseInterval = flag.Duration("interval", 500*time.Millisecond, "Client: Base probe interval (min interval if adaptive)")
+	flAdaptive     = flag.Bool("adaptive", true, "Client: Use adaptive timeout based on link quality (RFC 6298)")
+	flBaseInterval = flag.Duration("interval", 500*time.Millisecond, "Client: Probe interval (must stay well below server -read-timeout)")
 	flBaseTimeout  = flag.Duration("timeout", 1*time.Second, "Client: Base/Initial timeout")
+	flReadTimeout  = flag.Duration("read-timeout", prober.DefaultReadTimeout, "Server: idle read deadline per connection")
 
-	flMetricsBasicAuthUser = flag.String("metrics-user", "", "Metrics: Basic auth username (empty disables auth)")
-	flMetricsBasicAuthPass = flag.String("metrics-pass", "", "Metrics: Basic auth password")
+	flMetricsBasicAuthUser = flag.String("metrics-user", "", "Metrics: Basic auth username (empty disables auth; env TCP_PING_METRICS_USER)")
+	flMetricsBasicAuthPass = flag.String("metrics-pass", "", "Metrics: Basic auth password (env TCP_PING_METRICS_PASS; prefer env over CLI to avoid ps exposure)")
+	flMetricsTLSCert       = flag.String("metrics-tls-cert", "", "Metrics: TLS certificate file (requires -metrics-tls-key)")
+	flMetricsTLSKey        = flag.String("metrics-tls-key", "", "Metrics: TLS private key file (requires -metrics-tls-cert)")
 
 	// sensitiveFlags prevents secrets from being persisted in the service
-	// configuration during install.
+	// configuration during install. metrics-user is stripped alongside
+	// metrics-pass because the two must be configured as a pair.
 	sensitiveFlags = map[string]bool{
+		"metrics-user": true,
 		"metrics-pass": true,
 	}
 )
@@ -113,9 +119,28 @@ func buildConfig() prober.Config {
 	}
 }
 
+// resolveMetricsAuth combines the CLI flags with the TCP_PING_METRICS_USER /
+// TCP_PING_METRICS_PASS environment variables (flags win). Username and
+// password must be configured as a pair: user-only would otherwise enable
+// auth with an empty password.
+func resolveMetricsAuth() (string, string, error) {
+	user, pass := *flMetricsBasicAuthUser, *flMetricsBasicAuthPass
+	if user == "" {
+		user = os.Getenv("TCP_PING_METRICS_USER")
+	}
+	if pass == "" {
+		pass = os.Getenv("TCP_PING_METRICS_PASS")
+	}
+	if (user == "") != (pass == "") {
+		return "", "", errors.New("metrics basic auth requires both username and password (-metrics-user/-metrics-pass or TCP_PING_METRICS_USER/TCP_PING_METRICS_PASS)")
+	}
+	return user, pass, nil
+}
+
 // handleService manages the Windows service lifecycle via the
 // kardianos/service package. It reconstructs CLI arguments at install
-// time, excluding -svc itself and sensitive flags (-metrics-pass).
+// time, excluding -svc itself and sensitive flags (-metrics-user,
+// -metrics-pass).
 func handleService(action string) {
 	svcConfig := &service.Config{
 		Name:        "tcp_ping_prometheus",
@@ -139,6 +164,11 @@ func handleService(action string) {
 		args = append(args, "-svc=run")
 		svcConfig.Arguments = args
 		svcConfig.Executable = exePath
+
+		if *flMetricsBasicAuthUser != "" || *flMetricsBasicAuthPass != "" {
+			fmt.Println("WARNING: -metrics-user/-metrics-pass are NOT persisted into the service configuration.")
+			fmt.Println("Configure TCP_PING_METRICS_USER/TCP_PING_METRICS_PASS in the service environment instead.")
+		}
 	}
 
 	prg := &program{ctx: context.Background()}
@@ -192,9 +222,14 @@ type program struct {
 }
 
 // Start is called by the service framework to begin execution.
+// The WaitGroup Add happens here — before the goroutine starts — so
+// Stop can never race it (the framework calls Stop only after Start
+// has returned).
 func (p *program) Start(s service.Service) error {
 	p.ctx, p.cancel = context.WithCancel(context.Background())
+	p.wg.Add(1)
 	go func() {
+		defer p.wg.Done()
 		if err := p.run(); err != nil {
 			slog.Error("Service run error", "err", err)
 		}
@@ -203,7 +238,7 @@ func (p *program) Start(s service.Service) error {
 }
 
 // Stop is called by the service framework to shut down gracefully.
-// It cancels the context and waits for all goroutines to finish.
+// It cancels the context and waits for the run goroutine to finish.
 func (p *program) Stop(s service.Service) error {
 	if p.cancel != nil {
 		p.cancel()
@@ -217,10 +252,25 @@ func (p *program) Stop(s service.Service) error {
 func (p *program) run() error {
 	prober.InitMetrics()
 
+	user, pass, err := resolveMetricsAuth()
+	if err != nil {
+		return err
+	}
+	cert, key := *flMetricsTLSCert, *flMetricsTLSKey
+	if (cert == "") != (key == "") {
+		return errors.New("-metrics-tls-cert and -metrics-tls-key must be set together")
+	}
+	if user != "" && cert == "" {
+		slog.Warn("Metrics basic auth over plaintext HTTP: credentials are base64-only on the wire; consider -metrics-tls-cert/-metrics-tls-key")
+	}
+	if *flReadTimeout <= 0 {
+		return fmt.Errorf("-read-timeout must be positive, got %v", *flReadTimeout)
+	}
+
 	go func() {
 		mx := http.NewServeMux()
-		mx.Handle("/metrics", prober.MetricsAuth(*flMetricsBasicAuthUser, *flMetricsBasicAuthPass, promhttp.Handler()))
-		slog.Info("Starting metrics server", "addr", *flMetrics)
+		mx.Handle("/metrics", prober.MetricsAuth(user, pass, promhttp.Handler()))
+		slog.Info("Starting metrics server", "addr", *flMetrics, "tls", cert != "", "auth", user != "")
 		srv := &http.Server{
 			Addr:         *flMetrics,
 			Handler:      mx,
@@ -231,32 +281,43 @@ func (p *program) run() error {
 
 		go func() {
 			<-p.ctx.Done()
-			srv.Shutdown(context.Background())
+			shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			srv.Shutdown(shutCtx)
 		}()
 
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			slog.Error("Metrics server error", "err", err)
+		var serveErr error
+		if cert != "" {
+			serveErr = srv.ListenAndServeTLS(cert, key)
+		} else {
+			serveErr = srv.ListenAndServe()
+		}
+		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			slog.Error("Metrics server error", "err", serveErr)
 		}
 	}()
 
 	mode := *flMode
 	switch mode {
 	case "server":
-		return prober.RunServer(p.ctx, *flListen)
+		return prober.RunServer(p.ctx, *flListen, *flReadTimeout)
 	case "client":
 		cfg := buildConfig()
 		return prober.RunClient(p.ctx, cfg)
 	case "both":
-		p.wg.Add(1)
+		// Local WaitGroup: Add is sequenced before the goroutine starts
+		// and Wait runs in the same goroutine, so no Add/Wait race.
+		var wg sync.WaitGroup
+		wg.Add(1)
 		go func() {
-			defer p.wg.Done()
-			if err := prober.RunServer(p.ctx, *flListen); err != nil {
+			defer wg.Done()
+			if err := prober.RunServer(p.ctx, *flListen, *flReadTimeout); err != nil {
 				slog.Error("Server error", "err", err)
 			}
 		}()
 		cfg := buildConfig()
 		clientErr := prober.RunClient(p.ctx, cfg)
-		p.wg.Wait()
+		wg.Wait()
 		return clientErr
 	default:
 		return fmt.Errorf("unknown mode: %s", mode)

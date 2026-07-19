@@ -67,7 +67,7 @@ func TestServer_EnforceSizeAndHeader(t *testing.T) {
 		<-ctx.Done()
 		ln.Close()
 	}()
-	go prober.ServeListener(ctx, ln)
+	go prober.ServeListener(ctx, ln, prober.DefaultReadTimeout)
 
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -115,5 +115,107 @@ func TestServer_EnforceSizeAndHeader(t *testing.T) {
 		t.Errorf("Expected server to close connection on invalid 2nd packet header, but got reply")
 	} else {
 		t.Logf("Got expected error on 2nd packet: %v", err)
+	}
+}
+
+// TestServer_PerIPLimit: connections beyond MaxConnsPerIP from a single
+// remote IP must be closed immediately, while connections within the
+// limit keep working.
+func TestServer_PerIPLimit(t *testing.T) {
+	prober.InitMetrics()
+	old := prober.MaxConnsPerIP
+	prober.MaxConnsPerIP = 3
+	defer func() { prober.MaxConnsPerIP = old }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		<-ctx.Done()
+		ln.Close()
+	}()
+	go prober.ServeListener(ctx, ln, prober.DefaultReadTimeout)
+	addr := ln.Addr().String()
+
+	probe := make([]byte, prober.PayloadSize)
+	copy(probe, prober.MagicBytes)
+
+	// Open MaxConnsPerIP connections and prove each works (the echo
+	// round-trip also guarantees the server has registered the conn).
+	conns := make([]net.Conn, 0, 3)
+	for i := 0; i < 3; i++ {
+		c, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("dial %d: %v", i, err)
+		}
+		defer c.Close()
+		conns = append(conns, c)
+		c.SetDeadline(time.Now().Add(2 * time.Second))
+		if _, err := c.Write(probe); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+		if _, err := io.ReadFull(c, make([]byte, prober.PayloadSize)); err != nil {
+			t.Fatalf("conn %d within limit failed echo: %v", i, err)
+		}
+	}
+
+	// The next connection from the same IP must be rejected.
+	c4, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial 4th: %v", err)
+	}
+	defer c4.Close()
+	c4.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := c4.Write(probe); err != nil {
+		t.Logf("4th conn write failed (acceptable rejection): %v", err)
+		return
+	}
+	if _, err := io.ReadFull(c4, make([]byte, prober.PayloadSize)); err == nil {
+		t.Error("4th connection received echo despite per-IP limit")
+	}
+}
+
+// TestServer_ShutdownClosesConnections: cancelling the server context must
+// force-close established connections, not leave them to linger until the
+// read deadline.
+func TestServer_ShutdownClosesConnections(t *testing.T) {
+	prober.InitMetrics()
+	ctx, cancel := context.WithCancel(context.Background())
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go prober.ServeListener(ctx, ln, 30*time.Second)
+	addr := ln.Addr().String()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	probe := make([]byte, prober.PayloadSize)
+	copy(probe, prober.MagicBytes)
+	conn.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Write(probe); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(conn, make([]byte, prober.PayloadSize)); err != nil {
+		t.Fatalf("initial echo failed: %v", err)
+	}
+
+	cancel()
+
+	// Connection must be closed promptly by the server (EOF/error well
+	// before the 30s read deadline).
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Error("connection still open after server shutdown")
 	}
 }
