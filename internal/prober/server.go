@@ -143,7 +143,7 @@ loop:
 				mu.Unlock()
 				<-sem
 			}()
-			handleConn(c, readTimeout)
+			handleConn(c, readTimeout, ip)
 		}(conn, ip)
 	}
 
@@ -168,11 +168,12 @@ func waitForHandlers(handlers *sync.WaitGroup) {
 
 // handleConn services a single TCP echo connection. It reads 24-byte
 // probes, validates the magic header, and echoes the payload back.
-// Valid probes increment ServerProbesReceivedTotal so network-level loss
-// can be measured independently of the client (TCP retransmission hides
-// lost segments from the client's sent/timeout counters).
+// Valid probes increment ServerProbesReceived under the remote client
+// IP so network-level loss can be measured independently of the client
+// (TCP retransmission hides lost segments from the client's
+// sent/timeout counters) and correlated with the client's metrics.
 // Connections that send invalid data or exceed deadlines are closed.
-func handleConn(c net.Conn, readTimeout time.Duration) {
+func handleConn(c net.Conn, readTimeout time.Duration, clientIP string) {
 	defer c.Close()
 	if tcp, ok := c.(*net.TCPConn); ok {
 		tcp.SetKeepAlive(true)
@@ -198,7 +199,7 @@ func handleConn(c net.Conn, readTimeout time.Duration) {
 			return
 		}
 
-		ServerProbesReceivedTotal.Inc()
+		ServerProbesReceived.WithLabelValues(clientIP).Inc()
 
 		c.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		if _, err := c.Write(buf); err != nil {

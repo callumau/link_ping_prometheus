@@ -376,7 +376,7 @@ func runEchoLoop(
 			stats.Backoff()
 		}
 
-		LossPercent.WithLabelValues(t.Name, t.Address).Set(loss.lossPercent(now))
+		LinkLossRatio.WithLabelValues(t.Name, t.Address).Set(loss.lossRatio(now))
 
 		seq++
 		copy(buf[0:8], MagicBytes)

@@ -51,14 +51,14 @@ var (
 		Name: "link_rto_seconds",
 		Help: "Current adaptive timeout (RTO) being used.",
 	}, []string{"target", "address"})
-	LossPercent = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "link_loss_percent",
-		Help: "Packet loss percentage over the last 10 minutes (timeouts / sent on the wire).",
+	LinkLossRatio = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "link_loss_ratio",
+		Help: "Packet loss ratio (0.0-1.0) over the last 10 minutes (timeouts / sent on the wire). For arbitrary windows use rate(link_probes_timed_out_total[...]) / rate(link_probes_sent_total[...]).",
 	}, []string{"target", "address"})
-	ServerProbesReceivedTotal = prometheus.NewCounter(prometheus.CounterOpts{
+	ServerProbesReceived = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "link_server_probes_received_total",
-		Help: "Total validated echo probes received by the server. Compare with the client's link_probes_sent_total to measure true network loss: TCP retransmission hides lost segments from the client, so (sent - server_received) / sent is the real loss rate.",
-	})
+		Help: "Total validated probes received by the server, labelled by remote client address. Compare with the client's link_probes_sent_total to measure true network loss: TCP retransmission hides lost segments from the client, so (sent - server_received) / sent is the real loss rate.",
+	}, []string{"client"})
 )
 
 var registerOnce sync.Once
@@ -67,7 +67,7 @@ var registerOnce sync.Once
 // Safe to call multiple times; registration happens exactly once.
 func InitMetrics() {
 	registerOnce.Do(func() {
-		prometheus.MustRegister(ProbesSent, ProbesReceived, ProbesTimedOut, ConnectionsDropped, ConnectFailures, RTTRecent, LastRTT, LinkUp, RTOEstimate, LossPercent, ServerProbesReceivedTotal)
+		prometheus.MustRegister(ProbesSent, ProbesReceived, ProbesTimedOut, ConnectionsDropped, ConnectFailures, RTTRecent, LastRTT, LinkUp, RTOEstimate, LinkLossRatio, ServerProbesReceived)
 	})
 }
 
@@ -83,7 +83,7 @@ func SeedMetrics(targets []Target) {
 		LinkUp.WithLabelValues(t.Name, t.Address).Set(0)
 		LastRTT.WithLabelValues(t.Name, t.Address).Set(0)
 		RTOEstimate.WithLabelValues(t.Name, t.Address).Set(0)
-		LossPercent.WithLabelValues(t.Name, t.Address).Set(0)
+		LinkLossRatio.WithLabelValues(t.Name, t.Address).Set(0)
 		RTTRecent.WithLabelValues(t.Name, t.Address)
 	}
 }

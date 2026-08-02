@@ -117,7 +117,7 @@ func TestServer_EnforceSizeAndHeader(t *testing.T) {
 		t.Logf("Got expected error on 2nd packet: %v", err)
 	}
 
-	if got := getPlainCounterValue(prober.ServerProbesReceivedTotal); got < 1 {
+	if got := getCounterValue1(prober.ServerProbesReceived, "127.0.0.1"); got < 1 {
 		t.Errorf("Server should have counted at least the 1st valid probe, got %v", got)
 	}
 }

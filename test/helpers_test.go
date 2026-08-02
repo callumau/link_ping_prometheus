@@ -48,6 +48,14 @@ func getPlainCounterValue(c prometheus.Counter) float64 {
 	return m.GetCounter().GetValue()
 }
 
+func getCounterValue1(vec *prometheus.CounterVec, label1 string) float64 {
+	var m dto.Metric
+	if err := vec.WithLabelValues(label1).Write(&m); err != nil {
+		return 0
+	}
+	return m.GetCounter().GetValue()
+}
+
 func getGaugeValue(vec *prometheus.GaugeVec, targetName, address string) float64 {
 	var m dto.Metric
 	if err := vec.WithLabelValues(targetName, address).Write(&m); err != nil {

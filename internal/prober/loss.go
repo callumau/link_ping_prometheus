@@ -14,7 +14,7 @@ type lossEvent struct {
 	timeouts int
 }
 
-// lossTracker computes the packet loss percentage over a sliding
+// lossTracker computes the packet loss ratio over a sliding
 // 10-minute window from event deltas, so the gauge is independent of
 // counter resets and connection drops. Used from the single probe
 // goroutine of one target; not safe for concurrent use.
@@ -40,10 +40,10 @@ func (l *lossTracker) addTimeout(at time.Time, n int) {
 	l.timeouts += n
 }
 
-// lossPercent purges events older than the window and returns the
-// percentage of timed-out probes in the remaining window. Returns 0
-// when no probes were sent in the window.
-func (l *lossTracker) lossPercent(at time.Time) float64 {
+// lossRatio purges events older than the window and returns the
+// ratio of timed-out probes in the remaining window (0.0-1.0). Returns
+// 0 when no probes were sent in the window.
+func (l *lossTracker) lossRatio(at time.Time) float64 {
 	cutoff := at.Add(-lossWindow)
 	i := 0
 	for i < len(l.events) && l.events[i].at.Before(cutoff) {
@@ -57,5 +57,5 @@ func (l *lossTracker) lossPercent(at time.Time) float64 {
 	if l.sent == 0 {
 		return 0
 	}
-	return float64(l.timeouts) / float64(l.sent) * 100
+	return float64(l.timeouts) / float64(l.sent)
 }

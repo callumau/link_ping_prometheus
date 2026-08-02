@@ -485,9 +485,9 @@ func TestRobustness_TimestampSpoof(t *testing.T) {
 	}
 }
 
-// TestLossPercentGauge: link_loss_percent must track the application-
+// TestLossRatioGauge: link_loss_ratio must track the application-
 // visible loss ratio (timeouts over sent) over the sliding window.
-func TestLossPercentGauge(t *testing.T) {
+func TestLossRatioGauge(t *testing.T) {
 	prober.InitMetrics()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -527,12 +527,12 @@ func TestLossPercentGauge(t *testing.T) {
 
 	time.Sleep(2 * time.Second)
 
-	loss := getGaugeValue(prober.LossPercent, targetName, addr)
-	if loss <= 0 || loss >= 100 {
-		t.Errorf("Expected loss gauge between 0 and 100 with 50%% drop server, got %v", loss)
+	loss := getGaugeValue(prober.LinkLossRatio, targetName, addr)
+	if loss <= 0 || loss >= 1 {
+		t.Errorf("Expected loss gauge between 0 and 1 with 50%% drop server, got %v", loss)
 	}
-	if loss < 20 || loss > 80 {
-		t.Errorf("Expected loss gauge near 50%% with every-2nd probe dropped, got %v", loss)
+	if loss < 0.2 || loss > 0.8 {
+		t.Errorf("Expected loss gauge near 0.5 with every-2nd probe dropped, got %v", loss)
 	}
 }
 

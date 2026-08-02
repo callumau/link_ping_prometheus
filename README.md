@@ -15,7 +15,7 @@ link, with adaptive timeout capabilities (RFC 6298).
    Grafana Alloy, see below) and open the bundled dashboard.
 
 Each configured target is one monitored link. The dashboard gives the
-per-link picture: `link_up` status, `link_loss_percent` over a 10-minute
+per-link picture: `link_up` status, `link_loss_ratio` over a 10-minute
 window, RTT percentiles (p50/p90/p99), jitter, adaptive RTO, and
 throughput counters.
 
@@ -26,7 +26,7 @@ The exporter exposes the following metrics at `/metrics` (default port 2112).
 | Metric Name | Type | Labels | Description |
 |---|---|---|---|
 | `link_up` | Gauge | `target`, `address` | 1 = connected, 0 = disconnected/reconnecting. |
-| `link_loss_percent` | Gauge | `target`, `address` | Packet loss % over the last 10 min (timeouts / sent). |
+| `link_loss_ratio` | Gauge | `target`, `address` | Packet loss ratio (0.0–1.0) over the last 10 min (timeouts / sent). |
 | `link_probes_sent_total` | Counter | `target`, `address` | Total probes sent on established connections (dial failures excluded). |
 | `link_probes_received_total` | Counter | `target`, `address` | Total probe responses received and validated. |
 | `link_probes_timed_out_total` | Counter | `target`, `address` | Total probes that timed out. |
@@ -37,38 +37,48 @@ The exporter exposes the following metrics at `/metrics` (default port 2112).
 | `link_rtt_seconds_count` | Summary | `target`, `address` | Response count over the 10 min window. |
 | `link_last_rtt_seconds` | Gauge | `target`, `address` | Most recent RTT measurement. |
 | `link_rto_seconds` | Gauge | `target`, `address` | Current adaptive RTO in use. |
-| `link_server_probes_received_total` | Counter | — | Valid probes received by the server (server mode only). |
+| `link_server_probes_received_total` | Counter | `client` | Valid probes received by the server, per remote client IP (server mode only). |
 
 ## PromQL Examples
 
 ### Link Packet Loss (10-min Window)
 
-The `link_loss_percent` gauge is the monitoring number for a link:
-client-visible loss over the last 10 minutes, computed from the same
-window as the RTT percentiles.
+The `link_loss_ratio` gauge (0.0–1.0) is the monitoring number for a
+link: client-visible loss over the last 10 minutes, computed from the
+same window as the RTT percentiles. It survives connection drops and
+resets cleanly on restart.
 
 ```
-link_loss_percent
+link_loss_ratio * 100
 ```
+
+For arbitrary windows, derive loss from the counters instead:
+
+```
+rate(link_probes_timed_out_total[5m]) / rate(link_probes_sent_total[5m]) * 100
+```
+
+Both express **application-visible** loss, not raw network loss. Each
+probe is a single TCP segment, and the kernel retransmits lost segments
+(TCP RTO ~1s, doubling). Segments recovered faster than the client's
+adaptive RTO still count as received — with inflated RTT. With a link
+loss simulator (e.g. clumsy) at X%, expect the loss gauge to sit notably
+below X%, while RTT percentiles climb.
 
 While the client cannot connect at all, `link_up == 0` and
 `rate(link_connect_failures_total[5m]) > 0` are the conditions to alert
-on — the loss gauge is undefined for a down link rather than pinned at
+on — the loss ratio is undefined for a down link rather than pinned at
 100%.
 
-Note: `link_loss_percent` is **application-visible** loss, not raw
-network loss. Each probe is a single TCP segment, and the kernel
-retransmits lost segments (TCP RTO ~1s, doubling). Segments recovered
-faster than the client's adaptive RTO still count as received — with
-inflated RTT. With a link loss simulator (e.g. clumsy) at X%, expect the
-loss gauge to sit notably below X%, while RTT percentiles climb.
-
 To measure true network loss, run the server at the remote site and
-compare its `link_server_probes_received_total` against the client's
-`link_probes_sent_total`:
+compare its per-client `link_server_probes_received_total` against the
+client's `link_probes_sent_total`. The server counter is labelled with
+the remote client address (`client="203.0.113.5"`); select it explicitly
+to correlate with the client's series:
 
 ```
-100 * (1 - rate(link_server_probes_received_total[5m]) / rate(link_probes_sent_total[5m]))
+100 * (1 - rate(link_server_probes_received_total{client="203.0.113.5"}[5m])
+           / rate(link_probes_sent_total{target="site-b"}[5m]))
 ```
 
 Segments never delivered to the server are genuinely lost on the wire —
@@ -128,7 +138,7 @@ alert: LinkDown
   for:  1m
 
 alert: LinkLossHigh
-  expr: link_loss_percent > 20
+  expr: link_loss_ratio > 0.2
   for:  5m
 
 alert: LinkLatencyDegraded
