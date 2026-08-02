@@ -1,6 +1,23 @@
-# TCP Ping Prometheus Exporter
+# Link Monitor (TCP Ping Prometheus Exporter)
 
-A high-performance TCP ping exporter for Prometheus written in Go. It measures latency (RTT), packet loss, and connection stability by sending active TCP probes to target servers. Supports client (prober), server (echo), and combined modes with adaptive timeout capabilities (RFC 6298).
+A high-performance **site-to-site link monitor** for Prometheus written
+in Go. It measures latency (RTT), packet loss, jitter, and connection
+stability between two sites by sending active TCP probes across the
+link, with adaptive timeout capabilities (RFC 6298).
+
+## Typical Deployment: Site A ↔ Site B
+
+1. **Remote site (B):** run the echo server.
+   `./tcp_ping_prometheus -mode=server -listen=":4000" -metrics=":2112"`
+2. **Local site (A):** run the client, targeting site B's address.
+   `./tcp_ping_prometheus -mode=client -target="203.0.113.10:4000" -metrics=":2112"`
+3. Scrape both `/metrics` endpoints into Prometheus (or forward via
+   Grafana Alloy, see below) and open the bundled dashboard.
+
+Each configured target is one monitored link. The dashboard gives the
+per-link picture: `link_up` status, `link_loss_percent` over a 10-minute
+window, RTT percentiles (p50/p90/p99), jitter, adaptive RTO, and
+throughput counters.
 
 ## Metrics
 
@@ -8,45 +25,50 @@ The exporter exposes the following metrics at `/metrics` (default port 2112).
 
 | Metric Name | Type | Labels | Description |
 |---|---|---|---|
-| `link_probes_sent_total` | Counter | `target`, `address` | Total echo requests sent on established connections (dial failures excluded). |
-| `link_probes_received_total` | Counter | `target`, `address` | Total echo responses received and validated. |
-| `link_probes_timed_out_total` | Counter | `target`, `address` | Total requests that timed out. Packet loss = timeouts / sent. |
+| `link_up` | Gauge | `target`, `address` | 1 = connected, 0 = disconnected/reconnecting. |
+| `link_loss_percent` | Gauge | `target`, `address` | Packet loss % over the last 10 min (timeouts / sent). |
+| `link_probes_sent_total` | Counter | `target`, `address` | Total probes sent on established connections (dial failures excluded). |
+| `link_probes_received_total` | Counter | `target`, `address` | Total probe responses received and validated. |
+| `link_probes_timed_out_total` | Counter | `target`, `address` | Total probes that timed out. |
 | `link_connections_dropped_total` | Counter | `target`, `address` | Total established connections lost mid-probing. |
 | `link_connect_failures_total` | Counter | `target`, `address` | Total failed connection attempts (dial errors). Not counted in sent/timeout totals. |
 | `link_rtt_seconds` | Summary | `target`, `address` | Sliding-window RTT percentiles over 10 min (p50, p90, p99). |
 | `link_rtt_seconds_sum` | Summary | `target`, `address` | Sum of RTT over the 10 min window (divide by `_count` for mean). |
 | `link_rtt_seconds_count` | Summary | `target`, `address` | Response count over the 10 min window. |
 | `link_last_rtt_seconds` | Gauge | `target`, `address` | Most recent RTT measurement. |
-| `link_up` | Gauge | `target`, `address` | 1 = connected, 0 = disconnected/reconnecting. |
 | `link_rto_seconds` | Gauge | `target`, `address` | Current adaptive RTO in use. |
 | `link_server_probes_received_total` | Counter | — | Valid probes received by the server (server mode only). |
 
 ## PromQL Examples
 
-### Packet Loss Rate (%)
+### Link Packet Loss (10-min Window)
 
-Dial failures are excluded from `sent_total`/`timeouts_total` — while the
-client cannot connect, this ratio is undefined rather than pinned at 100%;
-alert on `link_up == 0` or `rate(link_connect_failures_total[5m]) > 0`
-for that condition.
+The `link_loss_percent` gauge is the monitoring number for a link:
+client-visible loss over the last 10 minutes, computed from the same
+window as the RTT percentiles.
 
 ```
-rate(link_probes_timed_out_total[5m]) / rate(link_probes_sent_total[5m]) * 100
+link_loss_percent
 ```
 
-Note: this is **application-visible** loss, not raw network loss. Each
-probe is a single TCP segment, and the kernel retransmits lost segments
-(TCP RTO ~1s, doubling). Segments recovered faster than the client's
-adaptive RTO still count as received — with inflated RTT. With a link
-loss simulator (e.g. clumsy) at X%, expect the timeouts ratio to be
-notably below X%, while RTT percentiles climb.
+While the client cannot connect at all, `link_up == 0` and
+`rate(link_connect_failures_total[5m]) > 0` are the conditions to alert
+on — the loss gauge is undefined for a down link rather than pinned at
+100%.
 
-To measure true network loss, run the server in server mode and compare
-its `link_server_probes_received_total` against the client's
+Note: `link_loss_percent` is **application-visible** loss, not raw
+network loss. Each probe is a single TCP segment, and the kernel
+retransmits lost segments (TCP RTO ~1s, doubling). Segments recovered
+faster than the client's adaptive RTO still count as received — with
+inflated RTT. With a link loss simulator (e.g. clumsy) at X%, expect the
+loss gauge to sit notably below X%, while RTT percentiles climb.
+
+To measure true network loss, run the server at the remote site and
+compare its `link_server_probes_received_total` against the client's
 `link_probes_sent_total`:
 
 ```
-1 - rate(link_server_probes_received_total[5m]) / rate(link_probes_sent_total[5m])
+100 * (1 - rate(link_server_probes_received_total[5m]) / rate(link_probes_sent_total[5m]))
 ```
 
 Segments never delivered to the server are genuinely lost on the wire —
@@ -71,6 +93,12 @@ link_rtt_seconds{quantile="0.9"}
 link_rtt_seconds{quantile="0.99"}
 ```
 
+### Jitter (p90 − p50)
+
+```
+(link_rtt_seconds{quantile="0.9"} - link_rtt_seconds{quantile="0.5"}) * 1000
+```
+
 ### Detecting a Baseline Shift (latency change detection)
 
 Compare the current 10-minute window against a longer baseline. Latency
@@ -90,6 +118,22 @@ via `link_rto_seconds`.
 
 ```
 link_up
+```
+
+### Outage Alerts
+
+```
+alert: LinkDown
+  expr: link_up == 0
+  for:  1m
+
+alert: LinkLossHigh
+  expr: link_loss_percent > 20
+  for:  5m
+
+alert: LinkLatencyDegraded
+  expr: link_rtt_seconds{quantile="0.5"} > min_over_time(link_rtt_seconds{quantile="0.5"}[24h]) * 1.5
+  for:  10m
 ```
 
 ## Grafana Alloy Scraping

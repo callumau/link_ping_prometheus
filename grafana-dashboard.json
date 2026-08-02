@@ -216,7 +216,7 @@
           "refId": "A"
         }
       ],
-      "title": "Connection",
+      "title": "Link Status",
       "type": "stat"
     },
     {
@@ -287,14 +287,14 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "100 * rate(link_probes_timed_out_total{job=~\"$job\", target=~\"$target\"}[5m]) / (rate(link_probes_timed_out_total{job=~\"$job\", target=~\"$target\"}[5m]) + rate(link_probes_sent_total{job=~\"$job\", target=~\"$target\"}[5m]))",
+          "expr": "link_loss_percent{job=~\"$job\", target=~\"$target\"}",
           "instant": true,
           "legendFormat": "{{target}}",
           "range": false,
           "refId": "A"
         }
       ],
-      "title": "Packet Loss",
+      "title": "Packet Loss (10-min window)",
       "type": "stat"
     },
     {
@@ -670,13 +670,13 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "100 * rate(link_probes_timed_out_total{job=~\"$job\", target=~\"$target\"}[5m]) / (rate(link_probes_timed_out_total{job=~\"$job\", target=~\"$target\"}[5m]) + rate(link_probes_sent_total{job=~\"$job\", target=~\"$target\"}[5m]))",
+          "expr": "link_loss_percent{job=~\"$job\", target=~\"$target\"}",
           "legendFormat": "{{target}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Packet Loss",
+      "title": "Packet Loss (10-min window)",
       "type": "timeseries"
     },
     {
@@ -890,7 +890,7 @@
           "refId": "A"
         }
       ],
-      "title": "Connection State",
+      "title": "Link Status (history)",
       "type": "timeseries"
     },
     {
@@ -1166,6 +1166,190 @@
       ],
       "title": "Adaptive RTO",
       "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ms",
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 24
+      },
+      "id": 11,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.1.0-246536",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(link_rtt_seconds{quantile=\"0.9\", job=~\"$job\", target=~\"$target\"} - link_rtt_seconds{quantile=\"0.5\", job=~\"$job\", target=~\"$target\"}) * 1000",
+          "legendFormat": "jitter"
+        }
+      ],
+      "title": "Jitter (p90-p50)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ms",
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 24
+      },
+      "id": 12,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.1.0-246536",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "100 * (1 - rate(link_server_probes_received_total[5m]) / rate(link_probes_sent_total{job=~\"$job\", target=~\"$target\"}[5m]))",
+          "legendFormat": "wire loss %"
+        }
+      ],
+      "title": "True Network Loss (server view)",
+      "type": "timeseries"
     }
   ],
   "refresh": "1m",
@@ -1208,7 +1392,7 @@
   },
   "timepicker": {},
   "timezone": "browser",
-  "title": "TCP Ping",
+  "title": "Link Monitor",
   "uid": "ae8cbe4e-25de-4d6c-a4eb-40fa95260008",
   "version": 1,
   "weekStart": ""
