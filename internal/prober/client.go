@@ -112,6 +112,7 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 	logger := slog.With("target", t.Name, "address", t.Address)
 
 	stats := NewAdaptiveStats(cfg.BaseTimeout)
+	loss := newLossTracker()
 
 	for {
 		if ctx.Err() != nil {
@@ -141,7 +142,7 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 			tcp.SetNoDelay(true)
 		}
 
-		err = runEchoLoop(ctx, conn, t, cfg, stats, logger)
+		err = runEchoLoop(ctx, conn, t, cfg, stats, loss, logger)
 		LinkUp.WithLabelValues(t.Name, t.Address).Set(0)
 
 		if err != nil {
@@ -155,20 +156,6 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
-}
-
-// runEchoLoopGuarded recovers panics from runEchoLoop so a single
-// target's failure can never kill its probe loop (or the process).
-// A panic is converted to an error, which the caller treats as a
-// connection drop followed by a reconnect.
-func runEchoLoopGuarded(ctx context.Context, conn net.Conn, t Target, cfg Config, stats *AdaptiveStats, logger *slog.Logger) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			logger.Error("Panic in echo loop; reconnecting", "panic", r)
-			err = fmt.Errorf("panic in echo loop: %v", r)
-		}
-	}()
-	return runEchoLoop(ctx, conn, t, cfg, stats, logger)
 }
 
 // resetTimer safely stops and resets a time.Timer. It handles the
@@ -216,6 +203,7 @@ func runEchoLoop(
 	t Target,
 	cfg Config,
 	stats *AdaptiveStats,
+	loss *lossTracker,
 	logger *slog.Logger,
 ) (retErr error) {
 
@@ -304,6 +292,7 @@ func runEchoLoop(
 			default:
 				if count := float64(len(pending)); count > 0 {
 					ProbesTimedOut.WithLabelValues(t.Name, t.Address).Add(count)
+					loss.addTimeout(time.Now(), int(count))
 				}
 				return
 			}
@@ -368,19 +357,26 @@ func runEchoLoop(
 
 		now := time.Now()
 		var timeoutOccurred bool
+		var timeoutCount int
 		if len(pending) > 0 {
 			for s, sentTime := range pending {
 				if now.Sub(sentTime) > timeout {
 					ProbesTimedOut.WithLabelValues(t.Name, t.Address).Inc()
 					delete(pending, s)
 					timeoutOccurred = true
+					timeoutCount++
 				}
 			}
+		}
+		if timeoutCount > 0 {
+			loss.addTimeout(now, timeoutCount)
 		}
 
 		if timeoutOccurred && cfg.Adaptive {
 			stats.Backoff()
 		}
+
+		LossPercent.WithLabelValues(t.Name, t.Address).Set(loss.lossPercent(now))
 
 		seq++
 		copy(buf[0:8], MagicBytes)
@@ -393,6 +389,7 @@ func runEchoLoop(
 		}
 
 		pending[seq] = now
+		loss.addSent(now, 1)
 		ProbesSent.WithLabelValues(t.Name, t.Address).Inc()
 	}
 }

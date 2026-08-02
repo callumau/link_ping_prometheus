@@ -51,6 +51,10 @@ var (
 		Name: "link_rto_seconds",
 		Help: "Current adaptive timeout (RTO) being used.",
 	}, []string{"target", "address"})
+	LossPercent = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "link_loss_percent",
+		Help: "Packet loss percentage over the last 10 minutes (timeouts / sent on the wire).",
+	}, []string{"target", "address"})
 	ServerProbesReceivedTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "link_server_probes_received_total",
 		Help: "Total validated echo probes received by the server. Compare with the client's link_probes_sent_total to measure true network loss: TCP retransmission hides lost segments from the client, so (sent - server_received) / sent is the real loss rate.",
@@ -63,7 +67,7 @@ var registerOnce sync.Once
 // Safe to call multiple times; registration happens exactly once.
 func InitMetrics() {
 	registerOnce.Do(func() {
-		prometheus.MustRegister(ProbesSent, ProbesReceived, ProbesTimedOut, ConnectionsDropped, ConnectFailures, RTTRecent, LastRTT, LinkUp, RTOEstimate, ServerProbesReceivedTotal)
+		prometheus.MustRegister(ProbesSent, ProbesReceived, ProbesTimedOut, ConnectionsDropped, ConnectFailures, RTTRecent, LastRTT, LinkUp, RTOEstimate, LossPercent, ServerProbesReceivedTotal)
 	})
 }
 
@@ -79,6 +83,7 @@ func SeedMetrics(targets []Target) {
 		LinkUp.WithLabelValues(t.Name, t.Address).Set(0)
 		LastRTT.WithLabelValues(t.Name, t.Address).Set(0)
 		RTOEstimate.WithLabelValues(t.Name, t.Address).Set(0)
+		LossPercent.WithLabelValues(t.Name, t.Address).Set(0)
 		RTTRecent.WithLabelValues(t.Name, t.Address)
 	}
 }

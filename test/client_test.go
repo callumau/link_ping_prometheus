@@ -485,6 +485,57 @@ func TestRobustness_TimestampSpoof(t *testing.T) {
 	}
 }
 
+// TestLossPercentGauge: link_loss_percent must track the application-
+// visible loss ratio (timeouts over sent) over the sliding window.
+func TestLossPercentGauge(t *testing.T) {
+	prober.InitMetrics()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	addr := ln.Addr().String()
+
+	// Echo every 2nd probe, drop the others.
+	go func() {
+		defer ln.Close()
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, prober.PayloadSize)
+		count := 0
+		for {
+			if _, err := io.ReadFull(conn, buf); err != nil {
+				return
+			}
+			count++
+			if count%2 == 0 {
+				continue
+			}
+			conn.Write(buf)
+		}
+	}()
+
+	targetName := "loss_gauge_test"
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := cfgWith(false, 50*time.Millisecond, 150*time.Millisecond, prober.Target{Name: targetName, Address: addr})
+	go prober.RunClient(ctx, cfg)
+
+	time.Sleep(2 * time.Second)
+
+	loss := getGaugeValue(prober.LossPercent, targetName, addr)
+	if loss <= 0 || loss >= 100 {
+		t.Errorf("Expected loss gauge between 0 and 100 with 50%% drop server, got %v", loss)
+	}
+	if loss < 20 || loss > 80 {
+		t.Errorf("Expected loss gauge near 50%% with every-2nd probe dropped, got %v", loss)
+	}
+}
+
 // TestGracefulShutdown_NoPhantomTimeouts: probes still in flight when the
 // context is cancelled must NOT be flushed into ProbesTimedOut — otherwise
 // every deploy/restart injects phantom packet loss.
