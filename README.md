@@ -15,9 +15,9 @@ link, with adaptive timeout capabilities (RFC 6298).
    Grafana Alloy, see below) and open the bundled dashboard.
 
 Each configured target is one monitored link. The dashboard gives the
-per-link picture: `link_up` status, `link_loss_ratio` over a 10-minute
-window, RTT percentiles (p50/p90/p99), jitter, adaptive RTO, and
-throughput counters.
+per-link picture: `link_up` status, packet loss (rate-derived), RTT
+percentiles (p50/p90/p99), jitter, adaptive RTO, and throughput
+counters.
 
 ## Metrics
 
@@ -26,49 +26,41 @@ The exporter exposes the following metrics at `/metrics` (default port 2112).
 | Metric Name | Type | Labels | Description |
 |---|---|---|---|
 | `link_up` | Gauge | `target`, `address` | 1 = connected, 0 = disconnected/reconnecting. |
-| `link_loss_ratio` | Gauge | `target`, `address` | Link loss ratio (0.0–1.0) over the last 10 min: (timed-out probes + failed connections) / probe attempts. Pins to 1.0 during an outage. |
 | `link_probes_sent_total` | Counter | `target`, `address` | Total probes sent on established connections (dial failures excluded). |
 | `link_probes_received_total` | Counter | `target`, `address` | Total probe responses received and validated. |
 | `link_probes_timed_out_total` | Counter | `target`, `address` | Total probes that timed out. |
 | `link_connections_dropped_total` | Counter | `target`, `address` | Total established connections lost mid-probing. |
 | `link_connect_failures_total` | Counter | `target`, `address` | Total failed connection attempts (dial errors). Not counted in sent/timeout totals. |
-| `link_rtt_seconds` | Summary | `target`, `address` | Sliding-window RTT percentiles over 10 min (p50, p90, p99). |
-| `link_rtt_seconds_sum` | Summary | `target`, `address` | Sum of RTT over the 10 min window (divide by `_count` for mean). |
-| `link_rtt_seconds_count` | Summary | `target`, `address` | Response count over the 10 min window. |
-| `link_last_rtt_seconds` | Gauge | `target`, `address` | Most recent RTT measurement. |
-| `link_rto_seconds` | Gauge | `target`, `address` | Current adaptive RTO in use. |
+| `link_rtt_seconds` | Histogram | `target`, `address` | RTT histogram: classic exponential buckets (0.1s, ×1.2, ×10) plus native histogram support (`NativeHistogramBucketFactor` 1.1). |
+| `link_rtt_seconds_bucket/sum/count` | Histogram | `target`, `address` | Classic-bucket series; quantiles, means, and jitter are derived in PromQL over any window. |
+| `link_rto_seconds` | Gauge | `target`, `address` | Current adaptive RTO in use (RFC 6298, floored at 200ms). |
 | `link_server_probes_received_total` | Counter | `client` | Valid probes received by the server, per remote client IP (server mode only). |
+
+Derived values (percentiles, loss, jitter) are deliberately **not**
+pre-computed in the exporter — Prometheus `rate()` / `histogram_quantile()`
+compute them from the raw counters and histogram, so any time window
+(1m, 1h, 24h) can be queried.
 
 ## PromQL Examples
 
-### Link Packet Loss (10-min Window)
+### Link Packet Loss (%)
 
-The `link_loss_ratio` gauge (0.0–1.0) is the monitoring number for a
-link: client-visible loss over the last 10 minutes, computed from the
-same window as the RTT percentiles. It survives connection drops and
-resets cleanly on restart.
+Loss is derived from the counters over any window:
 
 ```
-link_loss_ratio * 100
+100 * rate(link_probes_timed_out_total[5m]) / (rate(link_probes_timed_out_total[5m]) + rate(link_probes_received_total[5m]))
 ```
 
-For arbitrary windows, derive loss from the counters instead:
-
-```
-rate(link_probes_timed_out_total[5m]) / rate(link_probes_sent_total[5m]) * 100
-```
-
-Both express **application-visible** loss, not raw network loss. Each
-probe is a single TCP segment, and the kernel retransmits lost segments
-(TCP RTO ~1s, doubling). Segments recovered faster than the client's
-adaptive RTO still count as received — with inflated RTT. With a link
-loss simulator (e.g. clumsy) at X%, expect the loss gauge to sit notably
+This is **application-visible** loss, not raw network loss. Each probe
+is a single TCP segment, and the kernel retransmits lost segments (TCP
+RTO ~1s, doubling). Segments recovered faster than the client's adaptive
+RTO still count as received — with inflated RTT. With a link loss
+simulator (e.g. clumsy) at X%, expect the loss ratio to sit notably
 below X%, while RTT percentiles climb.
 
-While the client cannot connect at all, each failed connection attempt
-counts as a lost probe in the loss window, so `link_loss_ratio` pins to
-1.0 for the outage duration (and decays back once probes flow again).
-Alert on it directly, or alongside `link_up == 0`:
+While the client cannot connect at all, no probes are sent, so the rate
+ratio is undefined — alert on `link_up == 0` and
+`rate(link_connect_failures_total[5m]) > 0` instead.
 
 To measure true network loss, run the server at the remote site and
 compare its per-client `link_server_probes_received_total` against the
@@ -84,40 +76,41 @@ to correlate with the client's series:
 Segments never delivered to the server are genuinely lost on the wire —
 no retransmission can hide them there.
 
-### Average Latency (10-min Window)
-
-The summary's `_sum`/`_count` span the same 10-minute sliding window as
-the quantiles, so the mean matches the percentiles plotted alongside it.
-Do NOT use `rate()` on them — they are not counters; the window resets
-every 10 minutes.
+### Average Latency (RTT)
 
 ```
-link_rtt_seconds_sum / link_rtt_seconds_count
+rate(link_rtt_seconds_sum[5m]) / rate(link_rtt_seconds_count[5m])
 ```
 
-### Median / 90th / 99th Percentile Latency (Sliding Window)
+### Median / 90th / 99th Percentile Latency
 
 ```
-link_rtt_seconds{quantile="0.5"}
-link_rtt_seconds{quantile="0.9"}
-link_rtt_seconds{quantile="0.99"}
+histogram_quantile(0.5,  rate(link_rtt_seconds_bucket[5m]))
+histogram_quantile(0.9,  rate(link_rtt_seconds_bucket[5m]))
+histogram_quantile(0.99, rate(link_rtt_seconds_bucket[5m]))
 ```
+
+Classic buckets span 0.1s–~0.5s (0.1 × 1.2^9 ≈ 0.516s); values beyond
+the top bucket land in `+Inf`. The native histogram (bucket factor 1.1)
+carries fine-grained data; Prometheus scrapes and aggregates it
+transparently when native-histogram support is enabled.
 
 ### Jitter (p90 − p50)
 
 ```
-(link_rtt_seconds{quantile="0.9"} - link_rtt_seconds{quantile="0.5"}) * 1000
+(histogram_quantile(0.9, rate(link_rtt_seconds_bucket[5m]))
+ - histogram_quantile(0.5, rate(link_rtt_seconds_bucket[5m]))) * 1000
 ```
 
 ### Detecting a Baseline Shift (latency change detection)
 
-Compare the current 10-minute window against a longer baseline. Latency
-drift on a long-running link shows up as the recent window diverging
-from a 24h minimum:
+Compare the current window against a longer baseline. Latency drift on a
+long-running link shows up as the recent p50 diverging from a 24h
+minimum:
 
 ```
-link_rtt_seconds{quantile="0.5"}
-  > min_over_time(link_rtt_seconds{quantile="0.5"}[24h]) * 1.5
+histogram_quantile(0.5, rate(link_rtt_seconds_bucket[10m]))
+  > min_over_time(histogram_quantile(0.5, rate(link_rtt_seconds_bucket[10m]))[24h]) * 1.5
 ```
 
 Outages show up immediately in `link_up == 0`,
@@ -138,17 +131,17 @@ alert: LinkDown
   for:  1m
 
 alert: LinkLossHigh
-  expr: link_loss_ratio > 0.2
+  expr: rate(link_probes_timed_out_total[5m]) / (rate(link_probes_timed_out_total[5m]) + rate(link_probes_received_total[5m])) > 0.2
   for:  5m
 
 alert: LinkLatencyDegraded
-  expr: link_rtt_seconds{quantile="0.5"} > min_over_time(link_rtt_seconds{quantile="0.5"}[24h]) * 1.5
+  expr: histogram_quantile(0.5, rate(link_rtt_seconds_bucket[10m])) > min_over_time(histogram_quantile(0.5, rate(link_rtt_seconds_bucket[10m]))[24h]) * 1.5
   for:  10m
 ```
 
 ## Grafana Alloy Scraping
 
-The example below scrapes the metrics endpoint, keeps only `tcp_*`
+The example below scrapes the metrics endpoint, keeps only `link_*`
 metrics (dropping `go_*`, `process_*`, and the Prometheus client's own
 internals to save remote-write bandwidth and storage), and forwards the
 result to a `prometheus.remote_write` component.

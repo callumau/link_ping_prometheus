@@ -122,7 +122,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "link_last_rtt_seconds{job=~\"$job\", target=~\"$target\"} * 1000",
+          "expr": "histogram_quantile(0.5, rate(link_rtt_seconds_bucket{job=~\"$job\", target=~\"$target\"}[5m])) * 1000",
           "instant": true,
           "legendFormat": "{{target}}",
           "range": false,
@@ -130,7 +130,8 @@
         }
       ],
       "title": "Current RTT",
-      "type": "stat"
+      "type": "stat",
+      "description": "p50 RTT over the last 5 minutes (derived from histogram)."
     },
     {
       "datasource": {
@@ -286,15 +287,16 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "link_loss_ratio{job=~\"$job\", target=~\"$target\"} * 100",
+          "expr": "100 * rate(link_probes_timed_out_total{job=~\"$job\", target=~\"$target\"}[5m]) / (rate(link_probes_timed_out_total{job=~\"$job\", target=~\"$target\"}[5m]) + rate(link_probes_received_total{job=~\"$job\", target=~\"$target\"}[5m]))",
           "instant": true,
           "legendFormat": "{{target}}",
           "range": false,
           "refId": "A"
         }
       ],
-      "title": "Packet Loss (10-min window)",
-      "type": "stat"
+      "title": "Packet Loss",
+      "type": "stat",
+      "description": "Application-visible loss: rate(timeouts) / rate(timeouts + received)."
     },
     {
       "datasource": {
@@ -535,7 +537,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "link_rtt_seconds{quantile=\"0.5\", job=~\"$job\", target=~\"$target\"} * 1000",
+          "expr": "histogram_quantile(0.5, rate(link_rtt_seconds_bucket{job=~\"$job\", target=~\"$target\"}[5m])) * 1000",
           "legendFormat": "{{target}} p50",
           "range": true,
           "refId": "A"
@@ -546,7 +548,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "link_rtt_seconds{quantile=\"0.9\", job=~\"$job\", target=~\"$target\"} * 1000",
+          "expr": "histogram_quantile(0.9, rate(link_rtt_seconds_bucket{job=~\"$job\", target=~\"$target\"}[5m])) * 1000",
           "legendFormat": "{{target}} p90",
           "range": true,
           "refId": "B"
@@ -557,7 +559,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "link_rtt_seconds{quantile=\"0.99\", job=~\"$job\", target=~\"$target\"} * 1000",
+          "expr": "histogram_quantile(0.99, rate(link_rtt_seconds_bucket{job=~\"$job\", target=~\"$target\"}[5m])) * 1000",
           "legendFormat": "{{target}} p99",
           "range": true,
           "refId": "C"
@@ -668,13 +670,13 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "link_loss_ratio{job=~\"$job\", target=~\"$target\"} * 100",
+          "expr": "100 * rate(link_probes_timed_out_total{job=~\"$job\", target=~\"$target\"}[5m]) / (rate(link_probes_timed_out_total{job=~\"$job\", target=~\"$target\"}[5m]) + rate(link_probes_received_total{job=~\"$job\", target=~\"$target\"}[5m]))",
           "legendFormat": "{{target}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Packet Loss (10-min window)",
+      "title": "Packet Loss",
       "type": "timeseries"
     },
     {
@@ -766,7 +768,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "link_rtt_seconds_sum{job=~\"$job\", target=~\"$target\"} / link_rtt_seconds_count{job=~\"$job\", target=~\"$target\"} * 1000",
+          "expr": "rate(link_rtt_seconds_sum{job=~\"$job\", target=~\"$target\"}[5m]) / rate(link_rtt_seconds_count{job=~\"$job\", target=~\"$target\"}[5m]) * 1000",
           "legendFormat": "{{target}}",
           "range": true,
           "refId": "A"
@@ -1250,7 +1252,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "(link_rtt_seconds{quantile=\"0.9\", job=~\"$job\", target=~\"$target\"} - link_rtt_seconds{quantile=\"0.5\", job=~\"$job\", target=~\"$target\"}) * 1000",
+          "expr": "(histogram_quantile(0.9, rate(link_rtt_seconds_bucket{job=~\"$job\", target=~\"$target\"}[5m])) * 1000 - histogram_quantile(0.5, rate(link_rtt_seconds_bucket{job=~\"$job\", target=~\"$target\"}[5m])) * 1000)",
           "legendFormat": "jitter"
         }
       ],
