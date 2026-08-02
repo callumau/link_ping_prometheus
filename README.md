@@ -91,7 +91,7 @@ prometheus.scrape "tcp_ping" {
 		"__address__" = "localhost:2112",
 	}]
 	metrics_path    = "/metrics"
-	scrape_interval = "15s"
+	scrape_interval = "1m"
 	scrape_timeout  = "10s"
 	forward_to      = [prometheus.relabel.tcp_ping_keep.receiver]
 }
