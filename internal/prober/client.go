@@ -105,13 +105,15 @@ func dialTarget(ctx context.Context, address string) (net.Conn, error) {
 }
 
 // probeTarget manages the connection lifecycle for a single target.
-// Dial failures back off 2 seconds; lost connections wait 500 ms before
-// reconnecting. A panic in the echo loop is recovered and treated as a
-// connection loss — the target keeps being probed.
+// Dial failures and lost connections retry with exponential backoff
+// plus full jitter (100ms base up to 10s) so reconnection attempts
+// scatter instead of storming. A panic in the echo loop is recovered
+// and treated as a connection loss — the target keeps being probed.
 func probeTarget(ctx context.Context, t Target, cfg Config) {
 	logger := slog.With("target", t.Name, "address", t.Address)
 
 	stats := NewAdaptiveStats(cfg.BaseTimeout)
+	b := newBackoff(DefaultBackoffBase, DefaultBackoffMax)
 
 	for {
 		if ctx.Err() != nil {
@@ -126,13 +128,12 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 			ConnectFailures.WithLabelValues(t.Name, t.Address).Inc()
 			LinkUp.WithLabelValues(t.Name, t.Address).Set(0)
 			logger.Warn("Connect failed", "err", err)
-			select {
-			case <-ctx.Done():
+			if !retryDelay(ctx, b) {
 				return
-			case <-time.After(2 * time.Second):
-				continue
 			}
+			continue
 		}
+		b.reset()
 
 		logger.Info("Connected")
 		LinkUp.WithLabelValues(t.Name, t.Address).Set(1)
@@ -149,11 +150,22 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 			logger.Warn("Connection lost", "err", err)
 		}
 
-		select {
-		case <-ctx.Done():
+		if !retryDelay(ctx, b) {
 			return
-		case <-time.After(500 * time.Millisecond):
 		}
+	}
+}
+
+// retryDelay sleeps for the next backoff interval, honouring context
+// cancellation. Returns false when the context was cancelled.
+func retryDelay(ctx context.Context, b *backoff) bool {
+	delay := b.next()
+	slog.Debug("Retrying connection", "delay", delay)
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(delay):
+		return true
 	}
 }
 
