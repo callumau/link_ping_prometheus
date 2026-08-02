@@ -190,6 +190,62 @@ func TestServer_PerIPLimit(t *testing.T) {
 	}
 }
 
+// TestServer_ProbeCounterIgnoresInvalid: link_server_probes_received_total
+// must count only validated probes — garbage frames must not inflate it.
+func TestServer_ProbeCounterIgnoresInvalid(t *testing.T) {
+	prober.InitMetrics()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		<-ctx.Done()
+		ln.Close()
+	}()
+	go prober.ServeListener(ctx, ln, prober.DefaultReadTimeout)
+	addr := ln.Addr().String()
+
+	before := getCounterValue1(prober.ServerProbesReceived, "127.0.0.1")
+
+	// Valid probe -> counted.
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	probe := make([]byte, prober.PayloadSize)
+	copy(probe, prober.MagicBytes)
+	conn.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Write(probe); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(conn, make([]byte, prober.PayloadSize)); err != nil {
+		t.Fatalf("valid echo failed: %v", err)
+	}
+	conn.Close()
+
+	// Garbage (invalid magic) -> connection closed, must not count.
+	conn, err = net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Write([]byte("this is not a valid probe frame")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Error("expected server to close on invalid magic")
+	}
+
+	if got := getCounterValue1(prober.ServerProbesReceived, "127.0.0.1") - before; got != 1 {
+		t.Errorf("Server counter must increase by exactly 1 (valid probe only), got %v", got)
+	}
+}
+
 // TestServer_ShutdownWaitsForHandlers: ServeListener must return after
 // context cancellation even when a connection is established, proving
 // handler goroutines are joined (not abandoned) on shutdown.

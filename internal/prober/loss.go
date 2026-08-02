@@ -48,7 +48,9 @@ func (l *lossTracker) addTimeout(at time.Time, n int) {
 func (l *lossTracker) lossRatio(at time.Time) float64 {
 	cutoff := at.Add(-lossWindow)
 	i := 0
-	for i < len(l.events) && l.events[i].at.Before(cutoff) {
+	// Purge events at least one window old (inclusive of the cutoff:
+	// an event exactly `lossWindow` old must not be counted).
+	for i < len(l.events) && !l.events[i].at.After(cutoff) {
 		l.sent -= l.events[i].sent
 		l.timeouts -= l.events[i].timeouts
 		i++

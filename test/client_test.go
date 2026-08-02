@@ -2,6 +2,7 @@ package prober_test
 
 import (
 	"context"
+	"encoding/binary"
 	"io"
 	"math"
 	"net"
@@ -541,6 +542,338 @@ func TestLossRatioGauge(t *testing.T) {
 	}
 	if loss < 0.2 || loss > 0.8 {
 		t.Errorf("Expected loss gauge near 0.5 with every-2nd probe dropped, got %v", loss)
+	}
+}
+
+// TestRobustness_OutOfOrderResponses: the echo server must be able to
+// return responses in a different order than sent (groups of three
+// reversed). Every response must still be matched by sequence number,
+// counted once, and no timeouts may be attributed to reordering.
+func TestRobustness_OutOfOrderResponses(t *testing.T) {
+	prober.InitMetrics()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	addr := ln.Addr().String()
+
+	go func() {
+		defer ln.Close()
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, prober.PayloadSize)
+		group := make([][]byte, 0, 3)
+		for {
+			if _, err := io.ReadFull(conn, buf); err != nil {
+				return
+			}
+			group = append(group, append([]byte(nil), buf...))
+			if len(group) == 3 {
+				for i := 2; i >= 0; i-- {
+					if _, err := conn.Write(group[i]); err != nil {
+						return
+					}
+				}
+				group = group[:0]
+			}
+		}
+	}()
+
+	targetName := "reorder_test"
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := cfgWith(false, 50*time.Millisecond, 300*time.Millisecond, prober.Target{Name: targetName, Address: addr})
+
+	startRecv := getCounterValue(prober.ProbesReceived, targetName, addr)
+	startTimeout := getCounterValue(prober.ProbesTimedOut, targetName, addr)
+
+	go prober.RunClient(ctx, cfg)
+	time.Sleep(900 * time.Millisecond)
+	cancel()
+
+	endRecv := getCounterValue(prober.ProbesReceived, targetName, addr)
+	endTimeout := getCounterValue(prober.ProbesTimedOut, targetName, addr)
+
+	if endRecv-startRecv < 5 {
+		t.Errorf("Out-of-order responses should all be matched by seq: received %v", endRecv-startRecv)
+	}
+	if endTimeout != startTimeout {
+		t.Errorf("Reordering must not cause timeouts: %v -> %v", startTimeout, endTimeout)
+	}
+	if rtt := getGaugeValue(prober.LastRTT, targetName, addr); rtt <= 0 {
+		t.Errorf("RTT must stay positive under reordering, got %v", rtt)
+	}
+}
+
+// TestRobustness_DuplicateWithTamperedCopy: a valid echo followed
+// immediately by a copy with a tampered timestamp must count exactly
+// once — the second copy must be rejected, not double-counted or
+// counted as a different response.
+func TestRobustness_DuplicateWithTamperedCopy(t *testing.T) {
+	prober.InitMetrics()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	addr := ln.Addr().String()
+
+	go func() {
+		defer ln.Close()
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, prober.PayloadSize)
+		for {
+			if _, err := io.ReadFull(conn, buf); err != nil {
+				return
+			}
+			conn.Write(buf)
+			tampered := append([]byte(nil), buf...)
+			tampered[16] ^= 0xFF
+			conn.Write(tampered)
+		}
+	}()
+
+	targetName := "dup_tamper_test"
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := cfgWith(false, 50*time.Millisecond, 300*time.Millisecond, prober.Target{Name: targetName, Address: addr})
+
+	startRecv := getCounterValue(prober.ProbesReceived, targetName, addr)
+	startSent := getCounterValue(prober.ProbesSent, targetName, addr)
+
+	go prober.RunClient(ctx, cfg)
+	time.Sleep(600 * time.Millisecond)
+	cancel()
+
+	recvDelta := getCounterValue(prober.ProbesReceived, targetName, addr) - startRecv
+	sentDelta := getCounterValue(prober.ProbesSent, targetName, addr) - startSent
+
+	if math.Abs(recvDelta-sentDelta) > 1 {
+		t.Errorf("Tampered duplicate copies must not count: sent %v, received %v", sentDelta, recvDelta)
+	}
+}
+
+// TestRobustness_LateResponsesIgnored: responses arriving after their
+// probe already timed out must be silently dropped — never counted as
+// received, never disrupting the probe loop.
+func TestRobustness_LateResponsesIgnored(t *testing.T) {
+	prober.InitMetrics()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	addr := ln.Addr().String()
+
+	// Echo everything, but 250ms late — beyond the 100ms client timeout.
+	go func() {
+		defer ln.Close()
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, prober.PayloadSize)
+		for {
+			if _, err := io.ReadFull(conn, buf); err != nil {
+				return
+			}
+			time.Sleep(250 * time.Millisecond)
+			if _, err := conn.Write(buf); err != nil {
+				return
+			}
+		}
+	}()
+
+	targetName := "late_test"
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := cfgWith(false, 50*time.Millisecond, 100*time.Millisecond, prober.Target{Name: targetName, Address: addr})
+
+	startSent := getCounterValue(prober.ProbesSent, targetName, addr)
+	startTimeout := getCounterValue(prober.ProbesTimedOut, targetName, addr)
+	startRecv := getCounterValue(prober.ProbesReceived, targetName, addr)
+
+	go prober.RunClient(ctx, cfg)
+	time.Sleep(600 * time.Millisecond)
+	cancel()
+
+	sentDelta := getCounterValue(prober.ProbesSent, targetName, addr) - startSent
+	timeoutDelta := getCounterValue(prober.ProbesTimedOut, targetName, addr) - startTimeout
+	recvDelta := getCounterValue(prober.ProbesReceived, targetName, addr) - startRecv
+
+	if sentDelta < 6 {
+		t.Errorf("Expected probes to keep flowing through late responses, got %v", sentDelta)
+	}
+	if timeoutDelta < 3 {
+		t.Errorf("Expected late responses to be counted as timeouts, got %v", timeoutDelta)
+	}
+	if recvDelta != 0 {
+		t.Errorf("Late responses must never count as received, got %v", recvDelta)
+	}
+}
+
+// TestRobustness_TrickleWrites: responses arriving one byte at a time
+// must be reassembled by the reader and counted normally.
+func TestRobustness_TrickleWrites(t *testing.T) {
+	prober.InitMetrics()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	addr := ln.Addr().String()
+
+	go func() {
+		defer ln.Close()
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, prober.PayloadSize)
+		for {
+			if _, err := io.ReadFull(conn, buf); err != nil {
+				return
+			}
+			for i := 0; i < prober.PayloadSize; i++ {
+				if _, err := conn.Write(buf[i : i+1]); err != nil {
+					return
+				}
+				time.Sleep(8 * time.Millisecond)
+			}
+		}
+	}()
+
+	targetName := "trickle_test"
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// One frame takes ~192ms to arrive and the server is serial, so the
+	// probe interval must stay above the trickle duration or the backlog
+	// would genuinely time out.
+	cfg := cfgWith(false, 250*time.Millisecond, 400*time.Millisecond, prober.Target{Name: targetName, Address: addr})
+
+	startRecv := getCounterValue(prober.ProbesReceived, targetName, addr)
+	startTimeout := getCounterValue(prober.ProbesTimedOut, targetName, addr)
+
+	go prober.RunClient(ctx, cfg)
+	time.Sleep(1 * time.Second)
+	cancel()
+
+	recvDelta := getCounterValue(prober.ProbesReceived, targetName, addr) - startRecv
+	timeoutDelta := getCounterValue(prober.ProbesTimedOut, targetName, addr) - startTimeout
+
+	if recvDelta < 2 {
+		t.Errorf("Trickled frames should be reassembled and counted, got %v", recvDelta)
+	}
+	if timeoutDelta != 0 {
+		t.Errorf("Trickled frames must not time out, got %v", timeoutDelta)
+	}
+}
+
+// TestRobustness_SpuriousValidFrames: frames with a valid magic header
+// but a sequence number the client never sent must be ignored — they
+// must not inflate the received counter or disturb in-flight probes.
+func TestRobustness_SpuriousValidFrames(t *testing.T) {
+	prober.InitMetrics()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	addr := ln.Addr().String()
+
+	go func() {
+		defer ln.Close()
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, prober.PayloadSize)
+		spurious := make([]byte, prober.PayloadSize)
+		for {
+			if _, err := io.ReadFull(conn, buf); err != nil {
+				return
+			}
+			conn.Write(buf)
+			// Valid magic + valid-looking ts, but a seq the client
+			// could not have sent (client seqs start at 1 and grow).
+			copy(spurious, buf)
+			binary.LittleEndian.PutUint64(spurious[8:16], math.MaxUint64)
+			conn.Write(spurious)
+		}
+	}()
+
+	targetName := "spurious_test"
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := cfgWith(false, 50*time.Millisecond, 300*time.Millisecond, prober.Target{Name: targetName, Address: addr})
+
+	startRecv := getCounterValue(prober.ProbesReceived, targetName, addr)
+	startSent := getCounterValue(prober.ProbesSent, targetName, addr)
+
+	go prober.RunClient(ctx, cfg)
+	time.Sleep(600 * time.Millisecond)
+	cancel()
+
+	recvDelta := getCounterValue(prober.ProbesReceived, targetName, addr) - startRecv
+	sentDelta := getCounterValue(prober.ProbesSent, targetName, addr) - startSent
+
+	if math.Abs(recvDelta-sentDelta) > 1 {
+		t.Errorf("Spurious frames must be ignored: sent %v, received %v", sentDelta, recvDelta)
+	}
+}
+
+// TestIsolation_BrokenTargetDoesNotAffectHealthy: a dead link and a
+// healthy link monitored together must not contaminate each other's
+// metrics — the healthy link keeps loss 0 while the broken one pins
+// link_loss_ratio to 1.0 (regression guard for the outage-loss bug).
+func TestIsolation_BrokenTargetDoesNotAffectHealthy(t *testing.T) {
+	prober.InitMetrics()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	healthyAddr := startEchoServer(ctx, t)
+	deadAddr := "127.0.0.1:1" // nothing listening: instant refusal
+
+	targets := []prober.Target{
+		{Name: "healthy", Address: healthyAddr},
+		{Name: "broken", Address: deadAddr},
+	}
+	cfg := cfgWith(false, 100*time.Millisecond, 500*time.Millisecond, targets...)
+
+	go prober.RunClient(ctx, cfg)
+	time.Sleep(1 * time.Second)
+
+	if recv := getCounterValue(prober.ProbesReceived, "healthy", healthyAddr); recv <= 0 {
+		t.Errorf("Healthy link should receive probes, got %v", recv)
+	}
+	if loss := getGaugeValue(prober.LinkLossRatio, "healthy", healthyAddr); loss != 0 {
+		t.Errorf("Healthy link must keep loss 0, got %v", loss)
+	}
+	if up := getGaugeValue(prober.LinkUp, "healthy", healthyAddr); up != 1 {
+		t.Errorf("Healthy link must be up, got %v", up)
+	}
+
+	if up := getGaugeValue(prober.LinkUp, "broken", deadAddr); up != 0 {
+		t.Errorf("Broken link must be down, got %v", up)
+	}
+	if loss := getGaugeValue(prober.LinkLossRatio, "broken", deadAddr); loss < 0.9 {
+		t.Errorf("Broken link loss ratio must pin near 1.0, got %v", loss)
 	}
 }
 
