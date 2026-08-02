@@ -168,6 +168,9 @@ func waitForHandlers(handlers *sync.WaitGroup) {
 
 // handleConn services a single TCP echo connection. It reads 24-byte
 // probes, validates the magic header, and echoes the payload back.
+// Valid probes increment ServerProbesReceivedTotal so network-level loss
+// can be measured independently of the client (TCP retransmission hides
+// lost segments from the client's sent/timeout counters).
 // Connections that send invalid data or exceed deadlines are closed.
 func handleConn(c net.Conn, readTimeout time.Duration) {
 	defer c.Close()
@@ -194,6 +197,8 @@ func handleConn(c net.Conn, readTimeout time.Duration) {
 			slog.Warn("Invalid magic header", "addr", c.RemoteAddr())
 			return
 		}
+
+		ServerProbesReceivedTotal.Inc()
 
 		c.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		if _, err := c.Write(buf); err != nil {

@@ -51,6 +51,10 @@ var (
 		Name: "tcp_echo_estimated_timeout_seconds",
 		Help: "Current adaptive timeout (RTO) being used.",
 	}, []string{"target", "address"})
+	ServerProbesReceivedTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "tcp_echo_server_probes_received_total",
+		Help: "Total validated echo probes received by the server. Compare with the client's tcp_echo_sent_total to measure true network loss: TCP retransmission hides lost segments from the client, so (sent - server_received) / sent is the real loss rate.",
+	})
 )
 
 var registerOnce sync.Once
@@ -59,7 +63,7 @@ var registerOnce sync.Once
 // Safe to call multiple times; registration happens exactly once.
 func InitMetrics() {
 	registerOnce.Do(func() {
-		prometheus.MustRegister(SentTotal, ReceivedTotal, TimeoutTotal, DropTotal, ConnectFailuresTotal, RTTSecondsRecent, LastRTTSeconds, Connected, RTOEstimate)
+		prometheus.MustRegister(SentTotal, ReceivedTotal, TimeoutTotal, DropTotal, ConnectFailuresTotal, RTTSecondsRecent, LastRTTSeconds, Connected, RTOEstimate, ServerProbesReceivedTotal)
 	})
 }
 

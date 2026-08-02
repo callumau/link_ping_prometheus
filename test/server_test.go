@@ -116,6 +116,10 @@ func TestServer_EnforceSizeAndHeader(t *testing.T) {
 	} else {
 		t.Logf("Got expected error on 2nd packet: %v", err)
 	}
+
+	if got := getPlainCounterValue(prober.ServerProbesReceivedTotal); got < 1 {
+		t.Errorf("Server should have counted at least the 1st valid probe, got %v", got)
+	}
 }
 
 // TestServer_PerIPLimit: connections beyond MaxConnsPerIP from a single

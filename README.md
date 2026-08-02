@@ -19,6 +19,7 @@ The exporter exposes the following metrics at `/metrics` (default port 2112).
 | `tcp_echo_last_rtt_seconds` | Gauge | `target`, `address` | Most recent RTT measurement. |
 | `tcp_echo_connected` | Gauge | `target`, `address` | 1 = connected, 0 = disconnected/reconnecting. |
 | `tcp_echo_estimated_timeout_seconds` | Gauge | `target`, `address` | Current adaptive RTO in use. |
+| `tcp_echo_server_probes_received_total` | Counter | — | Valid probes received by the server (server mode only). |
 
 ## PromQL Examples
 
@@ -32,6 +33,24 @@ for that condition.
 ```
 rate(tcp_echo_timeouts_total[5m]) / rate(tcp_echo_sent_total[5m]) * 100
 ```
+
+Note: this is **application-visible** loss, not raw network loss. Each
+probe is a single TCP segment, and the kernel retransmits lost segments
+(TCP RTO ~1s, doubling). Segments recovered faster than the client's
+adaptive RTO still count as received — with inflated RTT. With a link
+loss simulator (e.g. clumsy) at X%, expect the timeouts ratio to be
+notably below X%, while RTT percentiles climb.
+
+To measure true network loss, run the server in server mode and compare
+its `tcp_echo_server_probes_received_total` against the client's
+`tcp_echo_sent_total`:
+
+```
+1 - rate(tcp_echo_server_probes_received_total[5m]) / rate(tcp_echo_sent_total[5m])
+```
+
+Segments never delivered to the server are genuinely lost on the wire —
+no retransmission can hide them there.
 
 ### Average Latency (10-min Window)
 
