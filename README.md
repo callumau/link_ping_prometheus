@@ -8,18 +8,18 @@ The exporter exposes the following metrics at `/metrics` (default port 2112).
 
 | Metric Name | Type | Labels | Description |
 |---|---|---|---|
-| `tcp_echo_sent_total` | Counter | `target`, `address` | Total echo requests sent on established connections (dial failures excluded). |
-| `tcp_echo_received_total` | Counter | `target`, `address` | Total echo responses received and validated. |
-| `tcp_echo_timeouts_total` | Counter | `target`, `address` | Total requests that timed out. Packet loss = timeouts / sent. |
-| `tcp_echo_dropped_total` | Counter | `target`, `address` | Total established connections lost mid-probing. |
-| `tcp_echo_connect_failures_total` | Counter | `target`, `address` | Total failed connection attempts (dial errors). Not counted in sent/timeout totals. |
-| `tcp_echo_rtt_recent_seconds` | Summary | `target`, `address` | Sliding-window RTT percentiles over 10 min (p50, p90, p99). |
-| `tcp_echo_rtt_recent_seconds_sum` | Summary | `target`, `address` | Sum of RTT over the 10 min window (divide by `_count` for mean). |
-| `tcp_echo_rtt_recent_seconds_count` | Summary | `target`, `address` | Response count over the 10 min window. |
-| `tcp_echo_last_rtt_seconds` | Gauge | `target`, `address` | Most recent RTT measurement. |
-| `tcp_echo_connected` | Gauge | `target`, `address` | 1 = connected, 0 = disconnected/reconnecting. |
-| `tcp_echo_estimated_timeout_seconds` | Gauge | `target`, `address` | Current adaptive RTO in use. |
-| `tcp_echo_server_probes_received_total` | Counter | — | Valid probes received by the server (server mode only). |
+| `link_probes_sent_total` | Counter | `target`, `address` | Total echo requests sent on established connections (dial failures excluded). |
+| `link_probes_received_total` | Counter | `target`, `address` | Total echo responses received and validated. |
+| `link_probes_timed_out_total` | Counter | `target`, `address` | Total requests that timed out. Packet loss = timeouts / sent. |
+| `link_connections_dropped_total` | Counter | `target`, `address` | Total established connections lost mid-probing. |
+| `link_connect_failures_total` | Counter | `target`, `address` | Total failed connection attempts (dial errors). Not counted in sent/timeout totals. |
+| `link_rtt_seconds` | Summary | `target`, `address` | Sliding-window RTT percentiles over 10 min (p50, p90, p99). |
+| `link_rtt_seconds_sum` | Summary | `target`, `address` | Sum of RTT over the 10 min window (divide by `_count` for mean). |
+| `link_rtt_seconds_count` | Summary | `target`, `address` | Response count over the 10 min window. |
+| `link_last_rtt_seconds` | Gauge | `target`, `address` | Most recent RTT measurement. |
+| `link_up` | Gauge | `target`, `address` | 1 = connected, 0 = disconnected/reconnecting. |
+| `link_rto_seconds` | Gauge | `target`, `address` | Current adaptive RTO in use. |
+| `link_server_probes_received_total` | Counter | — | Valid probes received by the server (server mode only). |
 
 ## PromQL Examples
 
@@ -27,11 +27,11 @@ The exporter exposes the following metrics at `/metrics` (default port 2112).
 
 Dial failures are excluded from `sent_total`/`timeouts_total` — while the
 client cannot connect, this ratio is undefined rather than pinned at 100%;
-alert on `tcp_echo_connected == 0` or `rate(tcp_echo_connect_failures_total[5m]) > 0`
+alert on `link_up == 0` or `rate(link_connect_failures_total[5m]) > 0`
 for that condition.
 
 ```
-rate(tcp_echo_timeouts_total[5m]) / rate(tcp_echo_sent_total[5m]) * 100
+rate(link_probes_timed_out_total[5m]) / rate(link_probes_sent_total[5m]) * 100
 ```
 
 Note: this is **application-visible** loss, not raw network loss. Each
@@ -42,11 +42,11 @@ loss simulator (e.g. clumsy) at X%, expect the timeouts ratio to be
 notably below X%, while RTT percentiles climb.
 
 To measure true network loss, run the server in server mode and compare
-its `tcp_echo_server_probes_received_total` against the client's
-`tcp_echo_sent_total`:
+its `link_server_probes_received_total` against the client's
+`link_probes_sent_total`:
 
 ```
-1 - rate(tcp_echo_server_probes_received_total[5m]) / rate(tcp_echo_sent_total[5m])
+1 - rate(link_server_probes_received_total[5m]) / rate(link_probes_sent_total[5m])
 ```
 
 Segments never delivered to the server are genuinely lost on the wire —
@@ -60,15 +60,15 @@ Do NOT use `rate()` on them — they are not counters; the window resets
 every 10 minutes.
 
 ```
-tcp_echo_rtt_recent_seconds_sum / tcp_echo_rtt_recent_seconds_count
+link_rtt_seconds_sum / link_rtt_seconds_count
 ```
 
 ### Median / 90th / 99th Percentile Latency (Sliding Window)
 
 ```
-tcp_echo_rtt_recent_seconds{quantile="0.5"}
-tcp_echo_rtt_recent_seconds{quantile="0.9"}
-tcp_echo_rtt_recent_seconds{quantile="0.99"}
+link_rtt_seconds{quantile="0.5"}
+link_rtt_seconds{quantile="0.9"}
+link_rtt_seconds{quantile="0.99"}
 ```
 
 ### Detecting a Baseline Shift (latency change detection)
@@ -78,18 +78,18 @@ drift on a long-running link shows up as the recent window diverging
 from a 24h minimum:
 
 ```
-tcp_echo_rtt_recent_seconds{quantile="0.5"}
-  > min_over_time(tcp_echo_rtt_recent_seconds{quantile="0.5"}[24h]) * 1.5
+link_rtt_seconds{quantile="0.5"}
+  > min_over_time(link_rtt_seconds{quantile="0.5"}[24h]) * 1.5
 ```
 
-Outages show up immediately in `tcp_echo_connected == 0`,
-`rate(tcp_echo_timeouts_total[5m]) > 0`, and the adaptive RTO climbing
-via `tcp_echo_estimated_timeout_seconds`.
+Outages show up immediately in `link_up == 0`,
+`rate(link_probes_timed_out_total[5m]) > 0`, and the adaptive RTO climbing
+via `link_rto_seconds`.
 
 ### Connection Status
 
 ```
-tcp_echo_connected
+link_up
 ```
 
 ## Grafana Alloy Scraping
@@ -118,7 +118,7 @@ prometheus.scrape "tcp_ping" {
 prometheus.relabel "tcp_ping_keep" {
 	rule {
 		source_labels = ["__name__"]
-		regex         = "tcp_.*"
+		regex         = "link_.*"
 		action        = "keep"
 	}
 	forward_to = [prometheus.remote_write.default.receiver]

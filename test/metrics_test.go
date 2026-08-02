@@ -79,15 +79,15 @@ func TestSeedMetrics(t *testing.T) {
 	}
 
 	want := []string{
-		"tcp_echo_sent_total",
-		"tcp_echo_received_total",
-		"tcp_echo_timeouts_total",
-		"tcp_echo_dropped_total",
-		"tcp_echo_connect_failures_total",
-		"tcp_echo_connected",
-		"tcp_echo_last_rtt_seconds",
-		"tcp_echo_estimated_timeout_seconds",
-		"tcp_echo_rtt_recent_seconds",
+		"link_probes_sent_total",
+		"link_probes_received_total",
+		"link_probes_timed_out_total",
+		"link_connections_dropped_total",
+		"link_connect_failures_total",
+		"link_up",
+		"link_last_rtt_seconds",
+		"link_rto_seconds",
+		"link_rtt_seconds",
 	}
 	for _, w := range want {
 		if !found[w] {

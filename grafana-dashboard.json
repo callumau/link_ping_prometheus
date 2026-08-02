@@ -122,7 +122,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "tcp_echo_last_rtt_seconds{job=~\"$job\", target=~\"$target\"} * 1000",
+          "expr": "link_last_rtt_seconds{job=~\"$job\", target=~\"$target\"} * 1000",
           "instant": true,
           "legendFormat": "{{target}}",
           "range": false,
@@ -209,7 +209,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "tcp_echo_connected{job=~\"$job\", target=~\"$target\"}",
+          "expr": "link_up{job=~\"$job\", target=~\"$target\"}",
           "instant": true,
           "legendFormat": "{{target}}",
           "range": false,
@@ -287,7 +287,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "100 * rate(tcp_echo_timeouts_total{job=~\"$job\", target=~\"$target\"}[5m]) / (rate(tcp_echo_timeouts_total{job=~\"$job\", target=~\"$target\"}[5m]) + rate(tcp_echo_sent_total{job=~\"$job\", target=~\"$target\"}[5m]))",
+          "expr": "100 * rate(link_probes_timed_out_total{job=~\"$job\", target=~\"$target\"}[5m]) / (rate(link_probes_timed_out_total{job=~\"$job\", target=~\"$target\"}[5m]) + rate(link_probes_sent_total{job=~\"$job\", target=~\"$target\"}[5m]))",
           "instant": true,
           "legendFormat": "{{target}}",
           "range": false,
@@ -365,7 +365,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "tcp_echo_estimated_timeout_seconds{job=~\"$job\", target=~\"$target\"} * 1000",
+          "expr": "link_rto_seconds{job=~\"$job\", target=~\"$target\"} * 1000",
           "instant": true,
           "legendFormat": "{{target}}",
           "range": false,
@@ -536,7 +536,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "tcp_echo_rtt_recent_seconds{quantile=\"0.5\", job=~\"$job\", target=~\"$target\"} * 1000",
+          "expr": "link_rtt_seconds{quantile=\"0.5\", job=~\"$job\", target=~\"$target\"} * 1000",
           "legendFormat": "{{target}} p50",
           "range": true,
           "refId": "A"
@@ -547,7 +547,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "tcp_echo_rtt_recent_seconds{quantile=\"0.9\", job=~\"$job\", target=~\"$target\"} * 1000",
+          "expr": "link_rtt_seconds{quantile=\"0.9\", job=~\"$job\", target=~\"$target\"} * 1000",
           "legendFormat": "{{target}} p90",
           "range": true,
           "refId": "B"
@@ -558,7 +558,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "tcp_echo_rtt_recent_seconds{quantile=\"0.99\", job=~\"$job\", target=~\"$target\"} * 1000",
+          "expr": "link_rtt_seconds{quantile=\"0.99\", job=~\"$job\", target=~\"$target\"} * 1000",
           "legendFormat": "{{target}} p99",
           "range": true,
           "refId": "C"
@@ -670,7 +670,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "100 * rate(tcp_echo_timeouts_total{job=~\"$job\", target=~\"$target\"}[5m]) / (rate(tcp_echo_timeouts_total{job=~\"$job\", target=~\"$target\"}[5m]) + rate(tcp_echo_sent_total{job=~\"$job\", target=~\"$target\"}[5m]))",
+          "expr": "100 * rate(link_probes_timed_out_total{job=~\"$job\", target=~\"$target\"}[5m]) / (rate(link_probes_timed_out_total{job=~\"$job\", target=~\"$target\"}[5m]) + rate(link_probes_sent_total{job=~\"$job\", target=~\"$target\"}[5m]))",
           "legendFormat": "{{target}}",
           "range": true,
           "refId": "A"
@@ -768,7 +768,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "tcp_echo_rtt_recent_seconds_sum{job=~\"$job\", target=~\"$target\"} / tcp_echo_rtt_recent_seconds_count{job=~\"$job\", target=~\"$target\"} * 1000",
+          "expr": "link_rtt_seconds_sum{job=~\"$job\", target=~\"$target\"} / link_rtt_seconds_count{job=~\"$job\", target=~\"$target\"} * 1000",
           "legendFormat": "{{target}}",
           "range": true,
           "refId": "A"
@@ -884,7 +884,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "tcp_echo_connected{job=~\"$job\", target=~\"$target\"}",
+          "expr": "link_up{job=~\"$job\", target=~\"$target\"}",
           "legendFormat": "{{target}}",
           "range": true,
           "refId": "A"
@@ -1038,7 +1038,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "rate(tcp_echo_sent_total{job=~\"$job\", target=~\"$target\"}[5m])",
+          "expr": "rate(link_probes_sent_total{job=~\"$job\", target=~\"$target\"}[5m])",
           "legendFormat": "{{target}} sent",
           "range": true,
           "refId": "A"
@@ -1049,7 +1049,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "rate(tcp_echo_received_total{job=~\"$job\", target=~\"$target\"}[5m])",
+          "expr": "rate(link_probes_received_total{job=~\"$job\", target=~\"$target\"}[5m])",
           "legendFormat": "{{target}} recv",
           "range": true,
           "refId": "B"
@@ -1060,7 +1060,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "rate(tcp_echo_timeouts_total{job=~\"$job\", target=~\"$target\"}[5m])",
+          "expr": "rate(link_probes_timed_out_total{job=~\"$job\", target=~\"$target\"}[5m])",
           "legendFormat": "{{target}} timeout",
           "range": true,
           "refId": "C"
@@ -1158,7 +1158,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "tcp_echo_estimated_timeout_seconds{job=~\"$job\", target=~\"$target\"} * 1000",
+          "expr": "link_rto_seconds{job=~\"$job\", target=~\"$target\"} * 1000",
           "legendFormat": "{{target}}",
           "range": true,
           "refId": "A"
@@ -1192,7 +1192,7 @@
           "type": "prometheus",
           "uid": "${DS_PROMETHEUS}"
         },
-        "definition": "label_values(tcp_echo_sent_total, target)",
+        "definition": "label_values(link_probes_sent_total, target)",
         "includeAll": true,
         "multi": true,
         "name": "target",

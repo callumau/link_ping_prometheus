@@ -123,8 +123,8 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 			if ctx.Err() != nil {
 				return
 			}
-			ConnectFailuresTotal.WithLabelValues(t.Name, t.Address).Inc()
-			Connected.WithLabelValues(t.Name, t.Address).Set(0)
+			ConnectFailures.WithLabelValues(t.Name, t.Address).Inc()
+			LinkUp.WithLabelValues(t.Name, t.Address).Set(0)
 			logger.Warn("Connect failed", "err", err)
 			select {
 			case <-ctx.Done():
@@ -135,17 +135,17 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 		}
 
 		logger.Info("Connected")
-		Connected.WithLabelValues(t.Name, t.Address).Set(1)
+		LinkUp.WithLabelValues(t.Name, t.Address).Set(1)
 
 		if tcp, ok := conn.(*net.TCPConn); ok {
 			tcp.SetNoDelay(true)
 		}
 
 		err = runEchoLoop(ctx, conn, t, cfg, stats, logger)
-		Connected.WithLabelValues(t.Name, t.Address).Set(0)
+		LinkUp.WithLabelValues(t.Name, t.Address).Set(0)
 
 		if err != nil {
-			DropTotal.WithLabelValues(t.Name, t.Address).Inc()
+			ConnectionsDropped.WithLabelValues(t.Name, t.Address).Inc()
 			logger.Warn("Connection lost", "err", err)
 		}
 
@@ -203,7 +203,7 @@ func resetTimer(t *time.Timer, d time.Duration) {
 // A nil return means clean context cancellation; in-flight probes are
 // NOT counted as timeouts in that case. Any non-nil return (reader
 // error, write error, panic via the recover in the deferred flush)
-// flushes in-flight probes to TimeoutTotal because the connection state
+// flushes in-flight probes to ProbesTimedOut because the connection state
 // is no longer trustworthy. Responses that already arrived before the
 // failure are matched and counted as received first.
 //
@@ -300,10 +300,10 @@ func runEchoLoop(
 					continue
 				}
 				delete(pending, resp.seq)
-				ReceivedTotal.WithLabelValues(t.Name, t.Address).Inc()
+				ProbesReceived.WithLabelValues(t.Name, t.Address).Inc()
 			default:
 				if count := float64(len(pending)); count > 0 {
-					TimeoutTotal.WithLabelValues(t.Name, t.Address).Add(count)
+					ProbesTimedOut.WithLabelValues(t.Name, t.Address).Add(count)
 				}
 				return
 			}
@@ -354,9 +354,9 @@ func runEchoLoop(
 
 				rttSec := resp.recv.Sub(sentTime).Seconds()
 
-				ReceivedTotal.WithLabelValues(t.Name, t.Address).Inc()
-				RTTSecondsRecent.WithLabelValues(t.Name, t.Address).Observe(rttSec)
-				LastRTTSeconds.WithLabelValues(t.Name, t.Address).Set(rttSec)
+				ProbesReceived.WithLabelValues(t.Name, t.Address).Inc()
+				RTTRecent.WithLabelValues(t.Name, t.Address).Observe(rttSec)
+				LastRTT.WithLabelValues(t.Name, t.Address).Set(rttSec)
 
 				if cfg.Adaptive {
 					stats.Update(rttSec)
@@ -371,7 +371,7 @@ func runEchoLoop(
 		if len(pending) > 0 {
 			for s, sentTime := range pending {
 				if now.Sub(sentTime) > timeout {
-					TimeoutTotal.WithLabelValues(t.Name, t.Address).Inc()
+					ProbesTimedOut.WithLabelValues(t.Name, t.Address).Inc()
 					delete(pending, s)
 					timeoutOccurred = true
 				}
@@ -393,6 +393,6 @@ func runEchoLoop(
 		}
 
 		pending[seq] = now
-		SentTotal.WithLabelValues(t.Name, t.Address).Inc()
+		ProbesSent.WithLabelValues(t.Name, t.Address).Inc()
 	}
 }

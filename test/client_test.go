@@ -26,19 +26,19 @@ func TestConnectionRefusedMetrics(t *testing.T) {
 
 	cfg := cfgWith(false, 100*time.Millisecond, 100*time.Millisecond, prober.Target{Name: "refused_test", Address: addr})
 
-	initialSent := getCounterValue(prober.SentTotal, "refused_test", addr)
-	initialTimeouts := getCounterValue(prober.TimeoutTotal, "refused_test", addr)
-	initialConnectFails := getCounterValue(prober.ConnectFailuresTotal, "refused_test", addr)
-	initialDrops := getCounterValue(prober.DropTotal, "refused_test", addr)
+	initialSent := getCounterValue(prober.ProbesSent, "refused_test", addr)
+	initialTimeouts := getCounterValue(prober.ProbesTimedOut, "refused_test", addr)
+	initialConnectFails := getCounterValue(prober.ConnectFailures, "refused_test", addr)
+	initialDrops := getCounterValue(prober.ConnectionsDropped, "refused_test", addr)
 
 	go prober.RunClient(ctx, cfg)
 
 	time.Sleep(500 * time.Millisecond)
 
-	finalSent := getCounterValue(prober.SentTotal, "refused_test", addr)
-	finalTimeouts := getCounterValue(prober.TimeoutTotal, "refused_test", addr)
-	finalConnectFails := getCounterValue(prober.ConnectFailuresTotal, "refused_test", addr)
-	finalDrops := getCounterValue(prober.DropTotal, "refused_test", addr)
+	finalSent := getCounterValue(prober.ProbesSent, "refused_test", addr)
+	finalTimeouts := getCounterValue(prober.ProbesTimedOut, "refused_test", addr)
+	finalConnectFails := getCounterValue(prober.ConnectFailures, "refused_test", addr)
+	finalDrops := getCounterValue(prober.ConnectionsDropped, "refused_test", addr)
 
 	if finalConnectFails <= initialConnectFails {
 		t.Errorf("Expected connect failures to increase on connection refused, got %v -> %v", initialConnectFails, finalConnectFails)
@@ -93,8 +93,8 @@ func TestAccuracy_PacketLoss(t *testing.T) {
 
 	cfg := cfgWith(false, 50*time.Millisecond, 100*time.Millisecond, prober.Target{Name: targetName, Address: addr})
 
-	startSent := getCounterValue(prober.SentTotal, targetName, addr)
-	startTimeout := getCounterValue(prober.TimeoutTotal, targetName, addr)
+	startSent := getCounterValue(prober.ProbesSent, targetName, addr)
+	startTimeout := getCounterValue(prober.ProbesTimedOut, targetName, addr)
 
 	go prober.RunClient(ctx, cfg)
 
@@ -103,8 +103,8 @@ func TestAccuracy_PacketLoss(t *testing.T) {
 
 	time.Sleep(200 * time.Millisecond)
 
-	endSent := getCounterValue(prober.SentTotal, targetName, addr)
-	endTimeout := getCounterValue(prober.TimeoutTotal, targetName, addr)
+	endSent := getCounterValue(prober.ProbesSent, targetName, addr)
+	endTimeout := getCounterValue(prober.ProbesTimedOut, targetName, addr)
 
 	sentCount := endSent - startSent
 	timeoutCount := endTimeout - startTimeout
@@ -157,7 +157,7 @@ func TestAccuracy_HighLatency(t *testing.T) {
 
 	time.Sleep(1500 * time.Millisecond)
 
-	rttVal := getGaugeValue(prober.LastRTTSeconds, targetName, addr)
+	rttVal := getGaugeValue(prober.LastRTT, targetName, addr)
 
 	if rttVal < delay.Seconds()-0.02 || rttVal > delay.Seconds()+0.05 {
 		t.Errorf("RTT Accuracy mismatch: expected ~%vs, got %vs", delay.Seconds(), rttVal)
@@ -198,16 +198,16 @@ func TestRobustness_CorruptSeq(t *testing.T) {
 
 	cfg := cfgWith(false, 50*time.Millisecond, 100*time.Millisecond, prober.Target{Name: targetName, Address: addr})
 
-	startRecv := getCounterValue(prober.ReceivedTotal, targetName, addr)
-	startTimeout := getCounterValue(prober.TimeoutTotal, targetName, addr)
+	startRecv := getCounterValue(prober.ProbesReceived, targetName, addr)
+	startTimeout := getCounterValue(prober.ProbesTimedOut, targetName, addr)
 
 	go prober.RunClient(ctx, cfg)
 	time.Sleep(500 * time.Millisecond)
 	cancel()
 	time.Sleep(100 * time.Millisecond)
 
-	endRecv := getCounterValue(prober.ReceivedTotal, targetName, addr)
-	endTimeout := getCounterValue(prober.TimeoutTotal, targetName, addr)
+	endRecv := getCounterValue(prober.ProbesReceived, targetName, addr)
+	endTimeout := getCounterValue(prober.ProbesTimedOut, targetName, addr)
 
 	if endRecv > startRecv {
 		t.Errorf("Client should not have accepted corrupt packets, but Recv increased by %v", endRecv-startRecv)
@@ -252,13 +252,13 @@ func TestRobustness_PartialWrites(t *testing.T) {
 
 	cfg := cfgWith(false, 100*time.Millisecond, 200*time.Millisecond, prober.Target{Name: targetName, Address: addr})
 
-	startRecv := getCounterValue(prober.ReceivedTotal, targetName, addr)
+	startRecv := getCounterValue(prober.ProbesReceived, targetName, addr)
 	go prober.RunClient(ctx, cfg)
 
 	time.Sleep(500 * time.Millisecond)
 	cancel()
 
-	endRecv := getCounterValue(prober.ReceivedTotal, targetName, addr)
+	endRecv := getCounterValue(prober.ProbesReceived, targetName, addr)
 	if endRecv <= startRecv {
 		t.Errorf("Partial writes should be reassembled, but Recv count did not increase")
 	}
@@ -292,14 +292,14 @@ func TestRobustness_StalledServer(t *testing.T) {
 
 	cfg := cfgWith(false, 50*time.Millisecond, 50*time.Millisecond, prober.Target{Name: targetName, Address: addr})
 
-	startTimeout := getCounterValue(prober.TimeoutTotal, targetName, addr)
+	startTimeout := getCounterValue(prober.ProbesTimedOut, targetName, addr)
 	go prober.RunClient(ctx, cfg)
 
 	time.Sleep(500 * time.Millisecond)
 	cancel()
 	time.Sleep(100 * time.Millisecond)
 
-	endTimeout := getCounterValue(prober.TimeoutTotal, targetName, addr)
+	endTimeout := getCounterValue(prober.ProbesTimedOut, targetName, addr)
 	if endTimeout-startTimeout < 4 {
 		t.Errorf("Expected significant timeouts during stall, got %v", endTimeout-startTimeout)
 	}
@@ -350,8 +350,8 @@ func TestAccuracy_KnownLatencyAndLoss(t *testing.T) {
 
 	cfg := cfgWith(false, 50*time.Millisecond, 500*time.Millisecond, prober.Target{Name: targetName, Address: addr})
 
-	startSent := getCounterValue(prober.SentTotal, targetName, addr)
-	startTimeout := getCounterValue(prober.TimeoutTotal, targetName, addr)
+	startSent := getCounterValue(prober.ProbesSent, targetName, addr)
+	startTimeout := getCounterValue(prober.ProbesTimedOut, targetName, addr)
 
 	go prober.RunClient(ctx, cfg)
 	// dropWindow packets take ~1.2s; their drops are all swept by ~1.7s.
@@ -360,9 +360,9 @@ func TestAccuracy_KnownLatencyAndLoss(t *testing.T) {
 	cancel()
 	time.Sleep(200 * time.Millisecond)
 
-	endSent := getCounterValue(prober.SentTotal, targetName, addr)
-	endTimeout := getCounterValue(prober.TimeoutTotal, targetName, addr)
-	rttVal := getGaugeValue(prober.LastRTTSeconds, targetName, addr)
+	endSent := getCounterValue(prober.ProbesSent, targetName, addr)
+	endTimeout := getCounterValue(prober.ProbesTimedOut, targetName, addr)
+	rttVal := getGaugeValue(prober.LastRTT, targetName, addr)
 
 	sentCount := endSent - startSent
 	timeoutCount := endTimeout - startTimeout
@@ -413,15 +413,15 @@ func TestDuplicateResponse(t *testing.T) {
 
 	cfg := cfgWith(false, 100*time.Millisecond, 500*time.Millisecond, prober.Target{Name: targetName, Address: addr})
 
-	startRecv := getCounterValue(prober.ReceivedTotal, targetName, addr)
-	startSent := getCounterValue(prober.SentTotal, targetName, addr)
+	startRecv := getCounterValue(prober.ProbesReceived, targetName, addr)
+	startSent := getCounterValue(prober.ProbesSent, targetName, addr)
 
 	go prober.RunClient(ctx, cfg)
 	time.Sleep(500 * time.Millisecond)
 	cancel()
 
-	endRecv := getCounterValue(prober.ReceivedTotal, targetName, addr)
-	endSent := getCounterValue(prober.SentTotal, targetName, addr)
+	endRecv := getCounterValue(prober.ProbesReceived, targetName, addr)
+	endSent := getCounterValue(prober.ProbesSent, targetName, addr)
 
 	recvDelta := endRecv - startRecv
 	sentDelta := endSent - startSent
@@ -466,16 +466,16 @@ func TestRobustness_TimestampSpoof(t *testing.T) {
 
 	cfg := cfgWith(false, 50*time.Millisecond, 100*time.Millisecond, prober.Target{Name: targetName, Address: addr})
 
-	startRecv := getCounterValue(prober.ReceivedTotal, targetName, addr)
-	startTimeout := getCounterValue(prober.TimeoutTotal, targetName, addr)
+	startRecv := getCounterValue(prober.ProbesReceived, targetName, addr)
+	startTimeout := getCounterValue(prober.ProbesTimedOut, targetName, addr)
 
 	go prober.RunClient(ctx, cfg)
 	time.Sleep(500 * time.Millisecond)
 	cancel()
 	time.Sleep(100 * time.Millisecond)
 
-	endRecv := getCounterValue(prober.ReceivedTotal, targetName, addr)
-	endTimeout := getCounterValue(prober.TimeoutTotal, targetName, addr)
+	endRecv := getCounterValue(prober.ProbesReceived, targetName, addr)
+	endTimeout := getCounterValue(prober.ProbesTimedOut, targetName, addr)
 
 	if endRecv > startRecv {
 		t.Errorf("Client accepted responses with tampered timestamps: Recv increased by %v", endRecv-startRecv)
@@ -486,7 +486,7 @@ func TestRobustness_TimestampSpoof(t *testing.T) {
 }
 
 // TestGracefulShutdown_NoPhantomTimeouts: probes still in flight when the
-// context is cancelled must NOT be flushed into TimeoutTotal — otherwise
+// context is cancelled must NOT be flushed into ProbesTimedOut — otherwise
 // every deploy/restart injects phantom packet loss.
 func TestGracefulShutdown_NoPhantomTimeouts(t *testing.T) {
 	prober.InitMetrics()
@@ -521,16 +521,16 @@ func TestGracefulShutdown_NoPhantomTimeouts(t *testing.T) {
 
 	cfg := cfgWith(false, 50*time.Millisecond, 5*time.Second, prober.Target{Name: targetName, Address: addr})
 
-	startSent := getCounterValue(prober.SentTotal, targetName, addr)
-	startTimeout := getCounterValue(prober.TimeoutTotal, targetName, addr)
+	startSent := getCounterValue(prober.ProbesSent, targetName, addr)
+	startTimeout := getCounterValue(prober.ProbesTimedOut, targetName, addr)
 
 	go prober.RunClient(ctx, cfg)
 	time.Sleep(300 * time.Millisecond)
 	cancel()
 	time.Sleep(300 * time.Millisecond)
 
-	endSent := getCounterValue(prober.SentTotal, targetName, addr)
-	endTimeout := getCounterValue(prober.TimeoutTotal, targetName, addr)
+	endSent := getCounterValue(prober.ProbesSent, targetName, addr)
+	endTimeout := getCounterValue(prober.ProbesTimedOut, targetName, addr)
 
 	if endSent <= startSent {
 		t.Fatalf("Expected probes to be sent, got %v -> %v", startSent, endSent)

@@ -33,10 +33,10 @@ func TestMultiTargetProbing(t *testing.T) {
 
 	time.Sleep(500 * time.Millisecond)
 
-	verifyCounter(t, prober.SentTotal, "target1", addr1)
-	verifyCounter(t, prober.ReceivedTotal, "target1", addr1)
-	verifyCounter(t, prober.SentTotal, "target2", addr2)
-	verifyCounter(t, prober.ReceivedTotal, "target2", addr2)
+	verifyCounter(t, prober.ProbesSent, "target1", addr1)
+	verifyCounter(t, prober.ProbesReceived, "target1", addr1)
+	verifyCounter(t, prober.ProbesSent, "target2", addr2)
+	verifyCounter(t, prober.ProbesReceived, "target2", addr2)
 }
 
 func TestServerDropout(t *testing.T) {
@@ -91,7 +91,7 @@ func TestServerDropout(t *testing.T) {
 
 	cfg := cfgWith(false, 50*time.Millisecond, 1*time.Second, prober.Target{Name: targetName, Address: serverAddr})
 
-	initialTimeouts := getCounterValue(prober.TimeoutTotal, targetName, serverAddr)
+	initialTimeouts := getCounterValue(prober.ProbesTimedOut, targetName, serverAddr)
 
 	go prober.RunClient(ctx, cfg)
 
@@ -103,7 +103,7 @@ func TestServerDropout(t *testing.T) {
 	close(closeConnCh)
 	time.Sleep(500 * time.Millisecond)
 
-	finalTimeouts := getCounterValue(prober.TimeoutTotal, targetName, serverAddr)
+	finalTimeouts := getCounterValue(prober.ProbesTimedOut, targetName, serverAddr)
 	diff := finalTimeouts - initialTimeouts
 
 	t.Logf("Timeouts: initial=%v, final=%v, diff=%v", initialTimeouts, finalTimeouts, diff)
@@ -136,7 +136,7 @@ func TestStress_ManyTargets(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	for _, tg := range targets {
-		sent := getCounterValue(prober.SentTotal, tg.Name, tg.Address)
+		sent := getCounterValue(prober.ProbesSent, tg.Name, tg.Address)
 		if sent < 5 {
 			t.Errorf("Target %s sent count too low: %v", tg.Name, sent)
 		}

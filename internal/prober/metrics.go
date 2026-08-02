@@ -12,48 +12,48 @@ import (
 
 // Prometheus metric descriptors. All use the label set {target, address}.
 var (
-	SentTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "tcp_echo_sent_total",
-		Help: "Total echo requests sent on established connections (dial failures excluded).",
+	ProbesSent = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "link_probes_sent_total",
+		Help: "Total link probes sent on established connections (dial failures excluded).",
 	}, []string{"target", "address"})
-	ReceivedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "tcp_echo_received_total",
-		Help: "Total echo responses received.",
+	ProbesReceived = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "link_probes_received_total",
+		Help: "Total link probe responses received.",
 	}, []string{"target", "address"})
-	TimeoutTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "tcp_echo_timeouts_total",
-		Help: "Total echo requests that timed out.",
+	ProbesTimedOut = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "link_probes_timed_out_total",
+		Help: "Total link probes that timed out.",
 	}, []string{"target", "address"})
-	DropTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "tcp_echo_dropped_total",
+	ConnectionsDropped = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "link_connections_dropped_total",
 		Help: "Total established connections that were lost mid-probing.",
 	}, []string{"target", "address"})
-	ConnectFailuresTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "tcp_echo_connect_failures_total",
+	ConnectFailures = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "link_connect_failures_total",
 		Help: "Total failed connection attempts (dial errors). Not counted in sent/timeout totals.",
 	}, []string{"target", "address"})
-	RTTSecondsRecent = prometheus.NewSummaryVec(prometheus.SummaryOpts{
-		Name:       "tcp_echo_rtt_recent_seconds",
+	RTTRecent = prometheus.NewSummaryVec(prometheus.SummaryOpts{
+		Name:       "link_rtt_seconds",
 		Help:       "Sliding-window RTT percentiles over the last 10 minutes.",
 		Objectives: map[float64]float64{0.5: 0.05, 0.9: 0.01, 0.99: 0.001},
 		MaxAge:     10 * time.Minute,
 		AgeBuckets: 5,
 	}, []string{"target", "address"})
-	LastRTTSeconds = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "tcp_echo_last_rtt_seconds",
+	LastRTT = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "link_last_rtt_seconds",
 		Help: "Most recent RTT in seconds.",
 	}, []string{"target", "address"})
-	Connected = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "tcp_echo_connected",
+	LinkUp = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "link_up",
 		Help: "1 if currently connected, 0 otherwise.",
 	}, []string{"target", "address"})
 	RTOEstimate = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "tcp_echo_estimated_timeout_seconds",
+		Name: "link_rto_seconds",
 		Help: "Current adaptive timeout (RTO) being used.",
 	}, []string{"target", "address"})
 	ServerProbesReceivedTotal = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "tcp_echo_server_probes_received_total",
-		Help: "Total validated echo probes received by the server. Compare with the client's tcp_echo_sent_total to measure true network loss: TCP retransmission hides lost segments from the client, so (sent - server_received) / sent is the real loss rate.",
+		Name: "link_server_probes_received_total",
+		Help: "Total validated echo probes received by the server. Compare with the client's link_probes_sent_total to measure true network loss: TCP retransmission hides lost segments from the client, so (sent - server_received) / sent is the real loss rate.",
 	})
 )
 
@@ -63,7 +63,7 @@ var registerOnce sync.Once
 // Safe to call multiple times; registration happens exactly once.
 func InitMetrics() {
 	registerOnce.Do(func() {
-		prometheus.MustRegister(SentTotal, ReceivedTotal, TimeoutTotal, DropTotal, ConnectFailuresTotal, RTTSecondsRecent, LastRTTSeconds, Connected, RTOEstimate, ServerProbesReceivedTotal)
+		prometheus.MustRegister(ProbesSent, ProbesReceived, ProbesTimedOut, ConnectionsDropped, ConnectFailures, RTTRecent, LastRTT, LinkUp, RTOEstimate, ServerProbesReceivedTotal)
 	})
 }
 
@@ -71,15 +71,15 @@ func InitMetrics() {
 // surface in /metrics output even before the first event.
 func SeedMetrics(targets []Target) {
 	for _, t := range targets {
-		SentTotal.WithLabelValues(t.Name, t.Address).Add(0)
-		ReceivedTotal.WithLabelValues(t.Name, t.Address).Add(0)
-		TimeoutTotal.WithLabelValues(t.Name, t.Address).Add(0)
-		DropTotal.WithLabelValues(t.Name, t.Address).Add(0)
-		ConnectFailuresTotal.WithLabelValues(t.Name, t.Address).Add(0)
-		Connected.WithLabelValues(t.Name, t.Address).Set(0)
-		LastRTTSeconds.WithLabelValues(t.Name, t.Address).Set(0)
+		ProbesSent.WithLabelValues(t.Name, t.Address).Add(0)
+		ProbesReceived.WithLabelValues(t.Name, t.Address).Add(0)
+		ProbesTimedOut.WithLabelValues(t.Name, t.Address).Add(0)
+		ConnectionsDropped.WithLabelValues(t.Name, t.Address).Add(0)
+		ConnectFailures.WithLabelValues(t.Name, t.Address).Add(0)
+		LinkUp.WithLabelValues(t.Name, t.Address).Set(0)
+		LastRTT.WithLabelValues(t.Name, t.Address).Set(0)
 		RTOEstimate.WithLabelValues(t.Name, t.Address).Set(0)
-		RTTSecondsRecent.WithLabelValues(t.Name, t.Address)
+		RTTRecent.WithLabelValues(t.Name, t.Address)
 	}
 }
 
