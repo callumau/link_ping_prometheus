@@ -53,6 +53,9 @@ func LoadTargets(path string) ([]Target, error) {
 		if err := ValidateTarget(t.Address); err != nil {
 			return nil, fmt.Errorf("target %d (%q): %w", i, t.Name, err)
 		}
+		if err := ValidateTargetName(t.Name); err != nil {
+			return nil, fmt.Errorf("target %d: %w", i, err)
+		}
 		if _, dup := seen[t.Name]; dup {
 			return nil, fmt.Errorf("target %d: duplicate name %q", i, t.Name)
 		}

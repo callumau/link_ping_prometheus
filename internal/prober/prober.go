@@ -51,6 +51,9 @@ func (c Config) Validate() error {
 		if err := ValidateTarget(t.Address); err != nil {
 			return err
 		}
+		if err := ValidateTargetName(t.Name); err != nil {
+			return err
+		}
 		if _, dup := seen[t.Name]; dup {
 			return fmt.Errorf("duplicate target name %q: metric labels would be ambiguous", t.Name)
 		}

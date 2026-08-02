@@ -31,6 +31,25 @@ func ValidateTarget(address string) error {
 	return nil
 }
 
+// ValidateTargetName checks that name is usable as a Prometheus label
+// value for the {target} dimension: non-empty, at most 63 characters,
+// and free of control characters that would corrupt the exposition
+// format or dashboards.
+func ValidateTargetName(name string) error {
+	if name == "" {
+		return errors.New("target name is empty")
+	}
+	if len(name) > 63 {
+		return fmt.Errorf("target name too long: %d chars (max 63)", len(name))
+	}
+	for _, c := range name {
+		if c < 0x20 || c == 0x7f {
+			return fmt.Errorf("target name %q contains control character", name)
+		}
+	}
+	return nil
+}
+
 // isValidHost checks whether host is a valid IP address or DNS name
 // (RFC 1035 label rules, max 253 characters, each label 1-63 characters,
 // ASCII alphanumeric plus hyphen, no leading/trailing hyphen).

@@ -121,6 +121,55 @@ func TestConfigValidate(t *testing.T) {
 	}
 }
 
+func TestValidateTargetName(t *testing.T) {
+	valid := []string{"default", "google", "a", "name-with-dashes", "snake_case_ok"}
+	for _, name := range valid {
+		if err := prober.ValidateTargetName(name); err != nil {
+			t.Errorf("expected %q to be valid, got %v", name, err)
+		}
+	}
+
+	invalid := []string{
+		"",
+		"a\nb", // control character
+		"a\x01b",
+		"a\x7fb",
+		string(make([]byte, 64)), // too long
+	}
+	for _, name := range invalid {
+		if err := prober.ValidateTargetName(name); err == nil {
+			t.Errorf("expected %q to be invalid, got nil", name)
+		}
+	}
+}
+
+func TestConfigValidate_RejectsBadNames(t *testing.T) {
+	cases := []struct {
+		name    string
+		target  prober.Target
+		wantErr bool
+	}{
+		{"empty name", prober.Target{Name: "", Address: "127.0.0.1:4000"}, true},
+		{"control char", prober.Target{Name: "bad\nname", Address: "127.0.0.1:4000"}, true},
+		{"too long", prober.Target{Name: string(make([]byte, 64)), Address: "127.0.0.1:4000"}, true},
+		{"valid", prober.Target{Name: "ok", Address: "127.0.0.1:4000"}, false},
+	}
+	for _, tc := range cases {
+		cfg := prober.Config{
+			Targets:      []prober.Target{tc.target},
+			BaseInterval: time.Second,
+			BaseTimeout:  time.Second,
+		}
+		err := cfg.Validate()
+		if tc.wantErr && err == nil {
+			t.Errorf("%s: expected error, got nil", tc.name)
+		}
+		if !tc.wantErr && err != nil {
+			t.Errorf("%s: expected nil, got %v", tc.name, err)
+		}
+	}
+}
+
 func TestLoadTargets_DuplicateNames(t *testing.T) {
 	tmpfile, err := os.CreateTemp("", "targets-dup-*.json")
 	if err != nil {
