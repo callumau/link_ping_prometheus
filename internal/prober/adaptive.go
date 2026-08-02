@@ -31,7 +31,8 @@ func NewAdaptiveStats(baseTimeout time.Duration) *AdaptiveStats {
 //   - First measurement sets SRTT = R, RTTVAR = R/2.
 //   - Subsequent measurements apply exponential weighted moving average
 //     with gain DefaultAlpha (1/8) for SRTT and DefaultBeta (1/4) for RTTVAR.
-//   - RTO = SRTT + 4 × RTTVAR.
+//   - RTO = SRTT + max(G, 4 × RTTVAR), where G is the clock granularity
+//     of the RTT measurement (RFC 6298 section 2.4).
 func (a *AdaptiveStats) Update(rttSeconds float64) {
 	a.consecutiveTimeouts = 0
 	if a.srtt == 0 {
@@ -41,7 +42,7 @@ func (a *AdaptiveStats) Update(rttSeconds float64) {
 		a.rttvar = (1-DefaultBeta)*a.rttvar + DefaultBeta*math.Abs(a.srtt-rttSeconds)
 		a.srtt = (1-DefaultAlpha)*a.srtt + DefaultAlpha*rttSeconds
 	}
-	a.rto = a.srtt + 4*a.rttvar
+	a.rto = a.srtt + math.Max(DefaultClockGranularity.Seconds(), 4*a.rttvar)
 }
 
 // SRTT returns the smoothed round-trip time in seconds.
@@ -66,7 +67,8 @@ func (a *AdaptiveStats) Backoff() {
 }
 
 // CurrentRTO returns the clamped RTO as a time.Duration, bounded by
-// [DefaultMinRTO, DefaultMaxRTO].
+// [DefaultMinRTO, DefaultMaxRTO]. The 200ms floor prevents false
+// positive timeouts caused by normal latency jitter on quiet links.
 func (a *AdaptiveStats) CurrentRTO() time.Duration {
 	val := math.Max(math.Min(a.rto, DefaultMaxRTO.Seconds()), DefaultMinRTO.Seconds())
 	return time.Duration(val * float64(time.Second))

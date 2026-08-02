@@ -64,6 +64,26 @@ func getGaugeValue(vec *prometheus.GaugeVec, targetName, address string) float64
 	return m.GetGauge().GetValue()
 }
 
+func getHistogramMean(vec *prometheus.HistogramVec, targetName, address string) float64 {
+	obs, err := vec.GetMetricWithLabelValues(targetName, address)
+	if err != nil {
+		return 0
+	}
+	m, ok := obs.(prometheus.Metric)
+	if !ok {
+		return 0
+	}
+	var d dto.Metric
+	if err := m.Write(&d); err != nil {
+		return 0
+	}
+	h := d.GetHistogram()
+	if h.GetSampleCount() == 0 {
+		return 0
+	}
+	return h.GetSampleSum() / float64(h.GetSampleCount())
+}
+
 func verifyCounter(t *testing.T, vec *prometheus.CounterVec, targetName, address string) {
 	t.Helper()
 	val := getCounterValue(vec, targetName, address)

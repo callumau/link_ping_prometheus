@@ -31,7 +31,6 @@ func TestConnectionRefusedMetrics(t *testing.T) {
 	initialTimeouts := getCounterValue(prober.ProbesTimedOut, "refused_test", addr)
 	initialConnectFails := getCounterValue(prober.ConnectFailures, "refused_test", addr)
 	initialDrops := getCounterValue(prober.ConnectionsDropped, "refused_test", addr)
-	initialLoss := getGaugeValue(prober.LinkLossRatio, "refused_test", addr)
 
 	go prober.RunClient(ctx, cfg)
 
@@ -41,7 +40,6 @@ func TestConnectionRefusedMetrics(t *testing.T) {
 	finalTimeouts := getCounterValue(prober.ProbesTimedOut, "refused_test", addr)
 	finalConnectFails := getCounterValue(prober.ConnectFailures, "refused_test", addr)
 	finalDrops := getCounterValue(prober.ConnectionsDropped, "refused_test", addr)
-	finalLoss := getGaugeValue(prober.LinkLossRatio, "refused_test", addr)
 
 	if finalConnectFails <= initialConnectFails {
 		t.Errorf("Expected connect failures to increase on connection refused, got %v -> %v", initialConnectFails, finalConnectFails)
@@ -54,12 +52,6 @@ func TestConnectionRefusedMetrics(t *testing.T) {
 	}
 	if finalDrops != initialDrops {
 		t.Errorf("Dial failures must not count as mid-connection drops, got %v -> %v", initialDrops, finalDrops)
-	}
-	if finalLoss <= initialLoss {
-		t.Errorf("Link loss ratio must climb toward 1.0 during connection failures, got %v -> %v", initialLoss, finalLoss)
-	}
-	if finalLoss < 0.5 {
-		t.Errorf("Expected link loss ratio near 1.0 with only failed connections, got %v", finalLoss)
 	}
 }
 
@@ -166,7 +158,7 @@ func TestAccuracy_HighLatency(t *testing.T) {
 
 	time.Sleep(1500 * time.Millisecond)
 
-	rttVal := getGaugeValue(prober.LastRTT, targetName, addr)
+	rttVal := getHistogramMean(prober.RTTSeconds, targetName, addr)
 
 	if rttVal < delay.Seconds()-0.02 || rttVal > delay.Seconds()+0.05 {
 		t.Errorf("RTT Accuracy mismatch: expected ~%vs, got %vs", delay.Seconds(), rttVal)
@@ -371,7 +363,7 @@ func TestAccuracy_KnownLatencyAndLoss(t *testing.T) {
 
 	endSent := getCounterValue(prober.ProbesSent, targetName, addr)
 	endTimeout := getCounterValue(prober.ProbesTimedOut, targetName, addr)
-	rttVal := getGaugeValue(prober.LastRTT, targetName, addr)
+	rttVal := getHistogramMean(prober.RTTSeconds, targetName, addr)
 
 	sentCount := endSent - startSent
 	timeoutCount := endTimeout - startTimeout
@@ -494,57 +486,6 @@ func TestRobustness_TimestampSpoof(t *testing.T) {
 	}
 }
 
-// TestLossRatioGauge: link_loss_ratio must track the application-
-// visible loss ratio (timeouts over sent) over the sliding window.
-func TestLossRatioGauge(t *testing.T) {
-	prober.InitMetrics()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	addr := ln.Addr().String()
-
-	// Echo every 2nd probe, drop the others.
-	go func() {
-		defer ln.Close()
-		conn, err := ln.Accept()
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-		buf := make([]byte, prober.PayloadSize)
-		count := 0
-		for {
-			if _, err := io.ReadFull(conn, buf); err != nil {
-				return
-			}
-			count++
-			if count%2 == 0 {
-				continue
-			}
-			conn.Write(buf)
-		}
-	}()
-
-	targetName := "loss_gauge_test"
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	cfg := cfgWith(false, 50*time.Millisecond, 150*time.Millisecond, prober.Target{Name: targetName, Address: addr})
-	go prober.RunClient(ctx, cfg)
-
-	time.Sleep(2 * time.Second)
-
-	loss := getGaugeValue(prober.LinkLossRatio, targetName, addr)
-	if loss <= 0 || loss >= 1 {
-		t.Errorf("Expected loss gauge between 0 and 1 with 50%% drop server, got %v", loss)
-	}
-	if loss < 0.2 || loss > 0.8 {
-		t.Errorf("Expected loss gauge near 0.5 with every-2nd probe dropped, got %v", loss)
-	}
-}
-
 // TestRobustness_OutOfOrderResponses: the echo server must be able to
 // return responses in a different order than sent (groups of three
 // reversed). Every response must still be matched by sequence number,
@@ -605,7 +546,7 @@ func TestRobustness_OutOfOrderResponses(t *testing.T) {
 	if endTimeout != startTimeout {
 		t.Errorf("Reordering must not cause timeouts: %v -> %v", startTimeout, endTimeout)
 	}
-	if rtt := getGaugeValue(prober.LastRTT, targetName, addr); rtt <= 0 {
+	if rtt := getHistogramMean(prober.RTTSeconds, targetName, addr); rtt <= 0 {
 		t.Errorf("RTT must stay positive under reordering, got %v", rtt)
 	}
 }
@@ -840,8 +781,8 @@ func TestRobustness_SpuriousValidFrames(t *testing.T) {
 
 // TestIsolation_BrokenTargetDoesNotAffectHealthy: a dead link and a
 // healthy link monitored together must not contaminate each other's
-// metrics — the healthy link keeps loss 0 while the broken one pins
-// link_loss_ratio to 1.0 (regression guard for the outage-loss bug).
+// metrics — the healthy link keeps probing while the broken one
+// accumulates connect failures.
 func TestIsolation_BrokenTargetDoesNotAffectHealthy(t *testing.T) {
 	prober.InitMetrics()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -862,18 +803,12 @@ func TestIsolation_BrokenTargetDoesNotAffectHealthy(t *testing.T) {
 	if recv := getCounterValue(prober.ProbesReceived, "healthy", healthyAddr); recv <= 0 {
 		t.Errorf("Healthy link should receive probes, got %v", recv)
 	}
-	if loss := getGaugeValue(prober.LinkLossRatio, "healthy", healthyAddr); loss != 0 {
-		t.Errorf("Healthy link must keep loss 0, got %v", loss)
-	}
 	if up := getGaugeValue(prober.LinkUp, "healthy", healthyAddr); up != 1 {
 		t.Errorf("Healthy link must be up, got %v", up)
 	}
 
 	if up := getGaugeValue(prober.LinkUp, "broken", deadAddr); up != 0 {
 		t.Errorf("Broken link must be down, got %v", up)
-	}
-	if loss := getGaugeValue(prober.LinkLossRatio, "broken", deadAddr); loss < 0.9 {
-		t.Errorf("Broken link loss ratio must pin near 1.0, got %v", loss)
 	}
 }
 

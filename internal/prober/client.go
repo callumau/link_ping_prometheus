@@ -112,7 +112,6 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 	logger := slog.With("target", t.Name, "address", t.Address)
 
 	stats := NewAdaptiveStats(cfg.BaseTimeout)
-	loss := newLossTracker()
 
 	for {
 		if ctx.Err() != nil {
@@ -126,13 +125,6 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 			}
 			ConnectFailures.WithLabelValues(t.Name, t.Address).Inc()
 			LinkUp.WithLabelValues(t.Name, t.Address).Set(0)
-			// A failed connection attempt is a lost probe for the link:
-			// count it in the loss window so link_loss_ratio reaches 1.0
-			// during a full outage instead of going stale or reading 0.
-			now := time.Now()
-			loss.addSent(now, 1)
-			loss.addTimeout(now, 1)
-			LinkLossRatio.WithLabelValues(t.Name, t.Address).Set(loss.lossRatio(now))
 			logger.Warn("Connect failed", "err", err)
 			select {
 			case <-ctx.Done():
@@ -149,7 +141,7 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 			tcp.SetNoDelay(true)
 		}
 
-		err = runEchoLoop(ctx, conn, t, cfg, stats, loss, logger)
+		err = runEchoLoop(ctx, conn, t, cfg, stats, logger)
 		LinkUp.WithLabelValues(t.Name, t.Address).Set(0)
 
 		if err != nil {
@@ -210,7 +202,6 @@ func runEchoLoop(
 	t Target,
 	cfg Config,
 	stats *AdaptiveStats,
-	loss *lossTracker,
 	logger *slog.Logger,
 ) (retErr error) {
 
@@ -299,7 +290,6 @@ func runEchoLoop(
 			default:
 				if count := float64(len(pending)); count > 0 {
 					ProbesTimedOut.WithLabelValues(t.Name, t.Address).Add(count)
-					loss.addTimeout(time.Now(), int(count))
 				}
 				return
 			}
@@ -351,8 +341,7 @@ func runEchoLoop(
 				rttSec := resp.recv.Sub(sentTime).Seconds()
 
 				ProbesReceived.WithLabelValues(t.Name, t.Address).Inc()
-				RTTRecent.WithLabelValues(t.Name, t.Address).Observe(rttSec)
-				LastRTT.WithLabelValues(t.Name, t.Address).Set(rttSec)
+				RTTSeconds.WithLabelValues(t.Name, t.Address).Observe(rttSec)
 
 				if cfg.Adaptive {
 					stats.Update(rttSec)
@@ -364,26 +353,19 @@ func runEchoLoop(
 
 		now := time.Now()
 		var timeoutOccurred bool
-		var timeoutCount int
 		if len(pending) > 0 {
 			for s, sentTime := range pending {
 				if now.Sub(sentTime) > timeout {
 					ProbesTimedOut.WithLabelValues(t.Name, t.Address).Inc()
 					delete(pending, s)
 					timeoutOccurred = true
-					timeoutCount++
 				}
 			}
-		}
-		if timeoutCount > 0 {
-			loss.addTimeout(now, timeoutCount)
 		}
 
 		if timeoutOccurred && cfg.Adaptive {
 			stats.Backoff()
 		}
-
-		LinkLossRatio.WithLabelValues(t.Name, t.Address).Set(loss.lossRatio(now))
 
 		seq++
 		copy(buf[0:8], MagicBytes)
@@ -396,7 +378,6 @@ func runEchoLoop(
 		}
 
 		pending[seq] = now
-		loss.addSent(now, 1)
 		ProbesSent.WithLabelValues(t.Name, t.Address).Inc()
 	}
 }

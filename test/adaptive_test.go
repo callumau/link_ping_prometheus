@@ -81,6 +81,32 @@ func TestAdaptiveStats_BackoffClampedAndConsecutive(t *testing.T) {
 	}
 }
 
+func TestAdaptiveStats_RTOFloorAndGranularity(t *testing.T) {
+	// Hard floor: even a tiny base timeout must clamp to 200ms.
+	stats := prober.NewAdaptiveStats(10 * time.Millisecond)
+	if r := stats.CurrentRTO(); r != prober.DefaultMinRTO {
+		t.Errorf("expected RTO floored at %v, got %v", prober.DefaultMinRTO, r)
+	}
+
+	// RFC 6298: RTO = SRTT + max(G, 4*RTTVAR). On a zero-jitter link
+	// RTTVAR decays below G/4, so the clock granularity term takes over.
+	stats.Update(0.050)
+	for i := 0; i < 25; i++ {
+		stats.Update(0.050)
+	}
+	wantG := 0.050 + prober.DefaultClockGranularity.Seconds()
+	if math.Abs(stats.RTO()-wantG) > 0.0005 {
+		t.Errorf("expected RTO = SRTT + max(G, 4*RTTVAR) ≈ %f, got %f", wantG, stats.RTO())
+	}
+
+	// RTTVAR term dominates when jitter is large: 4*RTTVAR > G.
+	stats.Update(0.200)
+	expect := stats.SRTT() + 4*stats.RTTVar()
+	if stats.RTO() < expect-0.0001 {
+		t.Errorf("RTO must include 4*RTTVAR term, got %f < %f", stats.RTO(), expect)
+	}
+}
+
 func TestAdaptive_RespondsToJitter(t *testing.T) {
 	prober.InitMetrics()
 

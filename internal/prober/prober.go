@@ -16,11 +16,16 @@ import (
 
 // Protocol constants.
 const (
-	MagicBytes         = "TCPPING\x00"
-	PayloadSize        = 24
-	DefaultAlpha       = 0.125
-	DefaultBeta        = 0.25
-	DefaultMinRTO      = 100 * time.Millisecond
+	MagicBytes   = "TCPPING\x00"
+	PayloadSize  = 24
+	DefaultAlpha = 0.125
+	DefaultBeta  = 0.25
+	// DefaultClockGranularity is G in RFC 6298: the granularity of the
+	// clock used to measure RTT, used as the lower bound for 4*RTTVAR.
+	DefaultClockGranularity = time.Millisecond
+	// DefaultMinRTO floors the adaptive RTO to prevent false positive
+	// timeouts caused by normal latency jitter.
+	DefaultMinRTO      = 200 * time.Millisecond
 	DefaultMaxRTO      = 3 * time.Second
 	MaxTargetsFileSize = 1 << 20
 	MaxTargetsCount    = 1000

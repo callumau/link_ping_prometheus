@@ -5,7 +5,6 @@ import (
 	"crypto/subtle"
 	"net/http"
 	"sync"
-	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -14,15 +13,15 @@ import (
 var (
 	ProbesSent = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "link_probes_sent_total",
-		Help: "Total link probes sent on established connections (dial failures excluded).",
+		Help: "Total probes sent on established connections (dial failures excluded).",
 	}, []string{"target", "address"})
 	ProbesReceived = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "link_probes_received_total",
-		Help: "Total link probe responses received.",
+		Help: "Total probe responses received.",
 	}, []string{"target", "address"})
 	ProbesTimedOut = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "link_probes_timed_out_total",
-		Help: "Total link probes that timed out.",
+		Help: "Total probes that timed out.",
 	}, []string{"target", "address"})
 	ConnectionsDropped = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "link_connections_dropped_total",
@@ -32,16 +31,16 @@ var (
 		Name: "link_connect_failures_total",
 		Help: "Total failed connection attempts (dial errors). Not counted in sent/timeout totals.",
 	}, []string{"target", "address"})
-	RTTRecent = prometheus.NewSummaryVec(prometheus.SummaryOpts{
-		Name:       "link_rtt_seconds",
-		Help:       "Sliding-window RTT percentiles over the last 10 minutes.",
-		Objectives: map[float64]float64{0.5: 0.05, 0.9: 0.01, 0.99: 0.001},
-		MaxAge:     10 * time.Minute,
-		AgeBuckets: 5,
-	}, []string{"target", "address"})
-	LastRTT = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "link_last_rtt_seconds",
-		Help: "Most recent RTT in seconds.",
+	// RTTSeconds is a classic histogram with exponential buckets plus
+	// native histogram support (client-side observation of the same
+	// series with finer native buckets). Quantiles, means, and jitter
+	// are derived in PromQL via rate()/histogram_quantile() so any
+	// time window can be queried; nothing is pre-computed client-side.
+	RTTSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:                        "link_rtt_seconds",
+		Help:                        "Round-trip time in seconds.",
+		Buckets:                     prometheus.ExponentialBuckets(0.1, 1.2, 10),
+		NativeHistogramBucketFactor: 1.1,
 	}, []string{"target", "address"})
 	LinkUp = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "link_up",
@@ -49,11 +48,7 @@ var (
 	}, []string{"target", "address"})
 	RTOEstimate = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "link_rto_seconds",
-		Help: "Current adaptive timeout (RTO) being used.",
-	}, []string{"target", "address"})
-	LinkLossRatio = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "link_loss_ratio",
-		Help: "Link loss ratio (0.0-1.0) over the last 10 minutes: (timed-out probes + failed connection attempts) / probe attempts. Reaches 1.0 during a full outage. For arbitrary windows use rate(link_probes_timed_out_total[...]) / rate(link_probes_sent_total[...]).",
+		Help: "Current adaptive RTO being used (RFC 6298, floored at 200ms).",
 	}, []string{"target", "address"})
 	ServerProbesReceived = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "link_server_probes_received_total",
@@ -67,7 +62,7 @@ var registerOnce sync.Once
 // Safe to call multiple times; registration happens exactly once.
 func InitMetrics() {
 	registerOnce.Do(func() {
-		prometheus.MustRegister(ProbesSent, ProbesReceived, ProbesTimedOut, ConnectionsDropped, ConnectFailures, RTTRecent, LastRTT, LinkUp, RTOEstimate, LinkLossRatio, ServerProbesReceived)
+		prometheus.MustRegister(ProbesSent, ProbesReceived, ProbesTimedOut, ConnectionsDropped, ConnectFailures, RTTSeconds, LinkUp, RTOEstimate, ServerProbesReceived)
 	})
 }
 
@@ -81,10 +76,8 @@ func SeedMetrics(targets []Target) {
 		ConnectionsDropped.WithLabelValues(t.Name, t.Address).Add(0)
 		ConnectFailures.WithLabelValues(t.Name, t.Address).Add(0)
 		LinkUp.WithLabelValues(t.Name, t.Address).Set(0)
-		LastRTT.WithLabelValues(t.Name, t.Address).Set(0)
 		RTOEstimate.WithLabelValues(t.Name, t.Address).Set(0)
-		LinkLossRatio.WithLabelValues(t.Name, t.Address).Set(0)
-		RTTRecent.WithLabelValues(t.Name, t.Address)
+		RTTSeconds.WithLabelValues(t.Name, t.Address)
 	}
 }
 
