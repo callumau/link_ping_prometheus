@@ -60,8 +60,16 @@ simulator (e.g. clumsy) at X%, expect the loss ratio to sit notably
 below X%, while RTT percentiles climb.
 
 While the client cannot connect at all, no probes are sent, so the rate
-ratio is undefined — alert on `link_up == 0` and
-`rate(link_connect_failures_total[5m]) > 0` instead.
+ratio above becomes NaN (0/0). To show **100% during a full outage**
+instead of a gap, OR the ratio with the down state:
+
+```
+100 * rate(link_probes_timed_out_total[5m]) / rate(link_probes_sent_total[5m]) OR (link_up == 0) * 100
+```
+
+`OR` takes the left side whenever it has a value, and falls back to 100%
+only while the link is down. Pair it with `link_up == 0` and
+`rate(link_connect_failures_total[5m]) > 0` for alerting on reachability.
 
 To measure true network loss, run the server at the remote site and
 compare its per-client `link_server_probes_received_total` against the
@@ -140,6 +148,79 @@ alert: LinkLatencyDegraded
   expr: histogram_quantile(0.5, rate(link_rtt_seconds_bucket[10m])) > min_over_time(histogram_quantile(0.5, rate(link_rtt_seconds_bucket[10m]))[24h]) * 1.5
   for:  10m
 ```
+
+## Practical Monitoring Guide
+
+Every query below works in both Prometheus and Grafana. "Now" = run it
+as an **instant query** (Prometheus console, or a Grafana stat/single
+stat panel). "Over time" = run the **same query** in a Grafana time
+series panel — the same expression renders the history.
+
+### Latency
+
+**Latency now** (median RTT over the last 5 minutes; the smallest
+window that produces a stable value):
+
+```
+histogram_quantile(0.5, rate(link_rtt_seconds_bucket[5m]))
+```
+
+**Latency over time** — same expression in a time series panel. Swap
+`0.5` for `0.9` / `0.99` for the higher percentiles, or use the mean:
+
+```
+rate(link_rtt_seconds_sum[5m]) / rate(link_rtt_seconds_count[5m])
+```
+
+Note: when the link is fully down no RTT samples exist, so latency
+panels show a gap (not 0) during the outage — combine with `link_up`
+to see the down period.
+
+### Packet Loss
+
+**Loss now** (percentage over the last 5 minutes):
+
+```
+100 * rate(link_probes_timed_out_total[5m]) / rate(link_probes_sent_total[5m])
+```
+
+**Loss over time** — same expression in a time series panel. Change
+`[5m]` to `[1h]` / `[24h]` for longer windows.
+
+**Show 100% during an outage** (instead of a gap, which the raw ratio
+produces when no probes are sent):
+
+```
+100 * rate(link_probes_timed_out_total[5m]) / rate(link_probes_sent_total[5m]) OR (link_up == 0) * 100
+```
+
+For **true wire loss** (what a link-loss simulator injects — the client
+ratio is masked by TCP retransmission), compare the server counter with
+the client's sent counter:
+
+```
+100 * (1 - rate(link_server_probes_received_total{client="203.0.113.5"}[5m]) / rate(link_probes_sent_total{target="site-b"}[5m]))
+```
+
+### Recording Rules (cheap graphs at scale)
+
+`rate()` recomputes on every query. For many links, precompute the
+5-minute rates with recording rules so dashboards and alerts are cheap:
+
+```yaml
+groups:
+  - name: link.rules
+    rules:
+      - record: link:rtt_p50_seconds:5m
+        expr: histogram_quantile(0.5, rate(link_rtt_seconds_bucket[5m]))
+      - record: link:loss_ratio:5m
+        expr: rate(link_probes_timed_out_total[5m]) / rate(link_probes_sent_total[5m])
+      - record: link:loss_ratio:5m_withoutage
+        expr: rate(link_probes_timed_out_total[5m]) / rate(link_probes_sent_total[5m]) OR (link_up == 0)
+```
+
+Graph `link:loss_ratio:5m_withoutage * 100` for the outage-inclusive
+loss panel.
 
 ## Grafana Alloy Scraping
 
