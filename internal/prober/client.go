@@ -138,7 +138,7 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 			tcp.SetNoDelay(true)
 		}
 
-		err = runEchoLoopGuarded(ctx, conn, t, cfg, stats, logger)
+		err = runEchoLoop(ctx, conn, t, cfg, stats, logger)
 		Connected.WithLabelValues(t.Name, t.Address).Set(0)
 
 		if err != nil {
@@ -199,8 +199,14 @@ func resetTimer(t *time.Timer, d time.Duration) {
 //
 // A nil return means clean context cancellation; in-flight probes are
 // NOT counted as timeouts in that case. Any non-nil return (reader
-// error, write error, panic via the guard) flushes in-flight probes to
-// TimeoutTotal because the connection state is no longer trustworthy.
+// error, write error, panic via the recover in the deferred flush)
+// flushes in-flight probes to TimeoutTotal because the connection state
+// is no longer trustworthy. Responses that already arrived before the
+// failure are matched and counted as received first.
+//
+// A panic is recovered here so a single target's failure can never kill
+// its probe loop (or the process); it is converted to an error, which
+// the caller treats as a connection drop followed by a reconnect.
 func runEchoLoop(
 	ctx context.Context,
 	conn net.Conn,
@@ -271,12 +277,33 @@ func runEchoLoop(
 	pending := make(map[uint64]time.Time)
 
 	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("Panic in echo loop; reconnecting", "panic", r)
+			retErr = fmt.Errorf("panic in echo loop: %v", r)
+		}
 		if retErr == nil {
 			return
 		}
-		count := float64(len(pending))
-		if count > 0 {
-			TimeoutTotal.WithLabelValues(t.Name, t.Address).Add(count)
+		// Drain responses that already arrived so they count as received,
+		// not as timeouts caused by the connection failure.
+		for {
+			select {
+			case resp := <-respCh:
+				sentTime, ok := pending[resp.seq]
+				if !ok {
+					continue
+				}
+				if resp.ts != uint64(sentTime.UnixNano()) {
+					continue
+				}
+				delete(pending, resp.seq)
+				ReceivedTotal.WithLabelValues(t.Name, t.Address).Inc()
+			default:
+				if count := float64(len(pending)); count > 0 {
+					TimeoutTotal.WithLabelValues(t.Name, t.Address).Add(count)
+				}
+				return
+			}
 		}
 	}()
 
