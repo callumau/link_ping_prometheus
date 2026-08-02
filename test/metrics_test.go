@@ -87,7 +87,6 @@ func TestSeedMetrics(t *testing.T) {
 		"tcp_echo_connected",
 		"tcp_echo_last_rtt_seconds",
 		"tcp_echo_estimated_timeout_seconds",
-		"tcp_echo_rtt_seconds",
 		"tcp_echo_rtt_recent_seconds",
 	}
 	for _, w := range want {

@@ -32,11 +32,6 @@ var (
 		Name: "tcp_echo_connect_failures_total",
 		Help: "Total failed connection attempts (dial errors). Not counted in sent/timeout totals.",
 	}, []string{"target", "address"})
-	RTTSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Name:    "tcp_echo_rtt_seconds",
-		Help:    "Round-trip time in seconds.",
-		Buckets: prometheus.ExponentialBuckets(0.0005, 2, 14),
-	}, []string{"target", "address"})
 	RTTSecondsRecent = prometheus.NewSummaryVec(prometheus.SummaryOpts{
 		Name:       "tcp_echo_rtt_recent_seconds",
 		Help:       "Sliding-window RTT percentiles over the last 10 minutes.",
@@ -64,7 +59,7 @@ var registerOnce sync.Once
 // Safe to call multiple times; registration happens exactly once.
 func InitMetrics() {
 	registerOnce.Do(func() {
-		prometheus.MustRegister(SentTotal, ReceivedTotal, TimeoutTotal, DropTotal, ConnectFailuresTotal, RTTSeconds, RTTSecondsRecent, LastRTTSeconds, Connected, RTOEstimate)
+		prometheus.MustRegister(SentTotal, ReceivedTotal, TimeoutTotal, DropTotal, ConnectFailuresTotal, RTTSecondsRecent, LastRTTSeconds, Connected, RTOEstimate)
 	})
 }
 
@@ -80,7 +75,6 @@ func SeedMetrics(targets []Target) {
 		Connected.WithLabelValues(t.Name, t.Address).Set(0)
 		LastRTTSeconds.WithLabelValues(t.Name, t.Address).Set(0)
 		RTOEstimate.WithLabelValues(t.Name, t.Address).Set(0)
-		RTTSeconds.WithLabelValues(t.Name, t.Address)
 		RTTSecondsRecent.WithLabelValues(t.Name, t.Address)
 	}
 }

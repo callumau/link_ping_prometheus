@@ -287,7 +287,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "100 * rate(tcp_echo_timeouts_total{job=~\"$job\", target=~\"$target\"}[5m]) / (rate(tcp_echo_timeouts_total{job=~\"$job\", target=~\"$target\"}[5m]) + rate(tcp_echo_rtt_seconds_count{job=~\"$job\", target=~\"$target\"}[5m]))",
+          "expr": "100 * rate(tcp_echo_timeouts_total{job=~\"$job\", target=~\"$target\"}[5m]) / (rate(tcp_echo_timeouts_total{job=~\"$job\", target=~\"$target\"}[5m]) + rate(tcp_echo_sent_total{job=~\"$job\", target=~\"$target\"}[5m]))",
           "instant": true,
           "legendFormat": "{{target}}",
           "range": false,
@@ -670,7 +670,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "100 * rate(tcp_echo_timeouts_total{job=~\"$job\", target=~\"$target\"}[5m]) / (rate(tcp_echo_timeouts_total{job=~\"$job\", target=~\"$target\"}[5m]) + rate(tcp_echo_rtt_seconds_count{job=~\"$job\", target=~\"$target\"}[5m]))",
+          "expr": "100 * rate(tcp_echo_timeouts_total{job=~\"$job\", target=~\"$target\"}[5m]) / (rate(tcp_echo_timeouts_total{job=~\"$job\", target=~\"$target\"}[5m]) + rate(tcp_echo_sent_total{job=~\"$job\", target=~\"$target\"}[5m]))",
           "legendFormat": "{{target}}",
           "range": true,
           "refId": "A"
@@ -768,7 +768,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "rate(tcp_echo_rtt_seconds_sum{job=~\"$job\", target=~\"$target\"}[5m]) / rate(tcp_echo_rtt_seconds_count{job=~\"$job\", target=~\"$target\"}[5m]) * 1000",
+          "expr": "tcp_echo_rtt_recent_seconds_sum{job=~\"$job\", target=~\"$target\"} / tcp_echo_rtt_recent_seconds_count{job=~\"$job\", target=~\"$target\"} * 1000",
           "legendFormat": "{{target}}",
           "range": true,
           "refId": "A"

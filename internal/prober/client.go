@@ -355,7 +355,6 @@ func runEchoLoop(
 				rttSec := resp.recv.Sub(sentTime).Seconds()
 
 				ReceivedTotal.WithLabelValues(t.Name, t.Address).Inc()
-				RTTSeconds.WithLabelValues(t.Name, t.Address).Observe(rttSec)
 				RTTSecondsRecent.WithLabelValues(t.Name, t.Address).Observe(rttSec)
 				LastRTTSeconds.WithLabelValues(t.Name, t.Address).Set(rttSec)
 

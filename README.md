@@ -13,8 +13,9 @@ The exporter exposes the following metrics at `/metrics` (default port 2112).
 | `tcp_echo_timeouts_total` | Counter | `target`, `address` | Total requests that timed out. Packet loss = timeouts / sent. |
 | `tcp_echo_dropped_total` | Counter | `target`, `address` | Total established connections lost mid-probing. |
 | `tcp_echo_connect_failures_total` | Counter | `target`, `address` | Total failed connection attempts (dial errors). Not counted in sent/timeout totals. |
-| `tcp_echo_rtt_seconds` | Histogram | `target`, `address` | Histogram of RTT in seconds (buckets: 500 µs – ~4 s). |
 | `tcp_echo_rtt_recent_seconds` | Summary | `target`, `address` | Sliding-window RTT percentiles over 10 min (p50, p90, p99). |
+| `tcp_echo_rtt_recent_seconds_sum` | Summary | `target`, `address` | Sum of RTT over the 10 min window (divide by `_count` for mean). |
+| `tcp_echo_rtt_recent_seconds_count` | Summary | `target`, `address` | Response count over the 10 min window. |
 | `tcp_echo_last_rtt_seconds` | Gauge | `target`, `address` | Most recent RTT measurement. |
 | `tcp_echo_connected` | Gauge | `target`, `address` | 1 = connected, 0 = disconnected/reconnecting. |
 | `tcp_echo_estimated_timeout_seconds` | Gauge | `target`, `address` | Current adaptive RTO in use. |
@@ -32,23 +33,39 @@ for that condition.
 rate(tcp_echo_timeouts_total[5m]) / rate(tcp_echo_sent_total[5m]) * 100
 ```
 
-### Average Latency (RTT)
+### Average Latency (10-min Window)
+
+The summary's `_sum`/`_count` span the same 10-minute sliding window as
+the quantiles, so the mean matches the percentiles plotted alongside it.
+Do NOT use `rate()` on them — they are not counters; the window resets
+every 10 minutes.
 
 ```
-rate(tcp_echo_rtt_seconds_sum[5m]) / rate(tcp_echo_rtt_seconds_count[5m])
+tcp_echo_rtt_recent_seconds_sum / tcp_echo_rtt_recent_seconds_count
 ```
 
-### 99th Percentile Latency (Histogram)
+### Median / 90th / 99th Percentile Latency (Sliding Window)
 
 ```
-histogram_quantile(0.99, rate(tcp_echo_rtt_seconds_bucket[5m]))
-```
-
-### 99th Percentile Latency (Sliding Window)
-
-```
+tcp_echo_rtt_recent_seconds{quantile="0.5"}
+tcp_echo_rtt_recent_seconds{quantile="0.9"}
 tcp_echo_rtt_recent_seconds{quantile="0.99"}
 ```
+
+### Detecting a Baseline Shift (latency change detection)
+
+Compare the current 10-minute window against a longer baseline. Latency
+drift on a long-running link shows up as the recent window diverging
+from a 24h minimum:
+
+```
+tcp_echo_rtt_recent_seconds{quantile="0.5"}
+  > min_over_time(tcp_echo_rtt_recent_seconds{quantile="0.5"}[24h]) * 1.5
+```
+
+Outages show up immediately in `tcp_echo_connected == 0`,
+`rate(tcp_echo_timeouts_total[5m]) > 0`, and the adaptive RTO climbing
+via `tcp_echo_estimated_timeout_seconds`.
 
 ### Connection Status
 
