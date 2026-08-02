@@ -125,21 +125,27 @@ func TestServer_PerIPLimit(t *testing.T) {
 	prober.InitMetrics()
 	old := prober.MaxConnsPerIP
 	prober.MaxConnsPerIP = 3
-	defer func() { prober.MaxConnsPerIP = old }()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer ln.Close()
+
+	done := make(chan struct{})
 	go func() {
-		<-ctx.Done()
-		ln.Close()
+		prober.ServeListener(ctx, ln, prober.DefaultReadTimeout)
+		close(done)
 	}()
-	go prober.ServeListener(ctx, ln, prober.DefaultReadTimeout)
+	// Restore the shared test variable only after ServeListener has
+	// returned; it reads MaxConnsPerIP on every accept.
+	defer func() {
+		cancel()
+		<-done
+		prober.MaxConnsPerIP = old
+	}()
 	addr := ln.Addr().String()
 
 	probe := make([]byte, prober.PayloadSize)
@@ -177,6 +183,53 @@ func TestServer_PerIPLimit(t *testing.T) {
 	}
 	if _, err := io.ReadFull(c4, make([]byte, prober.PayloadSize)); err == nil {
 		t.Error("4th connection received echo despite per-IP limit")
+	}
+}
+
+// TestServer_ShutdownWaitsForHandlers: ServeListener must return after
+// context cancellation even when a connection is established, proving
+// handler goroutines are joined (not abandoned) on shutdown.
+func TestServer_ShutdownWaitsForHandlers(t *testing.T) {
+	prober.InitMetrics()
+	ctx, cancel := context.WithCancel(context.Background())
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- prober.ServeListener(ctx, ln, 30*time.Second)
+	}()
+	addr := ln.Addr().String()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	probe := make([]byte, prober.PayloadSize)
+	copy(probe, prober.MagicBytes)
+	conn.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Write(probe); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(conn, make([]byte, prober.PayloadSize)); err != nil {
+		t.Fatalf("initial echo failed: %v", err)
+	}
+
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("ServeListener returned error: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("ServeListener did not return within 10s of cancel — handler wait hangs")
 	}
 }
 

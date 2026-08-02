@@ -47,8 +47,10 @@ func RunServer(ctx context.Context, addr string, readTimeout time.Duration) erro
 // ServeListener accepts connections on ln and handles each in a
 // goroutine. Limits: MaxConnsGlobal total, MaxConnsPerIP per remote IP.
 // Transient accept errors back off exponentially (10ms..1s) instead of
-// hot-looping. On ctx cancellation all tracked connections are closed.
-// Blocks until ctx is cancelled or ln is closed.
+// hot-looping. On ctx cancellation all tracked connections are closed
+// and ServeListener waits (bounded by 5s) for every handler goroutine
+// to finish before returning. Blocks until ctx is cancelled or ln is
+// closed.
 func ServeListener(ctx context.Context, ln net.Listener, readTimeout time.Duration) error {
 	if readTimeout <= 0 {
 		readTimeout = DefaultReadTimeout
@@ -58,29 +60,41 @@ func ServeListener(ctx context.Context, ln net.Listener, readTimeout time.Durati
 	var mu sync.Mutex
 	openConns := make(map[net.Conn]struct{})
 	perIP := make(map[string]int)
+	var handlers sync.WaitGroup
 
 	// Force-close all open connections on shutdown so handleConn
 	// goroutines exit promptly instead of lingering until readTimeout.
+	// Connections are collected under the lock and closed outside it:
+	// Close may block on platform cleanup and must never hold the lock
+	// the handlers' deferred cleanup needs. The listener is closed too:
+	// Accept blocks until it errors, so ctx cancellation alone would
+	// never let the accept loop exit.
 	go func() {
 		<-ctx.Done()
+		ln.Close()
 		mu.Lock()
+		conns := make([]net.Conn, 0, len(openConns))
 		for c := range openConns {
-			c.Close()
+			conns = append(conns, c)
 		}
 		mu.Unlock()
+		for _, c := range conns {
+			c.Close()
+		}
 	}()
 
 	backoff := 10 * time.Millisecond
+loop:
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil
+				break loop
 			}
 			slog.Warn("Accept error", "err", err, "backoff", backoff)
 			select {
 			case <-ctx.Done():
-				return nil
+				break loop
 			case <-time.After(backoff):
 			}
 			backoff *= 2
@@ -116,7 +130,9 @@ func ServeListener(ctx context.Context, ln net.Listener, readTimeout time.Durati
 		openConns[conn] = struct{}{}
 		mu.Unlock()
 
+		handlers.Add(1)
 		go func(c net.Conn, remoteIP string) {
+			defer handlers.Done()
 			defer func() {
 				mu.Lock()
 				delete(openConns, c)
@@ -129,6 +145,24 @@ func ServeListener(ctx context.Context, ln net.Listener, readTimeout time.Durati
 			}()
 			handleConn(c, readTimeout)
 		}(conn, ip)
+	}
+
+	waitForHandlers(&handlers)
+	return nil
+}
+
+// waitForHandlers blocks until all connection handler goroutines have
+// finished, with a bounded timeout so shutdown can never hang.
+func waitForHandlers(handlers *sync.WaitGroup) {
+	done := make(chan struct{})
+	go func() {
+		handlers.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		slog.Warn("Timed out waiting for connection handlers to finish")
 	}
 }
 
