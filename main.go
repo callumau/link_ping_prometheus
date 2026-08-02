@@ -94,20 +94,19 @@ func setupLogger(jsonFormat bool) {
 }
 
 // buildConfig resolves CLI flags into a prober.Config. It handles single
-// (-target) and multi-target (-targets) modes. On failure it logs and exits.
-func buildConfig() prober.Config {
+// (-target) and multi-target (-targets) modes. Failures are returned as
+// errors so the caller can abort before any server starts.
+func buildConfig() (prober.Config, error) {
 	var targets []prober.Target
 	if *flTargets != "" {
 		var err error
 		targets, err = prober.LoadTargets(*flTargets)
 		if err != nil {
-			slog.Error("Failed to load targets", "err", err)
-			os.Exit(1)
+			return prober.Config{}, fmt.Errorf("load targets: %w", err)
 		}
 	} else if *flTarget != "" {
 		if err := prober.ValidateTarget(*flTarget); err != nil {
-			slog.Error("Invalid target", "err", err)
-			os.Exit(1)
+			return prober.Config{}, fmt.Errorf("invalid target: %w", err)
 		}
 		targets = []prober.Target{{Name: "default", Address: *flTarget}}
 	}
@@ -116,7 +115,7 @@ func buildConfig() prober.Config {
 		Adaptive:     *flAdaptive,
 		BaseInterval: *flBaseInterval,
 		BaseTimeout:  *flBaseTimeout,
-	}
+	}, nil
 }
 
 // resolveMetricsAuth combines the CLI flags with the TCP_PING_METRICS_USER /
@@ -267,12 +266,28 @@ func (p *program) run() error {
 		return fmt.Errorf("-read-timeout must be positive, got %v", *flReadTimeout)
 	}
 
+	var cfg prober.Config
+	if *flMode != "server" {
+		var err error
+		cfg, err = buildConfig()
+		if err != nil {
+			return err
+		}
+		if cfg.BaseInterval >= *flReadTimeout {
+			slog.Warn("probe interval is not well below the server read-timeout; the server will disconnect idle clients mid-probing",
+				"interval", cfg.BaseInterval, "read_timeout", *flReadTimeout)
+		}
+	}
+
+	// Capture flag values before spawning the goroutine: it may outlive
+	// flag mutation by tests or shutdown code.
+	metricsAddr := *flMetrics
 	go func() {
 		mx := http.NewServeMux()
 		mx.Handle("/metrics", prober.MetricsAuth(user, pass, promhttp.Handler()))
-		slog.Info("Starting metrics server", "addr", *flMetrics, "tls", cert != "", "auth", user != "")
+		slog.Info("Starting metrics server", "addr", metricsAddr, "tls", cert != "", "auth", user != "")
 		srv := &http.Server{
-			Addr:         *flMetrics,
+			Addr:         metricsAddr,
 			Handler:      mx,
 			ReadTimeout:  10 * time.Second,
 			WriteTimeout: 10 * time.Second,
@@ -302,7 +317,6 @@ func (p *program) run() error {
 	case "server":
 		return prober.RunServer(p.ctx, *flListen, *flReadTimeout)
 	case "client":
-		cfg := buildConfig()
 		return prober.RunClient(p.ctx, cfg)
 	case "both":
 		// Local WaitGroup: Add is sequenced before the goroutine starts
@@ -315,7 +329,6 @@ func (p *program) run() error {
 				slog.Error("Server error", "err", err)
 			}
 		}()
-		cfg := buildConfig()
 		clientErr := prober.RunClient(p.ctx, cfg)
 		wg.Wait()
 		return clientErr

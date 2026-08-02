@@ -100,6 +100,16 @@ func TestRunRejectsBadFlagCombos(t *testing.T) {
 			t.Error("expected error for negative read timeout")
 		}
 	})
+
+	t.Run("client mode with invalid target", func(t *testing.T) {
+		saveFlags(t)
+		*flMode = "client"
+		*flTarget = "not an address"
+		prg := &program{ctx: context.Background()}
+		if err := prg.run(); err == nil {
+			t.Error("expected error for invalid target in client mode")
+		}
+	})
 }
 
 // TestProgramStartStopBothMode exercises the service Start/Stop lifecycle
