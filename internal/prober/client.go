@@ -126,6 +126,13 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 			}
 			ConnectFailures.WithLabelValues(t.Name, t.Address).Inc()
 			LinkUp.WithLabelValues(t.Name, t.Address).Set(0)
+			// A failed connection attempt is a lost probe for the link:
+			// count it in the loss window so link_loss_ratio reaches 1.0
+			// during a full outage instead of going stale or reading 0.
+			now := time.Now()
+			loss.addSent(now, 1)
+			loss.addTimeout(now, 1)
+			LinkLossRatio.WithLabelValues(t.Name, t.Address).Set(loss.lossRatio(now))
 			logger.Warn("Connect failed", "err", err)
 			select {
 			case <-ctx.Done():

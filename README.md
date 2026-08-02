@@ -26,7 +26,7 @@ The exporter exposes the following metrics at `/metrics` (default port 2112).
 | Metric Name | Type | Labels | Description |
 |---|---|---|---|
 | `link_up` | Gauge | `target`, `address` | 1 = connected, 0 = disconnected/reconnecting. |
-| `link_loss_ratio` | Gauge | `target`, `address` | Packet loss ratio (0.0–1.0) over the last 10 min (timeouts / sent). |
+| `link_loss_ratio` | Gauge | `target`, `address` | Link loss ratio (0.0–1.0) over the last 10 min: (timed-out probes + failed connections) / probe attempts. Pins to 1.0 during an outage. |
 | `link_probes_sent_total` | Counter | `target`, `address` | Total probes sent on established connections (dial failures excluded). |
 | `link_probes_received_total` | Counter | `target`, `address` | Total probe responses received and validated. |
 | `link_probes_timed_out_total` | Counter | `target`, `address` | Total probes that timed out. |
@@ -65,10 +65,10 @@ adaptive RTO still count as received — with inflated RTT. With a link
 loss simulator (e.g. clumsy) at X%, expect the loss gauge to sit notably
 below X%, while RTT percentiles climb.
 
-While the client cannot connect at all, `link_up == 0` and
-`rate(link_connect_failures_total[5m]) > 0` are the conditions to alert
-on — the loss ratio is undefined for a down link rather than pinned at
-100%.
+While the client cannot connect at all, each failed connection attempt
+counts as a lost probe in the loss window, so `link_loss_ratio` pins to
+1.0 for the outage duration (and decays back once probes flow again).
+Alert on it directly, or alongside `link_up == 0`:
 
 To measure true network loss, run the server at the remote site and
 compare its per-client `link_server_probes_received_total` against the

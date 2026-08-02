@@ -30,6 +30,7 @@ func TestConnectionRefusedMetrics(t *testing.T) {
 	initialTimeouts := getCounterValue(prober.ProbesTimedOut, "refused_test", addr)
 	initialConnectFails := getCounterValue(prober.ConnectFailures, "refused_test", addr)
 	initialDrops := getCounterValue(prober.ConnectionsDropped, "refused_test", addr)
+	initialLoss := getGaugeValue(prober.LinkLossRatio, "refused_test", addr)
 
 	go prober.RunClient(ctx, cfg)
 
@@ -39,6 +40,7 @@ func TestConnectionRefusedMetrics(t *testing.T) {
 	finalTimeouts := getCounterValue(prober.ProbesTimedOut, "refused_test", addr)
 	finalConnectFails := getCounterValue(prober.ConnectFailures, "refused_test", addr)
 	finalDrops := getCounterValue(prober.ConnectionsDropped, "refused_test", addr)
+	finalLoss := getGaugeValue(prober.LinkLossRatio, "refused_test", addr)
 
 	if finalConnectFails <= initialConnectFails {
 		t.Errorf("Expected connect failures to increase on connection refused, got %v -> %v", initialConnectFails, finalConnectFails)
@@ -51,6 +53,12 @@ func TestConnectionRefusedMetrics(t *testing.T) {
 	}
 	if finalDrops != initialDrops {
 		t.Errorf("Dial failures must not count as mid-connection drops, got %v -> %v", initialDrops, finalDrops)
+	}
+	if finalLoss <= initialLoss {
+		t.Errorf("Link loss ratio must climb toward 1.0 during connection failures, got %v -> %v", initialLoss, finalLoss)
+	}
+	if finalLoss < 0.5 {
+		t.Errorf("Expected link loss ratio near 1.0 with only failed connections, got %v", finalLoss)
 	}
 }
 

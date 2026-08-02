@@ -53,7 +53,7 @@ var (
 	}, []string{"target", "address"})
 	LinkLossRatio = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "link_loss_ratio",
-		Help: "Packet loss ratio (0.0-1.0) over the last 10 minutes (timeouts / sent on the wire). For arbitrary windows use rate(link_probes_timed_out_total[...]) / rate(link_probes_sent_total[...]).",
+		Help: "Link loss ratio (0.0-1.0) over the last 10 minutes: (timed-out probes + failed connection attempts) / probe attempts. Reaches 1.0 during a full outage. For arbitrary windows use rate(link_probes_timed_out_total[...]) / rate(link_probes_sent_total[...]).",
 	}, []string{"target", "address"})
 	ServerProbesReceived = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "link_server_probes_received_total",
