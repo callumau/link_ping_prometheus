@@ -73,6 +73,56 @@ via `tcp_echo_estimated_timeout_seconds`.
 tcp_echo_connected
 ```
 
+## Grafana Alloy Scraping
+
+The example below scrapes the metrics endpoint, keeps only `tcp_*`
+metrics (dropping `go_*`, `process_*`, and the Prometheus client's own
+internals to save remote-write bandwidth and storage), and forwards the
+result to a `prometheus.remote_write` component.
+
+Add your own `prometheus.remote_write "default"` block (endpoint URL,
+credentials) — it is intentionally not included here. If the remote
+write component has a different name, update the
+`prometheus.remote_write.default.receiver` reference below.
+
+```river
+prometheus.scrape "tcp_ping" {
+	targets = [{
+		"__address__" = "localhost:2112",
+	}]
+	metrics_path    = "/metrics"
+	scrape_interval = "15s"
+	scrape_timeout  = "10s"
+	forward_to      = [prometheus.relabel.tcp_ping_keep.receiver]
+}
+
+prometheus.relabel "tcp_ping_keep" {
+	rule {
+		source_labels = ["__name__"]
+		regex         = "tcp_.*"
+		action        = "keep"
+	}
+	forward_to = [prometheus.remote_write.default.receiver]
+}
+```
+
+If the agent and the prober run on different hosts, replace
+`localhost:2112` with the prober's address. With metrics basic auth
+enabled, add a `basic_auth` block to the scrape targets instead:
+
+```river
+prometheus.scrape "tcp_ping" {
+	targets = [{
+		"__address__" = "10.0.0.5:2112",
+	}]
+	...
+	basic_auth {
+		username = "monitoring"
+		password = "secret"
+	}
+}
+```
+
 ## Build
 
 ```sh
