@@ -43,6 +43,7 @@ var (
 	flBaseInterval = flag.Duration("interval", 500*time.Millisecond, "Client: Probe interval (must stay well below server -read-timeout)")
 	flBaseTimeout  = flag.Duration("timeout", 1*time.Second, "Client: Base/Initial timeout")
 	flReadTimeout  = flag.Duration("read-timeout", prober.DefaultReadTimeout, "Server: idle read deadline per connection")
+	flSource       = flag.String("source", "", "Source label applied to all metrics, e.g. local datacenter (sydney-dc)")
 
 	flMetricsBasicAuthUser = flag.String("metrics-user", "", "Metrics: Basic auth username (empty disables auth; env TCP_PING_METRICS_USER)")
 	flMetricsBasicAuthPass = flag.String("metrics-pass", "", "Metrics: Basic auth password (env TCP_PING_METRICS_PASS; prefer env over CLI to avoid ps exposure)")
@@ -111,6 +112,7 @@ func buildConfig() (prober.Config, error) {
 		targets = []prober.Target{{Name: "default", Address: *flTarget}}
 	}
 	return prober.Config{
+		Source:       *flSource,
 		Targets:      targets,
 		Adaptive:     *flAdaptive,
 		BaseInterval: *flBaseInterval,
@@ -315,7 +317,7 @@ func (p *program) run() error {
 	mode := *flMode
 	switch mode {
 	case "server":
-		return prober.RunServer(p.ctx, *flListen, *flReadTimeout)
+		return prober.RunServer(p.ctx, *flListen, *flReadTimeout, *flSource)
 	case "client":
 		return prober.RunClient(p.ctx, cfg)
 	case "both":
@@ -325,7 +327,7 @@ func (p *program) run() error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := prober.RunServer(p.ctx, *flListen, *flReadTimeout); err != nil {
+			if err := prober.RunServer(p.ctx, *flListen, *flReadTimeout, *flSource); err != nil {
 				slog.Error("Server error", "err", err)
 			}
 		}()

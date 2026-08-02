@@ -15,6 +15,9 @@ import (
 	"tcp_ping_prometheus/internal/prober"
 )
 
+// testSource is the topology label applied in test metric queries.
+const testSource = "test"
+
 type testGlobals struct {
 	adaptive bool
 	interval time.Duration
@@ -34,7 +37,7 @@ func (a *atomicLatency) get() time.Duration {
 
 func getCounterValue(vec *prometheus.CounterVec, targetName, address string) float64 {
 	var m dto.Metric
-	if err := vec.WithLabelValues(targetName, address).Write(&m); err != nil {
+	if err := vec.WithLabelValues(testSource, targetName, address).Write(&m); err != nil {
 		return 0
 	}
 	return m.GetCounter().GetValue()
@@ -50,7 +53,7 @@ func getPlainCounterValue(c prometheus.Counter) float64 {
 
 func getCounterValue1(vec *prometheus.CounterVec, label1 string) float64 {
 	var m dto.Metric
-	if err := vec.WithLabelValues(label1).Write(&m); err != nil {
+	if err := vec.WithLabelValues(testSource, label1).Write(&m); err != nil {
 		return 0
 	}
 	return m.GetCounter().GetValue()
@@ -58,14 +61,14 @@ func getCounterValue1(vec *prometheus.CounterVec, label1 string) float64 {
 
 func getGaugeValue(vec *prometheus.GaugeVec, targetName, address string) float64 {
 	var m dto.Metric
-	if err := vec.WithLabelValues(targetName, address).Write(&m); err != nil {
+	if err := vec.WithLabelValues(testSource, targetName, address).Write(&m); err != nil {
 		return 0
 	}
 	return m.GetGauge().GetValue()
 }
 
 func getHistogramMean(vec *prometheus.HistogramVec, targetName, address string) float64 {
-	obs, err := vec.GetMetricWithLabelValues(targetName, address)
+	obs, err := vec.GetMetricWithLabelValues(testSource, targetName, address)
 	if err != nil {
 		return 0
 	}
@@ -140,6 +143,7 @@ func makeTargets(count int) []prober.Target {
 
 func cfgWith(adaptive bool, interval, timeout time.Duration, targets ...prober.Target) prober.Config {
 	return prober.Config{
+		Source:       testSource,
 		Targets:      targets,
 		Adaptive:     adaptive,
 		BaseInterval: interval,

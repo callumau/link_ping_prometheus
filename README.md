@@ -9,8 +9,9 @@ link, with adaptive timeout capabilities (RFC 6298).
 
 1. **Remote site (B):** run the echo server.
    `./tcp_ping_prometheus -mode=server -listen=":4000" -metrics=":2112"`
-2. **Local site (A):** run the client, targeting site B's address.
-   `./tcp_ping_prometheus -mode=client -target="203.0.113.10:4000" -metrics=":2112"`
+2. **Local site (A):** run the client, targeting site B's address, and
+   tag every metric with the local topology label:
+   `./tcp_ping_prometheus -mode=client -target="203.0.113.10:4000" -source="sydney-dc" -metrics=":2112"`
 3. Scrape both `/metrics` endpoints into Prometheus (or forward via
    Grafana Alloy, see below) and open the bundled dashboard.
 
@@ -25,16 +26,17 @@ The exporter exposes the following metrics at `/metrics` (default port 2112).
 
 | Metric Name | Type | Labels | Description |
 |---|---|---|---|
-| `link_up` | Gauge | `target`, `address` | 1 = connected, 0 = disconnected/reconnecting. |
-| `link_probes_sent_total` | Counter | `target`, `address` | Total probes sent on established connections (dial failures excluded). |
-| `link_probes_received_total` | Counter | `target`, `address` | Total probe responses received and validated. |
-| `link_probes_timed_out_total` | Counter | `target`, `address` | Total probes that timed out. |
-| `link_connections_dropped_total` | Counter | `target`, `address` | Total established connections lost mid-probing. |
-| `link_connect_failures_total` | Counter | `target`, `address` | Total failed connection attempts (dial errors). Not counted in sent/timeout totals. |
-| `link_rtt_seconds` | Histogram | `target`, `address` | RTT histogram: classic exponential buckets (0.1s, ×1.2, ×10) plus native histogram support (`NativeHistogramBucketFactor` 1.1). |
-| `link_rtt_seconds_bucket/sum/count` | Histogram | `target`, `address` | Classic-bucket series; quantiles, means, and jitter are derived in PromQL over any window. |
-| `link_rto_seconds` | Gauge | `target`, `address` | Current adaptive RTO in use (RFC 6298, floored at 200ms). |
-| `link_server_probes_received_total` | Counter | `client` | Valid probes received by the server, per remote client IP (server mode only). |
+| `link_up` | Gauge | `source`, `target`, `address` | 1 = connected, 0 = disconnected/reconnecting. |
+| `link_probes_sent_total` | Counter | `source`, `target`, `address` | Total probes sent on established connections (dial failures excluded). |
+| `link_probes_received_total` | Counter | `source`, `target`, `address` | Total probe responses received and validated. |
+| `link_probes_timed_out_total` | Counter | `source`, `target`, `address` | Total probes that timed out. |
+| `link_probes_inflight` | Gauge | `source`, `target`, `address` | Current number of probes sent but waiting for a response or timeout. Grows during stalls — deadlock/detached-peer detection. |
+| `link_connections_dropped_total` | Counter | `source`, `target`, `address` | Total established connections lost mid-probing. |
+| `link_connect_failures_total` | Counter | `source`, `target`, `address` | Total failed connection attempts (dial errors). Not counted in sent/timeout totals. |
+| `link_rtt_seconds` | Histogram | `source`, `target`, `address` | RTT histogram with explicit buckets `{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0}` s plus native histogram support (`NativeHistogramBucketFactor` 1.1). |
+| `link_rtt_seconds_bucket/sum/count` | Histogram | `source`, `target`, `address` | Classic-bucket series; quantiles, means, and jitter are derived in PromQL over any window. |
+| `link_rto_seconds` | Gauge | `source`, `target`, `address` | Current adaptive RTO in use (RFC 6298, floored at 200ms). |
+| `link_server_probes_received_total` | Counter | `source`, `client` | Valid probes received by the server, per remote client IP (server mode only). |
 
 Derived values (percentiles, loss, jitter) are deliberately **not**
 pre-computed in the exporter — Prometheus `rate()` / `histogram_quantile()`
@@ -90,10 +92,11 @@ histogram_quantile(0.9,  rate(link_rtt_seconds_bucket[5m]))
 histogram_quantile(0.99, rate(link_rtt_seconds_bucket[5m]))
 ```
 
-Classic buckets span 0.1s–~0.5s (0.1 × 1.2^9 ≈ 0.516s); values beyond
-the top bucket land in `+Inf`. The native histogram (bucket factor 1.1)
-carries fine-grained data; Prometheus scrapes and aggregates it
-transparently when native-histogram support is enabled.
+Explicit buckets cover sub-100ms LAN RTTs (5ms lower bound) up to 10s
+of link degradation; values beyond 10s land in `+Inf`. The native
+histogram (bucket factor 1.1) carries fine-grained data; Prometheus
+scrapes and aggregates it transparently when native-histogram support
+is enabled.
 
 ### Jitter (p90 − p50)
 
@@ -228,6 +231,7 @@ tcp_ping_prometheus -mode=<mode> [flags]
 | `-timeout` | `1s` | Client: Base/initial probe timeout |
 | `-adaptive` | `true` | Enable adaptive RTO based on link quality |
 | `-read-timeout` | `10s` | Server: idle read deadline per connection |
+| `-source` | `""` | Source label applied to every metric series, e.g. the local site or datacenter (`sydney-dc`) |
 | `-metrics-user` | `""` | Basic auth username for /metrics (empty = disabled; env `TCP_PING_METRICS_USER`) |
 | `-metrics-pass` | `""` | Basic auth password for /metrics (env `TCP_PING_METRICS_PASS`; prefer env over CLI to avoid `ps` exposure) |
 | `-metrics-tls-cert` | `""` | TLS certificate file for /metrics (requires `-metrics-tls-key`) |

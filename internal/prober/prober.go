@@ -33,6 +33,9 @@ const (
 
 // Config holds the client probing configuration.
 type Config struct {
+	// Source is the topology label applied to every metric series, e.g.
+	// the local datacenter or site name ("sydney-dc").
+	Source       string
 	Targets      []Target
 	Adaptive     bool
 	BaseInterval time.Duration

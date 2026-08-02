@@ -9,29 +9,38 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// Prometheus metric descriptors. All use the label set {target, address}.
+// RTTBuckets are the explicit histogram buckets for link_rtt_seconds.
+// Fixed values (not generated) avoid floating-point label artifacts and
+// cover LAN links below 100ms up to 10s link outages.
+var RTTBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0}
+
+// Prometheus metric descriptors. All use the label set {source, target, address}.
 var (
 	ProbesSent = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "link_probes_sent_total",
 		Help: "Total probes sent on established connections (dial failures excluded).",
-	}, []string{"target", "address"})
+	}, []string{"source", "target", "address"})
 	ProbesReceived = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "link_probes_received_total",
 		Help: "Total probe responses received.",
-	}, []string{"target", "address"})
+	}, []string{"source", "target", "address"})
 	ProbesTimedOut = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "link_probes_timed_out_total",
 		Help: "Total probes that timed out.",
-	}, []string{"target", "address"})
+	}, []string{"source", "target", "address"})
+	ProbesInflight = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "link_probes_inflight",
+		Help: "Current number of probes sent but waiting for a response or timeout.",
+	}, []string{"source", "target", "address"})
 	ConnectionsDropped = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "link_connections_dropped_total",
 		Help: "Total established connections that were lost mid-probing.",
-	}, []string{"target", "address"})
+	}, []string{"source", "target", "address"})
 	ConnectFailures = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "link_connect_failures_total",
 		Help: "Total failed connection attempts (dial errors). Not counted in sent/timeout totals.",
-	}, []string{"target", "address"})
-	// RTTSeconds is a classic histogram with exponential buckets plus
+	}, []string{"source", "target", "address"})
+	// RTTSeconds is a classic histogram with explicit buckets plus
 	// native histogram support (client-side observation of the same
 	// series with finer native buckets). Quantiles, means, and jitter
 	// are derived in PromQL via rate()/histogram_quantile() so any
@@ -39,21 +48,21 @@ var (
 	RTTSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:                        "link_rtt_seconds",
 		Help:                        "Round-trip time in seconds.",
-		Buckets:                     prometheus.ExponentialBuckets(0.1, 1.2, 10),
+		Buckets:                     RTTBuckets,
 		NativeHistogramBucketFactor: 1.1,
-	}, []string{"target", "address"})
+	}, []string{"source", "target", "address"})
 	LinkUp = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "link_up",
 		Help: "1 if currently connected, 0 otherwise.",
-	}, []string{"target", "address"})
+	}, []string{"source", "target", "address"})
 	RTOEstimate = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "link_rto_seconds",
 		Help: "Current adaptive RTO being used (RFC 6298, floored at 200ms).",
-	}, []string{"target", "address"})
+	}, []string{"source", "target", "address"})
 	ServerProbesReceived = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "link_server_probes_received_total",
-		Help: "Total validated probes received by the server, labelled by remote client address. Compare with the client's link_probes_sent_total to measure true network loss: TCP retransmission hides lost segments from the client, so (sent - server_received) / sent is the real loss rate.",
-	}, []string{"client"})
+		Help: "Total validated probes received by the server, labelled by source and remote client address. Compare with the client's link_probes_sent_total to measure true network loss: TCP retransmission hides lost segments from the client, so (sent - server_received) / sent is the real loss rate.",
+	}, []string{"source", "client"})
 )
 
 var registerOnce sync.Once
@@ -62,22 +71,24 @@ var registerOnce sync.Once
 // Safe to call multiple times; registration happens exactly once.
 func InitMetrics() {
 	registerOnce.Do(func() {
-		prometheus.MustRegister(ProbesSent, ProbesReceived, ProbesTimedOut, ConnectionsDropped, ConnectFailures, RTTSeconds, LinkUp, RTOEstimate, ServerProbesReceived)
+		prometheus.MustRegister(ProbesSent, ProbesReceived, ProbesTimedOut, ProbesInflight, ConnectionsDropped, ConnectFailures, RTTSeconds, LinkUp, RTOEstimate, ServerProbesReceived)
 	})
 }
 
 // SeedMetrics initialises every metric series for each target so they all
-// surface in /metrics output even before the first event.
-func SeedMetrics(targets []Target) {
+// surface in /metrics output even before the first event. source is the
+// topology label applied to every series (e.g. the local datacenter).
+func SeedMetrics(source string, targets []Target) {
 	for _, t := range targets {
-		ProbesSent.WithLabelValues(t.Name, t.Address).Add(0)
-		ProbesReceived.WithLabelValues(t.Name, t.Address).Add(0)
-		ProbesTimedOut.WithLabelValues(t.Name, t.Address).Add(0)
-		ConnectionsDropped.WithLabelValues(t.Name, t.Address).Add(0)
-		ConnectFailures.WithLabelValues(t.Name, t.Address).Add(0)
-		LinkUp.WithLabelValues(t.Name, t.Address).Set(0)
-		RTOEstimate.WithLabelValues(t.Name, t.Address).Set(0)
-		RTTSeconds.WithLabelValues(t.Name, t.Address)
+		ProbesSent.WithLabelValues(source, t.Name, t.Address).Add(0)
+		ProbesReceived.WithLabelValues(source, t.Name, t.Address).Add(0)
+		ProbesTimedOut.WithLabelValues(source, t.Name, t.Address).Add(0)
+		ProbesInflight.WithLabelValues(source, t.Name, t.Address).Set(0)
+		ConnectionsDropped.WithLabelValues(source, t.Name, t.Address).Add(0)
+		ConnectFailures.WithLabelValues(source, t.Name, t.Address).Add(0)
+		LinkUp.WithLabelValues(source, t.Name, t.Address).Set(0)
+		RTOEstimate.WithLabelValues(source, t.Name, t.Address).Set(0)
+		RTTSeconds.WithLabelValues(source, t.Name, t.Address)
 	}
 }
 

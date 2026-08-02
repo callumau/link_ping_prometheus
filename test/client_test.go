@@ -812,6 +812,101 @@ func TestIsolation_BrokenTargetDoesNotAffectHealthy(t *testing.T) {
 	}
 }
 
+// TestInflight_ClimbsOnStallThenDrains: link_probes_inflight must grow
+// while responses are withheld (the deadlock-detection signal) and
+// return to zero on cancellation, clean or otherwise.
+func TestInflight_ClimbsOnStallThenDrains(t *testing.T) {
+	prober.InitMetrics()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	addr := ln.Addr().String()
+
+	// Read but never respond.
+	go func() {
+		defer ln.Close()
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, prober.PayloadSize)
+		for {
+			if _, err := io.ReadFull(conn, buf); err != nil {
+				return
+			}
+		}
+	}()
+
+	targetName := "inflight_stall_test"
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Long timeout relative to interval: nothing ever resolves, so the
+	// in-flight count must climb while the stall lasts.
+	cfg := cfgWith(false, 50*time.Millisecond, 5*time.Second, prober.Target{Name: targetName, Address: addr})
+	go prober.RunClient(ctx, cfg)
+
+	time.Sleep(500 * time.Millisecond)
+	if got := getGaugeValue(prober.ProbesInflight, targetName, addr); got < 5 {
+		t.Errorf("In-flight probes should climb during a stall, got %v", got)
+	}
+
+	cancel()
+	time.Sleep(300 * time.Millisecond)
+
+	if got := getGaugeValue(prober.ProbesInflight, targetName, addr); got != 0 {
+		t.Errorf("In-flight must drain to 0 after cancellation, got %v", got)
+	}
+}
+
+// TestInflight_ReturnsToZeroOnDrop: a connection dropped mid-probing
+// must flush its in-flight probes (counted as timeouts) and the gauge
+// must land at zero after the error path.
+func TestInflight_ReturnsToZeroOnDrop(t *testing.T) {
+	prober.InitMetrics()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	addr := ln.Addr().String()
+
+	// Echo a few times, then die mid-probing.
+	go func() {
+		defer ln.Close()
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, prober.PayloadSize)
+		for i := 0; i < 3; i++ {
+			if _, err := io.ReadFull(conn, buf); err != nil {
+				return
+			}
+			if _, err := conn.Write(buf); err != nil {
+				return
+			}
+		}
+		// Close without draining: client sees EOF/error mid-flight.
+	}()
+
+	targetName := "inflight_drop_test"
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := cfgWith(false, 50*time.Millisecond, 200*time.Millisecond, prober.Target{Name: targetName, Address: addr})
+	go prober.RunClient(ctx, cfg)
+
+	time.Sleep(800 * time.Millisecond)
+
+	if got := getGaugeValue(prober.ProbesInflight, targetName, addr); got != 0 {
+		t.Errorf("In-flight must drain to 0 after a connection drop, got %v", got)
+	}
+}
+
 // TestGracefulShutdown_NoPhantomTimeouts: probes still in flight when the
 // context is cancelled must NOT be flushed into ProbesTimedOut — otherwise
 // every deploy/restart injects phantom packet loss.

@@ -61,7 +61,7 @@ func TestSeedMetrics(t *testing.T) {
 	prober.InitMetrics()
 
 	name := "seed_unique_target"
-	prober.SeedMetrics([]prober.Target{{Name: name, Address: "192.0.2.1:4000"}})
+	prober.SeedMetrics(testSource, []prober.Target{{Name: name, Address: "192.0.2.1:4000"}})
 
 	mfs, err := prometheus.DefaultGatherer.Gather()
 	if err != nil {
@@ -82,6 +82,7 @@ func TestSeedMetrics(t *testing.T) {
 		"link_probes_sent_total",
 		"link_probes_received_total",
 		"link_probes_timed_out_total",
+		"link_probes_inflight",
 		"link_connections_dropped_total",
 		"link_connect_failures_total",
 		"link_up",

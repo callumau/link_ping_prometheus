@@ -67,7 +67,7 @@ func TestServer_EnforceSizeAndHeader(t *testing.T) {
 		<-ctx.Done()
 		ln.Close()
 	}()
-	go prober.ServeListener(ctx, ln, prober.DefaultReadTimeout)
+	go prober.ServeListener(ctx, ln, prober.DefaultReadTimeout, testSource)
 
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -140,7 +140,7 @@ func TestServer_PerIPLimit(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		prober.ServeListener(ctx, ln, prober.DefaultReadTimeout)
+		prober.ServeListener(ctx, ln, prober.DefaultReadTimeout, testSource)
 		close(done)
 	}()
 	// Restore the shared test variable only after ServeListener has
@@ -206,7 +206,7 @@ func TestServer_ProbeCounterIgnoresInvalid(t *testing.T) {
 		<-ctx.Done()
 		ln.Close()
 	}()
-	go prober.ServeListener(ctx, ln, prober.DefaultReadTimeout)
+	go prober.ServeListener(ctx, ln, prober.DefaultReadTimeout, testSource)
 	addr := ln.Addr().String()
 
 	before := getCounterValue1(prober.ServerProbesReceived, "127.0.0.1")
@@ -261,7 +261,7 @@ func TestServer_ShutdownWaitsForHandlers(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- prober.ServeListener(ctx, ln, 30*time.Second)
+		done <- prober.ServeListener(ctx, ln, 30*time.Second, testSource)
 	}()
 	addr := ln.Addr().String()
 
@@ -305,7 +305,7 @@ func TestServer_ShutdownClosesConnections(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ln.Close()
-	go prober.ServeListener(ctx, ln, 30*time.Second)
+	go prober.ServeListener(ctx, ln, 30*time.Second, testSource)
 	addr := ln.Addr().String()
 
 	conn, err := net.Dial("tcp", addr)

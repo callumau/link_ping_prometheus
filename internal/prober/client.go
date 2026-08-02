@@ -83,7 +83,7 @@ func RunClient(ctx context.Context, cfg Config) error {
 func startProbing(ctx context.Context, cfg Config) error {
 	slog.Info("Starting probing", "targets_count", len(cfg.Targets), "adaptive", cfg.Adaptive)
 
-	SeedMetrics(cfg.Targets)
+	SeedMetrics(cfg.Source, cfg.Targets)
 
 	var wg sync.WaitGroup
 	for _, t := range cfg.Targets {
@@ -125,8 +125,8 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 			if ctx.Err() != nil {
 				return
 			}
-			ConnectFailures.WithLabelValues(t.Name, t.Address).Inc()
-			LinkUp.WithLabelValues(t.Name, t.Address).Set(0)
+			ConnectFailures.WithLabelValues(cfg.Source, t.Name, t.Address).Inc()
+			LinkUp.WithLabelValues(cfg.Source, t.Name, t.Address).Set(0)
 			logger.Warn("Connect failed", "err", err)
 			if !retryDelay(ctx, b) {
 				return
@@ -136,17 +136,17 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 		b.reset()
 
 		logger.Info("Connected")
-		LinkUp.WithLabelValues(t.Name, t.Address).Set(1)
+		LinkUp.WithLabelValues(cfg.Source, t.Name, t.Address).Set(1)
 
 		if tcp, ok := conn.(*net.TCPConn); ok {
 			tcp.SetNoDelay(true)
 		}
 
 		err = runEchoLoop(ctx, conn, t, cfg, stats, logger)
-		LinkUp.WithLabelValues(t.Name, t.Address).Set(0)
+		LinkUp.WithLabelValues(cfg.Source, t.Name, t.Address).Set(0)
 
 		if err != nil {
-			ConnectionsDropped.WithLabelValues(t.Name, t.Address).Inc()
+			ConnectionsDropped.WithLabelValues(cfg.Source, t.Name, t.Address).Inc()
 			logger.Warn("Connection lost", "err", err)
 		}
 
@@ -282,7 +282,14 @@ func runEchoLoop(
 			logger.Error("Panic in echo loop; reconnecting", "panic", r)
 			retErr = fmt.Errorf("panic in echo loop: %v", r)
 		}
+		inflight := ProbesInflight.WithLabelValues(cfg.Source, t.Name, t.Address)
 		if retErr == nil {
+			// Clean context cancellation: in-flight probes die with the
+			// connection without counting as timeouts, but they are no
+			// longer in flight.
+			if n := float64(len(pending)); n > 0 {
+				inflight.Sub(n)
+			}
 			return
 		}
 		// Drain responses that already arrived so they count as received,
@@ -298,10 +305,12 @@ func runEchoLoop(
 					continue
 				}
 				delete(pending, resp.seq)
-				ProbesReceived.WithLabelValues(t.Name, t.Address).Inc()
+				ProbesReceived.WithLabelValues(cfg.Source, t.Name, t.Address).Inc()
+				inflight.Dec()
 			default:
 				if count := float64(len(pending)); count > 0 {
-					ProbesTimedOut.WithLabelValues(t.Name, t.Address).Add(count)
+					ProbesTimedOut.WithLabelValues(cfg.Source, t.Name, t.Address).Add(count)
+					inflight.Sub(count)
 				}
 				return
 			}
@@ -318,7 +327,7 @@ func runEchoLoop(
 			timeout = stats.CurrentRTO()
 		}
 
-		RTOEstimate.WithLabelValues(t.Name, t.Address).Set(timeout.Seconds())
+		RTOEstimate.WithLabelValues(cfg.Source, t.Name, t.Address).Set(timeout.Seconds())
 
 		resetTimer(intervalTimer, interval)
 
@@ -349,11 +358,12 @@ func runEchoLoop(
 					continue
 				}
 				delete(pending, resp.seq)
+				ProbesInflight.WithLabelValues(cfg.Source, t.Name, t.Address).Dec()
 
 				rttSec := resp.recv.Sub(sentTime).Seconds()
 
-				ProbesReceived.WithLabelValues(t.Name, t.Address).Inc()
-				RTTSeconds.WithLabelValues(t.Name, t.Address).Observe(rttSec)
+				ProbesReceived.WithLabelValues(cfg.Source, t.Name, t.Address).Inc()
+				RTTSeconds.WithLabelValues(cfg.Source, t.Name, t.Address).Observe(rttSec)
 
 				if cfg.Adaptive {
 					stats.Update(rttSec)
@@ -368,7 +378,8 @@ func runEchoLoop(
 		if len(pending) > 0 {
 			for s, sentTime := range pending {
 				if now.Sub(sentTime) > timeout {
-					ProbesTimedOut.WithLabelValues(t.Name, t.Address).Inc()
+					ProbesTimedOut.WithLabelValues(cfg.Source, t.Name, t.Address).Inc()
+					ProbesInflight.WithLabelValues(cfg.Source, t.Name, t.Address).Dec()
 					delete(pending, s)
 					timeoutOccurred = true
 				}
@@ -385,11 +396,17 @@ func runEchoLoop(
 		binary.LittleEndian.PutUint64(buf[16:24], uint64(now.UnixNano()))
 
 		conn.SetWriteDeadline(now.Add(timeout))
+		// Register the probe as in-flight before sending: any matching
+		// response or timeout must decrement it, so a stuck connection
+		// shows up as a growing gauge instead of a silent stall.
+		ProbesInflight.WithLabelValues(cfg.Source, t.Name, t.Address).Inc()
 		if _, err := conn.Write(buf); err != nil {
+			// Probe never left the socket; undo the in-flight increment.
+			ProbesInflight.WithLabelValues(cfg.Source, t.Name, t.Address).Dec()
 			return err
 		}
 
 		pending[seq] = now
-		ProbesSent.WithLabelValues(t.Name, t.Address).Inc()
+		ProbesSent.WithLabelValues(cfg.Source, t.Name, t.Address).Inc()
 	}
 }

@@ -29,7 +29,7 @@ var MaxConnsPerIP = 128
 // MaxConnsGlobal concurrent connections and MaxConnsPerIP per remote IP;
 // excess connections are immediately closed. Blocks until ctx is
 // cancelled, then closes the listener and all open connections.
-func RunServer(ctx context.Context, addr string, readTimeout time.Duration) error {
+func RunServer(ctx context.Context, addr string, readTimeout time.Duration, source string) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
@@ -41,7 +41,7 @@ func RunServer(ctx context.Context, addr string, readTimeout time.Duration) erro
 		ln.Close()
 	}()
 
-	return ServeListener(ctx, ln, readTimeout)
+	return ServeListener(ctx, ln, readTimeout, source)
 }
 
 // ServeListener accepts connections on ln and handles each in a
@@ -51,7 +51,7 @@ func RunServer(ctx context.Context, addr string, readTimeout time.Duration) erro
 // and ServeListener waits (bounded by 5s) for every handler goroutine
 // to finish before returning. Blocks until ctx is cancelled or ln is
 // closed.
-func ServeListener(ctx context.Context, ln net.Listener, readTimeout time.Duration) error {
+func ServeListener(ctx context.Context, ln net.Listener, readTimeout time.Duration, source string) error {
 	if readTimeout <= 0 {
 		readTimeout = DefaultReadTimeout
 	}
@@ -143,7 +143,7 @@ loop:
 				mu.Unlock()
 				<-sem
 			}()
-			handleConn(c, readTimeout, ip)
+			handleConn(c, readTimeout, ip, source)
 		}(conn, ip)
 	}
 
@@ -173,7 +173,7 @@ func waitForHandlers(handlers *sync.WaitGroup) {
 // (TCP retransmission hides lost segments from the client's
 // sent/timeout counters) and correlated with the client's metrics.
 // Connections that send invalid data or exceed deadlines are closed.
-func handleConn(c net.Conn, readTimeout time.Duration, clientIP string) {
+func handleConn(c net.Conn, readTimeout time.Duration, clientIP, source string) {
 	defer c.Close()
 	if tcp, ok := c.(*net.TCPConn); ok {
 		tcp.SetKeepAlive(true)
@@ -199,7 +199,7 @@ func handleConn(c net.Conn, readTimeout time.Duration, clientIP string) {
 			return
 		}
 
-		ServerProbesReceived.WithLabelValues(clientIP).Inc()
+		ServerProbesReceived.WithLabelValues(source, clientIP).Inc()
 
 		c.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		if _, err := c.Write(buf); err != nil {
