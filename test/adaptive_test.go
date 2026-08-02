@@ -41,6 +41,46 @@ func TestAdaptiveStats_Logic(t *testing.T) {
 	}
 }
 
+func TestAdaptiveStats_BackoffClampedAndConsecutive(t *testing.T) {
+	stats := prober.NewAdaptiveStats(1 * time.Second)
+
+	// First timeout in a series must NOT double the RTO (RFC 6298:
+	// doubling applies to retransmissions, not the initial timeout).
+	stats.Backoff()
+	if stats.RTO() != 1.0 {
+		t.Errorf("first backoff must not double RTO, got %f", stats.RTO())
+	}
+
+	// Subsequent consecutive timeouts double, but never beyond the clamp.
+	stats.Backoff()
+	if math.Abs(stats.RTO()-2.0) > 0.0001 {
+		t.Errorf("expected RTO 2.0 after second consecutive timeout, got %f", stats.RTO())
+	}
+	stats.Backoff()
+	if math.Abs(stats.RTO()-4.0) > 0.0001 && stats.RTO() != prober.DefaultMaxRTO.Seconds() {
+		t.Errorf("expected RTO 4.0 clamped to DefaultMaxRTO after third consecutive timeout, got %f", stats.RTO())
+	}
+
+	// Repeated backoffs must saturate at DefaultMaxRTO, not overflow.
+	max := prober.DefaultMaxRTO.Seconds()
+	for i := 0; i < 200; i++ {
+		stats.Backoff()
+	}
+	if r := stats.CurrentRTO(); r != prober.DefaultMaxRTO {
+		t.Errorf("expected RTO clamped to DefaultMaxRTO %v, got %v", prober.DefaultMaxRTO, r)
+	}
+	if stats.RTO() != max {
+		t.Errorf("expected internal RTO clamped to %f, got %f", max, stats.RTO())
+	}
+
+	// A successful measurement resets the consecutive-timeout counter.
+	stats.Update(0.1)
+	stats.Backoff()
+	if stats.RTO() != stats.SRTT()+4*stats.RTTVar() {
+		t.Errorf("after success, next backoff must not double: got %f", stats.RTO())
+	}
+}
+
 func TestAdaptive_RespondsToJitter(t *testing.T) {
 	prober.InitMetrics()
 
