@@ -34,9 +34,9 @@ func TestMultiTargetProbing(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 
 	verifyCounter(t, prober.ProbesSent, "target1", addr1)
-	verifyCounter(t, prober.ProbesReceived, "target1", addr1)
+	verifyHistogramCount(t, prober.RTTSeconds, "target1", addr1)
 	verifyCounter(t, prober.ProbesSent, "target2", addr2)
-	verifyCounter(t, prober.ProbesReceived, "target2", addr2)
+	verifyHistogramCount(t, prober.RTTSeconds, "target2", addr2)
 }
 
 func TestServerDropout(t *testing.T) {

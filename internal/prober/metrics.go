@@ -20,21 +20,17 @@ var (
 		Name: "link_probes_sent_total",
 		Help: "Total probes sent on established connections (dial failures excluded).",
 	}, []string{"source", "target", "address"})
-	ProbesReceived = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "link_probes_received_total",
-		Help: "Total probe responses received.",
-	}, []string{"source", "target", "address"})
 	ProbesTimedOut = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "link_probes_timed_out_total",
-		Help: "Total probes that timed out.",
+		Help: "Total probes that timed out. Loss = rate(timed_out) / rate(sent).",
 	}, []string{"source", "target", "address"})
 	ProbesInflight = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "link_probes_inflight",
 		Help: "Current number of probes sent but waiting for a response or timeout.",
 	}, []string{"source", "target", "address"})
-	ConnectionsDropped = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "link_connections_dropped_total",
-		Help: "Total established connections that were lost mid-probing.",
+	LinkFlaps = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "link_flaps_total",
+		Help: "Total link flaps: established connections lost mid-probing.",
 	}, []string{"source", "target", "address"})
 	ConnectFailures = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "link_connect_failures_total",
@@ -71,7 +67,7 @@ var registerOnce sync.Once
 // Safe to call multiple times; registration happens exactly once.
 func InitMetrics() {
 	registerOnce.Do(func() {
-		prometheus.MustRegister(ProbesSent, ProbesReceived, ProbesTimedOut, ProbesInflight, ConnectionsDropped, ConnectFailures, RTTSeconds, LinkUp, RTOEstimate, ServerProbesReceived)
+		prometheus.MustRegister(ProbesSent, ProbesTimedOut, ProbesInflight, LinkFlaps, ConnectFailures, RTTSeconds, LinkUp, RTOEstimate, ServerProbesReceived)
 	})
 }
 
@@ -81,10 +77,9 @@ func InitMetrics() {
 func SeedMetrics(source string, targets []Target) {
 	for _, t := range targets {
 		ProbesSent.WithLabelValues(source, t.Name, t.Address).Add(0)
-		ProbesReceived.WithLabelValues(source, t.Name, t.Address).Add(0)
 		ProbesTimedOut.WithLabelValues(source, t.Name, t.Address).Add(0)
 		ProbesInflight.WithLabelValues(source, t.Name, t.Address).Set(0)
-		ConnectionsDropped.WithLabelValues(source, t.Name, t.Address).Add(0)
+		LinkFlaps.WithLabelValues(source, t.Name, t.Address).Add(0)
 		ConnectFailures.WithLabelValues(source, t.Name, t.Address).Add(0)
 		LinkUp.WithLabelValues(source, t.Name, t.Address).Set(0)
 		RTOEstimate.WithLabelValues(source, t.Name, t.Address).Set(0)

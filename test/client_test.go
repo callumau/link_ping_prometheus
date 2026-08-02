@@ -30,7 +30,7 @@ func TestConnectionRefusedMetrics(t *testing.T) {
 	initialSent := getCounterValue(prober.ProbesSent, "refused_test", addr)
 	initialTimeouts := getCounterValue(prober.ProbesTimedOut, "refused_test", addr)
 	initialConnectFails := getCounterValue(prober.ConnectFailures, "refused_test", addr)
-	initialDrops := getCounterValue(prober.ConnectionsDropped, "refused_test", addr)
+	initialDrops := getCounterValue(prober.LinkFlaps, "refused_test", addr)
 
 	go prober.RunClient(ctx, cfg)
 
@@ -39,7 +39,7 @@ func TestConnectionRefusedMetrics(t *testing.T) {
 	finalSent := getCounterValue(prober.ProbesSent, "refused_test", addr)
 	finalTimeouts := getCounterValue(prober.ProbesTimedOut, "refused_test", addr)
 	finalConnectFails := getCounterValue(prober.ConnectFailures, "refused_test", addr)
-	finalDrops := getCounterValue(prober.ConnectionsDropped, "refused_test", addr)
+	finalDrops := getCounterValue(prober.LinkFlaps, "refused_test", addr)
 
 	if finalConnectFails <= initialConnectFails {
 		t.Errorf("Expected connect failures to increase on connection refused, got %v -> %v", initialConnectFails, finalConnectFails)
@@ -199,7 +199,7 @@ func TestRobustness_CorruptSeq(t *testing.T) {
 
 	cfg := cfgWith(false, 50*time.Millisecond, 100*time.Millisecond, prober.Target{Name: targetName, Address: addr})
 
-	startRecv := getCounterValue(prober.ProbesReceived, targetName, addr)
+	startRecv := getHistogramCount(prober.RTTSeconds, targetName, addr)
 	startTimeout := getCounterValue(prober.ProbesTimedOut, targetName, addr)
 
 	go prober.RunClient(ctx, cfg)
@@ -207,7 +207,7 @@ func TestRobustness_CorruptSeq(t *testing.T) {
 	cancel()
 	time.Sleep(100 * time.Millisecond)
 
-	endRecv := getCounterValue(prober.ProbesReceived, targetName, addr)
+	endRecv := getHistogramCount(prober.RTTSeconds, targetName, addr)
 	endTimeout := getCounterValue(prober.ProbesTimedOut, targetName, addr)
 
 	if endRecv > startRecv {
@@ -253,13 +253,13 @@ func TestRobustness_PartialWrites(t *testing.T) {
 
 	cfg := cfgWith(false, 100*time.Millisecond, 200*time.Millisecond, prober.Target{Name: targetName, Address: addr})
 
-	startRecv := getCounterValue(prober.ProbesReceived, targetName, addr)
+	startRecv := getHistogramCount(prober.RTTSeconds, targetName, addr)
 	go prober.RunClient(ctx, cfg)
 
 	time.Sleep(500 * time.Millisecond)
 	cancel()
 
-	endRecv := getCounterValue(prober.ProbesReceived, targetName, addr)
+	endRecv := getHistogramCount(prober.RTTSeconds, targetName, addr)
 	if endRecv <= startRecv {
 		t.Errorf("Partial writes should be reassembled, but Recv count did not increase")
 	}
@@ -414,14 +414,14 @@ func TestDuplicateResponse(t *testing.T) {
 
 	cfg := cfgWith(false, 100*time.Millisecond, 500*time.Millisecond, prober.Target{Name: targetName, Address: addr})
 
-	startRecv := getCounterValue(prober.ProbesReceived, targetName, addr)
+	startRecv := getHistogramCount(prober.RTTSeconds, targetName, addr)
 	startSent := getCounterValue(prober.ProbesSent, targetName, addr)
 
 	go prober.RunClient(ctx, cfg)
 	time.Sleep(500 * time.Millisecond)
 	cancel()
 
-	endRecv := getCounterValue(prober.ProbesReceived, targetName, addr)
+	endRecv := getHistogramCount(prober.RTTSeconds, targetName, addr)
 	endSent := getCounterValue(prober.ProbesSent, targetName, addr)
 
 	recvDelta := endRecv - startRecv
@@ -467,7 +467,7 @@ func TestRobustness_TimestampSpoof(t *testing.T) {
 
 	cfg := cfgWith(false, 50*time.Millisecond, 100*time.Millisecond, prober.Target{Name: targetName, Address: addr})
 
-	startRecv := getCounterValue(prober.ProbesReceived, targetName, addr)
+	startRecv := getHistogramCount(prober.RTTSeconds, targetName, addr)
 	startTimeout := getCounterValue(prober.ProbesTimedOut, targetName, addr)
 
 	go prober.RunClient(ctx, cfg)
@@ -475,7 +475,7 @@ func TestRobustness_TimestampSpoof(t *testing.T) {
 	cancel()
 	time.Sleep(100 * time.Millisecond)
 
-	endRecv := getCounterValue(prober.ProbesReceived, targetName, addr)
+	endRecv := getHistogramCount(prober.RTTSeconds, targetName, addr)
 	endTimeout := getCounterValue(prober.ProbesTimedOut, targetName, addr)
 
 	if endRecv > startRecv {
@@ -530,14 +530,14 @@ func TestRobustness_OutOfOrderResponses(t *testing.T) {
 
 	cfg := cfgWith(false, 50*time.Millisecond, 300*time.Millisecond, prober.Target{Name: targetName, Address: addr})
 
-	startRecv := getCounterValue(prober.ProbesReceived, targetName, addr)
+	startRecv := getHistogramCount(prober.RTTSeconds, targetName, addr)
 	startTimeout := getCounterValue(prober.ProbesTimedOut, targetName, addr)
 
 	go prober.RunClient(ctx, cfg)
 	time.Sleep(900 * time.Millisecond)
 	cancel()
 
-	endRecv := getCounterValue(prober.ProbesReceived, targetName, addr)
+	endRecv := getHistogramCount(prober.RTTSeconds, targetName, addr)
 	endTimeout := getCounterValue(prober.ProbesTimedOut, targetName, addr)
 
 	if endRecv-startRecv < 5 {
@@ -589,14 +589,14 @@ func TestRobustness_DuplicateWithTamperedCopy(t *testing.T) {
 
 	cfg := cfgWith(false, 50*time.Millisecond, 300*time.Millisecond, prober.Target{Name: targetName, Address: addr})
 
-	startRecv := getCounterValue(prober.ProbesReceived, targetName, addr)
+	startRecv := getHistogramCount(prober.RTTSeconds, targetName, addr)
 	startSent := getCounterValue(prober.ProbesSent, targetName, addr)
 
 	go prober.RunClient(ctx, cfg)
 	time.Sleep(600 * time.Millisecond)
 	cancel()
 
-	recvDelta := getCounterValue(prober.ProbesReceived, targetName, addr) - startRecv
+	recvDelta := getHistogramCount(prober.RTTSeconds, targetName, addr) - startRecv
 	sentDelta := getCounterValue(prober.ProbesSent, targetName, addr) - startSent
 
 	if math.Abs(recvDelta-sentDelta) > 1 {
@@ -644,7 +644,7 @@ func TestRobustness_LateResponsesIgnored(t *testing.T) {
 
 	startSent := getCounterValue(prober.ProbesSent, targetName, addr)
 	startTimeout := getCounterValue(prober.ProbesTimedOut, targetName, addr)
-	startRecv := getCounterValue(prober.ProbesReceived, targetName, addr)
+	startRecv := getHistogramCount(prober.RTTSeconds, targetName, addr)
 
 	go prober.RunClient(ctx, cfg)
 	time.Sleep(600 * time.Millisecond)
@@ -652,7 +652,7 @@ func TestRobustness_LateResponsesIgnored(t *testing.T) {
 
 	sentDelta := getCounterValue(prober.ProbesSent, targetName, addr) - startSent
 	timeoutDelta := getCounterValue(prober.ProbesTimedOut, targetName, addr) - startTimeout
-	recvDelta := getCounterValue(prober.ProbesReceived, targetName, addr) - startRecv
+	recvDelta := getHistogramCount(prober.RTTSeconds, targetName, addr) - startRecv
 
 	if sentDelta < 6 {
 		t.Errorf("Expected probes to keep flowing through late responses, got %v", sentDelta)
@@ -706,14 +706,14 @@ func TestRobustness_TrickleWrites(t *testing.T) {
 	// would genuinely time out.
 	cfg := cfgWith(false, 250*time.Millisecond, 400*time.Millisecond, prober.Target{Name: targetName, Address: addr})
 
-	startRecv := getCounterValue(prober.ProbesReceived, targetName, addr)
+	startRecv := getHistogramCount(prober.RTTSeconds, targetName, addr)
 	startTimeout := getCounterValue(prober.ProbesTimedOut, targetName, addr)
 
 	go prober.RunClient(ctx, cfg)
 	time.Sleep(1 * time.Second)
 	cancel()
 
-	recvDelta := getCounterValue(prober.ProbesReceived, targetName, addr) - startRecv
+	recvDelta := getHistogramCount(prober.RTTSeconds, targetName, addr) - startRecv
 	timeoutDelta := getCounterValue(prober.ProbesTimedOut, targetName, addr) - startTimeout
 
 	if recvDelta < 2 {
@@ -764,14 +764,14 @@ func TestRobustness_SpuriousValidFrames(t *testing.T) {
 
 	cfg := cfgWith(false, 50*time.Millisecond, 300*time.Millisecond, prober.Target{Name: targetName, Address: addr})
 
-	startRecv := getCounterValue(prober.ProbesReceived, targetName, addr)
+	startRecv := getHistogramCount(prober.RTTSeconds, targetName, addr)
 	startSent := getCounterValue(prober.ProbesSent, targetName, addr)
 
 	go prober.RunClient(ctx, cfg)
 	time.Sleep(600 * time.Millisecond)
 	cancel()
 
-	recvDelta := getCounterValue(prober.ProbesReceived, targetName, addr) - startRecv
+	recvDelta := getHistogramCount(prober.RTTSeconds, targetName, addr) - startRecv
 	sentDelta := getCounterValue(prober.ProbesSent, targetName, addr) - startSent
 
 	if math.Abs(recvDelta-sentDelta) > 1 {
@@ -800,7 +800,7 @@ func TestIsolation_BrokenTargetDoesNotAffectHealthy(t *testing.T) {
 	go prober.RunClient(ctx, cfg)
 	time.Sleep(1 * time.Second)
 
-	if recv := getCounterValue(prober.ProbesReceived, "healthy", healthyAddr); recv <= 0 {
+	if recv := getHistogramCount(prober.RTTSeconds, "healthy", healthyAddr); recv <= 0 {
 		t.Errorf("Healthy link should receive probes, got %v", recv)
 	}
 	if up := getGaugeValue(prober.LinkUp, "healthy", healthyAddr); up != 1 {

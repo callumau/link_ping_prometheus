@@ -28,10 +28,9 @@ The exporter exposes the following metrics at `/metrics` (default port 2112).
 |---|---|---|---|
 | `link_up` | Gauge | `source`, `target`, `address` | 1 = connected, 0 = disconnected/reconnecting. |
 | `link_probes_sent_total` | Counter | `source`, `target`, `address` | Total probes sent on established connections (dial failures excluded). |
-| `link_probes_received_total` | Counter | `source`, `target`, `address` | Total probe responses received and validated. |
 | `link_probes_timed_out_total` | Counter | `source`, `target`, `address` | Total probes that timed out. |
 | `link_probes_inflight` | Gauge | `source`, `target`, `address` | Current number of probes sent but waiting for a response or timeout. Grows during stalls — deadlock/detached-peer detection. |
-| `link_connections_dropped_total` | Counter | `source`, `target`, `address` | Total established connections lost mid-probing. |
+| `link_flaps_total` | Counter | `source`, `target`, `address` | Total link flaps: established connections lost mid-probing. Rate = link instability per window. |
 | `link_connect_failures_total` | Counter | `source`, `target`, `address` | Total failed connection attempts (dial errors). Not counted in sent/timeout totals. |
 | `link_rtt_seconds` | Histogram | `source`, `target`, `address` | RTT histogram with explicit buckets `{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0}` s plus native histogram support (`NativeHistogramBucketFactor` 1.1). |
 | `link_rtt_seconds_bucket/sum/count` | Histogram | `source`, `target`, `address` | Classic-bucket series; quantiles, means, and jitter are derived in PromQL over any window. |
@@ -50,7 +49,7 @@ compute them from the raw counters and histogram, so any time window
 Loss is derived from the counters over any window:
 
 ```
-100 * rate(link_probes_timed_out_total[5m]) / (rate(link_probes_timed_out_total[5m]) + rate(link_probes_received_total[5m]))
+100 * rate(link_probes_timed_out_total[5m]) / rate(link_probes_sent_total[5m])
 ```
 
 This is **application-visible** loss, not raw network loss. Each probe
@@ -134,7 +133,7 @@ alert: LinkDown
   for:  1m
 
 alert: LinkLossHigh
-  expr: rate(link_probes_timed_out_total[5m]) / (rate(link_probes_timed_out_total[5m]) + rate(link_probes_received_total[5m])) > 0.2
+  expr: rate(link_probes_timed_out_total[5m]) / rate(link_probes_sent_total[5m]) > 0.2
   for:  5m
 
 alert: LinkLatencyDegraded

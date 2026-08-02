@@ -287,7 +287,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "100 * rate(link_probes_timed_out_total{job=~\"$job\", target=~\"$target\"}[5m]) / (rate(link_probes_timed_out_total{job=~\"$job\", target=~\"$target\"}[5m]) + rate(link_probes_received_total{job=~\"$job\", target=~\"$target\"}[5m]))",
+          "expr": "100 * rate(link_probes_timed_out_total{job=~\"$job\", target=~\"$target\"}[5m]) / rate(link_probes_sent_total{job=~\"$job\", target=~\"$target\"}[5m])",
           "instant": true,
           "legendFormat": "{{target}}",
           "range": false,
@@ -296,7 +296,7 @@
       ],
       "title": "Packet Loss",
       "type": "stat",
-      "description": "Application-visible loss: rate(timeouts) / rate(timeouts + received)."
+      "description": "Application-visible loss: rate(timeouts) / rate(sent)."
     },
     {
       "datasource": {
@@ -670,7 +670,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "100 * rate(link_probes_timed_out_total{job=~\"$job\", target=~\"$target\"}[5m]) / (rate(link_probes_timed_out_total{job=~\"$job\", target=~\"$target\"}[5m]) + rate(link_probes_received_total{job=~\"$job\", target=~\"$target\"}[5m]))",
+          "expr": "100 * rate(link_probes_timed_out_total{job=~\"$job\", target=~\"$target\"}[5m]) / rate(link_probes_sent_total{job=~\"$job\", target=~\"$target\"}[5m])",
           "legendFormat": "{{target}}",
           "range": true,
           "refId": "A"
@@ -1042,17 +1042,6 @@
           "legendFormat": "{{target}} sent",
           "range": true,
           "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "rate(link_probes_received_total{job=~\"$job\", target=~\"$target\"}[5m])",
-          "legendFormat": "{{target}} recv",
-          "range": true,
-          "refId": "B"
         },
         {
           "datasource": {

@@ -87,11 +87,37 @@ func getHistogramMean(vec *prometheus.HistogramVec, targetName, address string) 
 	return h.GetSampleSum() / float64(h.GetSampleCount())
 }
 
+// getHistogramCount returns the number of observed RTT samples for a
+// target — the monitoring-visible count of received responses.
+func getHistogramCount(vec *prometheus.HistogramVec, targetName, address string) float64 {
+	obs, err := vec.GetMetricWithLabelValues(testSource, targetName, address)
+	if err != nil {
+		return 0
+	}
+	m, ok := obs.(prometheus.Metric)
+	if !ok {
+		return 0
+	}
+	var d dto.Metric
+	if err := m.Write(&d); err != nil {
+		return 0
+	}
+	return float64(d.GetHistogram().GetSampleCount())
+}
+
 func verifyCounter(t *testing.T, vec *prometheus.CounterVec, targetName, address string) {
 	t.Helper()
 	val := getCounterValue(vec, targetName, address)
 	if val <= 0 {
 		t.Errorf("expected metric value > 0 for target %s (addr %s), got %v", targetName, address, val)
+	}
+}
+
+func verifyHistogramCount(t *testing.T, vec *prometheus.HistogramVec, targetName, address string) {
+	t.Helper()
+	val := getHistogramCount(vec, targetName, address)
+	if val <= 0 {
+		t.Errorf("expected histogram sample count > 0 for target %s (addr %s), got %v", targetName, address, val)
 	}
 }
 

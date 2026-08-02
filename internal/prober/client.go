@@ -146,7 +146,7 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 		LinkUp.WithLabelValues(cfg.Source, t.Name, t.Address).Set(0)
 
 		if err != nil {
-			ConnectionsDropped.WithLabelValues(cfg.Source, t.Name, t.Address).Inc()
+			LinkFlaps.WithLabelValues(cfg.Source, t.Name, t.Address).Inc()
 			logger.Warn("Connection lost", "err", err)
 		}
 
@@ -305,7 +305,6 @@ func runEchoLoop(
 					continue
 				}
 				delete(pending, resp.seq)
-				ProbesReceived.WithLabelValues(cfg.Source, t.Name, t.Address).Inc()
 				inflight.Dec()
 			default:
 				if count := float64(len(pending)); count > 0 {
@@ -362,7 +361,6 @@ func runEchoLoop(
 
 				rttSec := resp.recv.Sub(sentTime).Seconds()
 
-				ProbesReceived.WithLabelValues(cfg.Source, t.Name, t.Address).Inc()
 				RTTSeconds.WithLabelValues(cfg.Source, t.Name, t.Address).Observe(rttSec)
 
 				if cfg.Adaptive {

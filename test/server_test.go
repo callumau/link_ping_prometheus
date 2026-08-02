@@ -40,13 +40,13 @@ func TestGarbageData_Server(t *testing.T) {
 	defer cancel()
 
 	cfg := cfgWith(false, 100*time.Millisecond, 100*time.Millisecond, prober.Target{Name: targetName, Address: addr})
-	startRecv := getCounterValue(prober.ProbesReceived, targetName, addr)
+	startRecv := getHistogramCount(prober.RTTSeconds, targetName, addr)
 
 	go prober.RunClient(ctx, cfg)
 	time.Sleep(500 * time.Millisecond)
 	cancel()
 
-	endRecv := getCounterValue(prober.ProbesReceived, targetName, addr)
+	endRecv := getHistogramCount(prober.RTTSeconds, targetName, addr)
 	if endRecv > startRecv {
 		t.Errorf("Garbage data counted as valid response? %v -> %v", startRecv, endRecv)
 	}
