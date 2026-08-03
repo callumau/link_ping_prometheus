@@ -67,6 +67,73 @@ func TestOutageCountsAsLoss(t *testing.T) {
 	}
 }
 
+// TestAccuracy_PacketLoss10s: over a sustained 10s+ window the client's
+// loss ratio must track the server's drop rate. The server reads every
+// probe but echoes only a fraction (dropping every 3rd), so no TCP
+// retransmission is involved — this isolates the client's counter
+// accounting. Adaptive RTO changes when timeouts are detected, not the
+// total count, so the ratio must converge to the injected drop rate.
+func TestAccuracy_PacketLoss10s(t *testing.T) {
+	prober.InitMetrics()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	addr := ln.Addr().String()
+
+	dropMod := 3
+	go func() {
+		defer ln.Close()
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, prober.PayloadSize)
+		count := 0
+		for {
+			if _, err := io.ReadFull(conn, buf); err != nil {
+				return
+			}
+			count++
+			if count%dropMod == 0 {
+				continue
+			}
+			conn.Write(buf)
+		}
+	}()
+
+	targetName := "loss_10s_test"
+	ctx, cancel := context.WithCancel(context.Background())
+
+	cfg := cfgWith(true, 100*time.Millisecond, 400*time.Millisecond, prober.Target{Name: targetName, Address: addr})
+	go prober.RunClient(ctx, cfg)
+
+	time.Sleep(12 * time.Second)
+	cancel()
+	time.Sleep(200 * time.Millisecond)
+
+	sent := getCounterValue(prober.ProbesSent, targetName, addr)
+	timeout := getCounterValue(prober.ProbesTimedOut, targetName, addr)
+	recv := getHistogramCount(prober.RTTSeconds, targetName, addr)
+
+	if sent < 80 {
+		t.Fatalf("Expected ~120 probes over 12s at 100ms interval, got %v (cpu load?)", sent)
+	}
+
+	got := timeout / sent
+	want := 1.0 / float64(dropMod)
+	if math.Abs(got-want) > 0.06 {
+		t.Errorf("Loss over 10s+ window: expected ~%v, got %v (sent %v, timeout %v)", want, got, sent, timeout)
+	}
+
+	if math.Abs(sent-recv-timeout) > 2 {
+		t.Errorf("Counter balance broken: sent=%v recv=%v timeout=%v inflight=%v",
+			sent, recv, timeout, getGaugeValue(prober.ProbesInflight, targetName, addr))
+	}
+}
+
 func TestAccuracy_PacketLoss(t *testing.T) {
 	prober.InitMetrics()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
