@@ -53,7 +53,7 @@
     ]
   },
   "editable": true,
-  "description": "Site-to-site link monitor. Latency panels (Current RTT, Percentiles, Average, Jitter) are RTT in ms, derived from link_rtt_seconds (seconds) via histogram_quantile/rate; they gap during outages. Packet Loss = 100 * rate(link_probes_timed_out_total)/rate(link_probes_sent_total), reads ~100% during a full outage (counters keep clocking probe slots while unreachable); a shorter rate window catches shorter outages. True wire loss (immune to TCP retransmission) needs the server-side link_server_probes_received_total.",
+  "description": "Site-to-site link monitor (UDP echo probes). Latency panels (Current RTT, Percentiles, Average, Jitter) are RTT in ms, derived from link_rtt_seconds (seconds) via histogram_quantile/rate; they gap during outages. Packet Loss = 100 * rate(link_probes_timed_out_total)/rate(link_probes_sent_total) — true network loss (UDP never retransmits), reading ~100% during a full outage; a shorter rate window catches shorter outages. The server-side link_server_probes_received_total is a cross-check on the client's sent counter.",
   "fiscalYearStartMonth": 0,
   "graphTooltip": 0,
   "id": null,
@@ -1064,7 +1064,7 @@
       ],
       "title": "Probe Throughput",
       "type": "timeseries",
-      "description": "Probes per second: rate(link_probes_sent_total). Stays at the probe cadence while up; continues at the same cadence during an outage (each slot counted as sent+lost)."
+      "description": "Probes per second: rate(link_probes_sent_total). Probes are always sent at the interval cadence — even into a down link, where they time out and read as 100% loss."
     },
     {
       "datasource": {
@@ -1349,7 +1349,7 @@
       ],
       "title": "True Network Loss (server view)",
       "type": "timeseries",
-      "description": "Real wire loss %: 100 * (1 - rate(server_received)/rate(client_sent)). Not masked by TCP retransmission. The server counter is per client IP; restrict with client=\"<ip>\" when multiple clients probe this server."
+      "description": "Real wire loss %: 100 * (1 - rate(server_received)/rate(client_sent)). Cross-checks the client's loss ratio (UDP loss is already true — no retransmission). The server counter is per client IP; restrict with client=\"<ip>\" when multiple clients probe this server."
     }
   ],
   "refresh": "1m",
