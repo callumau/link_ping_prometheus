@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -75,12 +74,6 @@ func RunClient(ctx context.Context, cfg Config) error {
 		slog.Warn("Multiple targets with address label - high cardinality if addresses vary widely")
 	}
 
-	return startProbing(ctx, cfg)
-}
-
-// startProbing launches a probe goroutine for each target and waits
-// for all to finish.
-func startProbing(ctx context.Context, cfg Config) error {
 	slog.Info("Starting probing", "targets_count", len(cfg.Targets), "adaptive", cfg.Adaptive)
 
 	SeedMetrics(cfg.Source, cfg.Targets)
@@ -97,105 +90,27 @@ func startProbing(ctx context.Context, cfg Config) error {
 	return nil
 }
 
-// dialTarget opens a TCP connection, honouring ctx cancellation so
-// shutdown is not blocked by an in-flight dial.
-func dialTarget(ctx context.Context, address string) (net.Conn, error) {
-	d := &net.Dialer{Timeout: 5 * time.Second}
-	return d.DialContext(ctx, "tcp", address)
-}
-
-// probeTarget manages the connection lifecycle for a single target.
-// While the target is unreachable, dialWithLoss keeps counting one
-// sent+lost probe slot per probe interval so the loss ratio reads ~100%
-// during an outage instead of going NaN (a fully down link is 100% loss).
-// Dial failures and lost connections retry with exponential backoff plus
-// full jitter (100ms base up to 10s) so reconnection attempts scatter
-// instead of storming. A panic in the echo loop is recovered and treated
-// as a connection loss — the target keeps being probed.
+// probeTarget runs the UDP probe loop for a single target until ctx is
+// cancelled. There is no connection lifecycle: datagrams sent into a dead
+// link vanish and time out naturally, so the loss ratio reads ~100%
+// during an outage without any fabricated counters.
 func probeTarget(ctx context.Context, t Target, cfg Config) {
 	logger := slog.With("target", t.Name, "address", t.Address)
-
 	stats := NewAdaptiveStats(cfg.BaseTimeout)
-	b := newBackoff(DefaultBackoffBase, DefaultBackoffMax)
 
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-
-		conn, err := dialWithLoss(ctx, cfg, t, b, logger)
-		if err != nil {
-			return
-		}
-		b.reset()
-
-		logger.Info("Connected")
-		LinkUp.WithLabelValues(cfg.Source, t.Name, t.Address).Set(1)
-
-		if tcp, ok := conn.(*net.TCPConn); ok {
-			tcp.SetNoDelay(true)
-		}
-
-		err = runEchoLoop(ctx, conn, t, cfg, stats, logger)
-		LinkUp.WithLabelValues(cfg.Source, t.Name, t.Address).Set(0)
-
-		if err != nil {
-			LinkFlaps.WithLabelValues(cfg.Source, t.Name, t.Address).Inc()
-			logger.Warn("Connection lost", "err", err)
-		}
+	// A connected UDP socket lets the kernel filter responses to the
+	// server's address and gives plain Read/Write semantics.
+	conn, err := net.Dial("udp", t.Address)
+	if err != nil {
+		// DialUDP only fails on malformed addresses, already rejected
+		// by Config.Validate.
+		logger.Error("Failed to open UDP socket", "err", err)
+		return
 	}
-}
+	defer conn.Close()
 
-// dialWithLoss attempts to establish a connection, keeping the probe
-// counters clocked while the target is unreachable. Each failed dial
-// counts a connect failure; the wait before the next attempt (exponential
-// backoff) runs downLossTicks, which counts one probe slot as sent and
-// lost per interval. Returns a connection on success or an error when ctx
-// is cancelled.
-func dialWithLoss(ctx context.Context, cfg Config, t Target, b *backoff, logger *slog.Logger) (net.Conn, error) {
-	for {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		conn, err := dialTarget(ctx, t.Address)
-		if err == nil {
-			return conn, nil
-		}
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		ConnectFailures.WithLabelValues(cfg.Source, t.Name, t.Address).Inc()
-		LinkUp.WithLabelValues(cfg.Source, t.Name, t.Address).Set(0)
-		logger.Warn("Connect failed", "err", err)
-		if !downLossTicks(ctx, cfg, t, b) {
-			return nil, ctx.Err()
-		}
-	}
-}
-
-// downLossTicks waits out the next backoff delay, incrementing
-// link_probes_sent_total and link_probes_timed_out_total once per probe
-// interval so the loss ratio holds at ~100% while the link is down rather
-// than collapsing to NaN. The backoff timer (not the ticker) decides when
-// to redial, so reconnect storms stay prevented; over a sustained outage
-// the counted slots converge to the normal probe cadence. Returns false
-// when ctx is cancelled.
-func downLossTicks(ctx context.Context, cfg Config, t Target, b *backoff) bool {
-	backoffTimer := time.NewTimer(b.next())
-	ticker := time.NewTicker(cfg.BaseInterval)
-	defer backoffTimer.Stop()
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return false
-		case <-backoffTimer.C:
-			return true
-		case <-ticker.C:
-			ProbesSent.WithLabelValues(cfg.Source, t.Name, t.Address).Inc()
-			ProbesTimedOut.WithLabelValues(cfg.Source, t.Name, t.Address).Inc()
-		}
-	}
+	LinkUp.WithLabelValues(cfg.Source, t.Name, t.Address).Set(0)
+	runEchoLoop(ctx, conn, t, cfg, stats, logger)
 }
 
 // resetTimer safely stops and resets a time.Timer. It handles the
@@ -211,32 +126,27 @@ func resetTimer(t *time.Timer, d time.Duration) {
 	t.Reset(d)
 }
 
-// runEchoLoop is the core probe loop for a single connection.
+// runEchoLoop is the core UDP probe loop for a single target.
 //
 // At each interval it:
-//  1. Drains buffered responses from the reader goroutine and matches
-//     them against pending sequence numbers. The echoed timestamp must
-//     exactly equal the timestamp written into the request payload;
-//     mismatches (corruption, replay, spoofing) are ignored and the
-//     probe is left to time out as a loss.
+//  1. Drains buffered responses and matches them against pending sequence
+//     numbers. The echoed timestamp must exactly equal the timestamp
+//     written into the request payload; mismatches (corruption, replay,
+//     spoofing) are ignored and the probe is left to time out as a loss.
 //  2. Checks for timeouts among in-flight probes.
 //  3. Sends a new probe with the next sequence number.
 //
-// The reader goroutine reads 24-byte responses with a 500 ms deadline
-// that also serves as a periodic context-cancellation check. On context
-// cancellation the connection is closed immediately via deferred close,
+// The reader goroutine reads 24-byte datagrams with a 500 ms read
+// deadline that also serves as a periodic context-cancellation check.
+// On context cancellation the connection is closed via deferred close,
 // which unblocks the reader.
 //
 // A nil return means clean context cancellation; in-flight probes are
-// NOT counted as timeouts in that case. Any non-nil return (reader
-// error, write error, panic via the recover in the deferred flush)
-// flushes in-flight probes to ProbesTimedOut because the connection state
-// is no longer trustworthy. Responses that already arrived before the
-// failure are matched and counted as received first.
+// NOT counted as timeouts in that case. Any panic is recovered here so a
+// single target's failure can never kill its probe loop (or the process).
 //
-// A panic is recovered here so a single target's failure can never kill
-// its probe loop (or the process); it is converted to an error, which
-// the caller treats as a connection drop followed by a reconnect.
+// Loss is exact: UDP has no retransmission, so a probe without an echo
+// within the RTO is genuinely lost on the wire.
 func runEchoLoop(
 	ctx context.Context,
 	conn net.Conn,
@@ -253,37 +163,33 @@ func runEchoLoop(
 	}
 
 	respCh := make(chan response, 100)
-	errCh := make(chan error, 1)
 
-	readerCtx, cancelReader := context.WithCancel(ctx)
-	defer cancelReader()
 	defer conn.Close()
 
 	go func() {
-		defer close(errCh)
-		bp := bufPool.Get().(*[]byte)
-		defer bufPool.Put(bp)
-		buf := *bp
+		buf := make([]byte, PayloadSize)
 		for {
-			if readerCtx.Err() != nil {
+			if ctx.Err() != nil {
 				return
 			}
 			conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 
-			_, err := io.ReadFull(conn, buf)
+			n, err := conn.Read(buf)
 			if err != nil {
-				if errors.Is(err, os.ErrDeadlineExceeded) {
+				if os.IsTimeout(err) {
 					continue
 				}
-				if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
-					select {
-					case errCh <- err:
-					case <-readerCtx.Done():
-					}
+				if errors.Is(err, net.ErrClosed) || ctx.Err() != nil {
+					return
 				}
-				return
+				// ICMP port-unreachable and similar are not fatal for a
+				// datagram socket: the probe times out naturally.
+				logger.Debug("UDP read error", "err", err)
+				continue
 			}
-
+			if n != PayloadSize {
+				continue
+			}
 			if string(buf[0:8]) != MagicBytes {
 				continue
 			}
@@ -293,55 +199,28 @@ func runEchoLoop(
 
 			select {
 			case respCh <- response{seq: seq, ts: ts, recv: time.Now()}:
-			case <-readerCtx.Done():
+			case <-ctx.Done():
 				return
 			}
 		}
 	}()
 
 	seq := uint64(0)
-	bp := bufPool.Get().(*[]byte)
-	defer bufPool.Put(bp)
-	buf := *bp
+	buf := make([]byte, PayloadSize)
 
 	pending := make(map[uint64]time.Time)
+	var lastResponse time.Time
 
 	defer func() {
 		if r := recover(); r != nil {
-			logger.Error("Panic in echo loop; reconnecting", "panic", r)
+			logger.Error("Panic in echo loop; continuing", "panic", r)
 			retErr = fmt.Errorf("panic in echo loop: %v", r)
 		}
+		// Probes still in flight die with the loop on cancellation
+		// without counting as timeouts, but must leave the gauge.
 		inflight := ProbesInflight.WithLabelValues(cfg.Source, t.Name, t.Address)
-		if retErr == nil {
-			// Clean context cancellation: in-flight probes die with the
-			// connection without counting as timeouts, but they are no
-			// longer in flight.
-			if n := float64(len(pending)); n > 0 {
-				inflight.Sub(n)
-			}
-			return
-		}
-		// Drain responses that already arrived so they count as received,
-		// not as timeouts caused by the connection failure.
-		for {
-			select {
-			case resp := <-respCh:
-				sentTime, ok := pending[resp.seq]
-				if !ok {
-					continue
-				}
-				if resp.ts != uint64(sentTime.UnixNano()) {
-					continue
-				}
-				delete(pending, resp.seq)
-				inflight.Dec()
-			default:
-				if count := float64(len(pending)); count > 0 {
-					ProbesTimedOut.WithLabelValues(cfg.Source, t.Name, t.Address).Add(count)
-					inflight.Sub(count)
-				}
-				return
-			}
+		if n := float64(len(pending)); n > 0 {
+			inflight.Sub(n)
 		}
 	}()
 
@@ -362,11 +241,6 @@ func runEchoLoop(
 		select {
 		case <-ctx.Done():
 			return nil
-		case err, ok := <-errCh:
-			if !ok {
-				return errors.New("reader closed unexpectedly")
-			}
-			return err
 		case <-intervalTimer.C:
 		}
 
@@ -395,6 +269,8 @@ func runEchoLoop(
 				if cfg.Adaptive {
 					stats.Update(rttSec)
 				}
+				lastResponse = resp.recv
+				LinkUp.WithLabelValues(cfg.Source, t.Name, t.Address).Set(1)
 			default:
 				break Drain
 			}
@@ -417,20 +293,27 @@ func runEchoLoop(
 			stats.Backoff()
 		}
 
+		// The link counts as down once nothing has been heard for a
+		// full timeout plus one interval of grace.
+		if !lastResponse.IsZero() && now.Sub(lastResponse) > timeout+interval {
+			LinkUp.WithLabelValues(cfg.Source, t.Name, t.Address).Set(0)
+		}
+
 		seq++
 		copy(buf[0:8], MagicBytes)
 		binary.LittleEndian.PutUint64(buf[8:16], seq)
 		binary.LittleEndian.PutUint64(buf[16:24], uint64(now.UnixNano()))
 
-		conn.SetWriteDeadline(now.Add(timeout))
 		// Register the probe as in-flight before sending: any matching
-		// response or timeout must decrement it, so a stuck connection
-		// shows up as a growing gauge instead of a silent stall.
+		// response or timeout must decrement it, so a stuck link shows
+		// up as a growing gauge instead of a silent stall.
 		ProbesInflight.WithLabelValues(cfg.Source, t.Name, t.Address).Inc()
 		if _, err := conn.Write(buf); err != nil {
-			// Probe never left the socket; undo the in-flight increment.
+			// Datagram never left the socket; undo the in-flight
+			// increment and try again next interval.
 			ProbesInflight.WithLabelValues(cfg.Source, t.Name, t.Address).Dec()
-			return err
+			logger.Debug("UDP write error", "err", err)
+			continue
 		}
 
 		pending[seq] = now

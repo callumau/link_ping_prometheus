@@ -13,13 +13,11 @@ func saveFlags(t *testing.T) {
 	oldTarget, oldTargets := *flTarget, *flTargets
 	oldUser, oldPass := *flMetricsBasicAuthUser, *flMetricsBasicAuthPass
 	oldCert, oldKey := *flMetricsTLSCert, *flMetricsTLSKey
-	oldReadTimeout := *flReadTimeout
 	t.Cleanup(func() {
 		*flMode, *flListen, *flMetrics = oldMode, oldListen, oldMetrics
 		*flTarget, *flTargets = oldTarget, oldTargets
 		*flMetricsBasicAuthUser, *flMetricsBasicAuthPass = oldUser, oldPass
 		*flMetricsTLSCert, *flMetricsTLSKey = oldCert, oldKey
-		*flReadTimeout = oldReadTimeout
 	})
 }
 
@@ -89,15 +87,6 @@ func TestRunRejectsBadFlagCombos(t *testing.T) {
 		prg := &program{ctx: context.Background()}
 		if err := prg.run(); err == nil {
 			t.Error("expected error for user without password")
-		}
-	})
-
-	t.Run("non-positive read timeout", func(t *testing.T) {
-		saveFlags(t)
-		*flReadTimeout = -1
-		prg := &program{ctx: context.Background()}
-		if err := prg.run(); err == nil {
-			t.Error("expected error for negative read timeout")
 		}
 	})
 

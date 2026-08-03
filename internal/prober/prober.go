@@ -1,11 +1,15 @@
-// Package prober implements a TCP echo probing engine for measuring
-// network latency, packet loss, and jitter. It provides both a server
-// (TCP echo responder) and a client (active prober with adaptive RTO).
+// Package prober implements a UDP echo probing engine for measuring
+// network latency and packet loss. It provides both a server (UDP echo
+// responder) and a client (active prober with adaptive RTO).
 //
 // Wire format: 24 bytes per probe — 8-byte magic header "TCPPING\x00",
 // 8-byte little-endian sequence number, 8-byte Unix-ns timestamp.
-// The server validates the magic header before echoing; invalid packets
-// cause an immediate connection close.
+// The server validates the magic header before echoing; invalid datagrams
+// are dropped.
+//
+// UDP is used deliberately: no retransmission means a probe without an
+// echo within the RTO is genuinely lost on the wire, so the loss ratio
+// is exact rather than masked by TCP retransmission.
 package prober
 
 import (

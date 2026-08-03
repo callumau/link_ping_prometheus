@@ -3,7 +3,6 @@ package prober_test
 import (
 	"context"
 	"fmt"
-	"io"
 	"net"
 	"testing"
 	"time"
@@ -39,57 +38,51 @@ func TestMultiTargetProbing(t *testing.T) {
 	verifyHistogramCount(t, prober.RTTSeconds, "target2", addr2)
 }
 
+// TestServerDropout: a remote that stops echoing (then disappears) must
+// show up as real timeouts and a down link — UDP has no retransmission
+// to hide it.
 func TestServerDropout(t *testing.T) {
 	prober.InitMetrics()
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen error: %v", err)
 	}
-	serverAddr := ln.Addr().String()
+	serverAddr := pc.LocalAddr().String()
 
-	serverCtx, serverCancel := context.WithCancel(context.Background())
-	defer serverCancel()
-
-	closeConnCh := make(chan struct{})
 	stopEchoCh := make(chan struct{})
+	closeCh := make(chan struct{})
 
 	go func() {
-		defer ln.Close()
-		conn, err := ln.Accept()
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-
-		buf := make([]byte, prober.PayloadSize)
+		buf := make([]byte, 1500)
 		for {
 			select {
-			case <-closeConnCh:
-				return
-			case <-serverCtx.Done():
+			case <-closeCh:
+				pc.Close()
 				return
 			default:
-				conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-				_, err := io.ReadFull(conn, buf)
-				if err != nil {
-					return
-				}
-				select {
-				case <-stopEchoCh:
-					continue
-				default:
-					conn.Write(buf)
-				}
+			}
+			n, raddr, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			if n != prober.PayloadSize || string(buf[0:8]) != prober.MagicBytes {
+				continue
+			}
+			select {
+			case <-stopEchoCh:
+				continue
+			default:
+				pc.WriteTo(buf[:n], raddr)
 			}
 		}
 	}()
 
 	targetName := "dropout_test"
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	cfg := cfgWith(false, 50*time.Millisecond, 1*time.Second, prober.Target{Name: targetName, Address: serverAddr})
+	cfg := cfgWith(false, 50*time.Millisecond, 300*time.Millisecond, prober.Target{Name: targetName, Address: serverAddr})
 
 	initialTimeouts := getCounterValue(prober.ProbesTimedOut, targetName, serverAddr)
 
@@ -98,10 +91,11 @@ func TestServerDropout(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	close(stopEchoCh)
-	time.Sleep(190 * time.Millisecond)
-
-	close(closeConnCh)
+	// Probes now go unanswered and must time out after the 300ms RTO.
 	time.Sleep(500 * time.Millisecond)
+
+	close(closeCh)
+	time.Sleep(200 * time.Millisecond)
 
 	finalTimeouts := getCounterValue(prober.ProbesTimedOut, targetName, serverAddr)
 	diff := finalTimeouts - initialTimeouts

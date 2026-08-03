@@ -82,8 +82,6 @@ func TestSeedMetrics(t *testing.T) {
 		"link_probes_sent_total",
 		"link_probes_timed_out_total",
 		"link_probes_inflight",
-		"link_flaps_total",
-		"link_connect_failures_total",
 		"link_up",
 		"link_rto_seconds",
 		"link_rtt_seconds",

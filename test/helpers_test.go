@@ -2,8 +2,6 @@ package prober_test
 
 import (
 	"context"
-	"fmt"
-	"io"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -121,50 +119,33 @@ func verifyHistogramCount(t *testing.T, vec *prometheus.HistogramVec, targetName
 	}
 }
 
+// startEchoServer starts a UDP echo responder on an ephemeral port that
+// echoes every validated probe, returning its address. It is used as the
+// healthy remote endpoint in client tests.
 func startEchoServer(ctx context.Context, t *testing.T) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed to listen: %v", err)
 	}
 	go func() {
 		<-ctx.Done()
-		ln.Close()
+		pc.Close()
 	}()
 	go func() {
+		buf := make([]byte, 1500)
 		for {
-			conn, err := ln.Accept()
+			n, raddr, err := pc.ReadFrom(buf)
 			if err != nil {
 				return
 			}
-			go func(c net.Conn) {
-				defer c.Close()
-				buf := make([]byte, prober.PayloadSize)
-				for {
-					c.SetReadDeadline(time.Now().Add(10 * time.Second))
-					if _, err := io.ReadFull(c, buf); err != nil {
-						return
-					}
-					c.SetWriteDeadline(time.Now().Add(5 * time.Second))
-					if _, err := c.Write(buf); err != nil {
-						return
-					}
-				}
-			}(conn)
+			if n != prober.PayloadSize || string(buf[0:8]) != prober.MagicBytes {
+				continue
+			}
+			pc.WriteTo(buf[:n], raddr)
 		}
 	}()
-	return ln.Addr().String()
-}
-
-func makeTargets(count int) []prober.Target {
-	targets := make([]prober.Target, count)
-	for i := range count {
-		targets[i] = prober.Target{
-			Name:    fmt.Sprintf("t%d", i),
-			Address: fmt.Sprintf("127.0.0.1:%d", 4000+i),
-		}
-	}
-	return targets
+	return pc.LocalAddr().String()
 }
 
 func cfgWith(adaptive bool, interval, timeout time.Duration, targets ...prober.Target) prober.Config {

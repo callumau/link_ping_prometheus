@@ -2,7 +2,6 @@ package prober_test
 
 import (
 	"context"
-	"io"
 	"net"
 	"testing"
 	"time"
@@ -10,43 +9,46 @@ import (
 	"tcp_ping_prometheus/internal/prober"
 )
 
+// TestGarbageData_Server: a peer that answers probes with garbage (wrong
+// size, wrong magic) must never be counted as a valid response.
 func TestGarbageData_Server(t *testing.T) {
 	prober.InitMetrics()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	fake, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
-	addr := ln.Addr().String()
+	defer fake.Close()
 
 	go func() {
-		defer ln.Close()
-		conn, err := ln.Accept()
-		if err != nil {
-			return
-		}
-		defer conn.Close()
+		buf := make([]byte, 1500)
 		for {
-			_, err := conn.Write([]byte("garbage data garbage data garbage data\n"))
+			n, raddr, err := fake.ReadFrom(buf)
 			if err != nil {
 				return
 			}
-			time.Sleep(10 * time.Millisecond)
+			if n == prober.PayloadSize {
+				// Same size but invalid magic.
+				bad := make([]byte, prober.PayloadSize)
+				copy(bad[0:8], "BADHEADR")
+				fake.WriteTo(bad, raddr)
+			} else {
+				fake.WriteTo([]byte("garbage data garbage data garbage data"), raddr)
+			}
 		}
 	}()
 
 	targetName := "garbage_test"
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	cfg := cfgWith(false, 100*time.Millisecond, 100*time.Millisecond, prober.Target{Name: targetName, Address: addr})
-	startRecv := getHistogramCount(prober.RTTSeconds, targetName, addr)
+	cfg := cfgWith(false, 100*time.Millisecond, 100*time.Millisecond, prober.Target{Name: targetName, Address: fake.LocalAddr().String()})
+	startRecv := getHistogramCount(prober.RTTSeconds, targetName, fake.LocalAddr().String())
 
 	go prober.RunClient(ctx, cfg)
 	time.Sleep(500 * time.Millisecond)
 	cancel()
 
-	endRecv := getHistogramCount(prober.RTTSeconds, targetName, addr)
+	endRecv := getHistogramCount(prober.RTTSeconds, targetName, fake.LocalAddr().String())
 	if endRecv > startRecv {
 		t.Errorf("Garbage data counted as valid response? %v -> %v", startRecv, endRecv)
 	}
@@ -57,278 +59,234 @@ func TestServer_EnforceSizeAndHeader(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	addr := ln.Addr().String()
+	go prober.ServePacketConn(ctx, pc, testSource)
+	addr := pc.LocalAddr().String()
 
-	go func() {
-		<-ctx.Done()
-		ln.Close()
-	}()
-	go prober.ServeListener(ctx, ln, prober.DefaultReadTimeout, testSource)
-
-	conn, err := net.Dial("tcp", addr)
+	conn, err := net.Dial("udp", addr)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer conn.Close()
 
-	buf := make([]byte, 34)
-	copy(buf[0:8], prober.MagicBytes)
-	_, err = conn.Write(buf)
-	if err != nil {
-		t.Fatal(err)
+	reply := make([]byte, 24)
+
+	// 34-byte datagram with a valid magic prefix is not a probe: no echo.
+	oversized := make([]byte, 34)
+	copy(oversized[0:8], prober.MagicBytes)
+	conn.Write(oversized)
+	conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if n, _ := conn.Read(reply); n != 0 {
+		t.Errorf("oversized datagram must not be echoed, got %d bytes", n)
 	}
 
-	reply := make([]byte, 24)
+	// Valid 24-byte probe: echoed.
+	probe := make([]byte, prober.PayloadSize)
+	copy(probe[0:8], prober.MagicBytes)
+	conn.Write(probe)
 	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	_, err = io.ReadFull(conn, reply)
-	if err != nil {
-		t.Fatalf("Should have received echo for first valid part: %v", err)
+	if n, err := conn.Read(reply); err != nil || n != prober.PayloadSize {
+		t.Fatalf("valid probe must be echoed: n=%d err=%v", n, err)
 	}
 	if string(reply[0:8]) != prober.MagicBytes {
 		t.Errorf("Reply header invalid")
 	}
 
-	conn.Close()
-	conn, err = net.Dial("tcp", addr)
+	// 24-byte datagram with bad magic: no echo.
+	bad := make([]byte, prober.PayloadSize)
+	copy(bad[0:8], "BADHEADR")
+	conn.Write(bad)
+	conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if n, _ := conn.Read(reply); n != 0 {
+		t.Errorf("bad-magic datagram must not be echoed, got %d bytes", n)
+	}
+
+	if got := getCounterValue1(prober.ServerProbesReceived, "127.0.0.1"); got < 1 {
+		t.Errorf("Server should have counted the valid probe, got %v", got)
+	}
+}
+
+// TestServer_PerIPRateLimit: packets beyond MaxPktsPerIP from one remote
+// IP within a rate window must be dropped, while packets within the
+// limit keep being echoed.
+func TestServer_PerIPRateLimit(t *testing.T) {
+	prober.InitMetrics()
+	oldIP, oldGlobal := prober.MaxPktsPerIP, prober.MaxPktsGlobal
+	prober.MaxPktsPerIP = 3
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		<-ctx.Done()
+		pc.Close()
+	}()
+	done := make(chan struct{})
+	go func() {
+		prober.ServePacketConn(ctx, pc, testSource)
+		close(done)
+	}()
+	// Restore the shared test variables after ServePacketConn has
+	// returned; it reads them at startup.
+	defer func() {
+		cancel()
+		<-done
+		prober.MaxPktsPerIP, prober.MaxPktsGlobal = oldIP, oldGlobal
+	}()
+	addr := pc.LocalAddr().String()
+
+	conn, err := net.Dial("udp", addr)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer conn.Close()
 
-	buf = make([]byte, 48)
-	copy(buf[0:8], prober.MagicBytes)
-	copy(buf[24:32], "BADHEADR")
-	conn.Write(buf)
-
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	_, err = io.ReadFull(conn, reply)
-	if err != nil {
-		t.Fatalf("Should get 1st reply: %v", err)
-	}
-
-	_, err = io.ReadFull(conn, reply)
-	if err == nil {
-		t.Errorf("Expected server to close connection on invalid 2nd packet header, but got reply")
-	} else {
-		t.Logf("Got expected error on 2nd packet: %v", err)
-	}
-
-	if got := getCounterValue1(prober.ServerProbesReceived, "127.0.0.1"); got < 1 {
-		t.Errorf("Server should have counted at least the 1st valid probe, got %v", got)
-	}
-}
-
-// TestServer_PerIPLimit: connections beyond MaxConnsPerIP from a single
-// remote IP must be closed immediately, while connections within the
-// limit keep working.
-func TestServer_PerIPLimit(t *testing.T) {
-	prober.InitMetrics()
-	old := prober.MaxConnsPerIP
-	prober.MaxConnsPerIP = 3
-
-	ctx, cancel := context.WithCancel(context.Background())
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-
-	done := make(chan struct{})
-	go func() {
-		prober.ServeListener(ctx, ln, prober.DefaultReadTimeout, testSource)
-		close(done)
-	}()
-	// Restore the shared test variable only after ServeListener has
-	// returned; it reads MaxConnsPerIP on every accept.
-	defer func() {
-		cancel()
-		<-done
-		prober.MaxConnsPerIP = old
-	}()
-	addr := ln.Addr().String()
-
 	probe := make([]byte, prober.PayloadSize)
-	copy(probe, prober.MagicBytes)
+	copy(probe[0:8], prober.MagicBytes)
 
-	// Open MaxConnsPerIP connections and prove each works (the echo
-	// round-trip also guarantees the server has registered the conn).
-	conns := make([]net.Conn, 0, 3)
+	got := 0
 	for i := 0; i < 3; i++ {
-		c, err := net.Dial("tcp", addr)
-		if err != nil {
-			t.Fatalf("dial %d: %v", i, err)
+		conn.Write(probe)
+		conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		if n, err := conn.Read(make([]byte, prober.PayloadSize)); err == nil && n == prober.PayloadSize {
+			got++
 		}
-		defer c.Close()
-		conns = append(conns, c)
-		c.SetDeadline(time.Now().Add(2 * time.Second))
-		if _, err := c.Write(probe); err != nil {
-			t.Fatalf("write %d: %v", i, err)
-		}
-		if _, err := io.ReadFull(c, make([]byte, prober.PayloadSize)); err != nil {
-			t.Fatalf("conn %d within limit failed echo: %v", i, err)
-		}
+	}
+	if got != 3 {
+		t.Fatalf("expected 3 echoes within the per-IP limit, got %d", got)
 	}
 
-	// The next connection from the same IP must be rejected.
-	c4, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("dial 4th: %v", err)
-	}
-	defer c4.Close()
-	c4.SetDeadline(time.Now().Add(2 * time.Second))
-	if _, err := c4.Write(probe); err != nil {
-		t.Logf("4th conn write failed (acceptable rejection): %v", err)
-		return
-	}
-	if _, err := io.ReadFull(c4, make([]byte, prober.PayloadSize)); err == nil {
-		t.Error("4th connection received echo despite per-IP limit")
+	// 4th datagram in the same rate window must be dropped.
+	conn.Write(probe)
+	conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if n, _ := conn.Read(make([]byte, prober.PayloadSize)); n != 0 {
+		t.Error("packet beyond per-IP limit must be dropped")
 	}
 }
 
 // TestServer_ProbeCounterIgnoresInvalid: link_server_probes_received_total
-// must count only validated probes — garbage frames must not inflate it.
+// must count only validated probes — garbage datagrams must not inflate it.
 func TestServer_ProbeCounterIgnoresInvalid(t *testing.T) {
 	prober.InitMetrics()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
-	go func() {
-		<-ctx.Done()
-		ln.Close()
-	}()
-	go prober.ServeListener(ctx, ln, prober.DefaultReadTimeout, testSource)
-	addr := ln.Addr().String()
+	go prober.ServePacketConn(ctx, pc, testSource)
+	addr := pc.LocalAddr().String()
 
 	before := getCounterValue1(prober.ServerProbesReceived, "127.0.0.1")
 
-	// Valid probe -> counted.
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	probe := make([]byte, prober.PayloadSize)
-	copy(probe, prober.MagicBytes)
-	conn.SetDeadline(time.Now().Add(2 * time.Second))
-	if _, err := conn.Write(probe); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := io.ReadFull(conn, make([]byte, prober.PayloadSize)); err != nil {
-		t.Fatalf("valid echo failed: %v", err)
-	}
-	conn.Close()
-
-	// Garbage (invalid magic) -> connection closed, must not count.
-	conn, err = net.Dial("tcp", addr)
+	conn, err := net.Dial("udp", addr)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(2 * time.Second))
-	if _, err := conn.Write([]byte("this is not a valid probe frame")); err != nil {
-		t.Fatal(err)
+
+	// Valid probe -> counted + echoed.
+	probe := make([]byte, prober.PayloadSize)
+	copy(probe[0:8], prober.MagicBytes)
+	conn.Write(probe)
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if n, err := conn.Read(make([]byte, prober.PayloadSize)); err != nil || n != prober.PayloadSize {
+		t.Fatalf("valid echo failed: n=%d err=%v", n, err)
 	}
-	if _, err := conn.Read(make([]byte, 1)); err == nil {
-		t.Error("expected server to close on invalid magic")
-	}
+
+	// Garbage (invalid magic) -> dropped, must not count.
+	conn.Write([]byte("this is not a valid probe frame"))
+
+	// Give the server a beat to process both datagrams.
+	time.Sleep(200 * time.Millisecond)
 
 	if got := getCounterValue1(prober.ServerProbesReceived, "127.0.0.1") - before; got != 1 {
 		t.Errorf("Server counter must increase by exactly 1 (valid probe only), got %v", got)
 	}
 }
 
-// TestServer_ShutdownWaitsForHandlers: ServeListener must return after
-// context cancellation even when a connection is established, proving
-// handler goroutines are joined (not abandoned) on shutdown.
-func TestServer_ShutdownWaitsForHandlers(t *testing.T) {
+// TestServer_ShutdownOnCancel: ServePacketConn must return promptly on
+// context cancellation (the socket is closed to unblock the read loop).
+func TestServer_ShutdownOnCancel(t *testing.T) {
 	prober.InitMetrics()
 	ctx, cancel := context.WithCancel(context.Background())
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	go func() {
+		<-ctx.Done()
+		pc.Close()
+	}()
 
 	done := make(chan error, 1)
 	go func() {
-		done <- prober.ServeListener(ctx, ln, 30*time.Second, testSource)
+		done <- prober.ServePacketConn(ctx, pc, testSource)
 	}()
-	addr := ln.Addr().String()
-
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-
-	probe := make([]byte, prober.PayloadSize)
-	copy(probe, prober.MagicBytes)
-	conn.SetDeadline(time.Now().Add(2 * time.Second))
-	if _, err := conn.Write(probe); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := io.ReadFull(conn, make([]byte, prober.PayloadSize)); err != nil {
-		t.Fatalf("initial echo failed: %v", err)
-	}
 
 	cancel()
 
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Errorf("ServeListener returned error: %v", err)
+			t.Errorf("ServePacketConn returned error: %v", err)
 		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("ServeListener did not return within 10s of cancel — handler wait hangs")
+	case <-time.After(5 * time.Second):
+		t.Fatal("ServePacketConn did not return within 5s of cancel")
 	}
 }
 
-// TestServer_ShutdownClosesConnections: cancelling the server context must
-// force-close established connections, not leave them to linger until the
-// read deadline.
-func TestServer_ShutdownClosesConnections(t *testing.T) {
+// TestServer_NoEchoAfterShutdown: after cancellation the server must stop
+// answering probes (no goroutine left echoing).
+func TestServer_NoEchoAfterShutdown(t *testing.T) {
 	prober.InitMetrics()
 	ctx, cancel := context.WithCancel(context.Background())
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
-	go prober.ServeListener(ctx, ln, 30*time.Second, testSource)
-	addr := ln.Addr().String()
+	go func() {
+		<-ctx.Done()
+		pc.Close()
+	}()
 
-	conn, err := net.Dial("tcp", addr)
+	done := make(chan struct{})
+	go func() {
+		prober.ServePacketConn(ctx, pc, testSource)
+		close(done)
+	}()
+	addr := pc.LocalAddr().String()
+
+	conn, err := net.Dial("udp", addr)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer conn.Close()
 
 	probe := make([]byte, prober.PayloadSize)
-	copy(probe, prober.MagicBytes)
-	conn.SetDeadline(time.Now().Add(2 * time.Second))
-	if _, err := conn.Write(probe); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := io.ReadFull(conn, make([]byte, prober.PayloadSize)); err != nil {
-		t.Fatalf("initial echo failed: %v", err)
+	copy(probe[0:8], prober.MagicBytes)
+	conn.Write(probe)
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if n, err := conn.Read(make([]byte, prober.PayloadSize)); err != nil || n != prober.PayloadSize {
+		t.Fatalf("initial echo failed: n=%d err=%v", n, err)
 	}
 
 	cancel()
+	<-done
 
-	// Connection must be closed promptly by the server (EOF/error well
-	// before the 30s read deadline).
-	if _, err := conn.Read(make([]byte, 1)); err == nil {
-		t.Error("connection still open after server shutdown")
+	conn.Write(probe)
+	conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if n, _ := conn.Read(make([]byte, prober.PayloadSize)); n != 0 {
+		t.Error("server still echoing after shutdown")
 	}
 }

@@ -18,23 +18,15 @@ var RTTBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5
 var (
 	ProbesSent = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "link_probes_sent_total",
-		Help: "Total probe slots at the probe interval, regardless of connection state. While the link is unreachable every slot is counted as sent and lost, so the loss ratio reads ~100% during an outage instead of going NaN.",
+		Help: "Total UDP probes sent. Probes into a down link still count as sent and time out naturally, so loss reads ~100% during an outage.",
 	}, []string{"source", "target", "address"})
 	ProbesTimedOut = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "link_probes_timed_out_total",
-		Help: "Total probes lost. Loss = rate(timed_out) / rate(sent). Counts probes that exceeded the RTO on a live link, plus every probe slot while the link is unreachable (the link is 100% down, so those slots are all lost).",
+		Help: "Total probes with no echo within the RTO. Loss = rate(timed_out) / rate(sent). No TCP retransmission: this is true network loss.",
 	}, []string{"source", "target", "address"})
 	ProbesInflight = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "link_probes_inflight",
-		Help: "Current number of probes sent but waiting for a response or timeout.",
-	}, []string{"source", "target", "address"})
-	LinkFlaps = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "link_flaps_total",
-		Help: "Total link flaps: established connections lost mid-probing.",
-	}, []string{"source", "target", "address"})
-	ConnectFailures = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "link_connect_failures_total",
-		Help: "Total failed connection attempts (dial errors). Not counted in sent/timeout totals.",
+		Help: "Current number of probes sent but waiting for a response or timeout. Grows during stalls.",
 	}, []string{"source", "target", "address"})
 	// RTTSeconds is a classic histogram with explicit buckets plus
 	// native histogram support (client-side observation of the same
@@ -49,7 +41,7 @@ var (
 	}, []string{"source", "target", "address"})
 	LinkUp = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "link_up",
-		Help: "1 if currently connected, 0 otherwise.",
+		Help: "1 if an echo was received within the last RTO+interval, 0 otherwise.",
 	}, []string{"source", "target", "address"})
 	RTOEstimate = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "link_rto_seconds",
@@ -57,7 +49,7 @@ var (
 	}, []string{"source", "target", "address"})
 	ServerProbesReceived = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "link_server_probes_received_total",
-		Help: "Total validated probes received by the server, labelled by source and remote client address. Compare with the client's link_probes_sent_total to measure true network loss: TCP retransmission hides lost segments from the client, so (sent - server_received) / sent is the real loss rate.",
+		Help: "Total validated probes received by the server, labelled by source and remote client address. Cross-check against the client's link_probes_sent_total: any mismatch is probes that never reached the server.",
 	}, []string{"source", "client"})
 )
 
@@ -67,7 +59,7 @@ var registerOnce sync.Once
 // Safe to call multiple times; registration happens exactly once.
 func InitMetrics() {
 	registerOnce.Do(func() {
-		prometheus.MustRegister(ProbesSent, ProbesTimedOut, ProbesInflight, LinkFlaps, ConnectFailures, RTTSeconds, LinkUp, RTOEstimate, ServerProbesReceived)
+		prometheus.MustRegister(ProbesSent, ProbesTimedOut, ProbesInflight, RTTSeconds, LinkUp, RTOEstimate, ServerProbesReceived)
 	})
 }
 
@@ -79,8 +71,6 @@ func SeedMetrics(source string, targets []Target) {
 		ProbesSent.WithLabelValues(source, t.Name, t.Address).Add(0)
 		ProbesTimedOut.WithLabelValues(source, t.Name, t.Address).Add(0)
 		ProbesInflight.WithLabelValues(source, t.Name, t.Address).Set(0)
-		LinkFlaps.WithLabelValues(source, t.Name, t.Address).Add(0)
-		ConnectFailures.WithLabelValues(source, t.Name, t.Address).Add(0)
 		LinkUp.WithLabelValues(source, t.Name, t.Address).Set(0)
 		RTOEstimate.WithLabelValues(source, t.Name, t.Address).Set(0)
 		RTTSeconds.WithLabelValues(source, t.Name, t.Address)

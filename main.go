@@ -1,13 +1,14 @@
-// Command tcp_ping_prometheus is a TCP echo probing agent that exposes
+// Command tcp_ping_prometheus is a UDP echo probing agent that exposes
 // Prometheus metrics for latency, packet loss, and jitter.
 //
 // It operates in three modes:
-//   - server: runs a TCP echo responder that validates a magic header.
-//   - client: dials targets and sends periodic probes, recording RTT.
+//   - server: runs a UDP echo responder that validates a magic header.
+//   - client: sends periodic probes to targets, recording RTT and loss.
 //   - both: runs server and client simultaneously.
 //
 // Adaptive RTO (RFC 6298) adjusts timeouts based on measured link
-// quality when -adaptive is enabled (default).
+// quality when -adaptive is enabled (default). UDP has no
+// retransmission, so the loss ratio is true network loss.
 package main
 
 import (
@@ -40,9 +41,8 @@ var (
 	flJSONLogs = flag.Bool("json-logs", false, "Log in JSON format")
 
 	flAdaptive     = flag.Bool("adaptive", true, "Client: Use adaptive timeout based on link quality (RFC 6298)")
-	flBaseInterval = flag.Duration("interval", 500*time.Millisecond, "Client: Probe interval (must stay well below server -read-timeout)")
+	flBaseInterval = flag.Duration("interval", 500*time.Millisecond, "Client: Probe interval")
 	flBaseTimeout  = flag.Duration("timeout", 1*time.Second, "Client: Base/Initial timeout")
-	flReadTimeout  = flag.Duration("read-timeout", prober.DefaultReadTimeout, "Server: idle read deadline per connection")
 	flSource       = flag.String("source", "", "Source label applied to all metrics, e.g. local datacenter (sydney-dc)")
 
 	flMetricsBasicAuthUser = flag.String("metrics-user", "", "Metrics: Basic auth username (empty disables auth; env TCP_PING_METRICS_USER)")
@@ -264,9 +264,6 @@ func (p *program) run() error {
 	if user != "" && cert == "" {
 		slog.Warn("Metrics basic auth over plaintext HTTP: credentials are base64-only on the wire; consider -metrics-tls-cert/-metrics-tls-key")
 	}
-	if *flReadTimeout <= 0 {
-		return fmt.Errorf("-read-timeout must be positive, got %v", *flReadTimeout)
-	}
 
 	var cfg prober.Config
 	if *flMode != "server" {
@@ -274,10 +271,6 @@ func (p *program) run() error {
 		cfg, err = buildConfig()
 		if err != nil {
 			return err
-		}
-		if cfg.BaseInterval >= *flReadTimeout {
-			slog.Warn("probe interval is not well below the server read-timeout; the server will disconnect idle clients mid-probing",
-				"interval", cfg.BaseInterval, "read_timeout", *flReadTimeout)
 		}
 	}
 
@@ -317,7 +310,7 @@ func (p *program) run() error {
 	mode := *flMode
 	switch mode {
 	case "server":
-		return prober.RunServer(p.ctx, *flListen, *flReadTimeout, *flSource)
+		return prober.RunServer(p.ctx, *flListen, *flSource)
 	case "client":
 		return prober.RunClient(p.ctx, cfg)
 	case "both":
@@ -327,7 +320,7 @@ func (p *program) run() error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := prober.RunServer(p.ctx, *flListen, *flReadTimeout, *flSource); err != nil {
+			if err := prober.RunServer(p.ctx, *flListen, *flSource); err != nil {
 				slog.Error("Server error", "err", err)
 			}
 		}()
