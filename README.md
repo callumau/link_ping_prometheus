@@ -38,7 +38,7 @@ The exporter exposes the following metrics at `/metrics` (default port 2112).
 
 | Metric Name | Type | Labels | Description |
 |---|---|---|---|
-| `link_up` | Gauge | `source`, `target`, `address` | 1 if an echo was received within the last RTO+interval, 0 otherwise. |
+| `link_up` | Gauge | `source`, `target`, `address` | 1 while probes are getting echoes, 0 after 3 consecutive probes time out. A single lost probe or brief stall does not flap the state. |
 | `link_probes_sent_total` | Counter | `source`, `target`, `address` | Total UDP probes sent. Probes into a down link still count as sent and time out naturally, so loss reads ~100% during an outage. |
 | `link_probes_timed_out_total` | Counter | `source`, `target`, `address` | Total probes with no echo within the RTO. True network loss — UDP never retransmits. |
 | `link_probes_inflight` | Gauge | `source`, `target`, `address` | Current number of probes sent but waiting for a response or timeout. Grows during stalls. |

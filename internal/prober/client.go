@@ -209,7 +209,10 @@ func runEchoLoop(
 	buf := make([]byte, PayloadSize)
 
 	pending := make(map[uint64]time.Time)
-	var lastResponse time.Time
+	// consecutiveMisses counts probes that timed out back-to-back. The
+	// link counts as down only after 3 consecutive missed probes, so a
+	// single lost probe or brief stall does not flap link_up.
+	consecutiveMisses := 0
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -269,7 +272,7 @@ func runEchoLoop(
 				if cfg.Adaptive {
 					stats.Update(rttSec)
 				}
-				lastResponse = resp.recv
+				consecutiveMisses = 0
 				LinkUp.WithLabelValues(cfg.Source, t.Name, t.Address).Set(1)
 			default:
 				break Drain
@@ -285,6 +288,7 @@ func runEchoLoop(
 					ProbesInflight.WithLabelValues(cfg.Source, t.Name, t.Address).Dec()
 					delete(pending, s)
 					timeoutOccurred = true
+					consecutiveMisses++
 				}
 			}
 		}
@@ -293,9 +297,10 @@ func runEchoLoop(
 			stats.Backoff()
 		}
 
-		// The link counts as down once nothing has been heard for a
-		// full timeout plus one interval of grace.
-		if !lastResponse.IsZero() && now.Sub(lastResponse) > timeout+interval {
+		// Down after LinkUpMissThreshold consecutive probes without an
+		// echo. A single lost probe or brief stall does not flap the
+		// state (enterprise health-check convention).
+		if consecutiveMisses >= LinkUpMissThreshold {
 			LinkUp.WithLabelValues(cfg.Source, t.Name, t.Address).Set(0)
 		}
 

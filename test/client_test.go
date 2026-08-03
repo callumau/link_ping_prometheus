@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"math"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -618,6 +619,56 @@ func TestGracefulShutdown_NoPhantomTimeouts(t *testing.T) {
 	}
 	if endTimeout != startTimeout {
 		t.Errorf("Graceful shutdown must not flush in-flight probes to timeouts: %v -> %v", startTimeout, endTimeout)
+	}
+}
+
+// TestLinkUp_RequiresThreeMisses: link_up must not flap on a single lost
+// probe, but must drop to 0 after LinkUpMissThreshold consecutive probes
+// time out (enterprise health-check convention).
+func TestLinkUp_RequiresThreeMisses(t *testing.T) {
+	prober.InitMetrics()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var dropOne atomic.Bool
+	dropOne.Store(true)
+	halt := make(chan struct{})
+	addr := udpEcho(t, ctx, func(buf []byte, w func([]byte)) {
+		if len(buf) != prober.PayloadSize || string(buf[0:8]) != prober.MagicBytes {
+			return
+		}
+		select {
+		case <-halt:
+			return
+		default:
+		}
+		if dropOne.CompareAndSwap(true, false) {
+			return // single missed probe
+		}
+		w(buf)
+	})
+
+	targetName := "linkup_test"
+	cfg := cfgWith(false, 50*time.Millisecond, 100*time.Millisecond, prober.Target{Name: targetName, Address: addr})
+	go prober.RunClient(ctx, cfg)
+
+	// A single dropped probe must not take the link down.
+	time.Sleep(400 * time.Millisecond)
+	if up := getGaugeValue(prober.LinkUp, targetName, addr); up != 1 {
+		t.Errorf("single missed probe must not flap link_up, got %v", up)
+	}
+
+	// Stop echoing entirely: down after LinkUpMissThreshold misses.
+	close(halt)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if up := getGaugeValue(prober.LinkUp, targetName, addr); up == 0 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if up := getGaugeValue(prober.LinkUp, targetName, addr); up != 0 {
+		t.Errorf("link_up must drop after %d consecutive missed probes, got %v", prober.LinkUpMissThreshold, up)
 	}
 }
 

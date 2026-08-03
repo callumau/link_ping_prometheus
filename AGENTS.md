@@ -25,7 +25,7 @@ UDP is deliberate: no retransmission, so the loss ratio is true network loss (TC
 - Always balances: `link_probes_sent_total = link_rtt_seconds_count + link_probes_timed_out_total + link_probes_inflight`
 - Client loss is true network loss (UDP never retransmits). `link_server_probes_received_total` (server side) is a cross-check on `sent`, not the primary loss source.
 - Adaptive RTO floor is `max(200ms, 2*SRTT)` with RFC 6298 doubling kept for recovery. A fixed 200ms floor caused spurious loss on ~185ms links.
-- `link_up` = 1 if an echo was heard within the last RTO+interval, 0 otherwise (swept per interval; no other state).
+- `link_up` = 1 while probes get echoes, 0 after 3 consecutive probes time out (`LinkUpMissThreshold`); a single lost probe must not flap it.
 - Removed (history): `link_flaps_total`, `link_connect_failures_total` were dropped in the TCP→UDP migration. Don't reintroduce connection-lifecycle metrics.
 
 ## Prometheus wiring

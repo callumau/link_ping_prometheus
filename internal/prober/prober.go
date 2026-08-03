@@ -29,10 +29,14 @@ const (
 	DefaultClockGranularity = time.Millisecond
 	// DefaultMinRTO floors the adaptive RTO to prevent false positive
 	// timeouts caused by normal latency jitter.
-	DefaultMinRTO      = 200 * time.Millisecond
-	DefaultMaxRTO      = 3 * time.Second
-	MaxTargetsFileSize = 1 << 20
-	MaxTargetsCount    = 1000
+	DefaultMinRTO = 200 * time.Millisecond
+	DefaultMaxRTO = 3 * time.Second
+	// LinkUpMissThreshold is the number of consecutive probes without an
+	// echo before link_up drops to 0 (enterprise health-check convention:
+	// down after N failures, so single losses don't flap the state).
+	LinkUpMissThreshold = 3
+	MaxTargetsFileSize  = 1 << 20
+	MaxTargetsCount     = 1000
 )
 
 // Config holds the client probing configuration.

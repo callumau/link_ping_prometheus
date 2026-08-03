@@ -220,7 +220,7 @@
       ],
       "title": "Link Status",
       "type": "stat",
-      "description": "1 = connected, 0 = down/reconnecting. Latency panels show a gap while 0 (no RTT samples)."
+      "description": "1 = up, 0 = down (after 3 consecutive missed probes). Latency panels show a gap while 0 (no RTT samples)."
     },
     {
       "datasource": {
@@ -898,7 +898,7 @@
       ],
       "title": "Link Status (history)",
       "type": "timeseries",
-      "description": "Connection state over time: 1 = up, 0 = down. Cross-reference with Packet Loss (100% while down)."
+      "description": "Connection state over time: 1 = up, 0 = down after 3 consecutive missed probes. Cross-reference with Packet Loss (100% while down)."
     },
     {
       "datasource": {

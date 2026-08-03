@@ -41,7 +41,7 @@ var (
 	}, []string{"source", "target", "address"})
 	LinkUp = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "link_up",
-		Help: "1 if an echo was received within the last RTO+interval, 0 otherwise.",
+		Help: "1 while probes are getting echoes, 0 after 3 consecutive probes time out. A single lost probe or brief stall does not flap the state.",
 	}, []string{"source", "target", "address"})
 	RTOEstimate = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "link_rto_seconds",
