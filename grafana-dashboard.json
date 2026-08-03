@@ -53,6 +53,7 @@
     ]
   },
   "editable": true,
+  "description": "Site-to-site link monitor. Latency panels (Current RTT, Percentiles, Average, Jitter) are RTT in ms, derived from link_rtt_seconds (seconds) via histogram_quantile/rate; they gap during outages. Packet Loss = 100 * rate(link_probes_timed_out_total)/rate(link_probes_sent_total), reads ~100% during a full outage (counters keep clocking probe slots while unreachable); a shorter rate window catches shorter outages. True wire loss (immune to TCP retransmission) needs the server-side link_server_probes_received_total.",
   "fiscalYearStartMonth": 0,
   "graphTooltip": 0,
   "id": null,
@@ -131,7 +132,7 @@
       ],
       "title": "Current RTT",
       "type": "stat",
-      "description": "p50 RTT over the last 5 minutes (derived from histogram)."
+      "description": "Median (p50) round-trip time over the last 5 minutes, in ms. No RTT samples during an outage -> gap; check Link Status."
     },
     {
       "datasource": {
@@ -218,7 +219,8 @@
         }
       ],
       "title": "Link Status",
-      "type": "stat"
+      "type": "stat",
+      "description": "1 = connected, 0 = down/reconnecting. Latency panels show a gap while 0 (no RTT samples)."
     },
     {
       "datasource": {
@@ -296,7 +298,7 @@
       ],
       "title": "Packet Loss",
       "type": "stat",
-      "description": "Application-visible loss: rate(timeouts) / rate(sent)."
+      "description": "Packet loss % over the last 5 minutes: 100 * rate(timed_out)/rate(sent). Reads ~100% during a full outage. Short outages appear as bumps, not full 100%."
     },
     {
       "datasource": {
@@ -374,7 +376,8 @@
         }
       ],
       "title": "Adaptive RTO",
-      "type": "stat"
+      "type": "stat",
+      "description": "Current probe timeout (RFC 6298, floor max(200ms, 2xSRTT)), in ms. Grows during degradation; pins at max during sustained loss."
     },
     {
       "datasource": {
@@ -566,7 +569,8 @@
         }
       ],
       "title": "Latency Percentiles",
-      "type": "timeseries"
+      "type": "timeseries",
+      "description": "RTT percentiles (p50/p90/p99) over a 5-minute window, in ms. Derived via histogram_quantile() from link_rtt_seconds_bucket (metric is seconds; x1000 = ms). Gaps = outage, no samples."
     },
     {
       "datasource": {
@@ -677,7 +681,8 @@
         }
       ],
       "title": "Packet Loss",
-      "type": "timeseries"
+      "type": "timeseries",
+      "description": "Packet loss % over time, 5-minute window: 100 * rate(timed_out)/rate(sent). Reads ~100% during a full outage. Pick a rate window >= the outage you want to see as a full 100% block."
     },
     {
       "datasource": {
@@ -775,7 +780,8 @@
         }
       ],
       "title": "Average Latency",
-      "type": "timeseries"
+      "type": "timeseries",
+      "description": "Mean RTT over a 5-minute window, in ms: rate(sum)/rate(count). Gaps = outage."
     },
     {
       "datasource": {
@@ -891,7 +897,8 @@
         }
       ],
       "title": "Link Status (history)",
-      "type": "timeseries"
+      "type": "timeseries",
+      "description": "Connection state over time: 1 = up, 0 = down. Cross-reference with Packet Loss (100% while down)."
     },
     {
       "datasource": {
@@ -1056,7 +1063,8 @@
         }
       ],
       "title": "Probe Throughput",
-      "type": "timeseries"
+      "type": "timeseries",
+      "description": "Probes per second: rate(link_probes_sent_total). Stays at the probe cadence while up; continues at the same cadence during an outage (each slot counted as sent+lost)."
     },
     {
       "datasource": {
@@ -1154,7 +1162,8 @@
         }
       ],
       "title": "Adaptive RTO",
-      "type": "timeseries"
+      "type": "timeseries",
+      "description": "Probe timeout in use over time (ms). Rises on consecutive timeouts so loss detection recovers from latency jumps; floor tracks 2x smoothed RTT."
     },
     {
       "datasource": {
@@ -1246,7 +1255,8 @@
         }
       ],
       "title": "Jitter (p90-p50)",
-      "type": "timeseries"
+      "type": "timeseries",
+      "description": "Latency spread over a 5-minute window, in ms: p90 minus p50 RTT. Rises with network variance."
     },
     {
       "datasource": {
@@ -1339,7 +1349,7 @@
       ],
       "title": "True Network Loss (server view)",
       "type": "timeseries",
-      "description": "Server counter is per client IP; restrict with client=\"<ip>\" when multiple clients probe this server."
+      "description": "Real wire loss %: 100 * (1 - rate(server_received)/rate(client_sent)). Not masked by TCP retransmission. The server counter is per client IP; restrict with client=\"<ip>\" when multiple clients probe this server."
     }
   ],
   "refresh": "1m",

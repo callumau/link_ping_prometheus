@@ -27,14 +27,14 @@ The exporter exposes the following metrics at `/metrics` (default port 2112).
 | Metric Name | Type | Labels | Description |
 |---|---|---|---|
 | `link_up` | Gauge | `source`, `target`, `address` | 1 = connected, 0 = disconnected/reconnecting. |
-| `link_probes_sent_total` | Counter | `source`, `target`, `address` | Total probes sent on established connections (dial failures excluded). |
-| `link_probes_timed_out_total` | Counter | `source`, `target`, `address` | Total probes that timed out. |
+| `link_probes_sent_total` | Counter | `source`, `target`, `address` | Total probe slots at the probe interval, regardless of connection state. While the link is unreachable every slot is counted as sent and lost, so the loss ratio reads ~100% during an outage instead of going NaN. |
+| `link_probes_timed_out_total` | Counter | `source`, `target`, `address` | Total probes lost: probes that exceeded the RTO on a live link, plus every probe slot while the link is unreachable (100% down). |
 | `link_probes_inflight` | Gauge | `source`, `target`, `address` | Current number of probes sent but waiting for a response or timeout. Grows during stalls — deadlock/detached-peer detection. |
 | `link_flaps_total` | Counter | `source`, `target`, `address` | Total link flaps: established connections lost mid-probing. Rate = link instability per window. |
 | `link_connect_failures_total` | Counter | `source`, `target`, `address` | Total failed connection attempts (dial errors). Not counted in sent/timeout totals. |
 | `link_rtt_seconds` | Histogram | `source`, `target`, `address` | RTT histogram with explicit buckets `{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0}` s plus native histogram support (`NativeHistogramBucketFactor` 1.1). |
 | `link_rtt_seconds_bucket/sum/count` | Histogram | `source`, `target`, `address` | Classic-bucket series; quantiles, means, and jitter are derived in PromQL over any window. |
-| `link_rto_seconds` | Gauge | `source`, `target`, `address` | Current adaptive RTO in use (RFC 6298, floored at 200ms). |
+| `link_rto_seconds` | Gauge | `source`, `target`, `address` | Current adaptive RTO in use (RFC 6298, doubled on consecutive timeouts). Floor is `max(200ms, 2×SRTT)` so a link's timeout always has headroom over its measured RTT. |
 | `link_server_probes_received_total` | Counter | `source`, `client` | Valid probes received by the server, per remote client IP (server mode only). |
 
 Derived values (percentiles, loss, jitter) are deliberately **not**
@@ -43,6 +43,30 @@ compute them from the raw counters and histogram, so any time window
 (1m, 1h, 24h) can be queried.
 
 ## PromQL Examples
+
+### Quick Reference
+
+Copy-paste these. RTT metrics are **seconds**; multiply by `1000` for ms.
+
+| You want | Query | Unit |
+|---|---|---|
+| **Packet loss** (incl. full outages) | `100 * rate(link_probes_timed_out_total[5m]) / rate(link_probes_sent_total[5m])` | % |
+| **Latency** median (p50) | `histogram_quantile(0.5, rate(link_rtt_seconds_bucket[5m]))` | s → ×1000 = ms |
+| **Latency** mean | `rate(link_rtt_seconds_sum[5m]) / rate(link_rtt_seconds_count[5m])` | s → ×1000 = ms |
+| **Latency** p90 / p99 | `histogram_quantile(0.9, ...)` / `histogram_quantile(0.99, ...)` | s → ×1000 = ms |
+| **True wire loss** (needs server at remote end) | `100 * (1 - rate(link_server_probes_received_total{client="<ip>"}[5m]) / rate(link_probes_sent_total[5m]))` | % |
+
+Two rules that trip people up:
+
+- **Never divide raw counter totals.** Counters accumulate forever, so
+  `timed_out / sent` on the raw /metrics dump is a *lifetime average*.
+  Always wrap them in `rate()` (or `increase()`) over a window.
+- **The rate window sets what you see.** It is both the smoothing period
+  and the shortest outage that reads as a full 100% loss block. A `[5m]`
+  window shows a 3-minute outage as a partial spike; `[1m]` catches it as
+  100% but is noisier. Pick the window to match the outages you want to
+  catch (the exporter's probe cadence does not limit visibility — every
+  down second lands in the counters regardless of scrape interval).
 
 ### Link Packet Loss (%)
 
@@ -59,17 +83,26 @@ RTO still count as received — with inflated RTT. With a link loss
 simulator (e.g. clumsy) at X%, expect the loss ratio to sit notably
 below X%, while RTT percentiles climb.
 
-While the client cannot connect at all, no probes are sent, so the rate
-ratio above becomes NaN (0/0). To show **100% during a full outage**
-instead of a gap, OR the ratio with the down state:
+While the client cannot connect at all, the counters keep clocking at the
+probe interval: every slot is counted as sent and lost, so the ratio
+above reads **~100% during a full outage** instead of going NaN (0/0). A
+fully down link is 100% loss — there is no separate "real" loss to
+uncover during that window. No PromQL `OR` workaround is needed. Pair the
+ratio with `link_up == 0` and `rate(link_connect_failures_total[5m]) > 0`
+for alerting on reachability.
 
-```
-100 * rate(link_probes_timed_out_total[5m]) / rate(link_probes_sent_total[5m]) OR (link_up == 0) * 100
-```
+**Sanity check for the counters:** `link_probes_sent_total` always equals
+`link_rtt_seconds_count` (received) + `link_probes_timed_out_total` +
+`link_probes_inflight`. If that sum ever differs, counters were lost or
+the connection dropped mid-probing (visible via `link_flaps_total`).
 
-`OR` takes the left side whenever it has a value, and falls back to 100%
-only while the link is down. Pair it with `link_up == 0` and
-`rate(link_connect_failures_total[5m]) > 0` for alerting on reachability.
+The adaptive RTO keeps the timeout honest on the link's actual RTT: it is
+RFC 6298 (`SRTT + 4×RTTVAR`, doubled on consecutive timeouts so it can
+recover when latency jumps above the current value), and its floor is
+`max(200ms, 2×SRTT)` rather than a fixed 200ms. A fixed floor is too tight
+on links whose RTT approaches it (e.g. ~185ms), causing normal jitter to
+count as loss and the RTO to pin at its 3s clamp; flooring at twice the
+smoothed RTT guarantees headroom and keeps the loss ratio meaningful.
 
 To measure true network loss, run the server at the remote site and
 compare its per-client `link_server_probes_received_total` against the
@@ -90,6 +123,9 @@ no retransmission can hide them there.
 ```
 rate(link_rtt_seconds_sum[5m]) / rate(link_rtt_seconds_count[5m])
 ```
+
+Returns **seconds**. For ms: `... * 1000`. No RTT samples exist while the
+link is fully down, so latency is a gap (not 0) during an outage.
 
 ### Median / 90th / 99th Percentile Latency
 
@@ -158,6 +194,9 @@ series panel — the same expression renders the history.
 
 ### Latency
 
+All latency queries return **seconds** — append `* 1000` for ms (the
+dashboard does this for you).
+
 **Latency now** (median RTT over the last 5 minutes; the smallest
 window that produces a stable value):
 
@@ -178,6 +217,9 @@ to see the down period.
 
 ### Packet Loss
 
+All loss queries return **percent**. Never divide raw counter totals —
+always `rate()` over a window (see Quick Reference).
+
 **Loss now** (percentage over the last 5 minutes):
 
 ```
@@ -187,11 +229,19 @@ to see the down period.
 **Loss over time** — same expression in a time series panel. Change
 `[5m]` to `[1h]` / `[24h]` for longer windows.
 
-**Show 100% during an outage** (instead of a gap, which the raw ratio
-produces when no probes are sent):
+**Which window?** `[5m]` smooths and is the standard panel default. To
+catch short outages as a full 100% block, shrink the window so it is not
+much larger than the outage duration: a 1-minute outage reads ~100% with
+`[1m]` but only bumps a `[5m]` panel. The counters never miss a down
+second regardless of scrape interval.
+
+**Show 100% during an outage** — no workaround needed. The counters keep
+clocking probe slots at the probe interval while the link is unreachable
+(a fully down link is 100% loss), so the raw ratio naturally reads ~100%
+instead of a gap:
 
 ```
-100 * rate(link_probes_timed_out_total[5m]) / rate(link_probes_sent_total[5m]) OR (link_up == 0) * 100
+100 * rate(link_probes_timed_out_total[5m]) / rate(link_probes_sent_total[5m])
 ```
 
 For **true wire loss** (what a link-loss simulator injects — the client
@@ -215,12 +265,12 @@ groups:
         expr: histogram_quantile(0.5, rate(link_rtt_seconds_bucket[5m]))
       - record: link:loss_ratio:5m
         expr: rate(link_probes_timed_out_total[5m]) / rate(link_probes_sent_total[5m])
-      - record: link:loss_ratio:5m_withoutage
-        expr: rate(link_probes_timed_out_total[5m]) / rate(link_probes_sent_total[5m]) OR (link_up == 0)
 ```
 
-Graph `link:loss_ratio:5m_withoutage * 100` for the outage-inclusive
-loss panel.
+The loss ratio already reads ~100% during outages (the counters keep
+clocking probe slots while the link is unreachable), so no separate
+outage-inclusive rule is required. Graph `link:loss_ratio:5m * 100` for
+the loss panel.
 
 ## Grafana Alloy Scraping
 
