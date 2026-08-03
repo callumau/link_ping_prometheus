@@ -53,7 +53,7 @@ var (
 	}, []string{"source", "target", "address"})
 	RTOEstimate = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "link_rto_seconds",
-		Help: "Current adaptive RTO being used (RFC 6298, floored at 200ms).",
+		Help: "Current adaptive RTO (RFC 6298: SRTT + 4*RTTVAR, doubled on consecutive timeouts). Floor is max(200ms, 2*SRTT) so a link's timeout always has headroom over its measured RTT.",
 	}, []string{"source", "target", "address"})
 	ServerProbesReceived = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "link_server_probes_received_total",

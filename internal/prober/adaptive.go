@@ -55,10 +55,13 @@ func (a *AdaptiveStats) RTTVar() float64 { return a.rttvar }
 func (a *AdaptiveStats) RTO() float64 { return a.rto }
 
 // Backoff doubles the RTO, clamped to DefaultMaxRTO. Called after
-// consecutive timeouts to avoid retry storms. The first timeout in a
-// series does not double (RFC 6298: doubling applies to retransmitted
-// segments); every subsequent consecutive timeout doubles, so a
-// sustained outage can never push RTO beyond the clamp.
+// consecutive timeouts. RFC 6298 applies doubling to retransmitted
+// segments so the RTO can adapt up even while no successful measurements
+// are arriving (e.g. a latency jump above the current RTO); without it a
+// degraded link would never recover from a too-small timeout. The first
+// timeout in a series does not double; every subsequent consecutive
+// timeout doubles, so a sustained outage can never push RTO beyond the
+// clamp.
 func (a *AdaptiveStats) Backoff() {
 	a.consecutiveTimeouts++
 	if a.consecutiveTimeouts > 1 {
@@ -66,10 +69,14 @@ func (a *AdaptiveStats) Backoff() {
 	}
 }
 
-// CurrentRTO returns the clamped RTO as a time.Duration, bounded by
-// [DefaultMinRTO, DefaultMaxRTO]. The 200ms floor prevents false
-// positive timeouts caused by normal latency jitter on quiet links.
+// CurrentRTO returns the clamped RTO as a time.Duration. The floor is
+// dynamic: max(DefaultMinRTO, 2*SRTT). A fixed floor like 200ms is too
+// tight on links whose RTT approaches it (e.g. ~185ms links), causing
+// spurious timeouts and loss inflation; flooring at twice the smoothed
+// RTT guarantees the timeout always has real headroom over the measured
+// RTT while the 200ms minimum still guards LAN links against jitter.
 func (a *AdaptiveStats) CurrentRTO() time.Duration {
-	val := math.Max(math.Min(a.rto, DefaultMaxRTO.Seconds()), DefaultMinRTO.Seconds())
+	floor := math.Max(DefaultMinRTO.Seconds(), 2*a.srtt)
+	val := math.Max(math.Min(a.rto, DefaultMaxRTO.Seconds()), floor)
 	return time.Duration(val * float64(time.Second))
 }

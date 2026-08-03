@@ -41,6 +41,10 @@ func TestAdaptiveStats_Logic(t *testing.T) {
 	}
 }
 
+// TestAdaptiveStats_BackoffClampedAndConsecutive: RTO doubling after
+// consecutive timeouts is the recovery mechanism that lets the RTO adapt
+// up when no successful measurements arrive (RFC 6298). It must double
+// only after the first timeout in a series and clamp at DefaultMaxRTO.
 func TestAdaptiveStats_BackoffClampedAndConsecutive(t *testing.T) {
 	stats := prober.NewAdaptiveStats(1 * time.Second)
 
@@ -78,6 +82,36 @@ func TestAdaptiveStats_BackoffClampedAndConsecutive(t *testing.T) {
 	stats.Backoff()
 	if stats.RTO() != stats.SRTT()+4*stats.RTTVar() {
 		t.Errorf("after success, next backoff must not double: got %f", stats.RTO())
+	}
+}
+
+// TestAdaptiveStats_DynamicFloor: the RTO floor must track the smoothed
+// RTT (2*SRTT, minimum 200ms) so a link whose RTT approaches a fixed
+// floor does not suffer spurious timeouts. A ~150ms link gets ~300ms RTO,
+// not 200ms; a quiet LAN stays at the 200ms minimum.
+func TestAdaptiveStats_DynamicFloor(t *testing.T) {
+	stats := prober.NewAdaptiveStats(10 * time.Millisecond)
+	if r := stats.CurrentRTO(); r != prober.DefaultMinRTO {
+		t.Errorf("with no measurements the floor is the 200ms minimum, got %v", r)
+	}
+
+	stats.Update(0.150)
+	for i := 0; i < 25; i++ {
+		stats.Update(0.150)
+	}
+	if r := stats.CurrentRTO(); r < 300*time.Millisecond {
+		t.Errorf("150ms link must floor RTO at 2*SRTT=300ms, got %v", r)
+	}
+	if r := stats.CurrentRTO(); r > 450*time.Millisecond {
+		t.Errorf("150ms link RTO must stay near the floor, got %v", r)
+	}
+
+	stats.Update(0.010)
+	for i := 0; i < 25; i++ {
+		stats.Update(0.010)
+	}
+	if r := stats.CurrentRTO(); r != prober.DefaultMinRTO {
+		t.Errorf("10ms link must fall back to the 200ms minimum, got %v", r)
 	}
 }
 
