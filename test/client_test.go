@@ -12,7 +12,12 @@ import (
 	"tcp_ping_prometheus/internal/prober"
 )
 
-func TestConnectionRefusedMetrics(t *testing.T) {
+// TestOutageCountsAsLoss: while a target is unreachable (connection
+// refused), the client must fabricate one sent+lost probe per interval so
+// the loss ratio reads ~100% instead of NaN. Connect failures and link-up
+// state keep reflecting the down link; in-flight stays at zero (fabricated
+// probes are never in flight).
+func TestOutageCountsAsLoss(t *testing.T) {
 	prober.InitMetrics()
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -30,7 +35,7 @@ func TestConnectionRefusedMetrics(t *testing.T) {
 	initialSent := getCounterValue(prober.ProbesSent, "refused_test", addr)
 	initialTimeouts := getCounterValue(prober.ProbesTimedOut, "refused_test", addr)
 	initialConnectFails := getCounterValue(prober.ConnectFailures, "refused_test", addr)
-	initialDrops := getCounterValue(prober.LinkFlaps, "refused_test", addr)
+	initialInflight := getGaugeValue(prober.ProbesInflight, "refused_test", addr)
 
 	go prober.RunClient(ctx, cfg)
 
@@ -39,19 +44,26 @@ func TestConnectionRefusedMetrics(t *testing.T) {
 	finalSent := getCounterValue(prober.ProbesSent, "refused_test", addr)
 	finalTimeouts := getCounterValue(prober.ProbesTimedOut, "refused_test", addr)
 	finalConnectFails := getCounterValue(prober.ConnectFailures, "refused_test", addr)
-	finalDrops := getCounterValue(prober.LinkFlaps, "refused_test", addr)
+	finalInflight := getGaugeValue(prober.ProbesInflight, "refused_test", addr)
 
 	if finalConnectFails <= initialConnectFails {
 		t.Errorf("Expected connect failures to increase on connection refused, got %v -> %v", initialConnectFails, finalConnectFails)
 	}
-	if finalSent != initialSent {
-		t.Errorf("Dial failures must not count as sent probes, got %v -> %v", initialSent, finalSent)
+	if finalSent <= initialSent {
+		t.Errorf("Outage must fabricate sent probes so loss stays visible, got %v -> %v", initialSent, finalSent)
 	}
-	if finalTimeouts != initialTimeouts {
-		t.Errorf("Dial failures must not count as probe timeouts, got %v -> %v", initialTimeouts, finalTimeouts)
+	if finalTimeouts <= initialTimeouts {
+		t.Errorf("Outage must fabricate timed-out probes so loss reads ~100%%, got %v -> %v", initialTimeouts, finalTimeouts)
 	}
-	if finalDrops != initialDrops {
-		t.Errorf("Dial failures must not count as mid-connection drops, got %v -> %v", initialDrops, finalDrops)
+	if math.Abs((finalSent-initialSent)-(finalTimeouts-initialTimeouts)) > 1 {
+		t.Errorf("Fabricated sent and timed-out increments must match (loss ~100%%), got sent delta %v, timeout delta %v",
+			finalSent-initialSent, finalTimeouts-initialTimeouts)
+	}
+	if finalInflight != initialInflight {
+		t.Errorf("Fabricated probes must never be in flight, got %v -> %v", initialInflight, finalInflight)
+	}
+	if up := getGaugeValue(prober.LinkUp, "refused_test", addr); up != 0 {
+		t.Errorf("Link must stay down during outage, got %v", up)
 	}
 }
 

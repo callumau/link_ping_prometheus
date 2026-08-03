@@ -18,11 +18,11 @@ var RTTBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5
 var (
 	ProbesSent = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "link_probes_sent_total",
-		Help: "Total probes sent on established connections (dial failures excluded).",
+		Help: "Total probe slots at the probe interval, regardless of connection state. While the link is unreachable every slot is counted as sent and lost, so the loss ratio reads ~100% during an outage instead of going NaN.",
 	}, []string{"source", "target", "address"})
 	ProbesTimedOut = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "link_probes_timed_out_total",
-		Help: "Total probes that timed out. Loss = rate(timed_out) / rate(sent).",
+		Help: "Total probes lost. Loss = rate(timed_out) / rate(sent). Counts probes that exceeded the RTO on a live link, plus every probe slot while the link is unreachable (the link is 100% down, so those slots are all lost).",
 	}, []string{"source", "target", "address"})
 	ProbesInflight = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "link_probes_inflight",

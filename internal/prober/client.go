@@ -105,10 +105,13 @@ func dialTarget(ctx context.Context, address string) (net.Conn, error) {
 }
 
 // probeTarget manages the connection lifecycle for a single target.
-// Dial failures and lost connections retry with exponential backoff
-// plus full jitter (100ms base up to 10s) so reconnection attempts
-// scatter instead of storming. A panic in the echo loop is recovered
-// and treated as a connection loss — the target keeps being probed.
+// While the target is unreachable, dialWithLoss keeps counting one
+// sent+lost probe slot per probe interval so the loss ratio reads ~100%
+// during an outage instead of going NaN (a fully down link is 100% loss).
+// Dial failures and lost connections retry with exponential backoff plus
+// full jitter (100ms base up to 10s) so reconnection attempts scatter
+// instead of storming. A panic in the echo loop is recovered and treated
+// as a connection loss — the target keeps being probed.
 func probeTarget(ctx context.Context, t Target, cfg Config) {
 	logger := slog.With("target", t.Name, "address", t.Address)
 
@@ -120,18 +123,9 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 			return
 		}
 
-		conn, err := dialTarget(ctx, t.Address)
+		conn, err := dialWithLoss(ctx, cfg, t, b, logger)
 		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			ConnectFailures.WithLabelValues(cfg.Source, t.Name, t.Address).Inc()
-			LinkUp.WithLabelValues(cfg.Source, t.Name, t.Address).Set(0)
-			logger.Warn("Connect failed", "err", err)
-			if !retryDelay(ctx, b) {
-				return
-			}
-			continue
+			return
 		}
 		b.reset()
 
@@ -149,23 +143,58 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 			LinkFlaps.WithLabelValues(cfg.Source, t.Name, t.Address).Inc()
 			logger.Warn("Connection lost", "err", err)
 		}
+	}
+}
 
-		if !retryDelay(ctx, b) {
-			return
+// dialWithLoss attempts to establish a connection, keeping the probe
+// counters clocked while the target is unreachable. Each failed dial
+// counts a connect failure; the wait before the next attempt (exponential
+// backoff) runs downLossTicks, which counts one probe slot as sent and
+// lost per interval. Returns a connection on success or an error when ctx
+// is cancelled.
+func dialWithLoss(ctx context.Context, cfg Config, t Target, b *backoff, logger *slog.Logger) (net.Conn, error) {
+	for {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		conn, err := dialTarget(ctx, t.Address)
+		if err == nil {
+			return conn, nil
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		ConnectFailures.WithLabelValues(cfg.Source, t.Name, t.Address).Inc()
+		LinkUp.WithLabelValues(cfg.Source, t.Name, t.Address).Set(0)
+		logger.Warn("Connect failed", "err", err)
+		if !downLossTicks(ctx, cfg, t, b) {
+			return nil, ctx.Err()
 		}
 	}
 }
 
-// retryDelay sleeps for the next backoff interval, honouring context
-// cancellation. Returns false when the context was cancelled.
-func retryDelay(ctx context.Context, b *backoff) bool {
-	delay := b.next()
-	slog.Debug("Retrying connection", "delay", delay)
-	select {
-	case <-ctx.Done():
-		return false
-	case <-time.After(delay):
-		return true
+// downLossTicks waits out the next backoff delay, incrementing
+// link_probes_sent_total and link_probes_timed_out_total once per probe
+// interval so the loss ratio holds at ~100% while the link is down rather
+// than collapsing to NaN. The backoff timer (not the ticker) decides when
+// to redial, so reconnect storms stay prevented; over a sustained outage
+// the counted slots converge to the normal probe cadence. Returns false
+// when ctx is cancelled.
+func downLossTicks(ctx context.Context, cfg Config, t Target, b *backoff) bool {
+	backoffTimer := time.NewTimer(b.next())
+	ticker := time.NewTicker(cfg.BaseInterval)
+	defer backoffTimer.Stop()
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-backoffTimer.C:
+			return true
+		case <-ticker.C:
+			ProbesSent.WithLabelValues(cfg.Source, t.Name, t.Address).Inc()
+			ProbesTimedOut.WithLabelValues(cfg.Source, t.Name, t.Address).Inc()
+		}
 	}
 }
 
