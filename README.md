@@ -5,6 +5,13 @@ in Go. It measures latency (RTT), packet loss, and jitter by sending
 active **UDP echo probes** across the link, with adaptive timeout
 capabilities (RFC 6298).
 
+The purpose is the status of the **link itself** between sites (or cores):
+one agent per site, and each target in the client config is one monitored
+link. Loss, latency, jitter, and up/down state together give the full
+picture of link health. Because it probes the network path directly, it
+answers "is this link degrading?" — it is not a proxy for what TCP
+applications experience (TCP hides loss as delay; UDP shows it plainly).
+
 UDP is used deliberately: there is no retransmission, so a probe without
 an echo within the timeout is genuinely lost on the wire. The loss ratio
 is **true network loss** — TCP-based probing can never show this, because
