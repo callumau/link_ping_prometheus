@@ -10,9 +10,13 @@ import (
 )
 
 // RTTBuckets are the explicit histogram buckets for link_rtt_seconds.
-// Fixed values (not generated) avoid floating-point label artifacts and
-// cover LAN links below 100ms up to 10s link outages.
-var RTTBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0}
+// Fixed values (not generated) avoid floating-point label artifacts.
+// They span sub-100ms LAN links up to 2.5s of degradation. Buckets above
+// the RTO cap (DefaultMaxRTO = 3s) would be dead weight: any probe
+// unresolved past the RTO is counted as loss and its late response
+// discarded, so RTT samples can never approach 5s/10s. +Inf is always
+// appended by the Prometheus client.
+var RTTBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5}
 
 // Prometheus metric descriptors. All use the label set {source, target, address}.
 var (

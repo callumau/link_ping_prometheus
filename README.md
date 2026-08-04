@@ -42,7 +42,7 @@ The exporter exposes the following metrics at `/metrics` (default port 2112).
 | `link_probes_sent_total` | Counter | `source`, `target`, `address` | Total UDP probes sent. Probes into a down link still count as sent and time out naturally, so loss reads ~100% during an outage. |
 | `link_probes_timed_out_total` | Counter | `source`, `target`, `address` | Total probes with no echo within the RTO. True network loss — UDP never retransmits. |
 | `link_probes_inflight` | Gauge | `source`, `target`, `address` | Current number of probes sent but waiting for a response or timeout. Grows during stalls. |
-| `link_rtt_seconds` | Histogram | `source`, `target`, `address` | RTT histogram with explicit buckets `{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0}` s plus native histogram support (`NativeHistogramBucketFactor` 1.1). |
+| `link_rtt_seconds` | Histogram | `source`, `target`, `address` | RTT histogram with explicit buckets `{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5}` s plus native histogram support (`NativeHistogramBucketFactor` 1.1). Buckets stop at 2.5s: anything slower than the RTO cap (3s) counts as loss, so higher buckets would never fill. |
 | `link_rtt_seconds_bucket/sum/count` | Histogram | `source`, `target`, `address` | Classic-bucket series; quantiles, means, and jitter are derived in PromQL over any window. |
 | `link_rto_seconds` | Gauge | `source`, `target`, `address` | Current adaptive RTO in use (RFC 6298, doubled on consecutive timeouts). Floor is `max(200ms, 2×SRTT)` so a link's timeout always has headroom over its measured RTT. |
 | `link_server_probes_received_total` | Counter | `source`, `client` | Valid probes received by the server, per remote client IP (server mode only). Cross-check against the client's sent counter. |
@@ -140,11 +140,12 @@ histogram_quantile(0.9,  rate(link_rtt_seconds_bucket[5m]))
 histogram_quantile(0.99, rate(link_rtt_seconds_bucket[5m]))
 ```
 
-Explicit buckets cover sub-100ms LAN RTTs (5ms lower bound) up to 10s
-of link degradation; values beyond 10s land in `+Inf`. The native
-histogram (bucket factor 1.1) carries fine-grained data; Prometheus
-scrapes and aggregates it transparently when native-histogram support
-is enabled.
+Explicit buckets cover sub-100ms LAN RTTs (5ms lower bound) up to 2.5s
+of link degradation; values beyond 2.5s land in `+Inf`. Buckets stop at
+2.5s because the RTO cap (3s) bounds measurable RTT: probes slower than
+that are counted as loss, not latency. The native histogram (bucket
+factor 1.1) carries fine-grained data; Prometheus scrapes and aggregates
+it transparently when native-histogram support is enabled.
 
 ### Jitter (p90 − p50)
 
