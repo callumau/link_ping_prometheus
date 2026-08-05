@@ -34,14 +34,22 @@ var (
 	}, []string{"source", "target", "address"})
 	// RTTSeconds is a classic histogram with explicit buckets plus
 	// native histogram support (client-side observation of the same
-	// series with finer native buckets). Quantiles, means, and jitter
-	// are derived in PromQL via rate()/histogram_quantile() so any
-	// time window can be queried; nothing is pre-computed client-side.
+	// series with finer native buckets). Quantiles and means are
+	// derived in PromQL via rate()/histogram_quantile() so any time
+	// window can be queried.
 	RTTSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:                        "link_rtt_seconds",
 		Help:                        "Round-trip time in seconds.",
 		Buckets:                     RTTBuckets,
 		NativeHistogramBucketFactor: 1.1,
+	}, []string{"source", "target", "address"})
+	// JitterSeconds is the smoothed RTT jitter (RFC 3550 §6.4.1:
+	// J += (|D(i-1,i)| - J)/16) computed from consecutive probe RTT
+	// deltas. The estimate resets after any gap in sequence numbers
+	// (a timed-out probe), so link recovery never spikes the gauge.
+	JitterSeconds = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "link_rtt_jitter_seconds",
+		Help: "Smoothed RTT jitter in seconds (RFC 3550, consecutive RTT deltas). Resets after a probe timeout; a single lost probe does not feed an artificial spike into the estimate.",
 	}, []string{"source", "target", "address"})
 	LinkUp = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "link_up",
@@ -63,7 +71,7 @@ var registerOnce sync.Once
 // Safe to call multiple times; registration happens exactly once.
 func InitMetrics() {
 	registerOnce.Do(func() {
-		prometheus.MustRegister(ProbesSent, ProbesTimedOut, ProbesInflight, RTTSeconds, LinkUp, RTOEstimate, ServerProbesReceived)
+		prometheus.MustRegister(ProbesSent, ProbesTimedOut, ProbesInflight, RTTSeconds, JitterSeconds, LinkUp, RTOEstimate, ServerProbesReceived)
 	})
 }
 
@@ -77,6 +85,7 @@ func SeedMetrics(source string, targets []Target) {
 		ProbesInflight.WithLabelValues(source, t.Name, t.Address).Set(0)
 		LinkUp.WithLabelValues(source, t.Name, t.Address).Set(0)
 		RTOEstimate.WithLabelValues(source, t.Name, t.Address).Set(0)
+		JitterSeconds.WithLabelValues(source, t.Name, t.Address).Set(0)
 		RTTSeconds.WithLabelValues(source, t.Name, t.Address)
 	}
 }
