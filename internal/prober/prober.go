@@ -2,7 +2,7 @@
 // network latency and packet loss. It provides both a server (UDP echo
 // responder) and a client (active prober with adaptive RTO).
 //
-// Wire format: 24 bytes per probe — 8-byte magic header "TCPPING\x00",
+// Wire format: 24 bytes per probe — 8-byte magic header "LNKPING\x00",
 // 8-byte little-endian sequence number, 8-byte Unix-ns timestamp.
 // The server validates the magic header before echoing; invalid datagrams
 // are dropped.
@@ -20,7 +20,7 @@ import (
 
 // Protocol constants.
 const (
-	MagicBytes   = "TCPPING\x00"
+	MagicBytes   = "LNKPING\x00"
 	PayloadSize  = 24
 	DefaultAlpha = 0.125
 	DefaultBeta  = 0.25

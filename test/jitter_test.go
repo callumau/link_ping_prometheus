@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"tcp_ping_prometheus/internal/prober"
+	"link_ping_prometheus/internal/prober"
 )
 
 // TestJitterGauge_ConstantRTTStaysZero: on a link with constant RTT the

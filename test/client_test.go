@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"tcp_ping_prometheus/internal/prober"
+	"link_ping_prometheus/internal/prober"
 )
 
 // udpEcho starts a UDP responder on an ephemeral port with a

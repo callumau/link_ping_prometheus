@@ -10,7 +10,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 
-	"tcp_ping_prometheus/internal/prober"
+	"link_ping_prometheus/internal/prober"
 )
 
 // testSource is the topology label applied in test metric queries.

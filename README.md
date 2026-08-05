@@ -21,10 +21,10 @@ the kernel retransmits lost segments and hides them as inflated RTT.
 
 1. **Remote site (B):** run the echo server (open UDP port 4000 in the
    firewall — the protocol is UDP, not TCP):
-   `./tcp_ping_prometheus -mode=server -listen=":4000" -metrics=":2112"`
+   `./link_ping_prometheus -mode=server -listen=":4000" -metrics=":2112"`
 2. **Local site (A):** run the client, targeting site B's address, and
    tag every metric with the local topology label:
-   `./tcp_ping_prometheus -mode=client -target="203.0.113.10:4000" -source="sydney-dc" -metrics=":2112"`
+   `./link_ping_prometheus -mode=client -target="203.0.113.10:4000" -source="sydney-dc" -metrics=":2112"`
 3. Scrape both `/metrics` endpoints into Prometheus (or forward via
    Grafana Alloy, see below) and open the bundled dashboard.
 
@@ -306,17 +306,17 @@ write component has a different name, update the
 `prometheus.remote_write.default.receiver` reference below.
 
 ```river
-prometheus.scrape "tcp_ping" {
+prometheus.scrape "link_ping" {
 	targets = [{
 		"__address__" = "localhost:2112",
 	}]
 	metrics_path    = "/metrics"
 	scrape_interval = "1m"
 	scrape_timeout  = "10s"
-	forward_to      = [prometheus.relabel.tcp_ping_keep.receiver]
+	forward_to      = [prometheus.relabel.link_ping_keep.receiver]
 }
 
-prometheus.relabel "tcp_ping_keep" {
+prometheus.relabel "link_ping_keep" {
 	rule {
 		source_labels = ["__name__"]
 		regex         = "link_.*"
@@ -331,7 +331,7 @@ If the agent and the prober run on different hosts, replace
 enabled, add a `basic_auth` block to the scrape targets instead:
 
 ```river
-prometheus.scrape "tcp_ping" {
+prometheus.scrape "link_ping" {
 	targets = [{
 		"__address__" = "10.0.0.5:2112",
 	}]
@@ -346,13 +346,13 @@ prometheus.scrape "tcp_ping" {
 ## Build
 
 ```sh
-go build -o ./build/tcp_ping_prometheus .
+go build -o ./build/link_ping_prometheus .
 ```
 
 Cross-compile for Windows:
 
 ```sh
-CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o build/tcp_ping_prometheus.exe .
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o build/link_ping_prometheus.exe .
 ```
 
 ## Test
@@ -361,12 +361,12 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o build/tcp_ping_prometheus.ex
 go test -count=1 ./test/...
 ```
 
-Release binaries for Linux, macOS, Windows at [Latest Release](https://github.com/callumau/tcp_ping_prometheus/releases/latest).
+Release binaries for Linux, macOS, Windows at [Latest Release](https://github.com/callumau/link_ping_prometheus/releases/latest).
 
 ## Usage
 
 ```
-tcp_ping_prometheus -mode=<mode> [flags]
+link_ping_prometheus -mode=<mode> [flags]
 ```
 
 ### Flags
@@ -382,8 +382,8 @@ tcp_ping_prometheus -mode=<mode> [flags]
 | `-timeout` | `1s` | Client: Base/initial probe timeout |
 | `-adaptive` | `true` | Enable adaptive RTO based on link quality |
 | `-source` | `""` | Source label applied to every metric series, e.g. the local site or datacenter (`sydney-dc`) |
-| `-metrics-user` | `""` | Basic auth username for /metrics (empty = disabled; env `TCP_PING_METRICS_USER`) |
-| `-metrics-pass` | `""` | Basic auth password for /metrics (env `TCP_PING_METRICS_PASS`; prefer env over CLI to avoid `ps` exposure) |
+| `-metrics-user` | `""` | Basic auth username for /metrics (empty = disabled; env `LINK_PING_METRICS_USER`) |
+| `-metrics-pass` | `""` | Basic auth password for /metrics (env `LINK_PING_METRICS_PASS`; prefer env over CLI to avoid `ps` exposure) |
 | `-metrics-tls-cert` | `""` | TLS certificate file for /metrics (requires `-metrics-tls-key`) |
 | `-metrics-tls-key` | `""` | TLS private key file for /metrics (requires `-metrics-tls-cert`) |
 | `-json-logs` | `false` | Output logs in JSON format |
@@ -407,48 +407,48 @@ Max 1000 targets, max file size 1 MB.
 Client (single target):
 
 ```sh
-./tcp_ping_prometheus -mode=client -target="192.168.1.71:4000" -interval=10ms -timeout=20ms -metrics=":2113"
+./link_ping_prometheus -mode=client -target="192.168.1.71:4000" -interval=10ms -timeout=20ms -metrics=":2113"
 ```
 
 Client (multiple targets):
 
 ```sh
-./tcp_ping_prometheus -mode=client -targets=targets.json -interval=10ms -timeout=20ms -metrics=":2113"
+./link_ping_prometheus -mode=client -targets=targets.json -interval=10ms -timeout=20ms -metrics=":2113"
 ```
 
 Server:
 
 ```sh
-./tcp_ping_prometheus -mode=server -listen=":4000" -metrics=":2112"
+./link_ping_prometheus -mode=server -listen=":4000" -metrics=":2112"
 ```
 
 Both:
 
 ```sh
-./tcp_ping_prometheus -mode=both -targets=targets.json -interval=10ms -timeout=20ms -metrics=":2113"
+./link_ping_prometheus -mode=both -targets=targets.json -interval=10ms -timeout=20ms -metrics=":2113"
 ```
 
 ## Service
 
 ### Windows
 
-Use `-svc` to install/uninstall/start/stop/run. The tool records runtime flags at install time (excluding `-svc`, `-metrics-user`, and `-metrics-pass`). Metrics auth credentials are **not** persisted into the service configuration; set `TCP_PING_METRICS_USER` / `TCP_PING_METRICS_PASS` in the service environment instead (a warning is printed at install time).
+Use `-svc` to install/uninstall/start/stop/run. The tool records runtime flags at install time (excluding `-svc`, `-metrics-user`, and `-metrics-pass`). Metrics auth credentials are **not** persisted into the service configuration; set `LINK_PING_METRICS_USER` / `LINK_PING_METRICS_PASS` in the service environment instead (a warning is printed at install time).
 
 ```
-tcp_ping_prometheus.exe -mode=both -targets=targets.json -interval=10ms -timeout=20ms -metrics=":2113" -svc=install
+link_ping_prometheus.exe -mode=both -targets=targets.json -interval=10ms -timeout=20ms -metrics=":2113" -svc=install
 ```
 
 ### Linux (systemd)
 
-Create `/etc/systemd/system/tcp_ping_prometheus.service`:
+Create `/etc/systemd/system/link_ping_prometheus.service`:
 
 ```ini
 [Unit]
-Description=TCP Ping Prometheus (UDP link monitor)
+Description=Link Ping Prometheus (UDP link monitor)
 After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/tcp_ping_prometheus -mode=server -listen=":4000" -metrics=":2112"
+ExecStart=/usr/local/bin/link_ping_prometheus -mode=server -listen=":4000" -metrics=":2112"
 Restart=always
 User=nobody
 
@@ -456,11 +456,11 @@ User=nobody
 WantedBy=multi-user.target
 ```
 
-Note: In client/both mode, use an absolute path for `-targets` (e.g., `-targets=/etc/tcp_ping_prometheus/targets.json`).
+Note: In client/both mode, use an absolute path for `-targets` (e.g., `-targets=/etc/link_ping_prometheus/targets.json`).
 
 ```sh
 sudo systemctl daemon-reload
-sudo systemctl enable --now tcp_ping_prometheus
+sudo systemctl enable --now link_ping_prometheus
 ```
 
 ## Grafana Dashboard
@@ -497,7 +497,7 @@ UDP datagram, 24 bytes per probe:
 
 | Offset | Size | Field |
 |---|---|---|
-| 0 | 8 | Magic header `TCPPING\x00` |
+| 0 | 8 | Magic header `LNKPING\x00` |
 | 8 | 8 | Sequence number (little-endian uint64) |
 | 16 | 8 | Client timestamp (Unix ns, little-endian uint64) |
 
@@ -524,6 +524,6 @@ single reader, and `-interval` only needs to stay below the client's
   and carries no state, but any internet-facing echo endpoint should be
   firewall-restricted to known monitoring sites.
 - The `/metrics` endpoint supports HTTP Basic Auth (`-metrics-user` / `-metrics-pass`) with constant-time comparison over hashed credentials. Both must be set together; the process refuses to start with only one.
-- Prefer the `TCP_PING_METRICS_USER` / `TCP_PING_METRICS_PASS` environment variables over CLI flags — flag values are visible in `ps` to other local users.
+- Prefer the `LINK_PING_METRICS_USER` / `LINK_PING_METRICS_PASS` environment variables over CLI flags — flag values are visible in `ps` to other local users.
 - Basic Auth without TLS sends credentials as base64 on the wire; a startup warning is logged in that configuration. Use `-metrics-tls-cert` / `-metrics-tls-key` to serve `/metrics` over HTTPS.
 - The wire protocol carries no sensitive data (sequence numbers and wall-clock timestamps only) and has no TLS — intended for internal network monitoring. Restrict access with a firewall on untrusted networks.

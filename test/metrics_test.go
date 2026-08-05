@@ -7,7 +7,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"tcp_ping_prometheus/internal/prober"
+	"link_ping_prometheus/internal/prober"
 )
 
 func TestMetricsAuth(t *testing.T) {

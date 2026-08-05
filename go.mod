@@ -1,4 +1,4 @@
-module tcp_ping_prometheus
+module link_ping_prometheus
 
 go 1.25.1
 

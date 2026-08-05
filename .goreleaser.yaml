@@ -1,6 +1,6 @@
 version: 2
 
-project_name: tcp_ping_prometheus
+project_name: link_ping_prometheus
 
 builds:
   - env:

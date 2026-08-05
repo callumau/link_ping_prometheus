@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"tcp_ping_prometheus/internal/prober"
+	"link_ping_prometheus/internal/prober"
 )
 
 func TestAdaptiveStats_Logic(t *testing.T) {

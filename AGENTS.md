@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Go module `tcp_ping_prometheus` — site-to-site link monitor: a UDP echo prober that exposes Prometheus metrics for latency, packet loss, and jitter. Runs in `server` (echo), `client` (probes), or `both` mode.
+Go module `link_ping_prometheus` — site-to-site link monitor: a UDP echo prober that exposes Prometheus metrics for latency, packet loss, and jitter. Runs in `server` (echo), `client` (probes), or `both` mode.
 
 UDP is deliberate: no retransmission, so the loss ratio is true network loss (TCP probing hides loss as inflated RTT).
 
@@ -17,7 +17,7 @@ UDP is deliberate: no retransmission, so the loss ratio is true network loss (TC
 - `main.go` — flags, modes, metrics HTTP server (Basic auth + optional TLS), Windows service via `-svc`
 - `internal/prober/` — `client.go` (per-target UDP probe loop + reader goroutine), `server.go` (single UDP read/echo loop + per-IP/global packet rate limits), `adaptive.go` (RFC 6298 RTO), `metrics.go` (metric definitions), `validate.go`
 - `test/` — integration tests (package `prober_test`) that spin real UDP echo servers on ephemeral ports; `udpEcho` helper in `client_test.go`, `startEchoServer` in `helpers_test.go`
-- Wire protocol: 24-byte UDP datagram — 8B magic `TCPPING\x00`, 8B little-endian seq, 8B little-endian unix-ns timestamp. Tests build/validate raw frames from this layout.
+- Wire protocol: 24-byte UDP datagram — 8B magic `LNKPING\x00`, 8B little-endian seq, 8B little-endian unix-ns timestamp. Tests build/validate raw frames from this layout.
 - No connection lifecycle: no dial/reconnect/backoff/flaps. Probes into a dead link time out naturally → loss reads ~100% during an outage with no fabricated counters.
 
 ## Metrics invariants (deliberate — do not break)

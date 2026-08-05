@@ -1,4 +1,4 @@
-// Command tcp_ping_prometheus is a UDP echo probing agent that exposes
+// Command link_ping_prometheus is a UDP echo probing agent that exposes
 // Prometheus metrics for latency, packet loss, and jitter.
 //
 // It operates in three modes:
@@ -24,7 +24,7 @@ import (
 	"syscall"
 	"time"
 
-	"tcp_ping_prometheus/internal/prober"
+	"link_ping_prometheus/internal/prober"
 
 	"github.com/kardianos/service"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -45,8 +45,8 @@ var (
 	flBaseTimeout  = flag.Duration("timeout", 1*time.Second, "Client: Base/Initial timeout")
 	flSource       = flag.String("source", "", "Source label applied to all metrics, e.g. local datacenter (sydney-dc)")
 
-	flMetricsBasicAuthUser = flag.String("metrics-user", "", "Metrics: Basic auth username (empty disables auth; env TCP_PING_METRICS_USER)")
-	flMetricsBasicAuthPass = flag.String("metrics-pass", "", "Metrics: Basic auth password (env TCP_PING_METRICS_PASS; prefer env over CLI to avoid ps exposure)")
+	flMetricsBasicAuthUser = flag.String("metrics-user", "", "Metrics: Basic auth username (empty disables auth; env LINK_PING_METRICS_USER)")
+	flMetricsBasicAuthPass = flag.String("metrics-pass", "", "Metrics: Basic auth password (env LINK_PING_METRICS_PASS; prefer env over CLI to avoid ps exposure)")
 	flMetricsTLSCert       = flag.String("metrics-tls-cert", "", "Metrics: TLS certificate file (requires -metrics-tls-key)")
 	flMetricsTLSKey        = flag.String("metrics-tls-key", "", "Metrics: TLS private key file (requires -metrics-tls-cert)")
 
@@ -120,20 +120,20 @@ func buildConfig() (prober.Config, error) {
 	}, nil
 }
 
-// resolveMetricsAuth combines the CLI flags with the TCP_PING_METRICS_USER /
-// TCP_PING_METRICS_PASS environment variables (flags win). Username and
+// resolveMetricsAuth combines the CLI flags with the LINK_PING_METRICS_USER /
+// LINK_PING_METRICS_PASS environment variables (flags win). Username and
 // password must be configured as a pair: user-only would otherwise enable
 // auth with an empty password.
 func resolveMetricsAuth() (string, string, error) {
 	user, pass := *flMetricsBasicAuthUser, *flMetricsBasicAuthPass
 	if user == "" {
-		user = os.Getenv("TCP_PING_METRICS_USER")
+		user = os.Getenv("LINK_PING_METRICS_USER")
 	}
 	if pass == "" {
-		pass = os.Getenv("TCP_PING_METRICS_PASS")
+		pass = os.Getenv("LINK_PING_METRICS_PASS")
 	}
 	if (user == "") != (pass == "") {
-		return "", "", errors.New("metrics basic auth requires both username and password (-metrics-user/-metrics-pass or TCP_PING_METRICS_USER/TCP_PING_METRICS_PASS)")
+		return "", "", errors.New("metrics basic auth requires both username and password (-metrics-user/-metrics-pass or LINK_PING_METRICS_USER/LINK_PING_METRICS_PASS)")
 	}
 	return user, pass, nil
 }
@@ -144,8 +144,8 @@ func resolveMetricsAuth() (string, string, error) {
 // -metrics-pass).
 func handleService(action string) {
 	svcConfig := &service.Config{
-		Name:        "tcp_ping_prometheus",
-		DisplayName: "TCP Ping Prometheus",
+		Name:        "link_ping_prometheus",
+		DisplayName: "Link Ping Prometheus",
 		Description: "Monitoring agent for TCP Echo latency.",
 		Arguments:   []string{},
 	}
@@ -168,7 +168,7 @@ func handleService(action string) {
 
 		if *flMetricsBasicAuthUser != "" || *flMetricsBasicAuthPass != "" {
 			fmt.Println("WARNING: -metrics-user/-metrics-pass are NOT persisted into the service configuration.")
-			fmt.Println("Configure TCP_PING_METRICS_USER/TCP_PING_METRICS_PASS in the service environment instead.")
+			fmt.Println("Configure LINK_PING_METRICS_USER/LINK_PING_METRICS_PASS in the service environment instead.")
 		}
 	}
 

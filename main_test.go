@@ -24,8 +24,8 @@ func saveFlags(t *testing.T) {
 func TestResolveMetricsAuth(t *testing.T) {
 	saveFlags(t)
 	// Isolate from any real environment.
-	t.Setenv("TCP_PING_METRICS_USER", "")
-	t.Setenv("TCP_PING_METRICS_PASS", "")
+	t.Setenv("LINK_PING_METRICS_USER", "")
+	t.Setenv("LINK_PING_METRICS_PASS", "")
 
 	reset := func() { *flMetricsBasicAuthUser, *flMetricsBasicAuthPass = "", "" }
 
@@ -55,8 +55,8 @@ func TestResolveMetricsAuth(t *testing.T) {
 
 	// Flags win over env; env fills in when flags are empty.
 	reset()
-	t.Setenv("TCP_PING_METRICS_USER", "envu")
-	t.Setenv("TCP_PING_METRICS_PASS", "envp")
+	t.Setenv("LINK_PING_METRICS_USER", "envu")
+	t.Setenv("LINK_PING_METRICS_PASS", "envp")
 	if u, p, err := resolveMetricsAuth(); err != nil || u != "envu" || p != "envp" {
 		t.Errorf("env fallback: got %q/%q, err %v", u, p, err)
 	}
@@ -69,8 +69,8 @@ func TestResolveMetricsAuth(t *testing.T) {
 
 func TestRunRejectsBadFlagCombos(t *testing.T) {
 	saveFlags(t)
-	t.Setenv("TCP_PING_METRICS_USER", "")
-	t.Setenv("TCP_PING_METRICS_PASS", "")
+	t.Setenv("LINK_PING_METRICS_USER", "")
+	t.Setenv("LINK_PING_METRICS_PASS", "")
 
 	t.Run("tls cert without key", func(t *testing.T) {
 		saveFlags(t)
@@ -107,8 +107,8 @@ func TestRunRejectsBadFlagCombos(t *testing.T) {
 // inside run()).
 func TestProgramStartStopBothMode(t *testing.T) {
 	saveFlags(t)
-	t.Setenv("TCP_PING_METRICS_USER", "")
-	t.Setenv("TCP_PING_METRICS_PASS", "")
+	t.Setenv("LINK_PING_METRICS_USER", "")
+	t.Setenv("LINK_PING_METRICS_PASS", "")
 
 	*flMode = "both"
 	*flListen = "127.0.0.1:0"
