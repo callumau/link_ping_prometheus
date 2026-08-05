@@ -43,14 +43,17 @@ The exporter exposes the following metrics at `/metrics` (default port 2112).
 | `link_probes_timed_out_total` | Counter | `source`, `target`, `address` | Total probes with no echo within the RTO. True network loss — UDP never retransmits. |
 | `link_probes_inflight` | Gauge | `source`, `target`, `address` | Current number of probes sent but waiting for a response or timeout. Grows during stalls. |
 | `link_rtt_seconds` | Histogram | `source`, `target`, `address` | RTT histogram with explicit buckets `{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5}` s plus native histogram support (`NativeHistogramBucketFactor` 1.1). Buckets stop at 2.5s: anything slower than the RTO cap (3s) counts as loss, so higher buckets would never fill. |
-| `link_rtt_seconds_bucket/sum/count` | Histogram | `source`, `target`, `address` | Classic-bucket series; quantiles, means, and jitter are derived in PromQL over any window. |
+| `link_rtt_seconds_bucket/sum/count` | Histogram | `source`, `target`, `address` | Classic-bucket series; quantiles and means are derived in PromQL over any window. |
+| `link_rtt_jitter_seconds` | Gauge | `source`, `target`, `address` | Smoothed RTT jitter in seconds (RFC 3550 §6.4.1: `J += (|D(i−1,i)| − J)/16`) computed from consecutive probe RTT deltas. Resets after a sequence gap (a timed-out probe), so link recovery never spikes the gauge. |
 | `link_rto_seconds` | Gauge | `source`, `target`, `address` | Current adaptive RTO in use (RFC 6298, doubled on consecutive timeouts). Floor is `max(200ms, 2×SRTT)` so a link's timeout always has headroom over its measured RTT. |
 | `link_server_probes_received_total` | Counter | `source`, `client` | Valid probes received by the server, per remote client IP (server mode only). Cross-check against the client's sent counter. |
 
-Derived values (percentiles, loss, jitter) are deliberately **not**
-pre-computed in the exporter — Prometheus `rate()` / `histogram_quantile()`
-compute them from the raw counters and histogram, so any time window
-(1m, 1h, 24h) can be queried.
+Percentiles and loss are **not** pre-computed in the exporter — Prometheus
+`rate()` / `histogram_quantile()` compute them from the raw counters and
+histogram, so any time window (1m, 1h, 24h) can be queried. Jitter is the
+one exception: it is a smoothed running estimate in the probe binary,
+because a gauge derived from consecutive-sample deltas cannot be
+reconstructed over arbitrary windows in PromQL.
 
 ## PromQL Examples
 
@@ -147,7 +150,21 @@ that are counted as loss, not latency. The native histogram (bucket
 factor 1.1) carries fine-grained data; Prometheus scrapes and aggregates
 it transparently when native-histogram support is enabled.
 
-### Jitter (p90 − p50)
+### Jitter (direct gauge)
+
+```
+link_rtt_jitter_seconds * 1000
+```
+
+Smoothed RFC 3550 jitter computed in the probe binary from consecutive
+RTT deltas (see metrics table). Instantaneous value, no window needed.
+The estimate resets after any timed-out probe, so recovery does not
+show an artificial spike.
+
+### Jitter (p90 − p50 proxy)
+
+The p90−p50 spread is kept as a window-based approximation when you
+want jitter over a specific time range instead of the smoothed gauge:
 
 ```
 (histogram_quantile(0.9, rate(link_rtt_seconds_bucket[5m]))

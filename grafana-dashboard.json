@@ -53,7 +53,7 @@
     ]
   },
   "editable": true,
-  "description": "Site-to-site link monitor (UDP echo probes). Latency panels (Current RTT, Percentiles, Average, Jitter) are RTT in ms, derived from link_rtt_seconds (seconds) via histogram_quantile/rate; they gap during outages. Packet Loss = 100 * rate(link_probes_timed_out_total)/rate(link_probes_sent_total) — true network loss (UDP never retransmits), reading ~100% during a full outage; a shorter rate window catches shorter outages. The server-side link_server_probes_received_total is a cross-check on the client's sent counter.",
+  "description": "Site-to-site link monitor (UDP echo probes). Latency panels (Current RTT, Percentiles, Average) are RTT in ms, derived from link_rtt_seconds (seconds) via histogram_quantile/rate; they gap during outages. Jitter panel is the RFC 3550 smoothed estimate exported by the probe (link_rtt_jitter_seconds), with p90-p50 spread as a secondary line. Packet Loss = 100 * rate(link_probes_timed_out_total)/rate(link_probes_sent_total) — true network loss (UDP never retransmits), reading ~100% during a full outage; a shorter rate window catches shorter outages. The server-side link_server_probes_received_total is a cross-check on the client's sent counter.",
   "fiscalYearStartMonth": 0,
   "graphTooltip": 0,
   "id": null,
@@ -1250,13 +1250,18 @@
       "targets": [
         {
           "refId": "A",
+          "expr": "link_rtt_jitter_seconds{job=~\"$job\", target=~\"$target\"} * 1000",
+          "legendFormat": "rfc3550"
+        },
+        {
+          "refId": "B",
           "expr": "(histogram_quantile(0.9, rate(link_rtt_seconds_bucket{job=~\"$job\", target=~\"$target\"}[5m])) * 1000 - histogram_quantile(0.5, rate(link_rtt_seconds_bucket{job=~\"$job\", target=~\"$target\"}[5m])) * 1000)",
-          "legendFormat": "jitter"
+          "legendFormat": "p90-p50 (5m)"
         }
       ],
-      "title": "Jitter (p90-p50)",
+      "title": "Jitter",
       "type": "timeseries",
-      "description": "Latency spread over a 5-minute window, in ms: p90 minus p50 RTT. Rises with network variance."
+      "description": "RTT jitter in ms. Primary line is the RFC 3550 smoothed estimate exported by the probe (link_rtt_jitter_seconds); it resets after a probe timeout so recovery does not spike. Secondary line is the p90-p50 spread over a 5-minute window."
     },
     {
       "datasource": {

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"os"
 	"sync"
@@ -213,6 +214,12 @@ func runEchoLoop(
 	// link counts as down only after 3 consecutive missed probes, so a
 	// single lost probe or brief stall does not flap link_up.
 	consecutiveMisses := 0
+	// RFC 3550 jitter state (smoothed RTT delta). A gap in sequence
+	// numbers — any timed-out probe — resets the estimate, so recovery
+	// never feeds an artificial spike into it.
+	var jitter, prevRTT float64
+	var prevSeq uint64
+	havePrev := false
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -268,6 +275,18 @@ func runEchoLoop(
 				rttSec := resp.recv.Sub(sentTime).Seconds()
 
 				RTTSeconds.WithLabelValues(cfg.Source, t.Name, t.Address).Observe(rttSec)
+
+				// Jitter over consecutive RTT samples (RFC 3550 §6.4.1):
+				// J += (|D(i-1,i)| - J)/16. Any gap in sequence numbers
+				// starts the estimate over, keeping post-outage recovery
+				// from spiking the gauge.
+				if havePrev && seq == prevSeq+1 {
+					jitter += (math.Abs(rttSec-prevRTT) - jitter) / 16
+				} else {
+					jitter = 0
+				}
+				prevRTT, prevSeq, havePrev = rttSec, seq, true
+				JitterSeconds.WithLabelValues(cfg.Source, t.Name, t.Address).Set(jitter)
 
 				if cfg.Adaptive {
 					stats.Update(rttSec)
