@@ -39,6 +39,13 @@ const (
 	MaxTargetsCount     = 1000
 )
 
+// ReconnectInterval bounds how long a client keeps one UDP socket before
+// re-dialing so a target hostname that changes IP via DNS is re-resolved.
+// The re-dial only happens with no probes in flight, so it never abandons
+// an in-flight probe or breaks the sent/rtt/timedout/inflight balance. A
+// variable (not a constant) so tests can lower it.
+var ReconnectInterval = 5 * time.Minute
+
 // Config holds the client probing configuration.
 type Config struct {
 	// Source is the topology label applied to every metric series, e.g.

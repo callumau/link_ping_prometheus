@@ -122,36 +122,77 @@ func newTargetMetrics(source string, t Target) targetMetrics {
 	}
 }
 
+// errReconnect is a sentinel returned by runEchoLoop to request a socket
+// re-dial (DNS re-resolution) once ReconnectInterval has elapsed. It is
+// not a panic and is returned only when no probes are in flight.
+var errReconnect = errors.New("periodic reconnect")
+
+// dialUDP dials a UDP socket. Kept as a package variable so tests can
+// substitute a failing dialer to exercise the dial-retry path
+// deterministically, without a flaky DNS dependency.
+var dialUDP = net.Dial
+
+// probeLoopState carries per-target state that must survive socket
+// re-dials (periodic DNS re-resolution): jitter, link_up miss counting,
+// and the sequence counter. seq lives here so it stays monotonic across
+// reconnects — the reconnect only happens with an empty pending set, so
+// the next sequence is naturally prev+1 and the RFC 3550 gap check does
+// not spuriously reset jitter.
+type probeLoopState struct {
+	seq               uint64
+	consecutiveMisses int
+	jitter            float64
+	prevRTT           float64
+	prevSeq           uint64
+	havePrev          bool
+}
+
 // probeTarget runs the UDP probe loop for a single target until ctx is
 // cancelled. There is no connection lifecycle: datagrams sent into a dead
 // link vanish and time out naturally, so the loss ratio reads ~100%
-// during an outage without any fabricated counters.
+// during an outage without any fabricated counters. The loop does re-dial
+// periodically (only when idle) so a target hostname that changes IP via
+// DNS is re-resolved, and a dial failure — including a transient DNS
+// outage at startup — is retried rather than killing the target.
 func probeTarget(ctx context.Context, t Target, cfg Config) {
 	logger := slog.With("target", t.Name, "address", t.Address)
 	stats := NewAdaptiveStats(cfg.BaseTimeout)
 	m := newTargetMetrics(cfg.Source, t)
+	state := &probeLoopState{}
 
 	m.linkUp.Set(0)
 	for {
 		// A connected UDP socket lets the kernel filter responses to
 		// the server's address and gives plain Read/Write semantics.
-		conn, err := net.Dial("udp", t.Address)
+		conn, err := dialUDP("udp", t.Address)
 		if err != nil {
-			// DialUDP only fails on malformed addresses, already
-			// rejected by Config.Validate.
-			logger.Error("Failed to open UDP socket", "err", err)
-			return
+			// Dial fails on DNS resolution failure as well as malformed
+			// addresses (already rejected by Config.Validate). Retry: a
+			// transient lookup failure must not strand the target with
+			// frozen metric series.
+			logger.Error("Failed to open UDP socket; retrying", "err", err)
+			select {
+			// pi-lens-ignore: waitgroup-done-scope
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
+			}
+			continue
 		}
 
 		// runEchoLoop recovers panics and returns them as errors; a
 		// panic is per-event corruption, not a link condition, so the
 		// target keeps probing rather than dying with frozen series
-		// (stale counters make loss rate() queries go NaN). RTO state
-		// and link_up survive the restart; the pause bounds a
+		// (stale counters make loss rate() queries go NaN). RTO state,
+		// link_up and jitter survive the restart; the pause bounds a
 		// panic-storm cycle.
-		err = runEchoLoop(ctx, conn, cfg, stats, m, logger)
+		err = runEchoLoop(ctx, conn, cfg, stats, m, state, logger)
 		if err == nil || ctx.Err() != nil {
 			return // clean context cancellation
+		}
+		if errors.Is(err, errReconnect) {
+			// Periodic re-dial to re-resolve DNS; not an error.
+			continue
 		}
 		logger.Error("Echo loop panicked; restarting probe loop", "err", err)
 		// pi-lens-ignore: go-time-sleep-test
@@ -187,6 +228,7 @@ func runEchoLoop(
 	cfg Config,
 	stats *AdaptiveStats,
 	m targetMetrics,
+	state *probeLoopState,
 	logger *slog.Logger,
 ) (retErr error) {
 
@@ -208,7 +250,10 @@ func runEchoLoop(
 	defer conn.Close()
 
 	go func() {
-		buf := make([]byte, PayloadSize)
+		// Read into a buffer larger than the payload so an oversized
+		// datagram is not silently truncated to PayloadSize by the kernel
+		// and mistaken for a valid probe (Read truncates to the buffer).
+		buf := make([]byte, MaxDatagramSize)
 		for {
 			if ctx.Err() != nil {
 				return
@@ -252,20 +297,13 @@ func runEchoLoop(
 		}
 	}()
 
-	seq := uint64(0)
 	buf := make([]byte, PayloadSize)
 
 	pending := make(map[uint64]time.Time)
-	// consecutiveMisses counts probes that timed out back-to-back. The
-	// link counts as down only after 3 consecutive missed probes, so a
-	// single lost probe or brief stall does not flap link_up.
-	consecutiveMisses := 0
-	// RFC 3550 jitter state (smoothed RTT delta). A gap in sequence
-	// numbers — any timed-out probe — resets the estimate, so recovery
-	// never feeds an artificial spike into it.
-	var jitter, prevRTT float64
-	var prevSeq uint64
-	havePrev := false
+	// started bounds the socket lifetime: once ReconnectInterval has
+	// elapsed and no probes are in flight, the loop returns errReconnect
+	// so the caller re-dials and re-resolves DNS.
+	started := time.Now()
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -341,19 +379,19 @@ func runEchoLoop(
 				// last-sent probe, so with multiple probes in flight
 				// (interval < RTO) it would mislabel every response after
 				// the first in a drain as a gap and pin jitter at 0.
-				if havePrev && resp.seq == prevSeq+1 {
-					jitter += (math.Abs(rttSec-prevRTT) - jitter) / 16
+				if state.havePrev && resp.seq == state.prevSeq+1 {
+					state.jitter += (math.Abs(rttSec-state.prevRTT) - state.jitter) / 16
 				} else {
-					jitter = 0
+					state.jitter = 0
 				}
-				prevRTT, prevSeq, havePrev = rttSec, resp.seq, true
-				m.jitter.Set(jitter)
+				state.prevRTT, state.prevSeq, state.havePrev = rttSec, resp.seq, true
+				m.jitter.Set(state.jitter)
 
 				if cfg.Adaptive {
 					// pi-lens-ignore: gorm-n-plus-one
 					stats.Update(rttSec)
 				}
-				consecutiveMisses = 0
+				state.consecutiveMisses = 0
 				m.linkUp.Set(1)
 			default:
 				break Drain
@@ -369,7 +407,7 @@ func runEchoLoop(
 					m.inflight.Dec()
 					delete(pending, s)
 					timeoutOccurred = true
-					consecutiveMisses++
+					state.consecutiveMisses++
 				}
 			}
 		}
@@ -381,13 +419,20 @@ func runEchoLoop(
 		// Down after LinkUpMissThreshold consecutive probes without an
 		// echo. A single lost probe or brief stall does not flap the
 		// state (enterprise health-check convention).
-		if consecutiveMisses >= LinkUpMissThreshold {
+		if state.consecutiveMisses >= LinkUpMissThreshold {
 			m.linkUp.Set(0)
 		}
 
-		seq++
+		// Reconnect to re-resolve DNS once the socket has lived long
+		// enough, but only when nothing is in flight: abandoning pending
+		// probes would break the sent/rtt/timedout/inflight balance.
+		if time.Since(started) >= ReconnectInterval && len(pending) == 0 {
+			return errReconnect
+		}
+
+		state.seq++
 		copy(buf[0:8], MagicBytes)
-		binary.LittleEndian.PutUint64(buf[8:16], seq)
+		binary.LittleEndian.PutUint64(buf[8:16], state.seq)
 		binary.LittleEndian.PutUint64(buf[16:24], uint64(now.UnixNano()))
 
 		// Register the probe as in-flight before sending: any matching
@@ -402,7 +447,7 @@ func runEchoLoop(
 			continue
 		}
 
-		pending[seq] = now
+		pending[state.seq] = now
 		m.sent.Inc()
 	}
 }

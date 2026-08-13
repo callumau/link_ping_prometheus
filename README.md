@@ -514,9 +514,10 @@ loss on timeout, protecting RTT samples from poisoning.
 
 The server rate-limits echo processing to 1000 packets/s per remote IP
 and 10000 packets/s globally (fixed one-second window); excess datagrams
-are dropped. There are no connections to manage: the probe loop is a
-single reader, and `-interval` only needs to stay below the client's
-`-timeout` (and, for loss accuracy, below the RTO).
+are dropped. The probe loop keeps a single connected UDP socket per
+target, but re-dials every 5 minutes (only when no probes are in flight)
+so a target hostname that changes IP via DNS is re-resolved; a transient
+DNS failure at startup is retried, not fatal.
 
 ## Security
 

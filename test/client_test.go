@@ -643,3 +643,51 @@ func TestAccuracy_PacketLoss10s(t *testing.T) {
 			sent, recv, timeout, getGaugeValue(prober.ProbesInflight, targetName, addr))
 	}
 }
+
+// TestReconnect_KeepsProbingAndBalance: with a short reconnect interval
+// the client must re-dial repeatedly (re-resolving DNS) without losing or
+// fabricating any probe — the sent/rtt/timedout/inflight balance holds
+// across every reconnect, and probes keep flowing to a healthy target.
+func TestReconnect_KeepsProbingAndBalance(t *testing.T) {
+	prober.InitMetrics()
+	old := prober.ReconnectInterval
+	prober.ReconnectInterval = 200 * time.Millisecond
+	defer func() { prober.ReconnectInterval = old }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	addr := startEchoServer(ctx, t)
+	targetName := "reconnect_test"
+	cfg := cfgWith(false, 50*time.Millisecond, 500*time.Millisecond, prober.Target{Name: targetName, Address: addr})
+
+	go prober.RunClient(ctx, cfg)
+	// Span several reconnect cycles (200ms each).
+	time.Sleep(1500 * time.Millisecond)
+	cancel()
+	time.Sleep(200 * time.Millisecond)
+
+	sent := getCounterValue(prober.ProbesSent, targetName, addr)
+	timeout := getCounterValue(prober.ProbesTimedOut, targetName, addr)
+	recv := getHistogramCount(prober.RTTSeconds, targetName, addr)
+	inflight := getGaugeValue(prober.ProbesInflight, targetName, addr)
+
+	if sent < 10 {
+		t.Errorf("probes must keep flowing across reconnects, sent=%v", sent)
+	}
+	if inflight != 0 {
+		t.Errorf("inflight must drain to 0 after cancel, got %v", inflight)
+	}
+	// Balance must hold across every reconnect. The only allowed
+	// residual is the probe(s) still in flight at the cancel instant:
+	// graceful shutdown abandons them (neither received, timed out, nor
+	// counted in the drained inflight gauge) — the behaviour
+	// TestGracefulShutdown_NoPhantomTimeouts asserts. At a 50ms interval
+	// that is at most ~2 probes; a reconnect bug would abandon ~1 probe
+	// per 200ms cycle (≈7 here), so the threshold cleanly separates.
+	lost := sent - recv - timeout - inflight
+	if lost > 2 {
+		t.Errorf("counter balance broken across reconnects: sent=%v recv=%v timeout=%v inflight=%v (lost=%v)",
+			sent, recv, timeout, inflight, lost)
+	}
+}
