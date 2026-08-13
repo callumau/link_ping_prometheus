@@ -296,30 +296,23 @@ func (p *program) run() error {
 	if err != nil {
 		return fmt.Errorf("metrics server: %w", err)
 	}
+	mx := http.NewServeMux()
+	mx.Handle("/metrics", prober.MetricsAuth(user, pass, promhttp.Handler()))
+	metricsSrv := &http.Server{
+		Handler:      mx,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+	metricsDone := make(chan struct{})
 	go func() {
-		mx := http.NewServeMux()
-		mx.Handle("/metrics", prober.MetricsAuth(user, pass, promhttp.Handler()))
+		defer close(metricsDone)
 		slog.Info("Starting metrics server", "addr", metricsAddr, "tls", cert != "", "auth", user != "")
-		srv := &http.Server{
-			Handler:      mx,
-			ReadTimeout:  10 * time.Second,
-			WriteTimeout: 10 * time.Second,
-			IdleTimeout:  60 * time.Second,
-		}
-
-		go func() {
-			<-p.ctx.Done()
-			// pi-lens-ignore: go-context-background-handler
-			shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			srv.Shutdown(shutCtx)
-		}()
-
 		var serveErr error
 		if cert != "" {
-			serveErr = srv.ServeTLS(metricsLn, cert, key)
+			serveErr = metricsSrv.ServeTLS(metricsLn, cert, key)
 		} else {
-			serveErr = srv.Serve(metricsLn)
+			serveErr = metricsSrv.Serve(metricsLn)
 		}
 		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
 			slog.Error("Metrics server error", "err", serveErr)
@@ -327,16 +320,16 @@ func (p *program) run() error {
 	}()
 
 	mode := *flMode
+	var modeErr error
 	switch mode {
 	case "server":
-		return prober.RunServer(p.ctx, *flListen, *flSource, allow)
+		modeErr = prober.RunServer(p.ctx, *flListen, *flSource, allow)
 	case "client":
-		return prober.RunClient(p.ctx, cfg)
+		modeErr = prober.RunClient(p.ctx, cfg)
 	case "both":
 		// Local WaitGroup: Add is sequenced before the goroutine starts
 		// and Wait runs in the same goroutine, so no Add/Wait race.
 		modeCtx, modeCancel := context.WithCancel(p.ctx)
-		defer modeCancel()
 		var wg sync.WaitGroup
 		var serverErr error
 		wg.Add(1)
@@ -351,13 +344,24 @@ func (p *program) run() error {
 				modeCancel()
 			}
 		}()
-		clientErr := prober.RunClient(modeCtx, cfg)
+		modeErr = prober.RunClient(modeCtx, cfg)
+		modeCancel()
 		wg.Wait()
 		if serverErr != nil {
-			return serverErr
+			modeErr = serverErr
 		}
-		return clientErr
 	default:
-		return fmt.Errorf("unknown mode: %s", mode)
+		modeErr = fmt.Errorf("unknown mode: %s", mode)
 	}
+
+	// Drain the metrics server on the way out so an in-flight scrape
+	// finishes instead of being cut off by process exit. Best-effort:
+	// the agent's own metrics are in-memory and die with it regardless.
+	// pi-lens-ignore: go-context-background-handler
+	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	// pi-lens-ignore: go-ignored-call-result
+	_ = metricsSrv.Shutdown(shutCtx)
+	<-metricsDone
+	return modeErr
 }
