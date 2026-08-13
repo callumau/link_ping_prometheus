@@ -59,10 +59,11 @@ func main() {
 	flag.Parse()
 	// Bound the Go heap so long-running RSS stays flat even during
 	// /metrics scrape or probe bursts. The standard GOMEMLIMIT env var
-	// (with units) overrides this default. 64MB is ample for the largest
-	// supported config (1000 targets) and keeps the agent lightweight.
+	// (with units) overrides this default. 128MB leaves headroom for the
+	// largest supported config (1000 targets: ~2000 goroutine stacks plus
+	// native-histogram buckets) while keeping the agent lightweight.
 	if os.Getenv("GOMEMLIMIT") == "" {
-		debug.SetMemoryLimit(64 << 20)
+		debug.SetMemoryLimit(128 << 20)
 	}
 	opts := &slog.HandlerOptions{Level: slog.LevelInfo}
 	if *flJSONLogs {

@@ -392,7 +392,7 @@ link_ping_prometheus -mode=<mode> [flags]
 | `-json-logs` | `false` | Output logs in JSON format |
 | `-svc` | `""` | Windows service action: `install`, `uninstall`, `start`, `stop`, `run` |
 
-Resource footprint: metric handles are resolved once per target at startup (no per-probe label lookups), and the Go heap is soft-capped at 64MB (`GOMEMLIMIT` env overrides) so RSS stays flat on long runs.
+Resource footprint: metric handles are resolved once per target at startup (no per-probe label lookups), and the Go heap is soft-capped at 128MB (`GOMEMLIMIT` env overrides) so RSS stays flat on long runs.
 
 ### Targets File
 
