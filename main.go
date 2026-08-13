@@ -18,6 +18,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -284,15 +285,22 @@ func (p *program) run() error {
 		return errors.New("server mode requires -allow (comma-separated client IP allowlist); fail-closed")
 	}
 
-	// Capture flag values before spawning the goroutine: it may outlive
-	// flag mutation by tests or shutdown code.
+	// Bind the metrics listener before any probing starts so a bind
+	// failure (port taken, permission denied) aborts startup instead of
+	// leaving the agent running with no /metrics endpoint — a silent
+	// partial failure for a monitoring agent. Capture flag values before
+	// spawning the goroutine: it may outlive flag mutation by tests or
+	// shutdown code.
 	metricsAddr := *flMetrics
+	metricsLn, err := net.Listen("tcp", metricsAddr)
+	if err != nil {
+		return fmt.Errorf("metrics server: %w", err)
+	}
 	go func() {
 		mx := http.NewServeMux()
 		mx.Handle("/metrics", prober.MetricsAuth(user, pass, promhttp.Handler()))
 		slog.Info("Starting metrics server", "addr", metricsAddr, "tls", cert != "", "auth", user != "")
 		srv := &http.Server{
-			Addr:         metricsAddr,
 			Handler:      mx,
 			ReadTimeout:  10 * time.Second,
 			WriteTimeout: 10 * time.Second,
@@ -309,9 +317,9 @@ func (p *program) run() error {
 
 		var serveErr error
 		if cert != "" {
-			serveErr = srv.ListenAndServeTLS(cert, key)
+			serveErr = srv.ServeTLS(metricsLn, cert, key)
 		} else {
-			serveErr = srv.ListenAndServe()
+			serveErr = srv.Serve(metricsLn)
 		}
 		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
 			slog.Error("Metrics server error", "err", serveErr)
@@ -327,16 +335,27 @@ func (p *program) run() error {
 	case "both":
 		// Local WaitGroup: Add is sequenced before the goroutine starts
 		// and Wait runs in the same goroutine, so no Add/Wait race.
+		modeCtx, modeCancel := context.WithCancel(p.ctx)
+		defer modeCancel()
 		var wg sync.WaitGroup
+		var serverErr error
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := prober.RunServer(p.ctx, *flListen, *flSource, allow); err != nil {
-				slog.Error("Server error", "err", err)
+			if err := prober.RunServer(modeCtx, *flListen, *flSource, allow); err != nil {
+				// A server that fails to start (e.g. port already in
+				// use) is fatal in both mode: cancelling the client too
+				// fails fast instead of probing silently without an
+				// echo responder.
+				serverErr = err
+				modeCancel()
 			}
 		}()
-		clientErr := prober.RunClient(p.ctx, cfg)
+		clientErr := prober.RunClient(modeCtx, cfg)
 		wg.Wait()
+		if serverErr != nil {
+			return serverErr
+		}
 		return clientErr
 	default:
 		return fmt.Errorf("unknown mode: %s", mode)
