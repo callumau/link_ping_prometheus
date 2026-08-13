@@ -20,8 +20,10 @@ the kernel retransmits lost segments and hides them as inflated RTT.
 ## Typical Deployment: Site A ↔ Site B
 
 1. **Remote site (B):** run the echo server (open UDP port 4000 in the
-   firewall — the protocol is UDP, not TCP):
-   `./link_ping_prometheus -mode=server -listen=":4000" -metrics=":2112"`
+   firewall — the protocol is UDP, not TCP). The server is **fail-closed**:
+   it only answers probers on the `-allow` list and will not start without
+   one, so an `-allow` entry for site A's IP is required:
+   `./link_ping_prometheus -mode=server -listen=":4000" -allow=203.0.113.5 -metrics=":2112"`
 2. **Local site (A):** run the client, targeting site B's address, and
    tag every metric with the local topology label:
    `./link_ping_prometheus -mode=client -target="203.0.113.10:4000" -source="sydney-dc" -metrics=":2112"`
@@ -37,14 +39,14 @@ percentiles (p50/p90/p99), jitter, and adaptive RTO.
 The exporter exposes the following metrics at `/metrics` (default port 2112).
 
 | Metric Name | Type | Labels | Description |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `link_up` | Gauge | `source`, `target`, `address` | 1 while probes are getting echoes, 0 after 3 consecutive probes time out. A single lost probe or brief stall does not flap the state. |
 | `link_probes_sent_total` | Counter | `source`, `target`, `address` | Total UDP probes sent. Probes into a down link still count as sent and time out naturally, so loss reads ~100% during an outage. |
 | `link_probes_timed_out_total` | Counter | `source`, `target`, `address` | Total probes with no echo within the RTO. True network loss — UDP never retransmits. |
 | `link_probes_inflight` | Gauge | `source`, `target`, `address` | Current number of probes sent but waiting for a response or timeout. Grows during stalls. |
 | `link_rtt_seconds` | Histogram | `source`, `target`, `address` | RTT histogram with explicit buckets `{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5}` s plus native histogram support (`NativeHistogramBucketFactor` 1.1). Buckets stop at 2.5s: anything slower than the RTO cap (3s) counts as loss, so higher buckets would never fill. |
 | `link_rtt_seconds_bucket/sum/count` | Histogram | `source`, `target`, `address` | Classic-bucket series; quantiles and means are derived in PromQL over any window. |
-| `link_rtt_jitter_seconds` | Gauge | `source`, `target`, `address` | Smoothed RTT jitter in seconds (RFC 3550 §6.4.1: `J += (|D(i−1,i)| − J)/16`) computed from consecutive probe RTT deltas. Resets after a sequence gap (a timed-out probe), so link recovery never spikes the gauge. |
+| `link_rtt_jitter_seconds` | Gauge | `source`, `target`, `address` | Smoothed RTT jitter in seconds (RFC 3550 §6.4.1: `J += ( | D(i−1,i) | − J)/16`) computed from consecutive probe RTT deltas. Resets after a sequence gap (a timed-out probe), so link recovery never spikes the gauge. |
 | `link_rto_seconds` | Gauge | `source`, `target`, `address` | Current adaptive RTO in use (RFC 6298, doubled on consecutive timeouts). Floor is `max(200ms, 2×SRTT)` so a link's timeout always has headroom over its measured RTT. |
 | `link_server_probes_received_total` | Counter | `source`, `client` | Valid probes received by the server, per remote client IP (server mode only). Cross-check against the client's sent counter. |
 
@@ -62,7 +64,7 @@ reconstructed over arbitrary windows in PromQL.
 Copy-paste these. RTT metrics are **seconds**; multiply by `1000` for ms.
 
 | You want | Query | Unit |
-|---|---|---|
+| --- | --- | --- |
 | **Packet loss** (incl. full outages) | `100 * rate(link_probes_timed_out_total[5m]) / rate(link_probes_sent_total[5m])` | % |
 | **Latency** median (p50) | `histogram_quantile(0.5, rate(link_rtt_seconds_bucket[5m]))` | s → ×1000 = ms |
 | **Latency** mean | `rate(link_rtt_seconds_sum[5m]) / rate(link_rtt_seconds_count[5m])` | s → ×1000 = ms |
@@ -307,22 +309,22 @@ write component has a different name, update the
 
 ```river
 prometheus.scrape "link_ping" {
-	targets = [{
-		"__address__" = "localhost:2112",
-	}]
-	metrics_path    = "/metrics"
-	scrape_interval = "1m"
-	scrape_timeout  = "10s"
-	forward_to      = [prometheus.relabel.link_ping_keep.receiver]
+ targets = [{
+  "__address__" = "localhost:2112",
+ }]
+ metrics_path    = "/metrics"
+ scrape_interval = "1m"
+ scrape_timeout  = "10s"
+ forward_to      = [prometheus.relabel.link_ping_keep.receiver]
 }
 
 prometheus.relabel "link_ping_keep" {
-	rule {
-		source_labels = ["__name__"]
-		regex         = "link_.*"
-		action        = "keep"
-	}
-	forward_to = [prometheus.remote_write.default.receiver]
+ rule {
+  source_labels = ["__name__"]
+  regex         = "link_.*"
+  action        = "keep"
+ }
+ forward_to = [prometheus.remote_write.default.receiver]
 }
 ```
 
@@ -332,14 +334,14 @@ enabled, add a `basic_auth` block to the scrape targets instead:
 
 ```river
 prometheus.scrape "link_ping" {
-	targets = [{
-		"__address__" = "10.0.0.5:2112",
-	}]
-	...
-	basic_auth {
-		username = "monitoring"
-		password = "secret"
-	}
+ targets = [{
+  "__address__" = "10.0.0.5:2112",
+ }]
+ ...
+ basic_auth {
+  username = "monitoring"
+  password = "secret"
+ }
 }
 ```
 
@@ -372,9 +374,10 @@ link_ping_prometheus -mode=<mode> [flags]
 ### Flags
 
 | Flag | Default | Description |
-|---|---|---|
+| --- | --- | --- |
 | `-mode` | `server` | Operation mode: `server`, `client`, `both` |
 | `-listen` | `:4000` | Server listen address |
+| `-allow` | `""` | Server: comma-separated client IP allowlist (fail-closed — required in `server`/`both` mode) |
 | `-target` | `""` | Client: single target `host:port` |
 | `-targets` | `""` | Client: path to JSON targets file |
 | `-metrics` | `:2112` | Prometheus metrics HTTP listen address |
@@ -419,7 +422,7 @@ Client (multiple targets):
 Server:
 
 ```sh
-./link_ping_prometheus -mode=server -listen=":4000" -metrics=":2112"
+./link_ping_prometheus -mode=server -listen=":4000" -allow=192.168.1.71 -metrics=":2112"
 ```
 
 Both:
@@ -448,7 +451,7 @@ Description=Link Ping Prometheus (UDP link monitor)
 After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/link_ping_prometheus -mode=server -listen=":4000" -metrics=":2112"
+ExecStart=/usr/local/bin/link_ping_prometheus -mode=server -listen=":4000" -allow=203.0.113.5 -metrics=":2112"
 Restart=always
 User=nobody
 
@@ -496,7 +499,7 @@ test/
 UDP datagram, 24 bytes per probe:
 
 | Offset | Size | Field |
-|---|---|---|
+| --- | --- | --- |
 | 0 | 8 | Magic header `LNKPING\x00` |
 | 8 | 8 | Sequence number (little-endian uint64) |
 | 16 | 8 | Client timestamp (Unix ns, little-endian uint64) |

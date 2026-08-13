@@ -9,6 +9,10 @@ import (
 	"link_ping_prometheus/internal/prober"
 )
 
+// testAllow is the fail-closed client allowlist used by server tests:
+// all dial from the loopback IP, so it is the sole permitted prober.
+var testAllow = map[string]struct{}{net.IPv4(127, 0, 0, 1).String(): {}}
+
 // TestGarbageData_Server: a peer that answers probes with garbage (wrong
 // size, wrong magic) must never be counted as a valid response.
 func TestGarbageData_Server(t *testing.T) {
@@ -63,7 +67,7 @@ func TestServer_EnforceSizeAndHeader(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	go prober.ServePacketConn(ctx, pc, testSource)
+	go prober.ServePacketConn(ctx, pc, testSource, testAllow)
 	addr := pc.LocalAddr().String()
 
 	conn, err := net.Dial("udp", addr)
@@ -130,7 +134,7 @@ func TestServer_PerIPRateLimit(t *testing.T) {
 	}()
 	done := make(chan struct{})
 	go func() {
-		prober.ServePacketConn(ctx, pc, testSource)
+		prober.ServePacketConn(ctx, pc, testSource, testAllow)
 		close(done)
 	}()
 	// Restore the shared test variables after ServePacketConn has
@@ -182,7 +186,7 @@ func TestServer_ProbeCounterIgnoresInvalid(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	go prober.ServePacketConn(ctx, pc, testSource)
+	go prober.ServePacketConn(ctx, pc, testSource, testAllow)
 	addr := pc.LocalAddr().String()
 
 	before := getCounterValue1(prober.ServerProbesReceived, "127.0.0.1")
@@ -230,7 +234,7 @@ func TestServer_ShutdownOnCancel(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- prober.ServePacketConn(ctx, pc, testSource)
+		done <- prober.ServePacketConn(ctx, pc, testSource, testAllow)
 	}()
 
 	cancel()
@@ -262,7 +266,7 @@ func TestServer_NoEchoAfterShutdown(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		prober.ServePacketConn(ctx, pc, testSource)
+		prober.ServePacketConn(ctx, pc, testSource, testAllow)
 		close(done)
 	}()
 	addr := pc.LocalAddr().String()
@@ -288,5 +292,68 @@ func TestServer_NoEchoAfterShutdown(t *testing.T) {
 	conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
 	if n, _ := conn.Read(make([]byte, prober.PayloadSize)); n != 0 {
 		t.Error("server still echoing after shutdown")
+	}
+}
+
+// TestServer_AllowlistDropsUnlisted: a valid probe from a source not in
+// the fail-closed allowlist must be neither echoed nor counted (fixes
+// the reflector and the metric-label-cardinality DoS).
+func TestServer_AllowlistDropsUnlisted(t *testing.T) {
+	prober.InitMetrics()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go prober.ServePacketConn(ctx, pc, testSource, testAllow) // only 127.0.0.1 allowed
+	addr := pc.LocalAddr().String()
+
+	before := getCounterValue1(prober.ServerProbesReceived, "127.0.0.1")
+
+	// Dial from a loopback alias that is NOT in the allowlist.
+	dst, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := net.DialUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 2), Port: 0}, dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	probe := make([]byte, prober.PayloadSize)
+	copy(probe[0:8], prober.MagicBytes)
+	conn.Write(probe)
+	conn.SetReadDeadline(time.Now().Add(400 * time.Millisecond))
+	if n, _ := conn.Read(make([]byte, prober.PayloadSize)); n != 0 {
+		t.Error("probe from non-allowlisted source must not be echoed")
+	}
+
+	// A probe from 127.0.0.1 (allowlisted) is still echoed + counted.
+	ok, err := net.Dial("udp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ok.Close()
+	ok.Write(probe)
+	ok.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if n, err := ok.Read(make([]byte, prober.PayloadSize)); err != nil || n != prober.PayloadSize {
+		t.Fatalf("allowlisted echo failed: n=%d err=%v", n, err)
+	}
+
+	if got := getCounterValue1(prober.ServerProbesReceived, "127.0.0.1") - before; got != 1 {
+		t.Errorf("only the allowlisted probe must be counted, got %v", got)
+	}
+}
+
+// TestServer_FailClosed: RunServer refuses to start with an empty
+// allowlist (an empty set admits no clients).
+func TestServer_FailClosed(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := prober.RunServer(ctx, "127.0.0.1:0", testSource, nil); err == nil {
+		t.Error("RunServer with empty allowlist must fail closed")
 	}
 }

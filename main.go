@@ -34,6 +34,7 @@ import (
 var (
 	flMode     = flag.String("mode", "server", "Mode: server, client, both")
 	flListen   = flag.String("listen", ":4000", "Server: Listen address")
+	flAllow    = flag.String("allow", "", "Server: Comma-separated client IP allowlist (fail-closed: required in server/both mode)")
 	flTarget   = flag.String("target", "", "Client: Single target address")
 	flTargets  = flag.String("targets", "", "Client: JSON file path with targets")
 	flMetrics  = flag.String("metrics", ":2112", "Metrics: Listen address")
@@ -274,6 +275,17 @@ func (p *program) run() error {
 		}
 	}
 
+	// Fail-closed client allowlist: the echo responder refuses to run
+	// without an explicit -allow list, so spoofed/unauthorised sources
+	// can neither reflect datagrams nor grow metric label cardinality.
+	allow, err := prober.ParseAllowlist(*flAllow)
+	if err != nil {
+		return err
+	}
+	if mode := *flMode; (mode == "server" || mode == "both") && len(allow) == 0 {
+		return errors.New("server mode requires -allow (comma-separated client IP allowlist); fail-closed")
+	}
+
 	// Capture flag values before spawning the goroutine: it may outlive
 	// flag mutation by tests or shutdown code.
 	metricsAddr := *flMetrics
@@ -310,7 +322,7 @@ func (p *program) run() error {
 	mode := *flMode
 	switch mode {
 	case "server":
-		return prober.RunServer(p.ctx, *flListen, *flSource)
+		return prober.RunServer(p.ctx, *flListen, *flSource, allow)
 	case "client":
 		return prober.RunClient(p.ctx, cfg)
 	case "both":
@@ -320,7 +332,7 @@ func (p *program) run() error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := prober.RunServer(p.ctx, *flListen, *flSource); err != nil {
+			if err := prober.RunServer(p.ctx, *flListen, *flSource, allow); err != nil {
 				slog.Error("Server error", "err", err)
 			}
 		}()
