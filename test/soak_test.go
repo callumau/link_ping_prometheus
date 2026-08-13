@@ -41,6 +41,7 @@ func TestSoakMemory(t *testing.T) {
 	d := time.Duration(secs) * time.Second
 
 	ctx, cancel := context.WithCancel(context.Background())
+	// pi-lens-ignore: go-context-background-handler
 	defer cancel()
 
 	addr := startEchoServer(ctx, t)

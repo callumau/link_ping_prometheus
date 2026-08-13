@@ -46,7 +46,7 @@ The exporter exposes the following metrics at `/metrics` (default port 2112).
 | `link_probes_inflight` | Gauge | `source`, `target`, `address` | Current number of probes sent but waiting for a response or timeout. Grows during stalls. |
 | `link_rtt_seconds` | Histogram | `source`, `target`, `address` | RTT histogram with explicit buckets `{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5}` s plus native histogram support (`NativeHistogramBucketFactor` 1.1). Buckets stop at 2.5s: anything slower than the RTO cap (3s) counts as loss, so higher buckets would never fill. |
 | `link_rtt_seconds_bucket/sum/count` | Histogram | `source`, `target`, `address` | Classic-bucket series; quantiles and means are derived in PromQL over any window. |
-| `link_rtt_jitter_seconds` | Gauge | `source`, `target`, `address` | Smoothed RTT jitter in seconds (RFC 3550 §6.4.1: `J += ( | D(i−1,i) | − J)/16`) computed from consecutive probe RTT deltas. Resets after a sequence gap (a timed-out probe), so link recovery never spikes the gauge. |
+| `link_rtt_jitter_seconds` | Gauge | `source`, `target`, `address` | Smoothed RTT jitter in seconds (RFC 3550 §6.4.1: `J += ( \| D(i−1,i) \| − J)/16`) computed from consecutive probe RTT deltas. Resets after a sequence gap (a timed-out probe), so link recovery never spikes the gauge. |
 | `link_rto_seconds` | Gauge | `source`, `target`, `address` | Current adaptive RTO in use (RFC 6298, doubled on consecutive timeouts). Floor is `max(200ms, 2×SRTT)` so a link's timeout always has headroom over its measured RTT. |
 | `link_server_probes_received_total` | Counter | `source`, `client` | Valid probes received by the server, per remote client IP (server mode only). Cross-check against the client's sent counter. |
 
@@ -87,7 +87,7 @@ Two rules that trip people up:
 
 Loss is derived from the counters over any window:
 
-```
+```promql
 100 * rate(link_probes_timed_out_total[5m]) / rate(link_probes_sent_total[5m])
 ```
 
@@ -120,7 +120,7 @@ The server-side `link_server_probes_received_total` (per remote client
 IP) is a useful cross-check on the client's `link_probes_sent_total` —
 any mismatch is probes that never reached the server:
 
-```
+```promql
 100 * (1 - rate(link_server_probes_received_total{client="203.0.113.5"}[5m])
            / rate(link_probes_sent_total{target="site-b"}[5m]))
 ```
@@ -130,7 +130,7 @@ no retransmission can hide them there.
 
 ### Average Latency (RTT)
 
-```
+```promql
 rate(link_rtt_seconds_sum[5m]) / rate(link_rtt_seconds_count[5m])
 ```
 
@@ -139,7 +139,7 @@ link is fully down, so latency is a gap (not 0) during an outage.
 
 ### Median / 90th / 99th Percentile Latency
 
-```
+```promql
 histogram_quantile(0.5,  rate(link_rtt_seconds_bucket[5m]))
 histogram_quantile(0.9,  rate(link_rtt_seconds_bucket[5m]))
 histogram_quantile(0.99, rate(link_rtt_seconds_bucket[5m]))
@@ -154,7 +154,7 @@ it transparently when native-histogram support is enabled.
 
 ### Jitter (direct gauge)
 
-```
+```promql
 link_rtt_jitter_seconds * 1000
 ```
 
@@ -168,7 +168,7 @@ show an artificial spike.
 The p90−p50 spread is kept as a window-based approximation when you
 want jitter over a specific time range instead of the smoothed gauge:
 
-```
+```promql
 (histogram_quantile(0.9, rate(link_rtt_seconds_bucket[5m]))
  - histogram_quantile(0.5, rate(link_rtt_seconds_bucket[5m]))) * 1000
 ```
@@ -179,7 +179,7 @@ Compare the current window against a longer baseline. Latency drift on a
 long-running link shows up as the recent p50 diverging from a 24h
 minimum:
 
-```
+```promql
 histogram_quantile(0.5, rate(link_rtt_seconds_bucket[10m]))
   > min_over_time(histogram_quantile(0.5, rate(link_rtt_seconds_bucket[10m]))[24h]) * 1.5
 ```
@@ -190,13 +190,13 @@ via `link_rto_seconds`.
 
 ### Link Status
 
-```
+```promql
 link_up
 ```
 
 ### Outage Alerts
 
-```
+```yaml
 alert: LinkDown
   expr: link_up == 0
   for:  1m
@@ -225,14 +225,14 @@ dashboard does this for you).
 **Latency now** (median RTT over the last 5 minutes; the smallest
 window that produces a stable value):
 
-```
+```promql
 histogram_quantile(0.5, rate(link_rtt_seconds_bucket[5m]))
 ```
 
 **Latency over time** — same expression in a time series panel. Swap
 `0.5` for `0.9` / `0.99` for the higher percentiles, or use the mean:
 
-```
+```promql
 rate(link_rtt_seconds_sum[5m]) / rate(link_rtt_seconds_count[5m])
 ```
 
@@ -247,7 +247,7 @@ always `rate()` over a window (see Quick Reference).
 
 **Loss now** (percentage over the last 5 minutes):
 
-```
+```promql
 100 * rate(link_probes_timed_out_total[5m]) / rate(link_probes_sent_total[5m])
 ```
 
@@ -264,7 +264,7 @@ second regardless of scrape interval.
 fully down link time out naturally, so the raw ratio reads ~100% instead
 of a gap:
 
-```
+```promql
 100 * rate(link_probes_timed_out_total[5m]) / rate(link_probes_sent_total[5m])
 ```
 
@@ -272,7 +272,7 @@ of a gap:
 (UDP never retransmits). The server-side counter provides a second
 opinion — probes that never reached the server:
 
-```
+```promql
 100 * (1 - rate(link_server_probes_received_total{client="203.0.113.5"}[5m]) / rate(link_probes_sent_total{target="site-b"}[5m]))
 ```
 
@@ -367,7 +367,7 @@ Release binaries for Linux, macOS, Windows at [Latest Release](https://github.co
 
 ## Usage
 
-```
+```sh
 link_ping_prometheus -mode=<mode> [flags]
 ```
 
@@ -439,7 +439,7 @@ Both:
 
 Use `-svc` to install/uninstall/start/stop/run. The tool records runtime flags at install time (excluding `-svc`, `-metrics-user`, and `-metrics-pass`). Metrics auth credentials are **not** persisted into the service configuration; set `LINK_PING_METRICS_USER` / `LINK_PING_METRICS_PASS` in the service environment instead (a warning is printed at install time).
 
-```
+```sh
 link_ping_prometheus.exe -mode=both -targets=targets.json -interval=10ms -timeout=20ms -metrics=":2113" -svc=install
 ```
 
@@ -476,7 +476,7 @@ Prebuilt dashboard at [grafana-dashboard.json](grafana-dashboard.json).
 
 ## Code Structure
 
-```
+```text
 main.go                     — CLI wrapper, flag parsing, service lifecycle
 main_test.go                — lifecycle race, auth/TLS flag validation tests
 internal/prober/
