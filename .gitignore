@@ -3,3 +3,5 @@ build/*
 example_queries.txt
 *.log
 link_ping_prometheus
+
+piolium/*
