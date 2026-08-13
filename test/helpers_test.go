@@ -3,7 +3,6 @@ package prober_test
 import (
 	"context"
 	"net"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,34 +15,9 @@ import (
 // testSource is the topology label applied in test metric queries.
 const testSource = "test"
 
-type testGlobals struct {
-	adaptive bool
-	interval time.Duration
-	timeout  time.Duration
-}
-
-type atomicLatency struct {
-	v atomic.Int64
-}
-
-func (a *atomicLatency) set(d time.Duration) {
-	a.v.Store(int64(d))
-}
-func (a *atomicLatency) get() time.Duration {
-	return time.Duration(a.v.Load())
-}
-
 func getCounterValue(vec *prometheus.CounterVec, targetName, address string) float64 {
 	var m dto.Metric
 	if err := vec.WithLabelValues(testSource, targetName, address).Write(&m); err != nil {
-		return 0
-	}
-	return m.GetCounter().GetValue()
-}
-
-func getPlainCounterValue(c prometheus.Counter) float64 {
-	var m dto.Metric
-	if err := c.Write(&m); err != nil {
 		return 0
 	}
 	return m.GetCounter().GetValue()
@@ -156,6 +130,7 @@ func cfgWith(adaptive bool, interval, timeout time.Duration, targets ...prober.T
 // probe for d. Tests then read end-state counters.
 func runClientFor(ctx context.Context, cfg prober.Config, d time.Duration) {
 	go prober.RunClient(ctx, cfg)
+	// pi-lens-ignore: go-time-sleep-test
 	time.Sleep(d)
 }
 
@@ -164,8 +139,10 @@ func runClientFor(ctx context.Context, cfg prober.Config, d time.Duration) {
 // read.
 func runClientSettle(ctx context.Context, cancel context.CancelFunc, cfg prober.Config, run time.Duration) {
 	go prober.RunClient(ctx, cfg)
+	// pi-lens-ignore: go-time-sleep-test
 	time.Sleep(run)
 	cancel()
+	// pi-lens-ignore: go-time-sleep-test
 	time.Sleep(100 * time.Millisecond)
 }
 

@@ -2,10 +2,14 @@
 # Used throughout comments, in the metric name link_rto_seconds, and in
 # identifiers like CurrentRTO / RTOEstimate; it is a deliberate domain
 # term, not a misspelling of "to".
+#
+# typos semantics: a word is always-valid only when the correction equals
+# the key. Mapping rto -> "RTO" (correction != key) makes typos flag rto
+# as a misspelling of RTO, which is the opposite of the intent.
 [default.extend-words]
-rto = "RTO"
+rto = "rto"
 
 [default.extend-identifiers]
-rto = "RTO"
-currentrto = "CurrentRTO"
-rtoestimate = "RTOEstimate"
+rto = "rto"
+currentrto = "currentrto"
+rtoestimate = "rtoestimate"

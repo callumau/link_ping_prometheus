@@ -6,9 +6,6 @@ import (
 )
 
 // AdaptiveStats implements RFC 6298-style RTO estimation for TCP probes.
-//
-// Fields are unexported; use the accessor methods SRTT, RTTVar, and RTO
-// to read the current state.
 type AdaptiveStats struct {
 	srtt                float64
 	rttvar              float64
@@ -44,15 +41,6 @@ func (a *AdaptiveStats) Update(rttSeconds float64) {
 	}
 	a.rto = a.srtt + math.Max(DefaultClockGranularity.Seconds(), 4*a.rttvar)
 }
-
-// SRTT returns the smoothed round-trip time in seconds.
-func (a *AdaptiveStats) SRTT() float64 { return a.srtt }
-
-// RTTVar returns the round-trip time variation in seconds.
-func (a *AdaptiveStats) RTTVar() float64 { return a.rttvar }
-
-// RTO returns the current retransmission timeout in seconds (before clamping).
-func (a *AdaptiveStats) RTO() float64 { return a.rto }
 
 // Backoff doubles the RTO, clamped to DefaultMaxRTO. Called after
 // consecutive timeouts. RFC 6298 applies doubling to retransmitted

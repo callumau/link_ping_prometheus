@@ -3,143 +3,17 @@ package prober_test
 import (
 	"context"
 	"io"
-	"math"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"link_ping_prometheus/internal/prober"
 )
 
-func TestAdaptiveStats_Logic(t *testing.T) {
-	stats := prober.NewAdaptiveStats(1 * time.Second)
-
-	if stats.SRTT() != 0 {
-		t.Errorf("Expected initial SRTT 0, got %f", stats.SRTT())
-	}
-
-	rtt := 0.100
-	stats.Update(rtt)
-	if math.Abs(stats.SRTT()-0.1) > 0.0001 {
-		t.Errorf("After 1st update: expected SRTT 0.1, got %f", stats.SRTT())
-	}
-	if math.Abs(stats.RTTVar()-0.05) > 0.0001 {
-		t.Errorf("After 1st update: expected RTTVAR 0.05, got %f", stats.RTTVar())
-	}
-	if math.Abs(stats.RTO()-0.3) > 0.0001 {
-		t.Errorf("After 1st update: expected RTO 0.3, got %f", stats.RTO())
-	}
-
-	stats.Update(0.100)
-	if math.Abs(stats.RTO()-0.25) > 0.0001 {
-		t.Errorf("After 2nd update: expected RTO 0.25, got %f", stats.RTO())
-	}
-
-	stats.Update(0.200)
-	if stats.RTO() <= 0.25 {
-		t.Errorf("Expected RTO to increase after spike, got %f", stats.RTO())
-	}
-}
-
-// TestAdaptiveStats_BackoffClampedAndConsecutive: RTO doubling after
-// consecutive timeouts is the recovery mechanism that lets the RTO adapt
-// up when no successful measurements arrive (RFC 6298). It must double
-// only after the first timeout in a series and clamp at DefaultMaxRTO.
-func TestAdaptiveStats_BackoffClampedAndConsecutive(t *testing.T) {
-	stats := prober.NewAdaptiveStats(1 * time.Second)
-
-	// First timeout in a series must NOT double the RTO (RFC 6298:
-	// doubling applies to retransmissions, not the initial timeout).
-	stats.Backoff()
-	if stats.RTO() != 1.0 {
-		t.Errorf("first backoff must not double RTO, got %f", stats.RTO())
-	}
-
-	// Subsequent consecutive timeouts double, but never beyond the clamp.
-	stats.Backoff()
-	if math.Abs(stats.RTO()-2.0) > 0.0001 {
-		t.Errorf("expected RTO 2.0 after second consecutive timeout, got %f", stats.RTO())
-	}
-	stats.Backoff()
-	if math.Abs(stats.RTO()-4.0) > 0.0001 && stats.RTO() != prober.DefaultMaxRTO.Seconds() {
-		t.Errorf("expected RTO 4.0 clamped to DefaultMaxRTO after third consecutive timeout, got %f", stats.RTO())
-	}
-
-	// Repeated backoffs must saturate at DefaultMaxRTO, not overflow.
-	max := prober.DefaultMaxRTO.Seconds()
-	for i := 0; i < 200; i++ {
-		stats.Backoff()
-	}
-	if r := stats.CurrentRTO(); r != prober.DefaultMaxRTO {
-		t.Errorf("expected RTO clamped to DefaultMaxRTO %v, got %v", prober.DefaultMaxRTO, r)
-	}
-	if stats.RTO() != max {
-		t.Errorf("expected internal RTO clamped to %f, got %f", max, stats.RTO())
-	}
-
-	// A successful measurement resets the consecutive-timeout counter.
-	stats.Update(0.1)
-	stats.Backoff()
-	if stats.RTO() != stats.SRTT()+4*stats.RTTVar() {
-		t.Errorf("after success, next backoff must not double: got %f", stats.RTO())
-	}
-}
-
-// TestAdaptiveStats_DynamicFloor: the RTO floor must track the smoothed
-// RTT (2*SRTT, minimum 200ms) so a link whose RTT approaches a fixed
-// floor does not suffer spurious timeouts. A ~150ms link gets ~300ms RTO,
-// not 200ms; a quiet LAN stays at the 200ms minimum.
-func TestAdaptiveStats_DynamicFloor(t *testing.T) {
-	stats := prober.NewAdaptiveStats(10 * time.Millisecond)
-	if r := stats.CurrentRTO(); r != prober.DefaultMinRTO {
-		t.Errorf("with no measurements the floor is the 200ms minimum, got %v", r)
-	}
-
-	stats.Update(0.150)
-	for i := 0; i < 25; i++ {
-		stats.Update(0.150)
-	}
-	if r := stats.CurrentRTO(); r < 300*time.Millisecond {
-		t.Errorf("150ms link must floor RTO at 2*SRTT=300ms, got %v", r)
-	}
-	if r := stats.CurrentRTO(); r > 450*time.Millisecond {
-		t.Errorf("150ms link RTO must stay near the floor, got %v", r)
-	}
-
-	stats.Update(0.010)
-	for i := 0; i < 25; i++ {
-		stats.Update(0.010)
-	}
-	if r := stats.CurrentRTO(); r != prober.DefaultMinRTO {
-		t.Errorf("10ms link must fall back to the 200ms minimum, got %v", r)
-	}
-}
-
-func TestAdaptiveStats_RTOFloorAndGranularity(t *testing.T) {
-	// Hard floor: even a tiny base timeout must clamp to 200ms.
-	stats := prober.NewAdaptiveStats(10 * time.Millisecond)
-	if r := stats.CurrentRTO(); r != prober.DefaultMinRTO {
-		t.Errorf("expected RTO floored at %v, got %v", prober.DefaultMinRTO, r)
-	}
-
-	// RFC 6298: RTO = SRTT + max(G, 4*RTTVAR). On a zero-jitter link
-	// RTTVAR decays below G/4, so the clock granularity term takes over.
-	stats.Update(0.050)
-	for i := 0; i < 25; i++ {
-		stats.Update(0.050)
-	}
-	wantG := 0.050 + prober.DefaultClockGranularity.Seconds()
-	if math.Abs(stats.RTO()-wantG) > 0.0005 {
-		t.Errorf("expected RTO = SRTT + max(G, 4*RTTVAR) ≈ %f, got %f", wantG, stats.RTO())
-	}
-
-	// RTTVAR term dominates when jitter is large: 4*RTTVAR > G.
-	stats.Update(0.200)
-	expect := stats.SRTT() + 4*stats.RTTVar()
-	if stats.RTO() < expect-0.0001 {
-		t.Errorf("RTO must include 4*RTTVAR term, got %f < %f", stats.RTO(), expect)
-	}
-}
+// The AdaptiveStats unit tests (SRTT/RTTVAR/RTO math, backoff clamping,
+// dynamic floor) live in internal/prober/adaptive_test.go, in-package,
+// where they read the unexported fields directly.
 
 func TestAdaptive_RespondsToJitter(t *testing.T) {
 	prober.InitMetrics()
@@ -151,8 +25,8 @@ func TestAdaptive_RespondsToJitter(t *testing.T) {
 	defer ln.Close()
 	addr := ln.Addr().String()
 
-	var delay atomicLatency
-	delay.set(10 * time.Millisecond)
+	var delay atomic.Int64
+	delay.Store(int64(10 * time.Millisecond))
 
 	go func() {
 		defer ln.Close()
@@ -166,21 +40,26 @@ func TestAdaptive_RespondsToJitter(t *testing.T) {
 			if _, err := io.ReadFull(conn, buf); err != nil {
 				return
 			}
-			time.Sleep(delay.get())
+			// pi-lens-ignore: go-time-sleep-test
+			time.Sleep(time.Duration(delay.Load()))
+			// pi-lens-ignore: go-ignored-call-result
 			conn.Write(buf)
 		}
 	}()
 
+	// pi-lens-ignore: go-context-background-handler
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	cfg := cfgWith(true, 50*time.Millisecond, 500*time.Millisecond, prober.Target{Name: "adaptive_jitter", Address: addr})
 	go prober.RunClient(ctx, cfg)
 
+	// pi-lens-ignore: go-time-sleep-test
 	time.Sleep(1 * time.Second)
 	rtoLow := getGaugeValue(prober.RTOEstimate, "adaptive_jitter", addr)
 
-	delay.set(150 * time.Millisecond)
+	delay.Store(int64(150 * time.Millisecond))
+	// pi-lens-ignore: go-time-sleep-test
 	time.Sleep(2 * time.Second)
 	rtoHigh := getGaugeValue(prober.RTOEstimate, "adaptive_jitter", addr)
 

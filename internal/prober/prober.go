@@ -62,13 +62,21 @@ func (c Config) Validate() error {
 	if c.BaseTimeout <= 0 {
 		return fmt.Errorf("probe timeout must be positive, got %v", c.BaseTimeout)
 	}
-	seen := make(map[string]struct{}, len(c.Targets))
-	for _, t := range c.Targets {
+	return validateTargets(c.Targets)
+}
+
+// validateTargets checks each target's address and name and rejects
+// duplicate names (target names are Prometheus label values, so
+// duplicates would produce ambiguous metric series). Shared by
+// Config.Validate and LoadTargets.
+func validateTargets(targets []Target) error {
+	seen := make(map[string]struct{}, len(targets))
+	for _, t := range targets {
 		if err := ValidateTarget(t.Address); err != nil {
-			return err
+			return fmt.Errorf("target %q: %w", t.Name, err)
 		}
 		if err := ValidateTargetName(t.Name); err != nil {
-			return err
+			return fmt.Errorf("target %q: %w", t.Name, err)
 		}
 		if _, dup := seen[t.Name]; dup {
 			return fmt.Errorf("duplicate target name %q: metric labels would be ambiguous", t.Name)

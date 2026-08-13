@@ -49,18 +49,8 @@ func LoadTargets(path string) ([]Target, error) {
 	if len(targets) > MaxTargetsCount {
 		return nil, fmt.Errorf("too many targets: %d (max %d)", len(targets), MaxTargetsCount)
 	}
-	seen := make(map[string]struct{}, len(targets))
-	for i, t := range targets {
-		if err := ValidateTarget(t.Address); err != nil {
-			return nil, fmt.Errorf("target %d (%q): %w", i, t.Name, err)
-		}
-		if err := ValidateTargetName(t.Name); err != nil {
-			return nil, fmt.Errorf("target %d: %w", i, err)
-		}
-		if _, dup := seen[t.Name]; dup {
-			return nil, fmt.Errorf("target %d: duplicate name %q", i, t.Name)
-		}
-		seen[t.Name] = struct{}{}
+	if err := validateTargets(targets); err != nil {
+		return nil, fmt.Errorf("invalid targets: %w", err)
 	}
 	return targets, nil
 }
@@ -114,19 +104,6 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 
 	LinkUp.WithLabelValues(cfg.Source, t.Name, t.Address).Set(0)
 	runEchoLoop(ctx, conn, t, cfg, stats, logger)
-}
-
-// resetTimer safely stops and resets a time.Timer. It handles the
-// race where a timer fires between Stop and Reset by draining the
-// channel when Stop returns false.
-func resetTimer(t *time.Timer, d time.Duration) {
-	if !t.Stop() {
-		select {
-		case <-t.C:
-		default:
-		}
-	}
-	t.Reset(d)
 }
 
 // runEchoLoop is the core UDP probe loop for a single target.
@@ -255,7 +232,15 @@ func runEchoLoop(
 		// pi-lens-ignore: typos, typos:unknown
 		RTOEstimate.WithLabelValues(cfg.Source, t.Name, t.Address).Set(timeout.Seconds())
 
-		resetTimer(intervalTimer, interval)
+		// Stop may race a firing timer; when Stop returns false the
+		// channel is drained so Reset starts clean.
+		if !intervalTimer.Stop() {
+			select {
+			case <-intervalTimer.C:
+			default:
+			}
+		}
+		intervalTimer.Reset(interval)
 
 		select {
 		// pi-lens-ignore: waitgroup-done-scope

@@ -63,14 +63,19 @@ var (
 
 func main() {
 	flag.Parse()
-	setupLogger(*flJSONLogs)
+	opts := &slog.HandlerOptions{Level: slog.LevelInfo}
+	if *flJSONLogs {
+		slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, opts)))
+	} else {
+		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, opts)))
+	}
 
 	if *flSvc != "" {
 		handleService(*flSvc)
 		return
 	}
 
-// pi-lens-ignore: go-context-background-handler
+	// pi-lens-ignore: go-context-background-handler
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
@@ -81,20 +86,6 @@ func main() {
 		slog.Error("Program exited with error", "err", err)
 		os.Exit(1)
 	}
-}
-
-// setupLogger configures the default slog logger with text or JSON output.
-func setupLogger(jsonFormat bool) {
-	opts := &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	}
-	var handler slog.Handler
-	if jsonFormat {
-		handler = slog.NewJSONHandler(os.Stdout, opts)
-	} else {
-		handler = slog.NewTextHandler(os.Stdout, opts)
-	}
-	slog.SetDefault(slog.New(handler))
 }
 
 // buildConfig resolves CLI flags into a prober.Config. It handles single
@@ -175,7 +166,7 @@ func handleService(action string) {
 		}
 	}
 
-// pi-lens-ignore: go-context-background-handler
+	// pi-lens-ignore: go-context-background-handler
 	prg := &program{ctx: context.Background()}
 
 	s, err := service.New(prg, svcConfig)
@@ -231,7 +222,7 @@ type program struct {
 // Stop can never race it (the framework calls Stop only after Start
 // has returned).
 func (p *program) Start(s service.Service) error {
-// pi-lens-ignore: go-context-background-handler
+	// pi-lens-ignore: go-context-background-handler
 	p.ctx, p.cancel = context.WithCancel(context.Background())
 	p.wg.Add(1)
 	go func() {
@@ -307,7 +298,7 @@ func (p *program) run() error {
 
 		go func() {
 			<-p.ctx.Done()
-// pi-lens-ignore: go-context-background-handler
+			// pi-lens-ignore: go-context-background-handler
 			shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			srv.Shutdown(shutCtx)
