@@ -15,17 +15,12 @@ import (
 // testSource is the topology label applied in test metric queries.
 const testSource = "test"
 
-func getCounterValue(vec *prometheus.CounterVec, targetName, address string) float64 {
+// getCounterValue reads a counter series, prepending testSource to the
+// given labels (variadic: 2 labels for client metrics, 1 for the server
+// metric).
+func getCounterValue(vec *prometheus.CounterVec, labels ...string) float64 {
 	var m dto.Metric
-	if err := vec.WithLabelValues(testSource, targetName, address).Write(&m); err != nil {
-		return 0
-	}
-	return m.GetCounter().GetValue()
-}
-
-func getCounterValue1(vec *prometheus.CounterVec, label1 string) float64 {
-	var m dto.Metric
-	if err := vec.WithLabelValues(testSource, label1).Write(&m); err != nil {
+	if err := vec.WithLabelValues(append([]string{testSource}, labels...)...).Write(&m); err != nil {
 		return 0
 	}
 	return m.GetCounter().GetValue()

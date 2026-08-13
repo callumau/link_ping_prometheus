@@ -138,7 +138,7 @@ func TestServer_EnforceSizeAndHeader(t *testing.T) {
 		t.Errorf("bad-magic datagram must not be echoed, got %d bytes", n)
 	}
 
-	if got := getCounterValue1(prober.ServerProbesReceived, "127.0.0.1"); got < 1 {
+	if got := getCounterValue(prober.ServerProbesReceived, "127.0.0.1"); got < 1 {
 		t.Errorf("Server should have counted the valid probe, got %v", got)
 	}
 }
@@ -196,7 +196,7 @@ func TestServer_ProbeCounterIgnoresInvalid(t *testing.T) {
 
 	addr := startServer(t, ctx)
 
-	before := getCounterValue1(prober.ServerProbesReceived, "127.0.0.1")
+	before := getCounterValue(prober.ServerProbesReceived, "127.0.0.1")
 
 	conn, err := net.Dial("udp", addr)
 	if err != nil {
@@ -219,7 +219,7 @@ func TestServer_ProbeCounterIgnoresInvalid(t *testing.T) {
 	// Give the server a beat to process both datagrams.
 	time.Sleep(200 * time.Millisecond)
 
-	if got := getCounterValue1(prober.ServerProbesReceived, "127.0.0.1") - before; got != 1 {
+	if got := getCounterValue(prober.ServerProbesReceived, "127.0.0.1") - before; got != 1 {
 		t.Errorf("Server counter must increase by exactly 1 (valid probe only), got %v", got)
 	}
 }
@@ -286,7 +286,7 @@ func TestServer_AllowlistDropsUnlisted(t *testing.T) {
 
 	addr := startServer(t, ctx)
 
-	before := getCounterValue1(prober.ServerProbesReceived, "127.0.0.1")
+	before := getCounterValue(prober.ServerProbesReceived, "127.0.0.1")
 
 	// Dial from a loopback alias that is NOT in the allowlist.
 	dst, err := net.ResolveUDPAddr("udp", addr)
@@ -319,7 +319,7 @@ func TestServer_AllowlistDropsUnlisted(t *testing.T) {
 		t.Fatalf("allowlisted echo failed: n=%d err=%v", n, err)
 	}
 
-	if got := getCounterValue1(prober.ServerProbesReceived, "127.0.0.1") - before; got != 1 {
+	if got := getCounterValue(prober.ServerProbesReceived, "127.0.0.1") - before; got != 1 {
 		t.Errorf("only the allowlisted probe must be counted, got %v", got)
 	}
 }

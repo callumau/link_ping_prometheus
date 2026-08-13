@@ -52,14 +52,6 @@ var (
 	flMetricsBasicAuthPass = flag.String("metrics-pass", "", "Metrics: Basic auth password (env LINK_PING_METRICS_PASS; prefer env over CLI to avoid ps exposure)")
 	flMetricsTLSCert       = flag.String("metrics-tls-cert", "", "Metrics: TLS certificate file (requires -metrics-tls-key)")
 	flMetricsTLSKey        = flag.String("metrics-tls-key", "", "Metrics: TLS private key file (requires -metrics-tls-cert)")
-
-	// sensitiveFlags prevents secrets from being persisted in the service
-	// configuration during install. metrics-user is stripped alongside
-	// metrics-pass because the two must be configured as a pair.
-	sensitiveFlags = map[string]bool{
-		"metrics-user": true,
-		"metrics-pass": true,
-	}
 )
 
 func main() {
@@ -159,8 +151,11 @@ func handleService(action string) {
 			os.Exit(1)
 		}
 		var args []string
+		// The two auth flags are stripped here (with -svc) so credentials
+		// are never persisted into the service configuration; they must be
+		// configured as a pair via LINK_PING_METRICS_USER/PASS.
 		flag.Visit(func(f *flag.Flag) {
-			if f.Name != "svc" && !sensitiveFlags[f.Name] {
+			if f.Name != "svc" && f.Name != "metrics-user" && f.Name != "metrics-pass" {
 				args = append(args, fmt.Sprintf("-%s=%s", f.Name, f.Value.String()))
 			}
 		})
