@@ -122,19 +122,32 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 	stats := NewAdaptiveStats(cfg.BaseTimeout)
 	m := newTargetMetrics(cfg.Source, t)
 
-	// A connected UDP socket lets the kernel filter responses to the
-	// server's address and gives plain Read/Write semantics.
-	conn, err := net.Dial("udp", t.Address)
-	if err != nil {
-		// DialUDP only fails on malformed addresses, already rejected
-		// by Config.Validate.
-		logger.Error("Failed to open UDP socket", "err", err)
-		return
-	}
-	defer conn.Close()
-
 	m.linkUp.Set(0)
-	runEchoLoop(ctx, conn, cfg, stats, m, logger)
+	for {
+		// A connected UDP socket lets the kernel filter responses to
+		// the server's address and gives plain Read/Write semantics.
+		conn, err := net.Dial("udp", t.Address)
+		if err != nil {
+			// DialUDP only fails on malformed addresses, already
+			// rejected by Config.Validate.
+			logger.Error("Failed to open UDP socket", "err", err)
+			return
+		}
+
+		// runEchoLoop recovers panics and returns them as errors; a
+		// panic is per-event corruption, not a link condition, so the
+		// target keeps probing rather than dying with frozen series
+		// (stale counters make loss rate() queries go NaN). RTO state
+		// and link_up survive the restart; the pause bounds a
+		// panic-storm cycle.
+		err = runEchoLoop(ctx, conn, cfg, stats, m, logger)
+		if err == nil || ctx.Err() != nil {
+			return // clean context cancellation
+		}
+		logger.Error("Echo loop panicked; restarting probe loop", "err", err)
+		// pi-lens-ignore: go-time-sleep-test
+		time.Sleep(time.Second)
+	}
 }
 
 // runEchoLoop is the core UDP probe loop for a single target.
@@ -176,6 +189,13 @@ func runEchoLoop(
 
 	respCh := make(chan response, 100)
 
+	// done unblocks the reader when the loop exits via panic recovery:
+	// conn.Close() frees a reader blocked on the socket, but a reader
+	// blocked pushing into a full respCh would otherwise leak until the
+	// process exits.
+	done := make(chan struct{})
+	defer close(done)
+
 	defer conn.Close()
 
 	go func() {
@@ -216,6 +236,8 @@ func runEchoLoop(
 			select {
 			case respCh <- response{seq: seq, ts: ts, recv: time.Now()}:
 			case <-ctx.Done():
+				return
+			case <-done:
 				return
 			}
 		}
