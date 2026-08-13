@@ -49,6 +49,7 @@ The exporter exposes the following metrics at `/metrics` (default port 2112).
 | `link_rtt_jitter_seconds` | Gauge | `source`, `target`, `address` | Smoothed RTT jitter in seconds (RFC 3550 §6.4.1: `J += ( \| D(i−1,i) \| − J)/16`) computed from consecutive probe RTT deltas. Resets after a sequence gap (a timed-out probe), so link recovery never spikes the gauge. |
 | `link_rto_seconds` | Gauge | `source`, `target`, `address` | Current adaptive RTO in use (RFC 6298, doubled on consecutive timeouts). Floor is `max(200ms, 2×SRTT)` so a link's timeout always has headroom over its measured RTT. |
 | `link_server_probes_received_total` | Counter | `source`, `client` | Valid probes received by the server, per remote client IP (server mode only). Cross-check against the client's sent counter. |
+| `link_ping_build_info` | Gauge | `version` | Build version; value is always 1. Git tag for release builds, UTC timestamp to the minute for dev builds. |
 
 Percentiles and loss are **not** pre-computed in the exporter — Prometheus
 `rate()` / `histogram_quantile()` compute them from the raw counters and

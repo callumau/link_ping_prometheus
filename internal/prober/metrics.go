@@ -63,6 +63,10 @@ var (
 		Name: "link_server_probes_received_total",
 		Help: "Total validated probes received by the server, labelled by source and remote client address. Cross-check against the client's link_probes_sent_total: any mismatch is probes that never reached the server.",
 	}, []string{"source", "client"})
+	BuildInfo = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "link_ping_build_info",
+		Help: "Build information; value is always 1 and the version label holds the build version (git tag for releases, UTC timestamp to the minute for dev builds).",
+	}, []string{"version"})
 )
 
 var registerOnce sync.Once
@@ -71,7 +75,7 @@ var registerOnce sync.Once
 // Safe to call multiple times; registration happens exactly once.
 func InitMetrics() {
 	registerOnce.Do(func() {
-		prometheus.MustRegister(ProbesSent, ProbesTimedOut, ProbesInflight, RTTSeconds, JitterSeconds, LinkUp, RTOEstimate, ServerProbesReceived)
+		prometheus.MustRegister(ProbesSent, ProbesTimedOut, ProbesInflight, RTTSeconds, JitterSeconds, LinkUp, RTOEstimate, ServerProbesReceived, BuildInfo)
 	})
 }
 

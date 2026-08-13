@@ -11,10 +11,11 @@ builds:
       - darwin
     ldflags:
       - -s -w
+      - -X main.version={{.Version}}
 
 archives:
   - formats: ['tar.gz']
-    # this name template makes the archive name compatible with the standard checksums
+    # archive name template compatible with the standard checksums
     name_template: >-
       {{ .ProjectName }}_
       {{- title .Os }}_
@@ -24,8 +25,8 @@ archives:
       {{- if .Arm }}v{{ .Arm }}{{ end }}
     # use zip for windows archives
     format_overrides:
-    - goos: windows
-      formats: ['zip']
+      - goos: windows
+        formats: ['zip']
 
 checksum:
   name_template: 'checksums.txt'

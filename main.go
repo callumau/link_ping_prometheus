@@ -36,6 +36,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+// version is the build version, injected at link time via
+// -ldflags "-X main.version=...". Goreleaser sets it to the git tag;
+// dev_build.sh sets it to a UTC timestamp to the minute. A plain
+// `go build` (and CI test builds) leaves it as "dev".
+var version = "dev"
+
 // CLI flags.
 var (
 	flMode     = flag.String("mode", "server", "Mode: server, client, both")
@@ -156,7 +162,7 @@ func handleService(action string) {
 	svcConfig := &service.Config{
 		Name:        "link_ping_prometheus",
 		DisplayName: "Link Ping Prometheus",
-		Description: "Monitoring agent for TCP Echo latency.",
+		Description: fmt.Sprintf("UDP echo link monitor: Prometheus latency, packet loss, and jitter metrics (v%s)", version),
 		Arguments:   []string{},
 	}
 
@@ -279,6 +285,8 @@ func (p *program) Stop(s service.Service) error {
 // dispatches to the selected mode (server, client, or both).
 func (p *program) run() error {
 	prober.InitMetrics()
+	prober.BuildInfo.WithLabelValues(version).Set(1)
+	slog.Info("starting", "version", version)
 
 	user, pass, err := resolveMetricsAuth()
 	if err != nil {
