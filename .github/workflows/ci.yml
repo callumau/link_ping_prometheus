@@ -3,23 +3,32 @@ name: CI
 on:
   push:
     branches:
-      - '**'
+      - "**"
   pull_request:
     branches:
-      - '**'
+      - "**"
+
+# Read-only workflow: test + build only, so grant no write permissions.
+permissions:
+  contents: read
 
 jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
     steps:
+      # v4.4.0 (SHA-pinned for supply-chain safety)
       - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          go-version: '>=1.20.0'
+          # CI only reads; don't persist the GITHUB_TOKEN into git config.
+          persist-credentials: false
+
+      # v5.6.0 (SHA-pinned for supply-chain safety)
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version: ">=1.20.0"
 
       - name: Run Tests
         run: go test -v ./...

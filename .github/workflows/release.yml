@@ -4,8 +4,10 @@ run-name: ${{ github.ref_name }}
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
 
+# GoReleaser must create the GitHub release and upload assets, so it
+# needs contents write — scoped to contents only, not the whole token.
 permissions:
   contents: write
 
@@ -14,21 +16,29 @@ jobs:
     name: Release
     runs-on: ubuntu-latest
     steps:
+      # v4.4.0 (SHA-pinned for supply-chain safety)
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 0
+          # The build reads the tree; GoReleaser authenticates via the
+          # explicit GITHUB_TOKEN env, not persisted git credentials.
+          persist-credentials: false
 
+      # v5.6.0 (SHA-pinned for supply-chain safety)
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
-          go-version: '>=1.20.0'
+          go-version: ">=1.20.0"
 
       - name: Run Tests
         run: go test -v ./...
 
+      # v6.4.0 (SHA-pinned for supply-chain safety)
       - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v6
+        # The full action SHA makes this line exceed the raw 80-col cap;
+        # the reference is pinned and literal, so length is waived here.
+        uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # yamllint disable-line rule:line-length
         with:
           distribution: goreleaser
           version: "~> v2"
