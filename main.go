@@ -14,14 +14,17 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime/debug"
 	"sync"
 	"syscall"
@@ -43,6 +46,7 @@ var (
 	flMetrics  = flag.String("metrics", ":2112", "Metrics: Listen address")
 	flSvc      = flag.String("svc", "", "Service: install, uninstall, start, stop, run")
 	flJSONLogs = flag.Bool("json-logs", false, "Log in JSON format")
+	flLogFile  = flag.String("log-file", "", "Log: append logs to this file in addition to stdout (stdout is discarded under the Windows service)")
 
 	flAdaptive     = flag.Bool("adaptive", true, "Client: Use adaptive timeout based on link quality (RFC 6298)")
 	flBaseInterval = flag.Duration("interval", 500*time.Millisecond, "Client: Probe interval")
@@ -65,11 +69,21 @@ func main() {
 	if os.Getenv("GOMEMLIMIT") == "" {
 		debug.SetMemoryLimit(128 << 20)
 	}
+	logW := io.Writer(os.Stdout)
+	if *flLogFile != "" {
+		f, err := os.OpenFile(*flLogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "open log file %q: %v\n", *flLogFile, err)
+			os.Exit(1)
+		}
+		defer f.Close()
+		logW = io.MultiWriter(os.Stdout, f)
+	}
 	opts := &slog.HandlerOptions{Level: slog.LevelInfo}
 	if *flJSONLogs {
-		slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, opts)))
+		slog.SetDefault(slog.New(slog.NewJSONHandler(logW, opts)))
 	} else {
-		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, opts)))
+		slog.SetDefault(slog.New(slog.NewTextHandler(logW, opts)))
 	}
 
 	if *flSvc != "" {
@@ -158,7 +172,16 @@ func handleService(action string) {
 		// configured as a pair via LINK_PING_METRICS_USER/PASS.
 		flag.Visit(func(f *flag.Flag) {
 			if f.Name != "svc" && f.Name != "metrics-user" && f.Name != "metrics-pass" {
-				args = append(args, fmt.Sprintf("-%s=%s", f.Name, f.Value.String()))
+				v := f.Value.String()
+				switch f.Name {
+				case "targets", "metrics-tls-cert", "metrics-tls-key", "log-file":
+					if v != "" && !filepath.IsAbs(v) {
+						if abs, err := filepath.Abs(v); err == nil {
+							v = abs
+						}
+					}
+				}
+				args = append(args, fmt.Sprintf("-%s=%s", f.Name, v))
 			}
 		})
 		args = append(args, "-svc=run")
@@ -234,6 +257,9 @@ func (p *program) Start(s service.Service) error {
 		defer p.wg.Done()
 		if err := p.run(); err != nil {
 			slog.Error("Service run error", "err", err)
+			if s != nil {
+				_ = s.Stop()
+			}
 		}
 	}()
 	return nil
@@ -261,6 +287,11 @@ func (p *program) run() error {
 	cert, key := *flMetricsTLSCert, *flMetricsTLSKey
 	if (cert == "") != (key == "") {
 		return errors.New("-metrics-tls-cert and -metrics-tls-key must be set together")
+	}
+	if cert != "" {
+		if _, err := tls.LoadX509KeyPair(cert, key); err != nil {
+			return fmt.Errorf("metrics TLS: %w", err)
+		}
 	}
 	if user != "" && cert == "" {
 		slog.Warn("Metrics basic auth over plaintext HTTP: credentials are base64-only on the wire; consider -metrics-tls-cert/-metrics-tls-key")

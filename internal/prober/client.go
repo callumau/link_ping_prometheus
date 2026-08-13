@@ -130,7 +130,9 @@ var errReconnect = errors.New("periodic reconnect")
 // dialUDP dials a UDP socket. Kept as a package variable so tests can
 // substitute a failing dialer to exercise the dial-retry path
 // deterministically, without a flaky DNS dependency.
-var dialUDP = net.Dial
+var dialUDP = func(ctx context.Context, network, address string) (net.Conn, error) {
+	return (&net.Dialer{}).DialContext(ctx, network, address)
+}
 
 // probeLoopState carries per-target state that must survive socket
 // re-dials (periodic DNS re-resolution): jitter, link_up miss counting,
@@ -164,7 +166,7 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 	for {
 		// A connected UDP socket lets the kernel filter responses to
 		// the server's address and gives plain Read/Write semantics.
-		conn, err := dialUDP("udp", t.Address)
+		conn, err := dialUDP(ctx, "udp", t.Address)
 		if err != nil {
 			// Dial fails on DNS resolution failure as well as malformed
 			// addresses (already rejected by Config.Validate). Retry: a
@@ -195,8 +197,11 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 			continue
 		}
 		logger.Error("Echo loop panicked; restarting probe loop", "err", err)
-		// pi-lens-ignore: go-time-sleep-test
-		time.Sleep(time.Second)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Second):
+		}
 	}
 }
 
@@ -424,9 +429,22 @@ func runEchoLoop(
 		}
 
 		// Reconnect to re-resolve DNS once the socket has lived long
-		// enough, but only when nothing is in flight: abandoning pending
-		// probes would break the sent/rtt/timedout/inflight balance.
-		if time.Since(started) >= ReconnectInterval && len(pending) == 0 {
+		// enough. Normally the pending set is empty here, but when the
+		// probe interval is shorter than the RTO (interval < RTO) probes
+		// are perpetually in flight and pending never drains, which
+		// would otherwise starve re-resolution forever and strand a
+		// target on a stale IP after a DNS change. In-flight probes can
+		// no longer receive their echo once this socket closes, so they
+		// are counted as timed out to preserve the
+		// sent/rtt/timedout/inflight balance. They deliberately do NOT
+		// count toward link_up misses (consecutiveMisses): they were cut
+		// short by the socket swap, not lost on the wire.
+		if time.Since(started) >= ReconnectInterval {
+			for s := range pending {
+				m.timedOut.Inc()
+				m.inflight.Dec()
+				delete(pending, s)
+			}
 			return errReconnect
 		}
 

@@ -19,7 +19,7 @@ func TestProbeTargetRetriesOnDialFailure(t *testing.T) {
 
 	var dials atomic.Int64
 	old := dialUDP
-	dialUDP = func(network, address string) (net.Conn, error) {
+	dialUDP = func(ctx context.Context, network, address string) (net.Conn, error) {
 		dials.Add(1)
 		return nil, errors.New("dial udp: lookup test.invalid: no such host")
 	}
