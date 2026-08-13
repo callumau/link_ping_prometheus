@@ -70,6 +70,15 @@ func RunClient(ctx context.Context, cfg Config) error {
 
 	slog.Info("Starting probing", "targets_count", len(cfg.Targets), "adaptive", cfg.Adaptive)
 
+	// Warn when this client's probe rate would exceed the echo server's
+	// per-IP cap: the server silently drops over-cap probes, which the
+	// client would read as artificial packet loss.
+	if pps := float64(len(cfg.Targets)) / cfg.BaseInterval.Seconds(); pps > float64(MaxPktsPerIP) {
+		slog.Warn("Probe rate exceeds the server per-IP echo cap; probes will be dropped and loss will read artificially high",
+			"expected_pkts_per_sec", pps, "server_cap_per_ip", MaxPktsPerIP,
+			"fix", "raise MaxPktsPerIP on the server or reduce targets/interval")
+	}
+
 	SeedMetrics(cfg.Source, cfg.Targets)
 
 	var wg sync.WaitGroup

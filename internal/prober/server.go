@@ -21,8 +21,11 @@ var (
 	// MaxPktsPerIP caps validated probes echoed per remote IP per second.
 	// UDP has no connection state, so a misconfigured or hostile prober
 	// would otherwise be able to flood the echo loop. A variable (not a
-	// constant) so tests can lower it.
-	MaxPktsPerIP = 1000
+	// constant) so tests can lower it. The cap must cover the largest
+	// supported client (MaxTargetsCount targets at the default 500ms
+	// interval = 2000 probes/sec), or a legit client's probes get
+	// silently dropped and its loss ratio reads artificially high.
+	MaxPktsPerIP = 2000
 	// MaxPktsGlobal caps total echoed probes per second.
 	MaxPktsGlobal = 10000
 )
