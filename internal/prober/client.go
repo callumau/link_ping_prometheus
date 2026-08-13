@@ -12,6 +12,8 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // Target identifies a single probe destination.
@@ -83,6 +85,34 @@ func RunClient(ctx context.Context, cfg Config) error {
 	return nil
 }
 
+// targetMetrics holds pre-resolved Prometheus metric handles for one
+// target. Resolving each handle once avoids the label hash + map lookup
+// (and its mutex) on every probe event — the hottest path in the prober.
+// The handles stay valid for the lifetime of the probe loop.
+type targetMetrics struct {
+	sent     prometheus.Counter
+	timedOut prometheus.Counter
+	inflight prometheus.Gauge
+	rtt      prometheus.Observer
+	jitter   prometheus.Gauge
+	linkUp   prometheus.Gauge
+	rto      prometheus.Gauge
+}
+
+// newTargetMetrics resolves (and thereby creates) the metric series for
+// a single target and returns direct handles to them.
+func newTargetMetrics(source string, t Target) targetMetrics {
+	return targetMetrics{
+		sent:     ProbesSent.WithLabelValues(source, t.Name, t.Address),
+		timedOut: ProbesTimedOut.WithLabelValues(source, t.Name, t.Address),
+		inflight: ProbesInflight.WithLabelValues(source, t.Name, t.Address),
+		rtt:      RTTSeconds.WithLabelValues(source, t.Name, t.Address),
+		jitter:   JitterSeconds.WithLabelValues(source, t.Name, t.Address),
+		linkUp:   LinkUp.WithLabelValues(source, t.Name, t.Address),
+		rto:      RTOEstimate.WithLabelValues(source, t.Name, t.Address),
+	}
+}
+
 // probeTarget runs the UDP probe loop for a single target until ctx is
 // cancelled. There is no connection lifecycle: datagrams sent into a dead
 // link vanish and time out naturally, so the loss ratio reads ~100%
@@ -90,6 +120,7 @@ func RunClient(ctx context.Context, cfg Config) error {
 func probeTarget(ctx context.Context, t Target, cfg Config) {
 	logger := slog.With("target", t.Name, "address", t.Address)
 	stats := NewAdaptiveStats(cfg.BaseTimeout)
+	m := newTargetMetrics(cfg.Source, t)
 
 	// A connected UDP socket lets the kernel filter responses to the
 	// server's address and gives plain Read/Write semantics.
@@ -102,8 +133,8 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 	}
 	defer conn.Close()
 
-	LinkUp.WithLabelValues(cfg.Source, t.Name, t.Address).Set(0)
-	runEchoLoop(ctx, conn, t, cfg, stats, logger)
+	m.linkUp.Set(0)
+	runEchoLoop(ctx, conn, cfg, stats, m, logger)
 }
 
 // runEchoLoop is the core UDP probe loop for a single target.
@@ -131,9 +162,9 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 func runEchoLoop(
 	ctx context.Context,
 	conn net.Conn,
-	t Target,
 	cfg Config,
 	stats *AdaptiveStats,
+	m targetMetrics,
 	logger *slog.Logger,
 ) (retErr error) {
 
@@ -212,7 +243,7 @@ func runEchoLoop(
 		}
 		// Probes still in flight die with the loop on cancellation
 		// without counting as timeouts, but must leave the gauge.
-		inflight := ProbesInflight.WithLabelValues(cfg.Source, t.Name, t.Address)
+		inflight := m.inflight
 		if n := float64(len(pending)); n > 0 {
 			inflight.Sub(n)
 		}
@@ -230,7 +261,7 @@ func runEchoLoop(
 		}
 
 		// pi-lens-ignore: typos, typos:unknown
-		RTOEstimate.WithLabelValues(cfg.Source, t.Name, t.Address).Set(timeout.Seconds())
+		m.rto.Set(timeout.Seconds())
 
 		// Stop may race a firing timer; when Stop returns false the
 		// channel is drained so Reset starts clean.
@@ -265,11 +296,11 @@ func runEchoLoop(
 					continue
 				}
 				delete(pending, resp.seq)
-				ProbesInflight.WithLabelValues(cfg.Source, t.Name, t.Address).Dec()
+				m.inflight.Dec()
 
 				rttSec := resp.recv.Sub(sentTime).Seconds()
 
-				RTTSeconds.WithLabelValues(cfg.Source, t.Name, t.Address).Observe(rttSec)
+				m.rtt.Observe(rttSec)
 
 				// Jitter over consecutive RTT samples (RFC 3550 §6.4.1):
 				// J += (|D(i-1,i)| - J)/16. Any gap in sequence numbers
@@ -281,14 +312,14 @@ func runEchoLoop(
 					jitter = 0
 				}
 				prevRTT, prevSeq, havePrev = rttSec, seq, true
-				JitterSeconds.WithLabelValues(cfg.Source, t.Name, t.Address).Set(jitter)
+				m.jitter.Set(jitter)
 
 				if cfg.Adaptive {
 					// pi-lens-ignore: gorm-n-plus-one
 					stats.Update(rttSec)
 				}
 				consecutiveMisses = 0
-				LinkUp.WithLabelValues(cfg.Source, t.Name, t.Address).Set(1)
+				m.linkUp.Set(1)
 			default:
 				break Drain
 			}
@@ -299,8 +330,8 @@ func runEchoLoop(
 		if len(pending) > 0 {
 			for s, sentTime := range pending {
 				if now.Sub(sentTime) > timeout {
-					ProbesTimedOut.WithLabelValues(cfg.Source, t.Name, t.Address).Inc()
-					ProbesInflight.WithLabelValues(cfg.Source, t.Name, t.Address).Dec()
+					m.timedOut.Inc()
+					m.inflight.Dec()
 					delete(pending, s)
 					timeoutOccurred = true
 					consecutiveMisses++
@@ -316,7 +347,7 @@ func runEchoLoop(
 		// echo. A single lost probe or brief stall does not flap the
 		// state (enterprise health-check convention).
 		if consecutiveMisses >= LinkUpMissThreshold {
-			LinkUp.WithLabelValues(cfg.Source, t.Name, t.Address).Set(0)
+			m.linkUp.Set(0)
 		}
 
 		seq++
@@ -327,16 +358,16 @@ func runEchoLoop(
 		// Register the probe as in-flight before sending: any matching
 		// response or timeout must decrement it, so a stuck link shows
 		// up as a growing gauge instead of a silent stall.
-		ProbesInflight.WithLabelValues(cfg.Source, t.Name, t.Address).Inc()
+		m.inflight.Inc()
 		if nw, err := conn.Write(buf); err != nil {
 			// Datagram never left the socket; undo the in-flight
 			// increment and try again next interval.
-			ProbesInflight.WithLabelValues(cfg.Source, t.Name, t.Address).Dec()
+			m.inflight.Dec()
 			logger.Debug("UDP write error", "bytes", nw, "err", err)
 			continue
 		}
 
 		pending[seq] = now
-		ProbesSent.WithLabelValues(cfg.Source, t.Name, t.Address).Inc()
+		m.sent.Inc()
 	}
 }

@@ -15,7 +15,7 @@ UDP is deliberate: no retransmission, so the loss ratio is true network loss (TC
 ## Architecture
 
 - `main.go` — flags, modes, metrics HTTP server (Basic auth + optional TLS), Windows service via `-svc`
-- `internal/prober/` — `client.go` (per-target UDP probe loop + reader goroutine), `server.go` (single UDP read/echo loop + per-IP/global packet rate limits + fail-closed `-allow` client IP allowlist — `RunServer`/`ServePacketConn` reject any source not on the list; empty allowlist admits nothing and `RunServer` refuses to start), `adaptive.go` (RFC 6298 RTO), `metrics.go` (metric definitions), `validate.go`
+- `internal/prober/` — `client.go` (per-target UDP probe loop + reader goroutine; metric handles are resolved once per target into a `targetMetrics` struct — keep it that way, per-event `WithLabelValues` lookups are the hot path), `server.go` (single UDP read/echo loop + per-IP/global packet rate limits + fail-closed `-allow` client IP allowlist — `RunServer`/`ServePacketConn` reject any source not on the list; empty allowlist admits nothing and `RunServer` refuses to start), `adaptive.go` (RFC 6298 RTO), `metrics.go` (metric definitions), `validate.go`
 - `test/` — integration tests (package `prober_test`) that spin real UDP echo servers on ephemeral ports; `udpEcho` helper in `client_test.go`, `startEchoServer` in `helpers_test.go`
 - Wire protocol: 24-byte UDP datagram — 8B magic `LNKPING\x00`, 8B little-endian seq, 8B little-endian unix-ns timestamp. Tests build/validate raw frames from this layout.
 - No connection lifecycle: no dial/reconnect/backoff/flaps. Probes into a dead link time out naturally → loss reads ~100% during an outage with no fabricated counters.
@@ -38,6 +38,7 @@ UDP is deliberate: no retransmission, so the loss ratio is true network loss (TC
 ## Tests
 
 - Sleep-timed with tight tolerances; can be flaky under CI load (tests tolerate "cpu load?").
+- `soak_test.go` is an opt-in long-run memory diagnostic — it skips unless `SOAK_SECONDS` or `SOAK_TARGETS` is set, so the default suite stays fast. Run `SOAK_SECONDS=600 go test -count=1 -run TestSoakMemory -v ./test/` for a soak. Heap must stay flat (+8MB ceiling over the run).
 - Always pass `-count=1` to bypass the Go test cache.
 - Helpers: `cfgWith(adaptive, interval, timeout, targets...)`; metric getters keyed by `testSource="test"`.
 - Server rate-limit caps (`MaxPktsPerIP`, `MaxPktsGlobal`) are vars so tests can lower them — restore them in a defer after `ServePacketConn` returns.

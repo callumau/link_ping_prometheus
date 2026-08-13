@@ -80,13 +80,13 @@ func InitMetrics() {
 // topology label applied to every series (e.g. the local datacenter).
 func SeedMetrics(source string, targets []Target) {
 	for _, t := range targets {
-		ProbesSent.WithLabelValues(source, t.Name, t.Address).Add(0)
-		ProbesTimedOut.WithLabelValues(source, t.Name, t.Address).Add(0)
-		ProbesInflight.WithLabelValues(source, t.Name, t.Address).Set(0)
-		LinkUp.WithLabelValues(source, t.Name, t.Address).Set(0)
-		RTOEstimate.WithLabelValues(source, t.Name, t.Address).Set(0)
-		JitterSeconds.WithLabelValues(source, t.Name, t.Address).Set(0)
-		RTTSeconds.WithLabelValues(source, t.Name, t.Address)
+		m := newTargetMetrics(source, t)
+		m.sent.Add(0)
+		m.timedOut.Add(0)
+		m.inflight.Set(0)
+		m.linkUp.Set(0)
+		m.rto.Set(0)
+		m.jitter.Set(0)
 	}
 }
 

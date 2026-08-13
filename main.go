@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"sync"
 	"syscall"
 	"time"
@@ -63,6 +64,13 @@ var (
 
 func main() {
 	flag.Parse()
+	// Bound the Go heap so long-running RSS stays flat even during
+	// /metrics scrape or probe bursts. The standard GOMEMLIMIT env var
+	// (with units) overrides this default. 64MB is ample for the largest
+	// supported config (1000 targets) and keeps the agent lightweight.
+	if os.Getenv("GOMEMLIMIT") == "" {
+		debug.SetMemoryLimit(64 << 20)
+	}
 	opts := &slog.HandlerOptions{Level: slog.LevelInfo}
 	if *flJSONLogs {
 		slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, opts)))
