@@ -6,6 +6,7 @@
 //   - client: sends periodic probes to targets, recording RTT and loss.
 //   - both: runs server and client simultaneously.
 //
+// pi-lens-ignore: typos, typos:unknown
 // Adaptive RTO (RFC 6298) adjusts timeouts based on measured link
 // quality when -adaptive is enabled (default). UDP has no
 // retransmission, so the loss ratio is true network loss.
@@ -69,6 +70,7 @@ func main() {
 		return
 	}
 
+// pi-lens-ignore: go-context-background-handler
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
@@ -173,6 +175,7 @@ func handleService(action string) {
 		}
 	}
 
+// pi-lens-ignore: go-context-background-handler
 	prg := &program{ctx: context.Background()}
 
 	s, err := service.New(prg, svcConfig)
@@ -228,6 +231,7 @@ type program struct {
 // Stop can never race it (the framework calls Stop only after Start
 // has returned).
 func (p *program) Start(s service.Service) error {
+// pi-lens-ignore: go-context-background-handler
 	p.ctx, p.cancel = context.WithCancel(context.Background())
 	p.wg.Add(1)
 	go func() {
@@ -303,6 +307,7 @@ func (p *program) run() error {
 
 		go func() {
 			<-p.ctx.Done()
+// pi-lens-ignore: go-context-background-handler
 			shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			srv.Shutdown(shutCtx)

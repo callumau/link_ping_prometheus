@@ -88,6 +88,19 @@ func TestValidateTarget_PortAndHostRules(t *testing.T) {
 	}
 }
 
+// assertValidate runs cfg.Validate and fails unless the outcome matches
+// wantErr. Shared by the table-driven validation tests.
+func assertValidate(t *testing.T, name string, cfg prober.Config, wantErr bool) {
+	t.Helper()
+	err := cfg.Validate()
+	if wantErr && err == nil {
+		t.Errorf("%s: expected error, got nil", name)
+	}
+	if !wantErr && err != nil {
+		t.Errorf("%s: expected nil, got %v", name, err)
+	}
+}
+
 func TestConfigValidate(t *testing.T) {
 	tg := prober.Target{Name: "x", Address: "127.0.0.1:4000"}
 
@@ -111,13 +124,7 @@ func TestConfigValidate(t *testing.T) {
 		}, true},
 	}
 	for _, tc := range cases {
-		err := tc.cfg.Validate()
-		if tc.wantErr && err == nil {
-			t.Errorf("%s: expected error, got nil", tc.name)
-		}
-		if !tc.wantErr && err != nil {
-			t.Errorf("%s: expected nil, got %v", tc.name, err)
-		}
+		assertValidate(t, tc.name, tc.cfg, tc.wantErr)
 	}
 }
 
@@ -160,13 +167,7 @@ func TestConfigValidate_RejectsBadNames(t *testing.T) {
 			BaseInterval: time.Second,
 			BaseTimeout:  time.Second,
 		}
-		err := cfg.Validate()
-		if tc.wantErr && err == nil {
-			t.Errorf("%s: expected error, got nil", tc.name)
-		}
-		if !tc.wantErr && err != nil {
-			t.Errorf("%s: expected nil, got %v", tc.name, err)
-		}
+		assertValidate(t, tc.name, cfg, tc.wantErr)
 	}
 }
 

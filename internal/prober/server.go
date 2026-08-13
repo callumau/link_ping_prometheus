@@ -33,7 +33,7 @@ var (
 // not run without at least one allowed prober.
 func ParseAllowlist(s string) (map[string]struct{}, error) {
 	set := make(map[string]struct{})
-	for _, part := range strings.Split(s, ",") {
+	for part := range strings.SplitSeq(s, ",") {
 		part = strings.TrimSpace(part)
 		if part == "" {
 			continue
@@ -106,7 +106,10 @@ func RunServer(ctx context.Context, addr string, source string, allowed map[stri
 		pc.Close()
 	}()
 
-	return ServePacketConn(ctx, pc, source, allowed)
+	if err := ServePacketConn(ctx, pc, source, allowed); err != nil {
+		return err
+	}
+	return nil
 }
 
 // ServePacketConn runs the UDP echo loop on pc. Datagrams of exactly
@@ -137,17 +140,14 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 		if string(buf[0:8]) != MagicBytes {
 			continue
 		}
-		ip, _, err := net.SplitHostPort(raddr.String())
-		if err != nil {
+		// The echo responder is UDP-only, so ReadFrom yields a
+		// *net.UDPAddr whose IP is already canonical for the allowlist
+		// lookup (no string round-trip or double parsing).
+		ua, ok := raddr.(*net.UDPAddr)
+		if !ok {
 			continue
 		}
-		// Canonicalize before comparing so IPv4/IPv6 forms match the
-		// allowlist keys deterministically.
-		rip := net.ParseIP(ip)
-		if rip == nil {
-			continue
-		}
-		norm := rip.String()
+		norm := ua.IP.String()
 		if _, ok := allowed[norm]; !ok {
 			continue
 		}
@@ -156,8 +156,8 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 		}
 
 		ServerProbesReceived.WithLabelValues(source, norm).Inc()
-		if _, err := pc.WriteTo(buf[:n], raddr); err != nil && ctx.Err() == nil {
-			slog.Debug("UDP write error", "addr", raddr, "err", err)
+		if nw, err := pc.WriteTo(buf[:n], raddr); err != nil && ctx.Err() == nil {
+			slog.Debug("UDP write error", "addr", raddr, "bytes", nw, "err", err)
 		}
 	}
 }

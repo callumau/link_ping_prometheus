@@ -3,7 +3,6 @@ package prober_test
 import (
 	"context"
 	"fmt"
-	"net"
 	"testing"
 	"time"
 
@@ -47,10 +46,7 @@ func TestServerDropout(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen error: %v", err)
-	}
+	pc := listenUDP(t, ctx)
 	serverAddr := pc.LocalAddr().String()
 
 	stopEchoCh := make(chan struct{})

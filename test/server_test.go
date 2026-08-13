@@ -13,6 +13,41 @@ import (
 // all dial from the loopback IP, so it is the sole permitted prober.
 var testAllow = map[string]struct{}{net.IPv4(127, 0, 0, 1).String(): {}}
 
+// startServer starts ServePacketConn on an ephemeral loopback port with
+// the standard test allowlist, returning the port address. The socket is
+// closed on ctx cancel.
+func startServer(t *testing.T, ctx context.Context) string {
+	t.Helper()
+	pc := listenUDP(t, ctx)
+	go prober.ServePacketConn(ctx, pc, testSource, testAllow)
+	return pc.LocalAddr().String()
+}
+
+// startServerDone is startServer with a channel that is closed when
+// ServePacketConn returns, for tests that assert shutdown behavior.
+func startServerDone(t *testing.T, ctx context.Context) (string, <-chan struct{}) {
+	t.Helper()
+	pc := listenUDP(t, ctx)
+	done := make(chan struct{})
+	go func() {
+		prober.ServePacketConn(ctx, pc, testSource, testAllow)
+		close(done)
+	}()
+	return pc.LocalAddr().String(), done
+}
+
+// dialProbe opens a UDP conn to addr and builds one valid probe frame.
+func dialProbe(t *testing.T, addr string) (net.Conn, []byte) {
+	t.Helper()
+	conn, err := net.Dial("udp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	probe := make([]byte, prober.PayloadSize)
+	copy(probe[0:8], prober.MagicBytes)
+	return conn, probe
+}
+
 // TestGarbageData_Server: a peer that answers probes with garbage (wrong
 // size, wrong magic) must never be counted as a valid response.
 func TestGarbageData_Server(t *testing.T) {
@@ -63,12 +98,7 @@ func TestServer_EnforceSizeAndHeader(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	go prober.ServePacketConn(ctx, pc, testSource, testAllow)
-	addr := pc.LocalAddr().String()
+	addr := startServer(t, ctx)
 
 	conn, err := net.Dial("udp", addr)
 	if err != nil {
@@ -124,19 +154,7 @@ func TestServer_PerIPRateLimit(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	go func() {
-		<-ctx.Done()
-		pc.Close()
-	}()
-	done := make(chan struct{})
-	go func() {
-		prober.ServePacketConn(ctx, pc, testSource, testAllow)
-		close(done)
-	}()
+	addr, done := startServerDone(t, ctx)
 	// Restore the shared test variables after ServePacketConn has
 	// returned; it reads them at startup.
 	defer func() {
@@ -144,16 +162,9 @@ func TestServer_PerIPRateLimit(t *testing.T) {
 		<-done
 		prober.MaxPktsPerIP, prober.MaxPktsGlobal = oldIP, oldGlobal
 	}()
-	addr := pc.LocalAddr().String()
 
-	conn, err := net.Dial("udp", addr)
-	if err != nil {
-		t.Fatal(err)
-	}
+	conn, probe := dialProbe(t, addr)
 	defer conn.Close()
-
-	probe := make([]byte, prober.PayloadSize)
-	copy(probe[0:8], prober.MagicBytes)
 
 	got := 0
 	for i := 0; i < 3; i++ {
@@ -177,17 +188,13 @@ func TestServer_PerIPRateLimit(t *testing.T) {
 
 // TestServer_ProbeCounterIgnoresInvalid: link_server_probes_received_total
 // must count only validated probes — garbage datagrams must not inflate it.
+// pi-lens-ignore: jscpd:duplicate
 func TestServer_ProbeCounterIgnoresInvalid(t *testing.T) {
 	prober.InitMetrics()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	go prober.ServePacketConn(ctx, pc, testSource, testAllow)
-	addr := pc.LocalAddr().String()
+	addr := startServer(t, ctx)
 
 	before := getCounterValue1(prober.ServerProbesReceived, "127.0.0.1")
 
@@ -223,14 +230,7 @@ func TestServer_ShutdownOnCancel(t *testing.T) {
 	prober.InitMetrics()
 	ctx, cancel := context.WithCancel(context.Background())
 
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	go func() {
-		<-ctx.Done()
-		pc.Close()
-	}()
+	pc := listenUDP(t, ctx)
 
 	done := make(chan error, 1)
 	go func() {
@@ -255,30 +255,10 @@ func TestServer_NoEchoAfterShutdown(t *testing.T) {
 	prober.InitMetrics()
 	ctx, cancel := context.WithCancel(context.Background())
 
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	go func() {
-		<-ctx.Done()
-		pc.Close()
-	}()
+	addr, done := startServerDone(t, ctx)
 
-	done := make(chan struct{})
-	go func() {
-		prober.ServePacketConn(ctx, pc, testSource, testAllow)
-		close(done)
-	}()
-	addr := pc.LocalAddr().String()
-
-	conn, err := net.Dial("udp", addr)
-	if err != nil {
-		t.Fatal(err)
-	}
+	conn, probe := dialProbe(t, addr)
 	defer conn.Close()
-
-	probe := make([]byte, prober.PayloadSize)
-	copy(probe[0:8], prober.MagicBytes)
 	conn.Write(probe)
 	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	if n, err := conn.Read(make([]byte, prober.PayloadSize)); err != nil || n != prober.PayloadSize {
@@ -298,17 +278,13 @@ func TestServer_NoEchoAfterShutdown(t *testing.T) {
 // TestServer_AllowlistDropsUnlisted: a valid probe from a source not in
 // the fail-closed allowlist must be neither echoed nor counted (fixes
 // the reflector and the metric-label-cardinality DoS).
+// pi-lens-ignore: jscpd:duplicate
 func TestServer_AllowlistDropsUnlisted(t *testing.T) {
 	prober.InitMetrics()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	go prober.ServePacketConn(ctx, pc, testSource, testAllow) // only 127.0.0.1 allowed
-	addr := pc.LocalAddr().String()
+	addr := startServer(t, ctx)
 
 	before := getCounterValue1(prober.ServerProbesReceived, "127.0.0.1")
 

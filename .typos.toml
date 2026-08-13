@@ -1,0 +1,11 @@
+# RTO = Retransmission Timeout (RFC 6298) — the adaptive probe timeout.
+# Used throughout comments, in the metric name link_rto_seconds, and in
+# identifiers like CurrentRTO / RTOEstimate; it is a deliberate domain
+# term, not a misspelling of "to".
+[default.extend-words]
+rto = "RTO"
+
+[default.extend-identifiers]
+rto = "RTO"
+currentrto = "CurrentRTO"
+rtoestimate = "RTOEstimate"

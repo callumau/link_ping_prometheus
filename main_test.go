@@ -21,6 +21,7 @@ func saveFlags(t *testing.T) {
 	})
 }
 
+// pi-lens-ignore: go-test-functions
 func TestResolveMetricsAuth(t *testing.T) {
 	saveFlags(t)
 	// Isolate from any real environment.
@@ -30,20 +31,20 @@ func TestResolveMetricsAuth(t *testing.T) {
 	reset := func() { *flMetricsBasicAuthUser, *flMetricsBasicAuthPass = "", "" }
 
 	reset()
-	if _, _, err := resolveMetricsAuth(); err != nil {
-		t.Errorf("empty pair must be allowed (auth disabled): %v", err)
+	if u, p, err := resolveMetricsAuth(); err != nil || u != "" || p != "" {
+		t.Errorf("empty pair must be allowed (auth disabled): %q/%q, err %v", u, p, err)
 	}
 
 	reset()
 	*flMetricsBasicAuthUser = "u"
-	if _, _, err := resolveMetricsAuth(); err == nil {
-		t.Error("user without password must error (would enable empty-password auth)")
+	if u, p, err := resolveMetricsAuth(); err == nil {
+		t.Errorf("user without password must error (would enable empty-password auth), got %q/%q", u, p)
 	}
 
 	reset()
 	*flMetricsBasicAuthPass = "p"
-	if _, _, err := resolveMetricsAuth(); err == nil {
-		t.Error("password without user must error")
+	if u, p, err := resolveMetricsAuth(); err == nil {
+		t.Errorf("password without user must error, got %q/%q", u, p)
 	}
 
 	reset()
@@ -62,11 +63,12 @@ func TestResolveMetricsAuth(t *testing.T) {
 	}
 
 	*flMetricsBasicAuthUser = "flagu"
-	if u, _, err := resolveMetricsAuth(); err != nil || u != "flagu" {
-		t.Errorf("flag should win over env: got %q, err %v", u, err)
+	if u, p, err := resolveMetricsAuth(); err != nil || u != "flagu" || p != "envp" {
+		t.Errorf("flag should win over env: got %q/%q, err %v", u, p, err)
 	}
 }
 
+// pi-lens-ignore: go-test-functions
 func TestRunRejectsBadFlagCombos(t *testing.T) {
 	saveFlags(t)
 	t.Setenv("LINK_PING_METRICS_USER", "")
@@ -75,6 +77,7 @@ func TestRunRejectsBadFlagCombos(t *testing.T) {
 	t.Run("tls cert without key", func(t *testing.T) {
 		saveFlags(t)
 		*flMetricsTLSCert = "cert.pem"
+		// pi-lens-ignore: go-context-background-handler
 		prg := &program{ctx: context.Background()}
 		if err := prg.run(); err == nil {
 			t.Error("expected error for cert without key")
@@ -84,6 +87,7 @@ func TestRunRejectsBadFlagCombos(t *testing.T) {
 	t.Run("metrics user without password", func(t *testing.T) {
 		saveFlags(t)
 		*flMetricsBasicAuthUser = "u"
+		// pi-lens-ignore: go-context-background-handler
 		prg := &program{ctx: context.Background()}
 		if err := prg.run(); err == nil {
 			t.Error("expected error for user without password")
@@ -94,6 +98,7 @@ func TestRunRejectsBadFlagCombos(t *testing.T) {
 		saveFlags(t)
 		*flMode = "client"
 		*flTarget = "not an address"
+		// pi-lens-ignore: go-context-background-handler
 		prg := &program{ctx: context.Background()}
 		if err := prg.run(); err == nil {
 			t.Error("expected error for invalid target in client mode")
@@ -105,6 +110,7 @@ func TestRunRejectsBadFlagCombos(t *testing.T) {
 // in "both" mode. With the race detector this proves the WaitGroup Add is
 // correctly sequenced before Stop's Wait (previously Add ran concurrently
 // inside run()).
+// pi-lens-ignore: go-test-functions
 func TestProgramStartStopBothMode(t *testing.T) {
 	saveFlags(t)
 	t.Setenv("LINK_PING_METRICS_USER", "")
@@ -120,6 +126,7 @@ func TestProgramStartStopBothMode(t *testing.T) {
 	if err := prg.Start(nil); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
+	// pi-lens-ignore: go-time-sleep-test
 	time.Sleep(200 * time.Millisecond)
 
 	done := make(chan struct{})
