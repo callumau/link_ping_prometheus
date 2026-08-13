@@ -33,8 +33,11 @@ jobs:
           # and this project's deps are few enough to fetch per run.
           cache: false
 
-      - name: Run Tests
-        run: go test -v ./...
+      - name: Vet
+        run: go vet ./...
+
+      - name: Run Tests (race detector)
+        run: go test -race -v ./...
 
       - name: Build
         run: go build -v ./...
