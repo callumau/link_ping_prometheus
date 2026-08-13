@@ -10,7 +10,80 @@ import (
 	"link_ping_prometheus/internal/prober"
 )
 
-// TestJitterGauge_ConstantRTTStaysZero: on a link with constant RTT the
+// TestJitterGauge_MultiInflightKeepsTracking: with more than one probe
+// in flight (interval < RTO — the state adaptive backoff produces on a
+// degraded link), echoes arrive in bursts and several can land in the
+// same drain tick. The RFC 3550 estimate must keep tracking the RTT
+// swing; it must not collapse to 0 just because a drain processed
+// several responses at once.
+func TestJitterGauge_MultiInflightKeepsTracking(t *testing.T) {
+	prober.InitMetrics()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Batch echo server: probes are gathered and flushed together every
+	// ~150ms, with the flush delay alternating 100ms/200ms per batch.
+	// Each flush delivers several echoes back-to-back (multiple
+	// responses per client drain) and consecutive batches have RTTs that
+	// differ by ~100ms — the condition that exposed the collapse.
+	var frames [][]byte
+	var flushAt time.Time
+	longDelay := false
+	addr := udpEcho(t, ctx, func(buf []byte, w func([]byte)) {
+		if len(buf) != prober.PayloadSize || string(buf[0:8]) != prober.MagicBytes {
+			return
+		}
+		frames = append(frames, append([]byte(nil), buf...))
+		if flushAt.IsZero() {
+			flushAt = time.Now().Add(150 * time.Millisecond)
+		}
+		if !time.Now().Before(flushAt) {
+			batch := frames
+			frames = nil
+			flushAt = time.Time{}
+			delay := 100 * time.Millisecond
+			if longDelay {
+				delay = 200 * time.Millisecond
+			}
+			longDelay = !longDelay
+			time.Sleep(delay)
+			for _, f := range batch {
+				w(f)
+			}
+		}
+	})
+
+	// Interval 50ms with a ~250-350ms RTT keeps ~5-7 probes in flight;
+	// the 2s timeout never fires, so every probe resolves as an echo.
+	cfg := cfgWith(false, 50*time.Millisecond, 2*time.Second, prober.Target{Name: "jitter_multi", Address: addr})
+	go prober.RunClient(ctx, cfg)
+
+	// The estimate must climb past 1ms once the first RTT swing is
+	// observed; it must never blow past the ~250ms worst-case delta.
+	var maxSeen float64
+	seen := false
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if j := getGaugeValue(prober.JitterSeconds, "jitter_multi", addr); j > maxSeen {
+			maxSeen = j
+		}
+		if j := getGaugeValue(prober.JitterSeconds, "jitter_multi", addr); j > 0.001 {
+			seen = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !seen {
+		t.Errorf("jitter collapsed to 0 with multiple probes in flight (max seen %.4fs); RTTs differing by ~100ms must feed the RFC 3550 estimate", maxSeen)
+	}
+	if j := getGaugeValue(prober.JitterSeconds, "jitter_multi", addr); j > 0.3 {
+		t.Errorf("jitter %.4fs exceeds the ~250ms worst-case RTT delta; estimate diverged", j)
+	}
+
+	cancel()
+}
+
 // consecutive-sample deltas are ~0, so the RFC 3550 estimate must stay
 // near zero — a negative control for the jitter gauge.
 func TestJitterGauge_ConstantRTTStaysZero(t *testing.T) {

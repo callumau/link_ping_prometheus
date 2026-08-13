@@ -305,13 +305,17 @@ func runEchoLoop(
 				// Jitter over consecutive RTT samples (RFC 3550 §6.4.1):
 				// J += (|D(i-1,i)| - J)/16. Any gap in sequence numbers
 				// starts the estimate over, keeping post-outage recovery
-				// from spiking the gauge.
-				if havePrev && seq == prevSeq+1 {
+				// from spiking the gauge. The comparison uses the
+				// response's own sequence number: the loop's seq is the
+				// last-sent probe, so with multiple probes in flight
+				// (interval < RTO) it would mislabel every response after
+				// the first in a drain as a gap and pin jitter at 0.
+				if havePrev && resp.seq == prevSeq+1 {
 					jitter += (math.Abs(rttSec-prevRTT) - jitter) / 16
 				} else {
 					jitter = 0
 				}
-				prevRTT, prevSeq, havePrev = rttSec, seq, true
+				prevRTT, prevSeq, havePrev = rttSec, resp.seq, true
 				m.jitter.Set(jitter)
 
 				if cfg.Adaptive {
