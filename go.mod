@@ -1,6 +1,6 @@
 module link_ping_prometheus
 
-go 1.25.1
+go 1.26.5
 
 require (
 	github.com/kardianos/service v1.2.4
