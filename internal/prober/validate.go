@@ -8,8 +8,10 @@ import (
 	"strings"
 )
 
-// ValidateTarget checks that address is a valid host:port string with
-// a resolvable hostname or IP address and a port in [1, 65535].
+// ValidateTarget checks that address is a valid host:port string with a
+// syntactically valid hostname or IP address and a port in [1, 65535].
+// Validation is syntax-only: no DNS resolution happens here (load-time
+// validation must not depend on the network).
 func ValidateTarget(address string) error {
 	if address == "" {
 		return errors.New("target address is empty")
