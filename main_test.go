@@ -13,11 +13,19 @@ func saveFlags(t *testing.T) {
 	oldTarget, oldTargets := *flTarget, *flTargets
 	oldUser, oldPass := *flMetricsBasicAuthUser, *flMetricsBasicAuthPass
 	oldCert, oldKey := *flMetricsTLSCert, *flMetricsTLSKey
+	oldAllow, oldSource := *flAllow, *flSource
+	oldAdaptive := *flAdaptive
+	oldInterval, oldTimeout := *flBaseInterval, *flBaseTimeout
+	oldLogFile, oldJSONLogs := *flLogFile, *flJSONLogs
 	t.Cleanup(func() {
 		*flMode, *flListen, *flMetrics = oldMode, oldListen, oldMetrics
 		*flTarget, *flTargets = oldTarget, oldTargets
 		*flMetricsBasicAuthUser, *flMetricsBasicAuthPass = oldUser, oldPass
 		*flMetricsTLSCert, *flMetricsTLSKey = oldCert, oldKey
+		*flAllow, *flSource = oldAllow, oldSource
+		*flAdaptive = oldAdaptive
+		*flBaseInterval, *flBaseTimeout = oldInterval, oldTimeout
+		*flLogFile, *flJSONLogs = oldLogFile, oldJSONLogs
 	})
 }
 
