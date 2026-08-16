@@ -28,6 +28,27 @@ archives:
       - goos: windows
         formats: ["zip"]
 
+# Multi-arch container image to GHCR. dockers_v2 builds one multi-platform
+# image (linux/amd64 + linux/arm64) in a single buildx call and stages the
+# binary under per-platform dirs in the build context (see Dockerfile).
+dockers_v2:
+  - images:
+      - "ghcr.io/callumau/link_ping_prometheus"
+    tags:
+      - "{{ .Tag }}"
+      - "{{ if and (not .IsNightly) (not .IsPrerelease) }}latest{{ end }}"
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    # No SBOM/provenance attestations (decision: image only).
+    sbom: false
+    flags:
+      - "--provenance=false"
+      - "--label=org.opencontainers.image.source={{ .GitURL }}"
+      - "--label=org.opencontainers.image.created={{ .Date }}"
+      - "--label=org.opencontainers.image.title={{ .ProjectName }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+
 checksum:
   name_template: "checksums.txt"
 

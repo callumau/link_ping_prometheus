@@ -34,6 +34,41 @@ Each configured target is one monitored link. The dashboard gives the
 per-link picture: `link_up` status, true packet loss (rate-derived), RTT
 percentiles (p50/p90/p99), jitter, and adaptive RTO.
 
+## Run with Docker
+
+Multi-arch container images (`linux/amd64`, `linux/arm64`) are published
+to [GitHub Container Registry](https://github.com/callumau/link_ping_prometheus/pkgs/container/link_ping_prometheus)
+on every release tag:
+
+```sh
+docker pull ghcr.io/callumau/link_ping_prometheus:latest
+```
+
+The image runs as an unprivileged user (UID 65532). Server mode listens
+on UDP 4000; the metrics endpoint is served on TCP 2112.
+
+Echo server at the remote site (fail-closed: `-allow` is required):
+
+```sh
+docker run -d --name link-ping-server --restart=always \
+  -p 4000:4000/udp -p 2112:2112 \
+  ghcr.io/callumau/link_ping_prometheus:latest \
+  -mode=server -listen=":4000" -allow=203.0.113.5
+```
+
+Client probing site B from site A (metrics only, no probe port needed):
+
+```sh
+docker run -d --name link-ping-client --restart=always \
+  -p 2112:2112 \
+  ghcr.io/callumau/link_ping_prometheus:latest \
+  -mode=client -target="203.0.113.10:4000" -source="sydney-dc"
+```
+
+All [flags](#usage) work the same as the bare binary; file-based flags
+(`-targets` JSON, TLS cert/key) need those files mounted into the scratch
+image, e.g. `-v /etc/link-ping:/cfg:ro -targets=/cfg/targets.json`.
+
 ## Metrics
 
 The exporter exposes the following metrics at `/metrics` (default port 2112).

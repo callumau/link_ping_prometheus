@@ -6,3 +6,5 @@ link_ping_prometheus
 
 piolium/*
 .pi/
+dist/
+
