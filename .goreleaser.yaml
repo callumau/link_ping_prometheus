@@ -36,7 +36,7 @@ dockers_v2:
       - "ghcr.io/callumau/link_ping_prometheus"
     tags:
       - "{{ .Tag }}"
-      - "{{ if and (not .IsNightly) (not .IsPrerelease) }}latest{{ end }}"
+      - "{{ if not .IsNightly }}latest{{ end }}"
     platforms:
       - linux/amd64
       - linux/arm64
