@@ -17,16 +17,16 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      # v4.4.0 (SHA-pinned for supply-chain safety)
+      # v7.0.1 (SHA-pinned for supply-chain safety)
       - name: Checkout code
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           # CI only reads; don't persist the GITHUB_TOKEN into git config.
           persist-credentials: false
 
-      # v5.6.0 (SHA-pinned for supply-chain safety)
+      # v7.0.0 (SHA-pinned for supply-chain safety)
       - name: Set up Go
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
           go-version: ">=1.20.0"
           # No action cache: a poisoned cache is a supply-chain vector,
