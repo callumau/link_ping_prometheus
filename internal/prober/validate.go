@@ -51,8 +51,9 @@ func ValidateTargetName(name string) error {
 }
 
 // isValidHost checks whether host is a valid IP address or DNS name
-// (RFC 1035 label rules, max 253 characters, each label 1-63 characters,
-// ASCII alphanumeric plus hyphen, no leading/trailing hyphen).
+// (RFC 1123 label rules — RFC 1035 as relaxed to allow labels starting
+// with digits — max 253 characters, each label 1-63 characters, ASCII
+// alphanumeric plus hyphen, no leading/trailing hyphen).
 func isValidHost(host string) bool {
 	if ip := net.ParseIP(host); ip != nil {
 		return true
