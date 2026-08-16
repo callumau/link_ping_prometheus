@@ -200,8 +200,9 @@ func handleService(action string) {
 		}
 	}
 
-	// pi-lens-ignore: go-context-background-handler
-	prg := &program{ctx: context.Background()}
+	// Zero-value program: ctx is only ever set by Start(), which
+	// install/uninstall/start/stop never invoke.
+	prg := &program{}
 
 	s, err := service.New(prg, svcConfig)
 	if err != nil {
