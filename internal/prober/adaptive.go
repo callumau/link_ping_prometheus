@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-// AdaptiveStats implements RFC 6298-style RTO estimation for TCP probes.
+// AdaptiveStats implements RFC 6298-style RTO estimation for probe RTTs.
 type AdaptiveStats struct {
 	srtt                float64
 	rttvar              float64

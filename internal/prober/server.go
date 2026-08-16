@@ -73,7 +73,10 @@ func (r *rateLimiter) allow(ip string) bool {
 	now := time.Now()
 	if now.Sub(r.window) >= time.Second {
 		r.window = now
-		r.perIP = make(map[string]int)
+		// clear in place (Go 1.21+) instead of reallocating: the window
+		// resets every second for the lifetime of the server, so reusing
+		// the map avoids per-second GC churn.
+		clear(r.perIP)
 		r.global = 0
 	}
 	if r.global >= r.globalCap {
