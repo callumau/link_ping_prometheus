@@ -100,12 +100,14 @@ func MetricsAuth(user, pass string, next http.Handler) http.Handler {
 	if user == "" {
 		return next
 	}
+	// Hash the reference credentials once at handler creation; the
+	// request-path hashes are computed per request.
+	uhRef, phRef := sha256.Sum256([]byte(user)), sha256.Sum256([]byte(pass))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		u, p, ok := r.BasicAuth()
 		// Hash before comparing: ConstantTimeCompare returns immediately on
 		// length mismatch, which would otherwise leak credential length.
 		uh, ph := sha256.Sum256([]byte(u)), sha256.Sum256([]byte(p))
-		uhRef, phRef := sha256.Sum256([]byte(user)), sha256.Sum256([]byte(pass))
 		if !ok || subtle.ConstantTimeCompare(uh[:], uhRef[:]) != 1 || subtle.ConstantTimeCompare(ph[:], phRef[:]) != 1 {
 			w.Header().Set("WWW-Authenticate", `Basic realm="metrics"`)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
