@@ -47,6 +47,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # v4.2.0 (SHA-pinned for supply-chain safety). The default docker
+      # driver can't build multi-platform images; this creates a
+      # docker-container builder that can.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # yamllint disable-line rule:line-length
+
       # v6.4.0 (SHA-pinned for supply-chain safety)
       - name: Run GoReleaser
         # The full action SHA makes this line exceed the raw 80-col cap;
