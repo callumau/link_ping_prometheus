@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Go module `link_ping_prometheus` — site-to-site link monitor: a UDP echo prober that exposes Prometheus metrics for latency, packet loss, and jitter. Runs in `server` (echo), `client` (probes), or `both` mode.
+Go module `link_ping_prometheus` — point-to-point link monitor: a UDP echo prober that exposes Prometheus metrics for latency, packet loss, and jitter. Runs in `server` (echo), `client` (probes), or `both` mode.
 
 UDP is deliberate: no retransmission, so the loss ratio is true network loss (TCP probing hides loss as inflated RTT).
 

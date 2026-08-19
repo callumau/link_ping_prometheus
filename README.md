@@ -1,6 +1,6 @@
 # Link Monitor (UDP Ping Prometheus Exporter)
 
-A high-performance **site-to-site link monitor** for Prometheus written
+A high-performance **point-to-point link monitor** for Prometheus written
 in Go. It measures latency (RTT), packet loss, and jitter by sending
 active **UDP echo probes** across the link, with adaptive timeout
 capabilities (RFC 6298). One agent per site; each target in the client
