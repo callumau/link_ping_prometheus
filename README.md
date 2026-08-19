@@ -1,23 +1,42 @@
 # Link Monitor (UDP Ping Prometheus Exporter)
 
-A high-performance **site-to-site link monitor** for Prometheus written
+A high-performance **point-to-point link monitor** for Prometheus written
 in Go. It measures latency (RTT), packet loss, and jitter by sending
 active **UDP echo probes** across the link, with adaptive timeout
-capabilities (RFC 6298).
+capabilities (RFC 6298). Run one agent per node; each target in the
+client config is one monitored point-to-point link — the path between
+this node and that target's node.
 
-The purpose is the status of the **link itself** between sites (or cores):
-one agent per site, and each target in the client config is one monitored
-link. Loss, latency, jitter, and up/down state together give the full
-picture of link health. Because it probes the network path directly, it
-answers "is this link degrading?" — it is not a proxy for what TCP
-applications experience (TCP hides loss as delay; UDP shows it plainly).
+**Why UDP:** no retransmission, so a probe without an echo within the
+timeout is genuinely lost on the wire — the loss ratio is **true network
+loss**. TCP-based probing can never show this: the kernel retransmits
+lost segments and hides them as inflated RTT. It answers "is this link
+degrading?" — it is not a proxy for what TCP applications experience.
 
-UDP is used deliberately: there is no retransmission, so a probe without
-an echo within the timeout is genuinely lost on the wire. The loss ratio
-is **true network loss** — TCP-based probing can never show this, because
-the kernel retransmits lost segments and hides them as inflated RTT.
+## Table of Contents
 
-## Typical Deployment: Site A ↔ Site B
+- [Typical Deployment](#typical-deployment)
+- [Run with Docker](#run-with-docker)
+- [Metrics](#metrics)
+- [PromQL Examples](#promql-examples)
+  - [Quick Reference](#quick-reference)
+  - [Link Packet Loss](#link-packet-loss)
+  - [Latency](#latency)
+  - [Jitter](#jitter)
+  - [Baseline Shift Detection](#baseline-shift-detection)
+  - [Link Status](#link-status)
+  - [Outage Alerts](#outage-alerts)
+- [Grafana Alloy Scraping](#grafana-alloy-scraping)
+- [Build](#build)
+- [Test](#test)
+- [Usage](#usage)
+- [Service](#service)
+- [Grafana Dashboard](#grafana-dashboard)
+- [Code Structure](#code-structure)
+- [Wire Protocol](#wire-protocol)
+- [Security](#security)
+
+## Typical Deployment
 
 1. **Remote site (B):** run the echo server (open UDP port 4000 in the
    firewall — the protocol is UDP, not TCP). The server is **fail-closed**:
@@ -28,7 +47,8 @@ the kernel retransmits lost segments and hides them as inflated RTT.
    tag every metric with the local topology label:
    `./link_ping_prometheus -mode=client -target="203.0.113.10:4000" -source="sydney-dc" -metrics=":2112"`
 3. Scrape both `/metrics` endpoints into Prometheus (or forward via
-   Grafana Alloy, see below) and open the bundled dashboard.
+   [Grafana Alloy](#grafana-alloy-scraping)) and open the bundled
+   dashboard.
 
 Each configured target is one monitored link. The dashboard gives the
 per-link picture: `link_up` status, true packet loss (rate-derived), RTT
@@ -77,12 +97,12 @@ The exporter exposes the following metrics at `/metrics` (default port 2112).
 | --- | --- | --- | --- |
 | `link_up` | Gauge | `source`, `target`, `address` | 1 while probes are getting echoes, 0 after 3 consecutive probes time out. A single lost probe or brief stall does not flap the state. |
 | `link_probes_sent_total` | Counter | `source`, `target`, `address` | Total UDP probes sent. Probes into a down link still count as sent and time out naturally, so loss reads ~100% during an outage. |
-| `link_probes_timed_out_total` | Counter | `source`, `target`, `address` | Total probes with no echo within the RTO. True network loss — UDP never retransmits. |
+| `link_probes_timed_out_total` | Counter | `source`, `target`, `address` | Total probes with no echo within the RTO — true network loss. |
 | `link_probes_inflight` | Gauge | `source`, `target`, `address` | Current number of probes sent but waiting for a response or timeout. Grows during stalls. |
 | `link_rtt_seconds` | Histogram | `source`, `target`, `address` | RTT histogram with explicit buckets `{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5}` s plus native histogram support (`NativeHistogramBucketFactor` 1.1). Buckets stop at 2.5s: anything slower than the RTO cap (3s) counts as loss, so higher buckets would never fill. |
 | `link_rtt_seconds_bucket/sum/count` | Histogram | `source`, `target`, `address` | Classic-bucket series; quantiles and means are derived in PromQL over any window. |
-| `link_rtt_jitter_seconds` | Gauge | `source`, `target`, `address` | Smoothed RTT jitter in seconds (RFC 3550 §6.4.1: `J += ( \| D(i−1,i) \| − J)/16`) computed from consecutive probe RTT deltas. Resets after a sequence gap (a timed-out probe), so link recovery never spikes the gauge. |
-| `link_rto_seconds` | Gauge | `source`, `target`, `address` | Current adaptive RTO in use (RFC 6298, doubled on consecutive timeouts). Floor is `max(200ms, 2×SRTT)` so a link's timeout always has headroom over its measured RTT. |
+| `link_rtt_jitter_seconds` | Gauge | `source`, `target`, `address` | Smoothed RTT jitter in seconds (RFC 3550 §6.4.1). Resets after a sequence gap (a timed-out probe), so link recovery never spikes the gauge. |
+| `link_rto_seconds` | Gauge | `source`, `target`, `address` | Current adaptive RTO in use (RFC 6298, doubled on consecutive timeouts; floor `max(200ms, 2×SRTT)`). |
 | `link_server_probes_received_total` | Counter | `source`, `client` | Valid probes received by the server, per remote client IP (server mode only). Cross-check against the client's sent counter. |
 | `link_ping_build_info` | Gauge | `version` | Build version; value is always 1. Git tag for release builds, UTC timestamp to the minute for dev builds. |
 
@@ -95,9 +115,14 @@ reconstructed over arbitrary windows in PromQL.
 
 ## PromQL Examples
 
+All queries run in both Prometheus and Grafana. Run them as **instant
+queries** (Prometheus console, Grafana stat panel) for "now", or in a
+**time series panel** for "over time" — the same expression renders both.
+RTT metrics are **seconds**; multiply by `1000` for ms.
+
 ### Quick Reference
 
-Copy-paste these. RTT metrics are **seconds**; multiply by `1000` for ms.
+Copy-paste these.
 
 | You want | Query | Unit |
 | --- | --- | --- |
@@ -105,6 +130,10 @@ Copy-paste these. RTT metrics are **seconds**; multiply by `1000` for ms.
 | **Latency** median (p50) | `histogram_quantile(0.5, rate(link_rtt_seconds_bucket[5m]))` | s → ×1000 = ms |
 | **Latency** mean | `rate(link_rtt_seconds_sum[5m]) / rate(link_rtt_seconds_count[5m])` | s → ×1000 = ms |
 | **Latency** p90 / p99 | `histogram_quantile(0.9, ...)` / `histogram_quantile(0.99, ...)` | s → ×1000 = ms |
+| **Jitter** (instantaneous) | `link_rtt_jitter_seconds * 1000` | ms |
+| **Jitter** (window-based) | `(histogram_quantile(0.9, rate(link_rtt_seconds_bucket[5m])) - histogram_quantile(0.5, rate(link_rtt_seconds_bucket[5m]))) * 1000` | ms |
+| **Link up** | `link_up` | 0/1 |
+| **Baseline shift** (recent p50 vs 24h min) | `histogram_quantile(0.5, rate(link_rtt_seconds_bucket[10m])) > min_over_time(histogram_quantile(0.5, rate(link_rtt_seconds_bucket[10m]))[24h]) * 1.5` | bool |
 | **True wire loss** (needs server at remote end) | `100 * (1 - rate(link_server_probes_received_total{client="<ip>"}[5m]) / rate(link_probes_sent_total[5m]))` | % |
 
 Two rules that trip people up:
@@ -119,108 +148,89 @@ Two rules that trip people up:
   catch (the exporter's probe cadence does not limit visibility — every
   down second lands in the counters regardless of scrape interval).
 
-### Link Packet Loss (%)
-
-Loss is derived from the counters over any window:
+### Link Packet Loss
 
 ```promql
 100 * rate(link_probes_timed_out_total[5m]) / rate(link_probes_sent_total[5m])
 ```
 
-This is **true network loss**. Each probe is a UDP datagram, and UDP
-never retransmits: a probe without an echo within the RTO was genuinely
-lost on the wire. With a link loss simulator (e.g. clumsy) at X%, expect
-the ratio to read X%. (Compare TCP-based probing, where the kernel
-retransmits lost segments and hides the loss as inflated RTT — that is
-why this tool uses UDP.)
+True network loss: each probe is a UDP datagram and UDP never
+retransmits, so a probe without an echo within the RTO was genuinely lost
+on the wire. With a link loss simulator (e.g. clumsy) at X%, expect the
+ratio to read X%. During a full outage probes are sent into the void and
+time out naturally, so the ratio reads **~100%** — no fabricated counters
+and no PromQL `OR` workaround. Pair with `link_up == 0` for reachability
+alerts.
 
-While the link is fully down, probes are sent into the void and time out
-naturally, so the ratio above reads **~100% during a full outage** — no
-fabricated counters and no PromQL `OR` workaround needed. Pair the ratio
-with `link_up == 0` for alerting on reachability.
-
-**Sanity check for the counters:** `link_probes_sent_total` always equals
+**Sanity check:** `link_probes_sent_total` always equals
 `link_rtt_seconds_count` (received) + `link_probes_timed_out_total` +
 `link_probes_inflight`. If that sum ever differs, counters were lost or
 the client socket stalled.
 
-The adaptive RTO keeps the timeout honest on the link's actual RTT: it is
-RFC 6298 (`SRTT + 4×RTTVAR`, doubled on consecutive timeouts so it can
-recover when latency jumps above the current value), and its floor is
-`max(200ms, 2×SRTT)` rather than a fixed 200ms. A fixed floor is too tight
-on links whose RTT approaches it (e.g. ~185ms), causing normal jitter to
-count as loss and the RTO to pin at its 3s clamp; flooring at twice the
-smoothed RTT guarantees headroom and keeps the loss ratio meaningful.
-
-The server-side `link_server_probes_received_total` (per remote client
-IP) is a useful cross-check on the client's `link_probes_sent_total` —
-any mismatch is probes that never reached the server:
+**Cross-check with the server** (server mode at the remote end):
+`link_server_probes_received_total` counts valid probes per remote client
+IP. Any mismatch with `link_probes_sent_total` is probes that never
+reached the server — genuinely lost on the wire:
 
 ```promql
 100 * (1 - rate(link_server_probes_received_total{client="203.0.113.5"}[5m])
            / rate(link_probes_sent_total{target="site-b"}[5m]))
 ```
 
-Segments never delivered to the server are genuinely lost on the wire —
-no retransmission can hide them there.
+**Why the loss ratio stays honest:** the adaptive RTO is RFC 6298
+(`SRTT + 4×RTTVAR`, doubled on consecutive timeouts so it recovers when
+latency jumps above the current value), floored at `max(200ms, 2×SRTT)`
+rather than a fixed 200ms — a fixed floor counts normal jitter on links
+whose RTT approaches it (e.g. ~185ms) as loss and pins the RTO at its 3s
+clamp. Flooring at twice the smoothed RTT guarantees headroom and keeps
+the loss ratio meaningful.
 
-### Average Latency (RTT)
-
-```promql
-rate(link_rtt_seconds_sum[5m]) / rate(link_rtt_seconds_count[5m])
-```
-
-Returns **seconds**. For ms: `... * 1000`. No RTT samples exist while the
-link is fully down, so latency is a gap (not 0) during an outage.
-
-### Median / 90th / 99th Percentile Latency
+### Latency
 
 ```promql
-histogram_quantile(0.5,  rate(link_rtt_seconds_bucket[5m]))
-histogram_quantile(0.9,  rate(link_rtt_seconds_bucket[5m]))
-histogram_quantile(0.99, rate(link_rtt_seconds_bucket[5m]))
+rate(link_rtt_seconds_sum[5m]) / rate(link_rtt_seconds_count[5m])   # mean
+histogram_quantile(0.5,  rate(link_rtt_seconds_bucket[5m]))         # p50
+histogram_quantile(0.9,  rate(link_rtt_seconds_bucket[5m]))         # p90
+histogram_quantile(0.99, rate(link_rtt_seconds_bucket[5m]))         # p99
 ```
+
+Returns seconds; `* 1000` for ms. No RTT samples exist while the link is
+fully down, so latency is a gap (not 0) during an outage — combine with
+`link_up`.
 
 Explicit buckets cover sub-100ms LAN RTTs (5ms lower bound) up to 2.5s
-of link degradation; values beyond 2.5s land in `+Inf`. Buckets stop at
-2.5s because the RTO cap (3s) bounds measurable RTT: probes slower than
-that are counted as loss, not latency. The native histogram (bucket
-factor 1.1) carries fine-grained data; Prometheus scrapes and aggregates
-it transparently when native-histogram support is enabled.
+of degradation; values beyond 2.5s land in `+Inf`. Buckets stop at 2.5s
+because the RTO cap (3s) bounds measurable RTT: probes slower than that
+are counted as loss, not latency. The native histogram (bucket factor
+1.1) carries fine-grained data; Prometheus scrapes and aggregates it
+transparently when native-histogram support is enabled.
 
-### Jitter (direct gauge)
+### Jitter
 
 ```promql
 link_rtt_jitter_seconds * 1000
 ```
 
 Smoothed RFC 3550 jitter computed in the probe binary from consecutive
-RTT deltas (see metrics table). Instantaneous value, no window needed.
-The estimate resets after any timed-out probe, so recovery does not
-show an artificial spike.
-
-### Jitter (p90 − p50 proxy)
-
-The p90−p50 spread is kept as a window-based approximation when you
-want jitter over a specific time range instead of the smoothed gauge:
+RTT deltas — instantaneous value, no window needed. The estimate resets
+after any timed-out probe, so recovery does not show an artificial spike.
+For jitter over a specific time range, use the p90−p50 spread as a
+window-based approximation:
 
 ```promql
 (histogram_quantile(0.9, rate(link_rtt_seconds_bucket[5m]))
  - histogram_quantile(0.5, rate(link_rtt_seconds_bucket[5m]))) * 1000
 ```
 
-### Detecting a Baseline Shift (latency change detection)
-
-Compare the current window against a longer baseline. Latency drift on a
-long-running link shows up as the recent p50 diverging from a 24h
-minimum:
+### Baseline Shift Detection
 
 ```promql
 histogram_quantile(0.5, rate(link_rtt_seconds_bucket[10m]))
   > min_over_time(histogram_quantile(0.5, rate(link_rtt_seconds_bucket[10m]))[24h]) * 1.5
 ```
 
-Outages show up immediately in `link_up == 0`,
+Latency drift on a long-running link shows up as the recent p50 diverging
+from a 24h minimum. Outages show up immediately in `link_up == 0`,
 `rate(link_probes_timed_out_total[5m]) > 0`, and the adaptive RTO climbing
 via `link_rto_seconds`.
 
@@ -245,91 +255,6 @@ alert: LinkLatencyDegraded
   expr: histogram_quantile(0.5, rate(link_rtt_seconds_bucket[10m])) > min_over_time(histogram_quantile(0.5, rate(link_rtt_seconds_bucket[10m]))[24h]) * 1.5
   for:  10m
 ```
-
-## Practical Monitoring Guide
-
-Every query below works in both Prometheus and Grafana. "Now" = run it
-as an **instant query** (Prometheus console, or a Grafana stat/single
-stat panel). "Over time" = run the **same query** in a Grafana time
-series panel — the same expression renders the history.
-
-### Latency
-
-All latency queries return **seconds** — append `* 1000` for ms (the
-dashboard does this for you).
-
-**Latency now** (median RTT over the last 5 minutes; the smallest
-window that produces a stable value):
-
-```promql
-histogram_quantile(0.5, rate(link_rtt_seconds_bucket[5m]))
-```
-
-**Latency over time** — same expression in a time series panel. Swap
-`0.5` for `0.9` / `0.99` for the higher percentiles, or use the mean:
-
-```promql
-rate(link_rtt_seconds_sum[5m]) / rate(link_rtt_seconds_count[5m])
-```
-
-Note: when the link is fully down no RTT samples exist, so latency
-panels show a gap (not 0) during the outage — combine with `link_up`
-to see the down period.
-
-### Packet Loss
-
-All loss queries return **percent**. Never divide raw counter totals —
-always `rate()` over a window (see Quick Reference).
-
-**Loss now** (percentage over the last 5 minutes):
-
-```promql
-100 * rate(link_probes_timed_out_total[5m]) / rate(link_probes_sent_total[5m])
-```
-
-**Loss over time** — same expression in a time series panel. Change
-`[5m]` to `[1h]` / `[24h]` for longer windows.
-
-**Which window?** `[5m]` smooths and is the standard panel default. To
-catch short outages as a full 100% block, shrink the window so it is not
-much larger than the outage duration: a 1-minute outage reads ~100% with
-`[1m]` but only bumps a `[5m]` panel. The counters never miss a down
-second regardless of scrape interval.
-
-**Show 100% during an outage** — no workaround needed. Probes sent into a
-fully down link time out naturally, so the raw ratio reads ~100% instead
-of a gap:
-
-```promql
-100 * rate(link_probes_timed_out_total[5m]) / rate(link_probes_sent_total[5m])
-```
-
-**Cross-check with the server:** the client ratio is already true loss
-(UDP never retransmits). The server-side counter provides a second
-opinion — probes that never reached the server:
-
-```promql
-100 * (1 - rate(link_server_probes_received_total{client="203.0.113.5"}[5m]) / rate(link_probes_sent_total{target="site-b"}[5m]))
-```
-
-### Recording Rules (cheap graphs at scale)
-
-`rate()` recomputes on every query. For many links, precompute the
-5-minute rates with recording rules so dashboards and alerts are cheap:
-
-```yaml
-groups:
-  - name: link.rules
-    rules:
-      - record: link:rtt_p50_seconds:5m
-        expr: histogram_quantile(0.5, rate(link_rtt_seconds_bucket[5m]))
-      - record: link:loss_ratio:5m
-        expr: rate(link_probes_timed_out_total[5m]) / rate(link_probes_sent_total[5m])
-```
-
-The loss ratio already reads ~100% during outages (probes into a down
-link time out naturally), so no separate outage-inclusive rule is
-required. Graph `link:loss_ratio:5m * 100` for the loss panel.
 
 ## Grafana Alloy Scraping
 
@@ -449,13 +374,13 @@ Max 1000 targets, max file size 1 MB.
 Client (single target):
 
 ```sh
-./link_ping_prometheus -mode=client -target="192.168.1.71:4000" -interval=10ms -timeout=20ms -metrics=":2113"
+./link_ping_prometheus -mode=client -target="192.168.1.71:4000" -metrics=":2113"
 ```
 
 Client (multiple targets):
 
 ```sh
-./link_ping_prometheus -mode=client -targets=targets.json -interval=10ms -timeout=20ms -metrics=":2113"
+./link_ping_prometheus -mode=client -targets=targets.json -metrics=":2113"
 ```
 
 Server:
@@ -467,7 +392,7 @@ Server:
 Both:
 
 ```sh
-./link_ping_prometheus -mode=both -targets=targets.json -interval=10ms -timeout=20ms -metrics=":2113"
+./link_ping_prometheus -mode=both -targets=targets.json -metrics=":2113"
 ```
 
 ## Service
@@ -477,7 +402,7 @@ Both:
 Use `-svc` to install/uninstall/start/stop/run. The tool records runtime flags at install time (excluding `-svc`, `-metrics-user`, and `-metrics-pass`). Metrics auth credentials are **not** persisted into the service configuration; set `LINK_PING_METRICS_USER` / `LINK_PING_METRICS_PASS` in the service environment instead (a warning is printed at install time).
 
 ```sh
-link_ping_prometheus.exe -mode=both -targets=targets.json -interval=10ms -timeout=20ms -metrics=":2113" -svc=install
+link_ping_prometheus.exe -mode=both -targets=targets.json -metrics=":2113" -svc=install
 ```
 
 ### Linux (systemd)
