@@ -402,7 +402,7 @@ Both:
 Use `-svc` to install/uninstall/start/stop/run. The tool records runtime flags at install time (excluding `-svc`, `-metrics-user`, and `-metrics-pass`). Metrics auth credentials are **not** persisted into the service configuration; set `LINK_PING_METRICS_USER` / `LINK_PING_METRICS_PASS` in the service environment instead (a warning is printed at install time).
 
 ```sh
-link_ping_prometheus.exe -mode=both -targets=targets.json -interval=10ms -timeout=20ms -metrics=":2113" -svc=install
+link_ping_prometheus.exe -mode=both -targets=targets.json -metrics=":2113" -svc=install
 ```
 
 ### Linux (systemd)
