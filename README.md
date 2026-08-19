@@ -3,8 +3,9 @@
 A high-performance **point-to-point link monitor** for Prometheus written
 in Go. It measures latency (RTT), packet loss, and jitter by sending
 active **UDP echo probes** across the link, with adaptive timeout
-capabilities (RFC 6298). One agent per site; each target in the client
-config is one monitored link.
+capabilities (RFC 6298). Run one agent per node; each target in the
+client config is one monitored point-to-point link — the path between
+this node and that target's node.
 
 **Why UDP:** no retransmission, so a probe without an echo within the
 timeout is genuinely lost on the wire — the loss ratio is **true network
