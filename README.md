@@ -374,13 +374,13 @@ Max 1000 targets, max file size 1 MB.
 Client (single target):
 
 ```sh
-./link_ping_prometheus -mode=client -target="192.168.1.71:4000" -interval=10ms -timeout=20ms -metrics=":2113"
+./link_ping_prometheus -mode=client -target="192.168.1.71:4000" -metrics=":2113"
 ```
 
 Client (multiple targets):
 
 ```sh
-./link_ping_prometheus -mode=client -targets=targets.json -interval=10ms -timeout=20ms -metrics=":2113"
+./link_ping_prometheus -mode=client -targets=targets.json -metrics=":2113"
 ```
 
 Server:
@@ -392,7 +392,7 @@ Server:
 Both:
 
 ```sh
-./link_ping_prometheus -mode=both -targets=targets.json -interval=10ms -timeout=20ms -metrics=":2113"
+./link_ping_prometheus -mode=both -targets=targets.json -metrics=":2113"
 ```
 
 ## Service
