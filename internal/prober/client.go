@@ -198,6 +198,7 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 		}
 		logger.Error("Echo loop panicked; restarting probe loop", "err", err)
 		select {
+		// pi-lens-ignore: waitgroup-done-scope
 		case <-ctx.Done():
 			return
 		case <-time.After(time.Second):
