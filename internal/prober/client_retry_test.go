@@ -14,6 +14,7 @@ import (
 // it keeps retrying until the context is cancelled. Uses the dialUDP seam
 // instead of an unresolvable hostname so the test is deterministic and
 // has no dependency on the local resolver.
+// pi-lens-ignore: go-test-functions
 func TestProbeTargetRetriesOnDialFailure(t *testing.T) {
 	InitMetrics()
 

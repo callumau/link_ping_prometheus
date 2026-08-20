@@ -67,7 +67,7 @@ func TestAdaptiveStats_BackoffClampedAndConsecutive(t *testing.T) {
 
 	// Repeated backoffs must saturate at DefaultMaxRTO, not overflow.
 	max := DefaultMaxRTO.Seconds()
-	for i := 0; i < 200; i++ {
+	for range 200 {
 		stats.Backoff()
 	}
 	if r := stats.CurrentRTO(); r != DefaultMaxRTO {
@@ -97,7 +97,7 @@ func TestAdaptiveStats_DynamicFloor(t *testing.T) {
 	}
 
 	stats.Update(0.150)
-	for i := 0; i < 25; i++ {
+	for range 25 {
 		// pi-lens-ignore: gorm-n-plus-one
 		stats.Update(0.150)
 	}
@@ -109,7 +109,7 @@ func TestAdaptiveStats_DynamicFloor(t *testing.T) {
 	}
 
 	stats.Update(0.010)
-	for i := 0; i < 25; i++ {
+	for range 25 {
 		// pi-lens-ignore: gorm-n-plus-one
 		stats.Update(0.010)
 	}
@@ -129,7 +129,7 @@ func TestAdaptiveStats_RTOFloorAndGranularity(t *testing.T) {
 	// RFC 6298: RTO = SRTT + max(G, 4*RTTVAR). On a zero-jitter link
 	// RTTVAR decays below G/4, so the clock granularity term takes over.
 	stats.Update(0.050)
-	for i := 0; i < 25; i++ {
+	for range 25 {
 		// pi-lens-ignore: gorm-n-plus-one
 		stats.Update(0.050)
 	}
