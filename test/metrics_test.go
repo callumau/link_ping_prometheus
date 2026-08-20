@@ -85,6 +85,7 @@ func TestSeedMetrics(t *testing.T) {
 		"link_up",
 		"link_rto_seconds",
 		"link_rtt_seconds",
+		"link_rtt_jitter_seconds",
 	}
 	for _, w := range want {
 		if !found[w] {

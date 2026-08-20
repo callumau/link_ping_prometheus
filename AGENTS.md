@@ -48,3 +48,10 @@ UDP is deliberate: no retransmission, so the loss ratio is true network loss (TC
 
 - Conventional Commits style in git log (`feat:`, `fix:`, `docs:`, etc.); one logical change per commit.
 - `grafana-dashboard.json` is a tracked Grafana dashboard — edit carefully, it must stay valid JSON.
+
+## Branching & workflow
+
+- Start a new branch (e.g. `feat/...`, `fix/...`) for every coding task; never commit directly to main.
+- Commit after each major logical change so every step is independently trackable and revertable — a history of one giant commit at the end defeats the point of branching.
+- Never merge to main on your own: always ask the user first and wait for explicit approval before any merge.
+- Work in parallel whenever possible: batch independent reads/commands into one turn, run independent tasks concurrently, and don't serialize work that has no dependency on each other.
