@@ -2,6 +2,7 @@ package prober
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -15,6 +16,12 @@ const (
 	// MaxDatagramSize bounds each read so oversized or foreign datagrams
 	// are seen whole and dropped instead of truncated.
 	MaxDatagramSize = 1500
+	// maxReplayWindow bounds how far a probe's timestamp may drift from
+	// the server clock before it is rejected as a captured-and-replayed
+	// frame (the HMAC alone cannot distinguish a replay). Requires
+	// approximately synchronized clocks between nodes (e.g. NTP); 30s
+	// tolerates typical WAN skew.
+	maxReplayWindow = 30 * time.Second
 )
 
 var (
@@ -46,6 +53,9 @@ func ParseAllowlist(s string) (map[string]struct{}, error) {
 			return nil, fmt.Errorf("invalid allowlist IP %q", part)
 		}
 		set[ip.String()] = struct{}{}
+	}
+	if len(set) > 256 {
+		return nil, fmt.Errorf("allowlist too large: %d (max 256)", len(set))
 	}
 	return set, nil
 }
@@ -97,7 +107,10 @@ func (r *rateLimiter) allow(ip string) bool {
 // sender and counted in ServerProbesReceived under the remote IP. There
 // is no connection lifecycle: loss is measured exactly because UDP does
 // not retransmit. Blocks until ctx is cancelled, then closes the socket.
-func RunServer(ctx context.Context, addr string, source string, allowed map[string]struct{}) error {
+// When echoSecret is non-empty, probes must be 32 bytes with HMAC; this
+// mitigates reflector spoofing where static magic alone allows off-path
+// 1:1 reflect to a victim allowlisted IP.
+func RunServer(ctx context.Context, addr string, source string, allowed map[string]struct{}, echoSecret string) error {
 	if len(allowed) == 0 {
 		return errors.New("server requires a non-empty client allowlist (-allow); fail-closed")
 	}
@@ -112,7 +125,7 @@ func RunServer(ctx context.Context, addr string, source string, allowed map[stri
 		pc.Close()
 	}()
 
-	if err := ServePacketConn(ctx, pc, source, allowed); err != nil {
+	if err := ServePacketConn(ctx, pc, source, allowed, echoSecret); err != nil {
 		return err
 	}
 	return nil
@@ -124,8 +137,21 @@ func RunServer(ctx context.Context, addr string, source string, allowed map[stri
 // fail-closed: an empty or nil map admits no clients, so only permitted
 // prober IPs can drive the echo responder or contribute metric labels.
 // Per-IP and global rate limits bound echo processing. Blocks until ctx
-// is cancelled or pc is closed.
-func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allowed map[string]struct{}) error {
+// is cancelled or pc is closed. Datagram handling order is deliberate:
+// cheap untrusted-source rejection (allowlist, rate limit) runs ahead of
+// any per-packet validation work, so a flood from a non-allowlisted host
+// costs no crypto and no metric work. A recovered panic is returned as an
+// error so callers treat it as a fatal failure, never a clean exit.
+// When echoSecret is non-empty, only 32-byte HMAC-authenticated datagrams
+// with a fresh timestamp are accepted; this mitigates reflector spoofing
+// (SEC22). When empty, 24-byte backward-compatible datagrams are accepted.
+func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allowed map[string]struct{}, echoSecret string) (retErr error) {
+	defer func() {
+		if r := recover(); r != nil {
+			retErr = fmt.Errorf("echo server panic: %v", r)
+			slog.Error("panic in echo server", "panic", r)
+		}
+	}()
 	buf := make([]byte, MaxDatagramSize)
 	rl := newRateLimiter(MaxPktsPerIP, MaxPktsGlobal)
 
@@ -140,12 +166,9 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 			slog.Debug("UDP read error", "err", err)
 			continue
 		}
-		if n != PayloadSize {
-			continue
-		}
-		if string(buf[0:8]) != MagicBytes {
-			continue
-		}
+		// Cheap untrusted-source rejection MUST stay ahead of crypto
+		// work: any internet host must not be able to buy HMAC-SHA256
+		// CPU per flood packet on a latency-measuring box.
 		// The echo responder is UDP-only, so ReadFrom yields a
 		// *net.UDPAddr whose IP is already canonical for the allowlist
 		// lookup (no string round-trip or double parsing).
@@ -159,6 +182,32 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 		}
 		if !rl.allow(norm) {
 			continue
+		}
+
+		expectedSize := PayloadSize
+		if echoSecret != "" {
+			expectedSize = PayloadSizeWithHMAC
+		}
+		if n != expectedSize {
+			continue
+		}
+		if string(buf[0:8]) != MagicBytes {
+			continue
+		}
+		if echoSecret != "" {
+			seq := binary.LittleEndian.Uint64(buf[8:16])
+			ts := binary.LittleEndian.Uint64(buf[16:24])
+			if !validHMAC(echoSecret, seq, ts, buf[24:32]) {
+				continue
+			}
+			// Replay guard: an authenticated frame older or newer than
+			// the window is a capture-replay, not a live probe. Clocks
+			// between nodes must be approximately synchronized (NTP).
+			skew := time.Since(time.Unix(0, int64(ts)))
+			if skew > maxReplayWindow || skew < -maxReplayWindow {
+				slog.Debug("replayed or stale probe timestamp rejected", "addr", norm, "skew", skew)
+				continue
+			}
 		}
 
 		ServerProbesReceived.WithLabelValues(source, norm).Inc()

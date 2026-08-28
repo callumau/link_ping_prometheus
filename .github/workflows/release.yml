@@ -31,7 +31,7 @@ jobs:
         # pi-lens-ignore: zizmor:cache-poisoning
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
-          go-version: ">=1.20.0"
+          go-version: "1.24"
           # No action cache: a poisoned cache is a supply-chain vector,
           # and this project's deps are few enough to fetch per run.
           cache: false

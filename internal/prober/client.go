@@ -44,6 +44,9 @@ func LoadTargets(path string) ([]Target, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read targets file: %w", err)
 	}
+	if len(data) > MaxTargetsFileSize {
+		return nil, fmt.Errorf("targets file too large after read: %d bytes (max %d)", len(data), MaxTargetsFileSize)
+	}
 	var targets []Target
 	if err := json.Unmarshal(data, &targets); err != nil {
 		return nil, fmt.Errorf("parse targets json: %w", err)
@@ -122,6 +125,12 @@ func newTargetMetrics(source string, t Target) targetMetrics {
 	}
 }
 
+// maxConsecutiveWriteFails bounds how many successive local send errors
+// are treated as transient before the target is marked down (link_up=0)
+// at Error level — a frozen link_up while nothing is being probed is the
+// worst failure mode for a monitor.
+const maxConsecutiveWriteFails = 3
+
 // errReconnect is a sentinel returned by runEchoLoop to request a socket
 // re-dial (DNS re-resolution) once ReconnectInterval has elapsed. It is
 // not a panic and is returned only when no probes are in flight.
@@ -173,11 +182,20 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 			// transient lookup failure must not strand the target with
 			// frozen metric series.
 			logger.Error("Failed to open UDP socket; retrying", "err", err)
+			// While the dial-retry loop runs, no probes are in flight and
+			// consecutiveMisses cannot advance, so a re-established session
+			// would keep showing a stale link_up=1 across a prolonged
+			// DNS/interface outage. Probing is structurally impossible here.
+			m.linkUp.Set(0)
+			t := time.NewTimer(time.Second)
 			select {
 			// pi-lens-ignore: waitgroup-done-scope
 			case <-ctx.Done():
+				if !t.Stop() {
+					<-t.C
+				}
 				return
-			case <-time.After(time.Second):
+			case <-t.C:
 			}
 			continue
 		}
@@ -197,11 +215,15 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 			continue
 		}
 		logger.Error("Echo loop panicked; restarting probe loop", "err", err)
+		t := time.NewTimer(time.Second)
 		select {
 		// pi-lens-ignore: waitgroup-done-scope
 		case <-ctx.Done():
+			if !t.Stop() {
+				<-t.C
+			}
 			return
-		case <-time.After(time.Second):
+		case <-t.C:
 		}
 	}
 }
@@ -260,15 +282,23 @@ func runEchoLoop(
 		// datagram is not silently truncated to PayloadSize by the kernel
 		// and mistaken for a valid probe (Read truncates to the buffer).
 		buf := make([]byte, MaxDatagramSize)
+		deadlineFails := 0
 		for {
 			if ctx.Err() != nil {
 				return
 			}
 			if err := conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
-				// Socket is gone; the loop cannot recover a deadline.
-				logger.Debug("set read deadline failed", "err", err)
-				return
+				// A deadline that cannot be set means the socket is unusable;
+				// bail out instead of hot-spinning on a guaranteed error. The
+				// periodic reconnect re-creates the reader.
+				deadlineFails++
+				if deadlineFails >= 3 {
+					logger.Error("SetReadDeadline persistently failing; stopping reader", "err", err)
+					return
+				}
+				continue
 			}
+			deadlineFails = 0
 
 			n, err := conn.Read(buf)
 			if err != nil {
@@ -283,7 +313,11 @@ func runEchoLoop(
 				logger.Debug("UDP read error", "err", err)
 				continue
 			}
-			if n != PayloadSize {
+			expectedSize := PayloadSize
+			if cfg.EchoSecret != "" {
+				expectedSize = PayloadSizeWithHMAC
+			}
+			if n != expectedSize {
 				continue
 			}
 			if string(buf[0:8]) != MagicBytes {
@@ -292,6 +326,11 @@ func runEchoLoop(
 
 			seq := binary.LittleEndian.Uint64(buf[8:16])
 			ts := binary.LittleEndian.Uint64(buf[16:24])
+			if cfg.EchoSecret != "" {
+				if !validHMAC(cfg.EchoSecret, seq, ts, buf[24:32]) {
+					continue
+				}
+			}
 
 			select {
 			case respCh <- response{seq: seq, ts: ts, recv: time.Now()}:
@@ -303,9 +342,15 @@ func runEchoLoop(
 		}
 	}()
 
-	buf := make([]byte, PayloadSize)
-
+	var warnedSlowRTT bool
+	writeFails := 0
+	payloadSize := PayloadSize
+	if cfg.EchoSecret != "" {
+		payloadSize = PayloadSizeWithHMAC
+	}
+	buf := make([]byte, payloadSize)
 	pending := make(map[uint64]time.Time)
+	pendingHighWater := 0
 	// started bounds the socket lifetime: once ReconnectInterval has
 	// elapsed and no probes are in flight, the loop returns errReconnect
 	// so the caller re-dials and re-resolves DNS.
@@ -315,6 +360,11 @@ func runEchoLoop(
 		if r := recover(); r != nil {
 			logger.Error("Panic in echo loop; continuing", "panic", r)
 			retErr = fmt.Errorf("panic in echo loop: %v", r)
+			// Abandoned probes can never match on this socket, so they
+			// are losses, not silent drops: count them as timed out so
+			// sent = rtt_count + timed_out + inflight keeps balancing
+			// across the restart (same treatment as the reconnect flush).
+			m.timedOut.Add(float64(len(pending)))
 		}
 		// Probes still in flight die with the loop on cancellation
 		// without counting as timeouts, but must leave the gauge.
@@ -375,6 +425,17 @@ func runEchoLoop(
 
 				rttSec := resp.recv.Sub(sentTime).Seconds()
 
+				// With a fixed (non-adaptive) timeout, a true RTT above the
+				// timeout makes every probe read as loss — indistinguishable
+				// from a dead link. Warn once so the operator can tell them
+				// apart; adaptive RTO tracks the real RTT instead.
+				if !cfg.Adaptive && !warnedSlowRTT && rttSec > cfg.BaseTimeout.Seconds() {
+					warnedSlowRTT = true
+					logger.Warn("Observed RTT exceeds fixed timeout; such probes all read as loss",
+						"rtt_seconds", rttSec, "timeout", cfg.BaseTimeout.String(),
+						"fix", "enable adaptive RTO or raise -timeout")
+				}
+
 				m.rtt.Observe(rttSec)
 
 				// Jitter over consecutive RTT samples (RFC 3550 §6.4.1):
@@ -422,6 +483,14 @@ func runEchoLoop(
 			stats.Backoff()
 		}
 
+		// S6: shrink pending map after stall to avoid retaining high-water capacity for lifetime of runEchoLoop (5m). Only reallocates when map was large (>512) and has now drained.
+		if len(pending) > pendingHighWater {
+			pendingHighWater = len(pending)
+		} else if len(pending) == 0 && pendingHighWater > 512 {
+			pending = make(map[uint64]time.Time)
+			pendingHighWater = 0
+		}
+
 		// Down after LinkUpMissThreshold consecutive probes without an
 		// echo. A single lost probe or brief stall does not flap the
 		// state (enterprise health-check convention).
@@ -449,24 +518,44 @@ func runEchoLoop(
 			return errReconnect
 		}
 
-		state.seq++
+		// Reserve, but do not yet consume, the sequence number: a failed
+		// write never put the datagram on the wire, so burning its seq
+		// would look like a loss to the RFC 3550 gap check and spuriously
+		// reset the jitter estimate. Consume it only after a successful
+		// write.
+		seq := state.seq + 1
 		copy(buf[0:8], MagicBytes)
-		binary.LittleEndian.PutUint64(buf[8:16], state.seq)
-		binary.LittleEndian.PutUint64(buf[16:24], uint64(now.UnixNano()))
-
-		// Register the probe as in-flight before sending: any matching
-		// response or timeout must decrement it, so a stuck link shows
-		// up as a growing gauge instead of a silent stall.
-		m.inflight.Inc()
-		if nw, err := conn.Write(buf); err != nil {
-			// Datagram never left the socket; undo the in-flight
-			// increment and try again next interval.
-			m.inflight.Dec()
-			logger.Debug("UDP write error", "bytes", nw, "err", err)
-			continue
+		binary.LittleEndian.PutUint64(buf[8:16], seq)
+		ts := uint64(now.UnixNano())
+		binary.LittleEndian.PutUint64(buf[16:24], ts)
+		if cfg.EchoSecret != "" {
+			h := computeHMAC(cfg.EchoSecret, seq, ts)
+			copy(buf[24:32], h[:])
 		}
 
+		// Send first, then register: registering in-flight only after a
+		// successful write means a failed or panicking write can never
+		// orphan a gauge increment (every pending entry has exactly one
+		// matching inflight unit, so any exit-path flush balances).
+		if _, err := conn.Write(buf); err != nil {
+			writeFails++
+			if writeFails == maxConsecutiveWriteFails {
+				// Sustained local write failures mean nothing is being
+				// probed while consecutiveMisses stays frozen — the worst
+				// failure mode is link_up stuck at 1. Escalate once at
+				// Error (Debug is invisible at default verbosity) and
+				// reflect reality in the gauge.
+				logger.Error("Persistent UDP write failures; marking link down",
+					"consecutive_failures", writeFails, "err", err)
+				m.linkUp.Set(0)
+			}
+			continue
+		}
+		writeFails = 0
+		state.seq = seq
+
 		pending[state.seq] = now
+		m.inflight.Inc()
 		m.sent.Inc()
 	}
 }

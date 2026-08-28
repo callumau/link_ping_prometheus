@@ -40,10 +40,10 @@ dockers_v2:
     platforms:
       - linux/amd64
       - linux/arm64
-    # No SBOM/provenance attestations (decision: image only).
-    sbom: false
+    # SBOM/SLSA provenance enabled for supply-chain audit via
+    # ghcr attestation; verify via gh attestation verify + cosign.
+    sbom: true
     flags:
-      - "--provenance=false"
       - "--label=org.opencontainers.image.source={{ .GitURL }}"
       - "--label=org.opencontainers.image.created={{ .Date }}"
       - "--label=org.opencontainers.image.title={{ .ProjectName }}"

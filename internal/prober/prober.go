@@ -13,6 +13,9 @@
 package prober
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"time"
@@ -20,10 +23,11 @@ import (
 
 // Protocol constants.
 const (
-	MagicBytes   = "LNKPING\x00"
-	PayloadSize  = 24
-	DefaultAlpha = 0.125
-	DefaultBeta  = 0.25
+	MagicBytes          = "LNKPING\x00"
+	PayloadSize         = 24
+	PayloadSizeWithHMAC = 32
+	DefaultAlpha        = 0.125
+	DefaultBeta         = 0.25
 	// DefaultClockGranularity is G in RFC 6298: the granularity of the
 	// clock used to measure RTT, used as the lower bound for 4*RTTVAR.
 	DefaultClockGranularity = time.Millisecond
@@ -55,6 +59,11 @@ type Config struct {
 	Adaptive     bool
 	BaseInterval time.Duration
 	BaseTimeout  time.Duration
+	// EchoSecret, when non-empty, enables HMAC-SHA256 authentication of
+	// UDP probes to mitigate reflector spoofing (SEC22). When set, probes
+	// are 32 bytes (magic+seq+timestamp+hmac8); otherwise 24 bytes for
+	// backward compatibility.
+	EchoSecret string
 }
 
 // Validate checks that at least one target is present and that all
@@ -91,4 +100,29 @@ func validateTargets(targets []Target) error {
 		seen[t.Name] = struct{}{}
 	}
 	return nil
+}
+
+// computeHMAC returns truncated HMAC-SHA256 (first 8 bytes) over
+// magic+seq+timestamp. Used when EchoSecret is set to authenticate
+// probes and mitigate reflector spoofing (SEC22). Truncation keeps
+// payload at 32 bytes while retaining 64-bit forgery resistance.
+func computeHMAC(key string, seq, ts uint64) [8]byte {
+	mac := hmac.New(sha256.New, []byte(key))
+	mac.Write([]byte(MagicBytes))
+	var tmp [16]byte
+	binary.LittleEndian.PutUint64(tmp[0:8], seq)
+	binary.LittleEndian.PutUint64(tmp[8:16], ts)
+	mac.Write(tmp[:])
+	sum := mac.Sum(nil)
+	var out [8]byte
+	copy(out[:], sum[:8])
+	return out
+}
+
+// validHMAC reports whether the supplied 8-byte tag matches the
+// expected HMAC for the given seq/ts and key. Constant-time compare
+// via hmac.Equal.
+func validHMAC(key string, seq, ts uint64, tag []byte) bool {
+	expected := computeHMAC(key, seq, ts)
+	return hmac.Equal(expected[:], tag)
 }

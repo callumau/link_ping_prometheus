@@ -34,9 +34,8 @@ func ValidateTarget(address string) error {
 }
 
 // ValidateTargetName checks that name is usable as a Prometheus label
-// value for the {target} dimension: non-empty, at most 63 characters,
-// and free of control characters that would corrupt the exposition
-// format or dashboards.
+// value for the {target} dimension: non-empty, 1-63 chars, strict
+// enterprise regex ^[a-zA-Z0-9_-]+$ (breaking for names with dots/spaces).
 func ValidateTargetName(name string) error {
 	if name == "" {
 		return errors.New("target name is empty")
@@ -45,8 +44,8 @@ func ValidateTargetName(name string) error {
 		return fmt.Errorf("target name too long: %d chars (max 63)", len(name))
 	}
 	for _, c := range name {
-		if c < 0x20 || c == 0x7f {
-			return fmt.Errorf("target name %q contains control character", name)
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_') {
+			return fmt.Errorf("target name %q contains invalid character %q (allowed: a-zA-Z0-9_-)", name, c)
 		}
 	}
 	return nil
