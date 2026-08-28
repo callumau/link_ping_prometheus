@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"math"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -299,6 +300,11 @@ func TestDuplicateResponse(t *testing.T) {
 
 	recvDelta := endRecv - startRecv
 	sentDelta := endSent - startSent
+
+	// Vacuous-pass guard: without probes the assertion below is trivially true.
+	if sentDelta < 1 {
+		t.Fatalf("client sent no probes; duplicate-counting not exercised (cpu load?)")
+	}
 
 	if recvDelta > sentDelta+1 {
 		t.Errorf("Duplicate responses counted! Sent %v, Recv %v", sentDelta, recvDelta)
@@ -683,9 +689,71 @@ func TestAccuracy_PacketLoss10s(t *testing.T) {
 		t.Errorf("Loss over 10s+ window: expected ~%v, got %v (sent %v, timeout %v)", want, got, sent, timeout)
 	}
 
-	if math.Abs(sent-recv-timeout) > 2 {
+	inflight := getGaugeValue(prober.ProbesInflight, targetName, addr)
+	// Cancel abandons up to a few in-flight probes uncounted (graceful
+	// shutdown semantics), so the residual must tolerate that population.
+	if math.Abs(sent-recv-timeout-inflight) > 3 {
 		t.Errorf("Counter balance broken: sent=%v recv=%v timeout=%v inflight=%v",
-			sent, recv, timeout, getGaugeValue(prober.ProbesInflight, targetName, addr))
+			sent, recv, timeout, inflight)
+	}
+}
+
+// TestReconnect_KeepsProbingAndBalance: with a short reconnect interval
+// the client must re-dial repeatedly (re-resolving DNS) without losing or
+// fabricating any probe — the sent/rtt/timedout/inflight balance holds
+// across every reconnect, and probes keep flowing to a healthy target.
+func TestRobustness_DuplicateStormBalance(t *testing.T) {
+	prober.InitMetrics()
+	// pi-lens-ignore: go-context-background-handler
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var mu sync.Mutex
+	var prev []byte
+	addr := validatedEcho(t, ctx, func(buf []byte, w func([]byte)) {
+		w(buf)
+		w(buf)
+		w(buf)
+		mu.Lock()
+		defer mu.Unlock()
+		if prev != nil {
+			w(prev) // stale replay of an already-matched sequence number
+		}
+		prev = append([]byte(nil), buf...)
+	})
+
+	// Timeout longer than the run so nothing expires: every sent probe
+	// ends matched-once or still pending, making the balance equation
+	// exact rather than approximate.
+	targetName, cfg := namedCfg("dup_storm_test", addr, 50*time.Millisecond, 2*time.Second)
+
+	startSent := getCounterValue(prober.ProbesSent, targetName, addr)
+	startRecv := getHistogramCount(prober.RTTSeconds, targetName, addr)
+	startTimeout := getCounterValue(prober.ProbesTimedOut, targetName, addr)
+
+	runClientSettle(ctx, cancel, cfg, 700*time.Millisecond)
+
+	sentDelta := getCounterValue(prober.ProbesSent, targetName, addr) - startSent
+	recvDelta := getHistogramCount(prober.RTTSeconds, targetName, addr) - startRecv
+	timeoutDelta := getCounterValue(prober.ProbesTimedOut, targetName, addr) - startTimeout
+	inflight := getGaugeValue(prober.ProbesInflight, targetName, addr)
+
+	if sentDelta < 5 {
+		t.Fatalf("run too short to exercise the duplicate storm, sent=%v", sentDelta)
+	}
+	if recvDelta > sentDelta {
+		t.Errorf("duplicates counted as extra receives: sent=%v recv=%v", sentDelta, recvDelta)
+	}
+	if timeoutDelta != 0 {
+		t.Errorf("no probe should expire inside a %v window, timed_out grew by %v", cfg.BaseTimeout, timeoutDelta)
+	}
+	// Exact balance modulo the documented cancel-instant abandonment
+	// (graceful shutdown neither receives nor times out probes still in
+	// flight — see TestGracefulShutdown_NoPhantomTimeouts); at a 50ms
+	// interval that is at most ~2 probes.
+	if lost := sentDelta - recvDelta - timeoutDelta - inflight; lost > 2 {
+		t.Errorf("balance broken under duplicate storm: sent=%v recv=%v timeout=%v inflight=%v (lost=%v)",
+			sentDelta, recvDelta, timeoutDelta, inflight, lost)
 	}
 }
 

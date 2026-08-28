@@ -102,6 +102,14 @@ func TestSoakMemory(t *testing.T) {
 		t.Errorf("heap grew %.1fMB over %s (%.1f -> %.1f); investigate",
 			last-first, d, first, last)
 	}
+	// Goroutine leak detection: each target spawns ~2 goroutines (probe loop + reader);
+	// allow targets*2 + slack for the sampler and runtime.
+	firstGoro := samples[0].goro
+	lastGoro := samples[len(samples)-1].goro
+	allowedDelta := max(targets*2+10, 20)
+	if delta := lastGoro - firstGoro; delta > allowedDelta {
+		t.Errorf("goroutine leak: delta %d exceeds %d (baseline %d -> final %d with %d targets)", delta, allowedDelta, firstGoro, lastGoro, targets)
+	}
 }
 
 func heapMB() float64 {

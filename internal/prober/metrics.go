@@ -3,6 +3,7 @@ package prober
 import (
 	"crypto/sha256"
 	"crypto/subtle"
+	"log/slog"
 	"net/http"
 	"sync"
 
@@ -53,7 +54,9 @@ var (
 	}, []string{"source", "target", "address"})
 	LinkUp = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "link_up",
-		Help: "1 while probes are getting echoes, 0 after 3 consecutive probes time out. A single lost probe or brief stall does not flap the state.",
+		// keep in sync with LinkUpMissThreshold — test/metrics_test.go pins the
+		// Help text to the constant so they cannot silently diverge.
+		Help: "1 while probes are getting echoes, 0 after 3 consecutive probes time out (LinkUpMissThreshold). A single lost probe or brief stall does not flap the state.",
 	}, []string{"source", "target", "address"})
 	RTOEstimate = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "link_rto_seconds",
@@ -109,6 +112,7 @@ func MetricsAuth(user, pass string, next http.Handler) http.Handler {
 		// length mismatch, which would otherwise leak credential length.
 		uh, ph := sha256.Sum256([]byte(u)), sha256.Sum256([]byte(p))
 		if !ok || subtle.ConstantTimeCompare(uh[:], uhRef[:]) != 1 || subtle.ConstantTimeCompare(ph[:], phRef[:]) != 1 {
+			slog.Warn("metrics auth failed", "remote", r.RemoteAddr)
 			w.Header().Set("WWW-Authenticate", `Basic realm="metrics"`)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return

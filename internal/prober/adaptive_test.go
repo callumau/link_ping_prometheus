@@ -118,6 +118,37 @@ func TestAdaptiveStats_DynamicFloor(t *testing.T) {
 	}
 }
 
+// TestAdaptiveStats_ConvergenceTracksTrueMeanAndFloorHoldsEveryStep:
+// feeding a deterministic sample series with a known mean (80ms ±10ms
+// alternating), SRTT must converge to the true mean and the clamped RTO
+// must respect the dynamic floor max(200ms, 2*SRTT) at EVERY step — a
+// floor violation would let the RTO dip below twice the measured RTT
+// and fabricate timeouts on exactly the links adaptive mode exists for.
+func TestAdaptiveStats_ConvergenceTracksTrueMeanAndFloorHoldsEveryStep(t *testing.T) {
+	stats := NewAdaptiveStats(1 * time.Second)
+
+	for i := range 60 {
+		sample := 0.070
+		if i%2 == 1 {
+			sample = 0.090
+		}
+		stats.Update(sample)
+
+		floor := math.Max(DefaultMinRTO.Seconds(), 2*stats.srtt)
+		if r := stats.CurrentRTO().Seconds(); r < floor-1e-9 {
+			t.Fatalf("step %d: RTO %v below dynamic floor %v", i, stats.CurrentRTO(), floor)
+		}
+		if r := stats.CurrentRTO().Seconds(); r > DefaultMaxRTO.Seconds()+1e-9 {
+			t.Fatalf("step %d: RTO %v above DefaultMaxRTO", i, stats.CurrentRTO())
+		}
+	}
+
+	const trueMean = 0.080
+	if math.Abs(stats.srtt-trueMean) > 0.003 {
+		t.Errorf("SRTT %v failed to converge to true mean %v after 60 samples", stats.srtt, trueMean)
+	}
+}
+
 // pi-lens-ignore: go-test-functions
 func TestAdaptiveStats_RTOFloorAndGranularity(t *testing.T) {
 	// Hard floor: even a tiny base timeout must clamp to 200ms.

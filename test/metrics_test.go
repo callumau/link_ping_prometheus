@@ -1,14 +1,30 @@
 package prober_test
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
 
 	"link_ping_prometheus/internal/prober"
 )
+
+// TestLinkUpHelpPinsMissThreshold keeps the user-facing Help text in sync
+// with the tunable constant so changing one without the other fails CI.
+func TestLinkUpHelpPinsMissThreshold(t *testing.T) {
+	gauge, err := prober.LinkUp.GetMetricWithLabelValues("x", "y", "z")
+	if err != nil {
+		t.Fatalf("seeded LinkUp metric not found: %v", err)
+	}
+	help := gauge.Desc().String()
+	want := fmt.Sprintf("%d consecutive probes time out (LinkUpMissThreshold)", prober.LinkUpMissThreshold)
+	if !strings.Contains(help, want) {
+		t.Errorf("LinkUp Help does not mention current LinkUpMissThreshold (%q):\n%s", want, help)
+	}
+}
 
 func TestMetricsAuth(t *testing.T) {
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
