@@ -52,7 +52,7 @@
                       "version": "v0",
                       "spec": {
                         "editorMode": "code",
-                        "expr": "histogram_quantile(0.5, rate(link_rtt_seconds_bucket{instance=~\"$instance\", target=~\"$target\"}[5m])) * 1000",
+                        "expr": "histogram_quantile(0.5, rate(link_rtt_seconds_bucket{instance=~\"$instance\", target=~\"$target\"}[$__rate_interval])) * 1000",
                         "instant": false,
                         "legendFormat": "{{target}}",
                         "range": true
@@ -263,7 +263,7 @@
                       "version": "v0",
                       "spec": {
                         "editorMode": "code",
-                        "expr": "avg_over_time(link_rtt_jitter_seconds[2m])",
+                        "expr": "avg_over_time(link_rtt_jitter_seconds[$__rate_interval])",
                         "legendFormat": "Jitter",
                         "range": true
                       },
@@ -496,7 +496,7 @@
                       "version": "v0",
                       "spec": {
                         "editorMode": "code",
-                        "expr": "100 * rate(link_probes_timed_out_total{instance=~\"$instance\", target=~\"$target\"}[5m]) / rate(link_probes_sent_total{instance=~\"$instance\", target=~\"$target\"}[5m])",
+                        "expr": "clamp_max(100 * rate(link_probes_timed_out_total{instance=~\"$instance\", target=~\"$target\"}[$__rate_interval]) / rate(link_probes_sent_total{instance=~\"$instance\", target=~\"$target\"}[$__rate_interval]), 100)",
                         "instant": true,
                         "legendFormat": "{{target}}",
                         "range": false
@@ -688,7 +688,7 @@
                       "version": "v0",
                       "spec": {
                         "editorMode": "code",
-                        "expr": "histogram_quantile(0.5, rate(link_rtt_seconds_bucket{instance=~\"$instance\", target=~\"$target\"}[2m]))",
+                        "expr": "histogram_quantile(0.5, rate(link_rtt_seconds_bucket{instance=~\"$instance\", target=~\"$target\"}[$__rate_interval]))",
                         "legendFormat": "{{target}} p50",
                         "range": true
                       },
@@ -709,7 +709,7 @@
                       "version": "v0",
                       "spec": {
                         "editorMode": "code",
-                        "expr": "histogram_quantile(0.9, rate(link_rtt_seconds_bucket{instance=~\"$instance\", target=~\"$target\"}[2m]))",
+                        "expr": "histogram_quantile(0.9, rate(link_rtt_seconds_bucket{instance=~\"$instance\", target=~\"$target\"}[$__rate_interval]))",
                         "legendFormat": "{{target}} p90",
                         "range": true
                       },
@@ -730,7 +730,7 @@
                       "version": "v0",
                       "spec": {
                         "editorMode": "code",
-                        "expr": "histogram_quantile(0.99, rate(link_rtt_seconds_bucket{instance=~\"$instance\", target=~\"$target\"}[2m]))",
+                        "expr": "histogram_quantile(0.99, rate(link_rtt_seconds_bucket{instance=~\"$instance\", target=~\"$target\"}[$__rate_interval]))",
                         "legendFormat": "{{target}} p99",
                         "range": true
                       },
@@ -921,7 +921,7 @@
                       "version": "v0",
                       "spec": {
                         "editorMode": "code",
-                        "expr": "100 * rate(link_probes_timed_out_total{instance=~\"$instance\", target=~\"$target\"}[5m]) / rate(link_probes_sent_total{instance=~\"$instance\", target=~\"$target\"}[2m])",
+                        "expr": "clamp_max(100 * rate(link_probes_timed_out_total{instance=~\"$instance\", target=~\"$target\"}[$__rate_interval]) / rate(link_probes_sent_total{instance=~\"$instance\", target=~\"$target\"}[$__rate_interval]), 100)",
                         "legendFormat": "{{target}}",
                         "range": true
                       },
@@ -1054,7 +1054,7 @@
                       "version": "v0",
                       "spec": {
                         "editorMode": "code",
-                        "expr": "rate(link_rtt_seconds_sum{instance=~\"$instance\", target=~\"$target\"}[5m]) / rate(link_rtt_seconds_count{instance=~\"$instance\", target=~\"$target\"}[2m])",
+                        "expr": "rate(link_rtt_seconds_sum{instance=~\"$instance\", target=~\"$target\"}[$__rate_interval]) / rate(link_rtt_seconds_count{instance=~\"$instance\", target=~\"$target\"}[$__rate_interval])",
                         "legendFormat": "{{target}}",
                         "range": true
                       },
@@ -1311,7 +1311,7 @@
                       "version": "v0",
                       "spec": {
                         "editorMode": "code",
-                        "expr": "rate(link_probes_sent_total{instance=~\"$instance\", target=~\"$target\"}[5m])",
+                        "expr": "rate(link_probes_sent_total{instance=~\"$instance\", target=~\"$target\"}[$__rate_interval])",
                         "legendFormat": "Sent",
                         "range": true
                       },
@@ -1332,7 +1332,7 @@
                       "version": "v0",
                       "spec": {
                         "editorMode": "code",
-                        "expr": "rate(link_probes_timed_out_total{instance=~\"$instance\", target=~\"$target\"}[5m])",
+                        "expr": "rate(link_probes_timed_out_total{instance=~\"$instance\", target=~\"$target\"}[$__rate_interval])",
                         "legendFormat": "Timeout",
                         "range": true
                       },

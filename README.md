@@ -30,7 +30,13 @@ degrading?" — it is not a proxy for what TCP applications experience.
 - [Build](#build)
 - [Test](#test)
 - [Usage](#usage)
-- [Service](#service)
+  - [Flags](#flags)
+  - [Targets File](#targets-file)
+  - [Examples](#examples)
+- [Installation](#installation)
+  - [Service](#service)
+    - [Windows](#windows)
+    - [Linux (systemd)](#linux-systemd)
 - [Grafana Dashboard](#grafana-dashboard)
 - [Code Structure](#code-structure)
 - [Wire Protocol](#wire-protocol)
@@ -95,7 +101,7 @@ The exporter exposes the following metrics at `/metrics` (default port 2112).
 
 | Metric Name | Type | Labels | Description |
 | --- | --- | --- | --- |
-| `link_up` | Gauge | `source`, `target`, `address` | 1 while probes are getting echoes, 0 after 3 consecutive probes time out. A single lost probe or brief stall does not flap the state. |
+| `link_up` | Gauge | `source`, `target`, `address` | 1 while probes are getting echoes, 0 after 3 consecutive probes time out or probing becomes structurally impossible (persistent local send failures, dial/DNS retry). A single lost probe or brief stall does not flap the state. |
 | `link_probes_sent_total` | Counter | `source`, `target`, `address` | Total UDP probes sent. Probes into a down link still count as sent and time out naturally, so loss reads ~100% during an outage. |
 | `link_probes_timed_out_total` | Counter | `source`, `target`, `address` | Total probes with no echo within the RTO — true network loss. |
 | `link_probes_inflight` | Gauge | `source`, `target`, `address` | Current number of probes sent but waiting for a response or timeout. Grows during stalls. |
@@ -126,15 +132,15 @@ Copy-paste these.
 
 | You want | Query | Unit |
 | --- | --- | --- |
-| **Packet loss** (incl. full outages) | `100 * rate(link_probes_timed_out_total[5m]) / rate(link_probes_sent_total[5m])` | % |
-| **Latency** median (p50) | `histogram_quantile(0.5, rate(link_rtt_seconds_bucket[5m]))` | s → ×1000 = ms |
-| **Latency** mean | `rate(link_rtt_seconds_sum[5m]) / rate(link_rtt_seconds_count[5m])` | s → ×1000 = ms |
+| **Packet loss** (incl. full outages) | `clamp_max(100 * rate(link_probes_timed_out_total[$__rate_interval]) / rate(link_probes_sent_total[$__rate_interval]), 100)` | % (clamped at 100) |
+| **Latency** median (p50) | `histogram_quantile(0.5, rate(link_rtt_seconds_bucket[$__rate_interval]))` | s → ×1000 = ms |
+| **Latency** mean | `rate(link_rtt_seconds_sum[$__rate_interval]) / rate(link_rtt_seconds_count[$__rate_interval])` | s → ×1000 = ms |
 | **Latency** p90 / p99 | `histogram_quantile(0.9, ...)` / `histogram_quantile(0.99, ...)` | s → ×1000 = ms |
 | **Jitter** (instantaneous) | `link_rtt_jitter_seconds * 1000` | ms |
-| **Jitter** (window-based) | `(histogram_quantile(0.9, rate(link_rtt_seconds_bucket[5m])) - histogram_quantile(0.5, rate(link_rtt_seconds_bucket[5m]))) * 1000` | ms |
+| **Jitter** (window-based) | `(histogram_quantile(0.9, rate(link_rtt_seconds_bucket[$__rate_interval])) - histogram_quantile(0.5, rate(link_rtt_seconds_bucket[$__rate_interval]))) * 1000` | ms |
 | **Link up** | `link_up` | 0/1 |
 | **Baseline shift** (recent p50 vs 24h min) | `histogram_quantile(0.5, rate(link_rtt_seconds_bucket[10m])) > min_over_time(histogram_quantile(0.5, rate(link_rtt_seconds_bucket[10m]))[24h]) * 1.5` | bool |
-| **True wire loss** (needs server at remote end) | `100 * (1 - rate(link_server_probes_received_total{client="<ip>"}[5m]) / rate(link_probes_sent_total[5m]))` | % |
+| **True wire loss** (needs server at remote end) | `100 * (1 - rate(link_server_probes_received_total{client="<ip>"}[$__rate_interval]) / rate(link_probes_sent_total[$__rate_interval]))` | % |
 
 Two rules that trip people up:
 
@@ -142,7 +148,7 @@ Two rules that trip people up:
   `timed_out / sent` on the raw /metrics dump is a *lifetime average*.
   Always wrap them in `rate()` (or `increase()`) over a window.
 - **The rate window sets what you see.** It is both the smoothing period
-  and the shortest outage that reads as a full 100% loss block. A `[5m]`
+  and the shortest outage that reads as a full 100% loss block. A `[$__rate_interval]`
   window shows a 3-minute outage as a partial spike; `[1m]` catches it as
   100% but is noisier. Pick the window to match the outages you want to
   catch (the exporter's probe cadence does not limit visibility — every
@@ -151,7 +157,7 @@ Two rules that trip people up:
 ### Link Packet Loss
 
 ```promql
-100 * rate(link_probes_timed_out_total[5m]) / rate(link_probes_sent_total[5m])
+100 * rate(link_probes_timed_out_total[$__rate_interval]) / rate(link_probes_sent_total[$__rate_interval])
 ```
 
 True network loss: each probe is a UDP datagram and UDP never
@@ -173,8 +179,8 @@ IP. Any mismatch with `link_probes_sent_total` is probes that never
 reached the server — genuinely lost on the wire:
 
 ```promql
-100 * (1 - rate(link_server_probes_received_total{client="203.0.113.5"}[5m])
-           / rate(link_probes_sent_total{target="site-b"}[5m]))
+100 * (1 - rate(link_server_probes_received_total{client="203.0.113.5"}[$__rate_interval])
+           / rate(link_probes_sent_total{target="site-b"}[$__rate_interval]))
 ```
 
 **Why the loss ratio stays honest:** the adaptive RTO is RFC 6298
@@ -185,13 +191,18 @@ whose RTT approaches it (e.g. ~185ms) as loss and pins the RTO at its 3s
 clamp. Flooring at twice the smoothed RTT guarantees headroom and keeps
 the loss ratio meaningful.
 
+One deliberate exception: when probes are in flight across the periodic
+5-minute DNS re-dial (only possible with aggressive `-interval` values below
+the RTO), those probes are force-timed-out and count as a small synthetic
+loss each re-dial.
+
 ### Latency
 
 ```promql
-rate(link_rtt_seconds_sum[5m]) / rate(link_rtt_seconds_count[5m])   # mean
-histogram_quantile(0.5,  rate(link_rtt_seconds_bucket[5m]))         # p50
-histogram_quantile(0.9,  rate(link_rtt_seconds_bucket[5m]))         # p90
-histogram_quantile(0.99, rate(link_rtt_seconds_bucket[5m]))         # p99
+rate(link_rtt_seconds_sum[$__rate_interval]) / rate(link_rtt_seconds_count[$__rate_interval])   # mean
+histogram_quantile(0.5,  rate(link_rtt_seconds_bucket[$__rate_interval]))         # p50
+histogram_quantile(0.9,  rate(link_rtt_seconds_bucket[$__rate_interval]))         # p90
+histogram_quantile(0.99, rate(link_rtt_seconds_bucket[$__rate_interval]))         # p99
 ```
 
 Returns seconds; `* 1000` for ms. No RTT samples exist while the link is
@@ -218,8 +229,8 @@ For jitter over a specific time range, use the p90−p50 spread as a
 window-based approximation:
 
 ```promql
-(histogram_quantile(0.9, rate(link_rtt_seconds_bucket[5m]))
- - histogram_quantile(0.5, rate(link_rtt_seconds_bucket[5m]))) * 1000
+(histogram_quantile(0.9, rate(link_rtt_seconds_bucket[$__rate_interval]))
+ - histogram_quantile(0.5, rate(link_rtt_seconds_bucket[$__rate_interval]))) * 1000
 ```
 
 ### Baseline Shift Detection
@@ -231,7 +242,7 @@ histogram_quantile(0.5, rate(link_rtt_seconds_bucket[10m]))
 
 Latency drift on a long-running link shows up as the recent p50 diverging
 from a 24h minimum. Outages show up immediately in `link_up == 0`,
-`rate(link_probes_timed_out_total[5m]) > 0`, and the adaptive RTO climbing
+`rate(link_probes_timed_out_total[$__rate_interval]) > 0`, and the adaptive RTO climbing
 via `link_rto_seconds`.
 
 ### Link Status
@@ -248,7 +259,7 @@ alert: LinkDown
   for:  1m
 
 alert: LinkLossHigh
-  expr: rate(link_probes_timed_out_total[5m]) / rate(link_probes_sent_total[5m]) > 0.2
+  expr: rate(link_probes_timed_out_total[$__rate_interval]) / rate(link_probes_sent_total[$__rate_interval]) > 0.2
   for:  5m
 
 alert: LinkLatencyDegraded
@@ -321,7 +332,9 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o build/link_ping_prometheus.e
 ## Test
 
 ```sh
-go test -count=1 ./test/...
+go test -count=1 ./...          # full suite (~2 min; CI also runs it under -race)
+go vet ./...
+SOAK_SECONDS=600 go test -count=1 -run TestSoakMemory -v ./test/   # opt-in memory soak (heap must stay flat, +8MB ceiling)
 ```
 
 Release binaries for Linux, macOS, Windows at [Latest Release](https://github.com/callumau/link_ping_prometheus/releases/latest).
@@ -341,20 +354,24 @@ link_ping_prometheus -mode=<mode> [flags]
 | `-allow` | `""` | Server: comma-separated client IP allowlist (fail-closed — required in `server`/`both` mode) |
 | `-target` | `""` | Client: single target `host:port` |
 | `-targets` | `""` | Client: path to JSON targets file |
-| `-metrics` | `:2112` | Prometheus metrics HTTP listen address |
+| `-metrics` | `127.0.0.1:2112` | Prometheus metrics HTTP listen address (localhost-only by default; use `:2112` to expose for remote scrape — firewall-restrict) |
 | `-interval` | `500ms` | Client: probe interval |
 | `-timeout` | `1s` | Client: Base/initial probe timeout |
-| `-adaptive` | `true` | Enable adaptive RTO based on link quality |
+| `-adaptive` | `true` | Enable adaptive RTO based on link quality. With `false`, the fixed `-timeout` applies: links whose true RTT exceeds it read as 100% loss with no warning — pick a timeout comfortably above expected RTT |
 | `-source` | `""` | Source label applied to every metric series, e.g. the local site or datacenter (`sydney-dc`) |
 | `-metrics-user` | `""` | Basic auth username for /metrics (empty = disabled; env `LINK_PING_METRICS_USER`) |
 | `-metrics-pass` | `""` | Basic auth password for /metrics (env `LINK_PING_METRICS_PASS`; prefer env over CLI to avoid `ps` exposure) |
 | `-metrics-tls-cert` | `""` | TLS certificate file for /metrics (requires `-metrics-tls-key`) |
 | `-metrics-tls-key` | `""` | TLS private key file for /metrics (requires `-metrics-tls-cert`) |
+| `-metrics-allow-insecure` | `false` | Allow Basic Auth without TLS (otherwise auth over plaintext HTTP is rejected) |
 | `-json-logs` | `false` | Output logs in JSON format |
 | `-log-file` | `""` | Append logs to this file in addition to stdout (required for Windows service logging, where stdout is discarded) |
+| `-log-file-max-mb` | `10` | Max log file size in MB before rotation (0 disables rotation) |
+| `-log-file-max-backups` | `5` | Max rotated log files to keep |
+| `-log-file-max-age` | `28` | Max days to keep rotated log files |
 | `-svc` | `""` | Windows service action: `install`, `uninstall`, `start`, `stop`, `run` |
 
-Resource footprint: metric handles are resolved once per target at startup (no per-probe label lookups), and the Go heap is soft-capped at 128MB (`GOMEMLIMIT` env overrides) so RSS stays flat on long runs.
+Resource footprint: metric handles are resolved once per target at startup (no per-probe label lookups), and the Go heap is soft-capped at 128MB (`GOMEMLIMIT` env overrides) so RSS stays flat on long runs. For >100 targets set `GOMEMLIMIT=256MiB` (or higher) as a system environment variable and restart the service.
 
 ### Targets File
 
@@ -374,13 +391,13 @@ Max 1000 targets, max file size 1 MB.
 Client (single target):
 
 ```sh
-./link_ping_prometheus -mode=client -target="192.168.1.71:4000" -metrics=":2113"
+./link_ping_prometheus -mode=client -target="192.168.1.71:4000" -metrics=":2112"
 ```
 
 Client (multiple targets):
 
 ```sh
-./link_ping_prometheus -mode=client -targets=targets.json -metrics=":2113"
+./link_ping_prometheus -mode=client -targets=targets.json -metrics=":2112"
 ```
 
 Server:
@@ -392,20 +409,53 @@ Server:
 Both:
 
 ```sh
-./link_ping_prometheus -mode=both -targets=targets.json -metrics=":2113"
+./link_ping_prometheus -mode=both -targets=targets.json -metrics=":2112"
 ```
 
-## Service
+## Installation
 
-### Windows
+### Service
 
-Use `-svc` to install/uninstall/start/stop/run. The tool records runtime flags at install time (excluding `-svc`, `-metrics-user`, and `-metrics-pass`). Metrics auth credentials are **not** persisted into the service configuration; set `LINK_PING_METRICS_USER` / `LINK_PING_METRICS_PASS` in the service environment instead (a warning is printed at install time).
+#### Windows
+
+Use `-svc` to install/uninstall/start/stop/run. The tool records runtime flags at install time (excluding `-svc`, `-metrics-user`, `-metrics-pass`, and `-echo-secret`). Metrics auth credentials are **not** persisted into the service configuration; set `LINK_PING_METRICS_USER` / `LINK_PING_METRICS_PASS` in the service environment instead (a warning is printed at install time).
 
 ```sh
-link_ping_prometheus.exe -mode=both -targets=targets.json -metrics=":2113" -svc=install
+link_ping_prometheus.exe -mode=both -targets=targets.json -metrics=":2112" -log-file="C:\ProgramData\link_ping\link_ping.log" -svc=install
 ```
 
-### Linux (systemd)
+**Built-in service hardening (configured automatically at install):**
+
+- **Crash recovery**: SCM failure action is *restart* after 5s (reset period 24h). A crash or fatal internal error exits non-zero so recovery fires — a dead monitor never stays down silently.
+- **Delayed auto-start** with dependencies on `Tcpip` (sockets) and `W32Time` (time sync — the HMAC replay window requires roughly NTP-synchronized clocks between nodes).
+- **Lifecycle events in the Windows Event Log** (Application source `link_ping_prometheus`): start, stop, and fatal errors are visible even with no access to the log file.
+- **Credentials never persisted** into the service configuration.
+
+**Enterprise deployment checklist:**
+
+> `installer/windows/install-service.bat` / `uninstall-service.bat` in this repo automate steps 1–4 below (admin check, ACL'd log dir, escalating restart ladder, per-service SID, credential prompts). Run from an elevated prompt: an interactive wizard asks for mode (server/client/both), metrics address, targets — a JSON file or a single host:port — the **required** client IP allow-list for server/both modes, log directory, and optional service account, then shows a summary before installing.
+
+1. **Always pass `-log-file` at install.** Under the service, stdout is discarded; without a log file, verbose logs go nowhere (lifecycle/fatal events still reach the event log). Log rotation is built in (`-log-file-max-mb/-backups/-age`). A warning is printed if you skip it.
+2. **Service account.** By default the service installs as `LocalSystem`, which is more privilege than this prober needs (outbound UDP + a metrics port + its log directory). For least privilege, switch to a passwordless built-in or gMSA account after install:
+
+   ```sh
+   sc.exe config link_ping_prometheus obj= "NT AUTHORITY\LocalService"
+   ```
+
+   Use `NT AUTHORITY\NetworkService` instead of LocalService if network firewalls expect machine-account identity, or a domain gMSA (`DOMAIN\svc-linkping$`) if policy mandates managed accounts. Grant the chosen account write access to the log directory only.
+3. **Secrets delivery.** Set the credential environment variables machine-wide via System Properties → Environment Variables, or per-service:
+
+   ```sh
+   reg add HKLM\SYSTEM\CurrentControlSet\Services\link_ping_prometheus\Environment /v LINK_PING_METRICS_USER /t REG_SZ /d <user> /f
+   reg add HKLM\SYSTEM\CurrentControlSet\Services\link_ping_prometheus\Environment /v LINK_PING_METRICS_PASS /t REG_SZ /d <pass> /f
+   reg add HKLM\SYSTEM\CurrentControlSet\Services\link_ping_prometheus\Environment /v LINK_PING_ECHO_SECRET /t REG_SZ /d <secret> /f
+   ```
+
+   Be aware: that registry key is readable by all local users by default — treat these values as non-secret-grade, restrict who can log on to the host, and prefer an ACL-hardened secrets file sourced by your config management for higher assurance. Restart the service after changing them.
+4. **Further hardening (optional, post-install):** restart escalation ladder via `sc.exe failure link_ping_prometheus reset= 86400 actions= restart/5000/restart/30000/restart/60000`; restrict who can reconfigure the service via `sc.exe sdset`; give the service a per-service SID (`sc.exe sidtype link_ping_prometheus unrestricted`) and ACL the log/data directories to it; keep the binary under `%ProgramFiles%` with Admins-only write ACLs; Authenticode-sign the binary and allowlist via AppLocker/WDAC.
+5. **Upgrades:** re-run `installer/windows/install-service.bat` with the new binary — it detects the existing service, swaps the binary only when its SHA256 differs, and restarts (runtime truth updates via `link_ping_build_info`). Parameters are preserved. If any runtime flags changed, uninstall and reinstall instead — arguments are snapshotted at install time.
+
+#### Linux (systemd)
 
 Create `/etc/systemd/system/link_ping_prometheus.service`:
 
@@ -474,7 +524,7 @@ requires the echoed timestamp to exactly match the value it sent —
 corrupted, replayed, or spoofed responses are discarded and counted as
 loss on timeout, protecting RTT samples from poisoning.
 
-The server rate-limits echo processing to 1000 packets/s per remote IP
+The server rate-limits echo processing to 2000 packets/s per remote IP
 and 10000 packets/s globally (fixed one-second window); excess datagrams
 are dropped. The probe loop keeps a single connected UDP socket per
 target, but re-dials every 5 minutes (only when no probes are in flight)
@@ -488,6 +538,10 @@ DNS failure at startup is retried, not fatal.
   echo processing per source IP and globally.
 - Echoed timestamps are validated exactly (see Wire Protocol), so off-path
   corruption and replays cannot fabricate RTT samples.
+- With `-echo-secret` set, the server also rejects probes whose embedded
+  timestamp is older or newer than ~30 seconds, so a captured probe cannot be
+  replayed indefinitely with a spoofed source. This means both nodes must have
+  roughly synchronized clocks — NTP is recommended on monitoring endpoints.
 - UDP is not amplification-prone (echo is the same size as the request)
   and carries no state, but any internet-facing echo endpoint should be
   firewall-restricted to known monitoring sites.
