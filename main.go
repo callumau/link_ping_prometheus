@@ -63,7 +63,7 @@ var (
 	flAdaptive          = flag.Bool("adaptive", true, "Client: Use adaptive timeout based on link quality (RFC 6298)")
 	flBaseInterval      = flag.Duration("interval", 500*time.Millisecond, "Client: Probe interval")
 	flBaseTimeout       = flag.Duration("timeout", 1*time.Second, "Client: Base/Initial timeout")
-	flReconnectInterval = flag.Duration("reconnect-interval", 5*time.Minute, "Client: How long to keep a UDP socket before re-dialing for DNS re-resolution (0 disables)")
+	flReconnectInterval = flag.Duration("reconnect-interval", 5*time.Minute, "Client: How long to keep a UDP socket before re-dialing for DNS re-resolution (0 means global default 5m; use a large value e.g. 24h to effectively disable)")
 	flSource            = flag.String("source", "", "Source label applied to all metrics, e.g. local datacenter (sydney-dc) (defaults to hostname)")
 
 	flMetricsBasicAuthUser = flag.String("metrics-user", "", "Metrics: Basic auth username (empty disables auth; env LINK_PING_METRICS_USER)")
