@@ -377,7 +377,20 @@ func runEchoLoop(
 		recv time.Time
 	}
 
-	respCh := make(chan response, 100)
+	// respCh buffers in-flight responses between the reader and the drain.
+	// Size scales with expected max inflight (timeout/interval) so aggressive
+	// intervals (e.g. 10ms/3s => 300) do not stall the reader. Clamped 100..1000.
+	bufSize := 100
+	if cfg.BaseInterval > 0 {
+		n := int(cfg.BaseTimeout/cfg.BaseInterval) + 20
+		if n > bufSize {
+			bufSize = n
+		}
+		if bufSize > 1000 {
+			bufSize = 1000
+		}
+	}
+	respCh := make(chan response, bufSize)
 
 	// done unblocks the reader when the loop exits via panic recovery:
 	// conn.Close() frees a reader blocked on the socket, but a reader

@@ -78,6 +78,12 @@ func newRateLimiter(perIPCap, globalCap int) *rateLimiter {
 // allow reports whether a packet from ip may be processed, incrementing
 // the window counters when it may. The window resets every second.
 func (r *rateLimiter) allow(ip string) bool {
+	ok, _ := r.allowWithReason(ip)
+	return ok
+}
+
+// allowWithReason is like allow but also returns the reason when denied: "rate_global" or "rate_ip".
+func (r *rateLimiter) allowWithReason(ip string) (bool, string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	now := time.Now()
@@ -90,14 +96,14 @@ func (r *rateLimiter) allow(ip string) bool {
 		r.global = 0
 	}
 	if r.global >= r.globalCap {
-		return false
+		return false, "rate_global"
 	}
 	if r.perIP[ip] >= r.perIPCap {
-		return false
+		return false, "rate_ip"
 	}
 	r.perIP[ip]++
 	r.global++
-	return true
+	return true, ""
 }
 
 // RunServer starts a UDP echo responder on addr. served is the
@@ -174,13 +180,16 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 		// lookup (no string round-trip or double parsing).
 		ua, ok := raddr.(*net.UDPAddr)
 		if !ok {
+			ServerProbesDropped.WithLabelValues(source, "invalid_addr").Inc()
 			continue
 		}
 		norm := ua.IP.String()
 		if _, ok := allowed[norm]; !ok {
+			ServerProbesDropped.WithLabelValues(source, "allowlist").Inc()
 			continue
 		}
-		if !rl.allow(norm) {
+		if ok, reason := rl.allowWithReason(norm); !ok {
+			ServerProbesDropped.WithLabelValues(source, reason).Inc()
 			continue
 		}
 
@@ -189,23 +198,28 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 			expectedSize = PayloadSizeWithHMAC
 		}
 		if n != expectedSize {
+			ServerProbesDropped.WithLabelValues(source, "size").Inc()
 			continue
 		}
 		if string(buf[0:8]) != MagicBytes {
+			ServerProbesDropped.WithLabelValues(source, "magic").Inc()
 			continue
 		}
 		if echoSecret != "" {
 			seq := binary.LittleEndian.Uint64(buf[8:16])
 			ts := binary.LittleEndian.Uint64(buf[16:24])
 			if !validHMAC(echoSecret, seq, ts, buf[24:32]) {
+				ServerProbesDropped.WithLabelValues(source, "hmac").Inc()
 				continue
 			}
 			// Replay guard: an authenticated frame older or newer than
 			// the window is a capture-replay, not a live probe. Clocks
 			// between nodes must be approximately synchronized (NTP).
 			skew := time.Since(time.Unix(0, int64(ts)))
+			ServerClockSkew.WithLabelValues(source, norm).Set(skew.Seconds())
 			if skew > maxReplayWindow || skew < -maxReplayWindow {
-				slog.Debug("replayed or stale probe timestamp rejected", "addr", norm, "skew", skew)
+				ServerProbesDropped.WithLabelValues(source, "replay").Inc()
+				slog.Warn("replayed or stale probe timestamp rejected (check NTP/clock sync)", "addr", norm, "skew", skew, "window", maxReplayWindow)
 				continue
 			}
 		}
