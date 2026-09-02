@@ -66,6 +66,14 @@ var (
 		Name: "link_server_probes_received_total",
 		Help: "Total validated probes received by the server, labelled by source and remote client address. Cross-check against the client's link_probes_sent_total: any mismatch is probes that never reached the server.",
 	}, []string{"source", "client"})
+	ServerProbesDropped = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "link_server_probes_dropped_total",
+		Help: "Total probes dropped by the server, labelled by source and reason (allowlist, rate_ip, rate_global, size, magic, hmac, replay). Distinguishes misconfig (wrong secret, clock skew) and overload from true network loss.",
+	}, []string{"source", "reason"})
+	ServerClockSkew = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "link_server_clock_skew_seconds",
+		Help: "Last observed clock skew in seconds (server time minus client timestamp) for HMAC-authenticated probes. Positive means client is behind. Used to diagnose NTP drift causing replay drops.",
+	}, []string{"source", "client"})
 	BuildInfo = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "link_ping_build_info",
 		Help: "Build information; value is always 1 and the version label holds the build version (git tag for releases, UTC timestamp to the minute for dev builds).",
@@ -78,7 +86,7 @@ var registerOnce sync.Once
 // Safe to call multiple times; registration happens exactly once.
 func InitMetrics() {
 	registerOnce.Do(func() {
-		prometheus.MustRegister(ProbesSent, ProbesTimedOut, ProbesInflight, RTTSeconds, JitterSeconds, LinkUp, RTOEstimate, ServerProbesReceived, BuildInfo)
+		prometheus.MustRegister(ProbesSent, ProbesTimedOut, ProbesInflight, RTTSeconds, JitterSeconds, LinkUp, RTOEstimate, ServerProbesReceived, ServerProbesDropped, ServerClockSkew, BuildInfo)
 	})
 }
 

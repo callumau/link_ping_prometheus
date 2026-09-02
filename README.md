@@ -110,6 +110,8 @@ The exporter exposes the following metrics at `/metrics` (default port 2112).
 | `link_rtt_jitter_seconds` | Gauge | `source`, `target`, `address` | Smoothed RTT jitter in seconds (RFC 3550 §6.4.1). Resets after a sequence gap (a timed-out probe), so link recovery never spikes the gauge. |
 | `link_rto_seconds` | Gauge | `source`, `target`, `address` | Current adaptive RTO in use (RFC 6298, doubled on consecutive timeouts; floor `max(200ms, 2×SRTT)`). |
 | `link_server_probes_received_total` | Counter | `source`, `client` | Valid probes received by the server, per remote client IP (server mode only). Cross-check against the client's sent counter. |
+| `link_server_probes_dropped_total` | Counter | `source`, `reason` | Probes dropped by server: `allowlist`, `rate_ip`, `rate_global`, `size`, `magic`, `hmac`, `replay`, `invalid_addr`. `hmac`/`replay` diagnose secret/NTP misconfig vs true loss. |
+| `link_server_clock_skew_seconds` | Gauge | `source` | Last observed clock skew (server minus client timestamp) for HMAC probes; positive means client behind. Diagnose replay drops from NTP drift. |
 | `link_ping_build_info` | Gauge | `version` | Build version; value is always 1. Git tag for release builds, UTC timestamp to the minute for dev builds. |
 
 Percentiles and loss are **not** pre-computed in the exporter — Prometheus
