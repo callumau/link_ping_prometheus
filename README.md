@@ -355,10 +355,11 @@ link_ping_prometheus -mode=<mode> [flags]
 | `-target` | `""` | Client: single target `host:port` |
 | `-targets` | `""` | Client: path to JSON targets file |
 | `-metrics` | `127.0.0.1:2112` | Prometheus metrics HTTP listen address (localhost-only by default; use `:2112` to expose for remote scrape — firewall-restrict) |
-| `-interval` | `500ms` | Client: probe interval |
-| `-timeout` | `1s` | Client: Base/initial probe timeout |
+| `-interval` | `500ms` | Client: probe interval (warns if `>= -timeout`; probes will queue) |
+| `-timeout` | `1s` | Client: Base/initial probe timeout (with `-adaptive=false` warns if `<200ms`; spurious loss on moderate-RTT links) |
+| `-reconnect-interval` | `5m` | Client: How long to keep a UDP socket before re-dialing for DNS re-resolution (0 means use default 5m via global; must be `>= -interval` or an error; set e.g. `24h` to effectively disable) |
 | `-adaptive` | `true` | Enable adaptive RTO based on link quality. With `false`, the fixed `-timeout` applies: links whose true RTT exceeds it read as 100% loss with no warning — pick a timeout comfortably above expected RTT |
-| `-source` | `""` | Source label applied to every metric series, e.g. the local site or datacenter (`sydney-dc`) |
+| `-source` | `""` | Source label applied to every metric series, e.g. the local site or datacenter (`sydney-dc`) (defaults to hostname) |
 | `-metrics-user` | `""` | Basic auth username for /metrics (empty = disabled; env `LINK_PING_METRICS_USER`) |
 | `-metrics-pass` | `""` | Basic auth password for /metrics (env `LINK_PING_METRICS_PASS`; prefer env over CLI to avoid `ps` exposure) |
 | `-metrics-tls-cert` | `""` | TLS certificate file for /metrics (requires `-metrics-tls-key`) |
@@ -371,20 +372,22 @@ link_ping_prometheus -mode=<mode> [flags]
 | `-log-file-max-age` | `28` | Max days to keep rotated log files |
 | `-svc` | `""` | Windows service action: `install`, `uninstall`, `start`, `stop`, `run` |
 
+Liveness endpoints `GET /healthz` and `GET /readyz` on the same metrics listener return `200 ok` (`text/plain`) unauthenticated, for Kubernetes/container probes. `/metrics` remains protected by Basic Auth/TLS when configured; the health endpoints are never auth-gated and are available over both HTTP and HTTPS.
+
 Resource footprint: metric handles are resolved once per target at startup (no per-probe label lookups), and the Go heap is soft-capped at 128MB (`GOMEMLIMIT` env overrides) so RSS stays flat on long runs. For >100 targets set `GOMEMLIMIT=256MiB` (or higher) as a system environment variable and restart the service.
 
 ### Targets File
 
-JSON file with an array of `{"name": "...", "address": "host:port"}` objects:
+JSON file with an array of `{"name": "...", "address": "host:port"}` objects. Optional per-target `interval`/`timeout` override the global `-interval`/`-timeout` (duration strings like `"500ms"`, `"1s"`; 0 or absent means use global):
 
 ```json
 [
   {"name": "server1", "address": "192.168.1.10:4000"},
-  {"name": "server2", "address": "192.168.1.11:4000"}
+  {"name": "server2", "address": "192.168.1.11:4000", "interval": "200ms", "timeout": "800ms"}
 ]
 ```
 
-Max 1000 targets, max file size 1 MB.
+Max 1000 targets, max file size 1 MB. Per-target interval/timeout must be >0 when set; `interval >= timeout` warns (global and per-target) and `reconnect-interval < interval` is an error.
 
 ### Examples
 
@@ -527,7 +530,7 @@ loss on timeout, protecting RTT samples from poisoning.
 The server rate-limits echo processing to 2000 packets/s per remote IP
 and 10000 packets/s globally (fixed one-second window); excess datagrams
 are dropped. The probe loop keeps a single connected UDP socket per
-target, but re-dials every 5 minutes (only when no probes are in flight)
+target, but re-dials every 5 minutes by default (`-reconnect-interval`, only when no probes are in flight)
 so a target hostname that changes IP via DNS is re-resolved; a transient
 DNS failure at startup is retried, not fatal.
 
