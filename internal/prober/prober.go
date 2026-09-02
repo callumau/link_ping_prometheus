@@ -64,6 +64,10 @@ type Config struct {
 	// are 32 bytes (magic+seq+timestamp+hmac8); otherwise 24 bytes for
 	// backward compatibility.
 	EchoSecret string
+	// ReconnectInterval bounds how long a UDP socket is kept before
+	// re-dialing for DNS re-resolution. Zero means use the global
+	// ReconnectInterval var (test compat).
+	ReconnectInterval time.Duration
 }
 
 // Validate checks that at least one target is present and that all
@@ -77,6 +81,12 @@ func (c Config) Validate() error {
 	}
 	if c.BaseTimeout <= 0 {
 		return fmt.Errorf("probe timeout must be positive, got %v", c.BaseTimeout)
+	}
+	if c.ReconnectInterval < 0 {
+		return fmt.Errorf("reconnect interval must be >= 0, got %v", c.ReconnectInterval)
+	}
+	if c.ReconnectInterval != 0 && c.ReconnectInterval < c.BaseInterval {
+		return fmt.Errorf("reconnect interval %v must be >= probe interval %v", c.ReconnectInterval, c.BaseInterval)
 	}
 	return validateTargets(c.Targets)
 }
@@ -93,6 +103,12 @@ func validateTargets(targets []Target) error {
 		}
 		if err := ValidateTargetName(t.Name); err != nil {
 			return fmt.Errorf("target %q: %w", t.Name, err)
+		}
+		if t.Interval < 0 {
+			return fmt.Errorf("target %q: interval must be >= 0, got %v", t.Name, t.Interval)
+		}
+		if t.Timeout < 0 {
+			return fmt.Errorf("target %q: timeout must be >= 0, got %v", t.Name, t.Timeout)
 		}
 		if _, dup := seen[t.Name]; dup {
 			return fmt.Errorf("duplicate target name %q: metric labels would be ambiguous", t.Name)

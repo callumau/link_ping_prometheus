@@ -248,7 +248,7 @@
         "spec": {
           "id": 11,
           "title": "Jitter",
-          "description": "",
+          "description": "Smoothed RFC3550 jitter in ms, resets after gap (sequence loss). Instant gauge, not windowed.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -263,7 +263,7 @@
                       "version": "v0",
                       "spec": {
                         "editorMode": "code",
-                        "expr": "avg_over_time(link_rtt_jitter_seconds[$__rate_interval])",
+                        "expr": "link_rtt_jitter_seconds * 1000",
                         "legendFormat": "Jitter",
                         "range": true
                       },
@@ -303,7 +303,7 @@
               },
               "fieldConfig": {
                 "defaults": {
-                  "unit": "s",
+                  "unit": "ms",
                   "thresholds": {
                     "mode": "absolute",
                     "steps": [
@@ -312,11 +312,11 @@
                         "color": "green"
                       },
                       {
-                        "value": 0.01,
+                        "value": 10,
                         "color": "#EAB839"
                       },
                       {
-                        "value": 0.02,
+                        "value": 20,
                         "color": "dark-red"
                       }
                     ]

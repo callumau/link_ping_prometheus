@@ -18,8 +18,78 @@ import (
 
 // Target identifies a single probe destination.
 type Target struct {
-	Name    string `json:"name"`
-	Address string `json:"address"`
+	Name     string        `json:"name"`
+	Address  string        `json:"address"`
+	Interval time.Duration `json:"interval,omitempty"`
+	Timeout  time.Duration `json:"timeout,omitempty"`
+}
+
+// MarshalJSON encodes Interval/Timeout as duration strings (e.g. "500ms")
+// when non-zero, omitting them otherwise so the global config is used.
+func (t Target) MarshalJSON() ([]byte, error) {
+	type out struct {
+		Name     string  `json:"name"`
+		Address  string  `json:"address"`
+		Interval *string `json:"interval,omitempty"`
+		Timeout  *string `json:"timeout,omitempty"`
+	}
+	o := out{Name: t.Name, Address: t.Address}
+	if t.Interval != 0 {
+		s := t.Interval.String()
+		o.Interval = &s
+	}
+	if t.Timeout != 0 {
+		s := t.Timeout.String()
+		o.Timeout = &s
+	}
+	return json.Marshal(o)
+}
+
+// UnmarshalJSON decodes Interval/Timeout from duration strings (e.g. "500ms")
+// when present; absent or empty means use global (0). Numbers are rejected
+// to avoid ambiguity (use string "500ms").
+func (t *Target) UnmarshalJSON(data []byte) error {
+	type raw struct {
+		Name     string          `json:"name"`
+		Address  string          `json:"address"`
+		Interval json.RawMessage `json:"interval"`
+		Timeout  json.RawMessage `json:"timeout"`
+	}
+	var r raw
+	if err := json.Unmarshal(data, &r); err != nil {
+		return err
+	}
+	t.Name = r.Name
+	t.Address = r.Address
+	t.Interval = 0
+	t.Timeout = 0
+	if len(r.Interval) != 0 && string(r.Interval) != "null" {
+		var s string
+		if err := json.Unmarshal(r.Interval, &s); err != nil {
+			return fmt.Errorf("interval must be a duration string like \"500ms\": %w", err)
+		}
+		if s != "" {
+			d, err := time.ParseDuration(s)
+			if err != nil {
+				return fmt.Errorf("invalid interval %q: %w", s, err)
+			}
+			t.Interval = d
+		}
+	}
+	if len(r.Timeout) != 0 && string(r.Timeout) != "null" {
+		var s string
+		if err := json.Unmarshal(r.Timeout, &s); err != nil {
+			return fmt.Errorf("timeout must be a duration string like \"1s\": %w", err)
+		}
+		if s != "" {
+			d, err := time.ParseDuration(s)
+			if err != nil {
+				return fmt.Errorf("invalid timeout %q: %w", s, err)
+			}
+			t.Timeout = d
+		}
+	}
+	return nil
 }
 
 // LoadTargets reads and validates a JSON file containing an array of
@@ -72,6 +142,38 @@ func RunClient(ctx context.Context, cfg Config) error {
 	}
 
 	slog.Info("Starting probing", "targets_count", len(cfg.Targets), "adaptive", cfg.Adaptive)
+
+	if !cfg.Adaptive && cfg.BaseTimeout < 200*time.Millisecond {
+		slog.Warn("Fixed timeout below 200ms with adaptive disabled; short timeouts cause spurious loss on moderate-RTT links",
+			"timeout", cfg.BaseTimeout, "adaptive", cfg.Adaptive, "fix", "enable -adaptive or increase -timeout to >=200ms")
+	}
+	if cfg.BaseInterval >= cfg.BaseTimeout {
+		slog.Warn("Probe interval >= timeout; probes will queue and loss will read artificially high",
+			"interval", cfg.BaseInterval, "timeout", cfg.BaseTimeout, "fix", "set -interval < -timeout (e.g. interval 500ms, timeout 1s)")
+	}
+	effectiveReconnect := ReconnectInterval
+	if cfg.ReconnectInterval != 0 {
+		effectiveReconnect = cfg.ReconnectInterval
+	}
+	if effectiveReconnect != 0 && effectiveReconnect < cfg.BaseInterval {
+		slog.Warn("Reconnect interval < probe interval; reconnect will be delayed until next probe",
+			"reconnect_interval", effectiveReconnect, "interval", cfg.BaseInterval)
+	}
+	// Per-target interval/timeout warnings (0 means use global, already validated >0 when set).
+	for _, tg := range cfg.Targets {
+		effInterval := cfg.BaseInterval
+		if tg.Interval != 0 {
+			effInterval = tg.Interval
+		}
+		effTimeout := cfg.BaseTimeout
+		if tg.Timeout != 0 {
+			effTimeout = tg.Timeout
+		}
+		if effInterval >= effTimeout {
+			slog.Warn("Per-target interval >= timeout; probes will queue",
+				"target", tg.Name, "interval", effInterval, "timeout", effTimeout)
+		}
+	}
 
 	// Warn when this client's probe rate would exceed the echo server's
 	// per-IP cap: the server silently drops over-cap probes, which the
@@ -166,10 +268,19 @@ type probeLoopState struct {
 // DNS is re-resolved, and a dial failure — including a transient DNS
 // outage at startup — is retried rather than killing the target.
 func probeTarget(ctx context.Context, t Target, cfg Config) {
+	// Per-target overrides: Interval/Timeout 0 means use global.
+	effectiveCfg := cfg
+	if t.Interval != 0 {
+		effectiveCfg.BaseInterval = t.Interval
+	}
+	if t.Timeout != 0 {
+		effectiveCfg.BaseTimeout = t.Timeout
+	}
 	logger := slog.With("target", t.Name, "address", t.Address)
-	stats := NewAdaptiveStats(cfg.BaseTimeout)
+	stats := NewAdaptiveStats(effectiveCfg.BaseTimeout)
 	m := newTargetMetrics(cfg.Source, t)
 	state := &probeLoopState{}
+	cfg = effectiveCfg
 
 	m.linkUp.Set(0)
 	for {
@@ -509,7 +620,11 @@ func runEchoLoop(
 		// sent/rtt/timedout/inflight balance. They deliberately do NOT
 		// count toward link_up misses (consecutiveMisses): they were cut
 		// short by the socket swap, not lost on the wire.
-		if time.Since(started) >= ReconnectInterval {
+		reconnectInterval := ReconnectInterval
+		if cfg.ReconnectInterval != 0 {
+			reconnectInterval = cfg.ReconnectInterval
+		}
+		if reconnectInterval != 0 && time.Since(started) >= reconnectInterval {
 			for s := range pending {
 				m.timedOut.Inc()
 				m.inflight.Dec()

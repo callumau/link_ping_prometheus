@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -59,10 +60,11 @@ var (
 	flLogMaxBackups = flag.Int("log-file-max-backups", 5, "Log: max rotated files to keep")
 	flLogMaxAge     = flag.Int("log-file-max-age", 28, "Log: max days to keep rotated files")
 
-	flAdaptive     = flag.Bool("adaptive", true, "Client: Use adaptive timeout based on link quality (RFC 6298)")
-	flBaseInterval = flag.Duration("interval", 500*time.Millisecond, "Client: Probe interval")
-	flBaseTimeout  = flag.Duration("timeout", 1*time.Second, "Client: Base/Initial timeout")
-	flSource       = flag.String("source", "", "Source label applied to all metrics, e.g. local datacenter (sydney-dc)")
+	flAdaptive          = flag.Bool("adaptive", true, "Client: Use adaptive timeout based on link quality (RFC 6298)")
+	flBaseInterval      = flag.Duration("interval", 500*time.Millisecond, "Client: Probe interval")
+	flBaseTimeout       = flag.Duration("timeout", 1*time.Second, "Client: Base/Initial timeout")
+	flReconnectInterval = flag.Duration("reconnect-interval", 5*time.Minute, "Client: How long to keep a UDP socket before re-dialing for DNS re-resolution (0 disables)")
+	flSource            = flag.String("source", "", "Source label applied to all metrics, e.g. local datacenter (sydney-dc) (defaults to hostname)")
 
 	flMetricsBasicAuthUser = flag.String("metrics-user", "", "Metrics: Basic auth username (empty disables auth; env LINK_PING_METRICS_USER)")
 	flMetricsBasicAuthPass = flag.String("metrics-pass", "", "Metrics: Basic auth password (env LINK_PING_METRICS_PASS; prefer env over CLI to avoid ps exposure)")
@@ -163,6 +165,55 @@ func resolveEchoSecret() string {
 	return os.Getenv("LINK_PING_ECHO_SECRET")
 }
 
+func sanitizeHostname(s string) string {
+	s = strings.ToLower(s)
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('-')
+		}
+	}
+	out := b.String()
+	if out == "" {
+		return "unknown"
+	}
+	if len(out) > 63 {
+		out = out[:63]
+		for len(out) > 0 && out[len(out)-1] == '-' {
+			out = out[:len(out)-1]
+		}
+		if out == "" {
+			return "unknown"
+		}
+	}
+	return out
+}
+
+func effectiveSource() string {
+	if *flSource != "" {
+		return *flSource
+	}
+	h, err := os.Hostname()
+	if err != nil || strings.TrimSpace(h) == "" {
+		slog.Info("source defaulted to hostname", "source", "unknown", "hostname", h)
+		return "unknown"
+	}
+	sanitized := sanitizeHostname(h)
+	if err := prober.ValidateTargetName(sanitized); err != nil {
+		slog.Info("source defaulted to hostname", "source", "unknown", "hostname", h, "sanitized", sanitized, "validate_err", err)
+		return "unknown"
+	}
+	if sanitized != h {
+		slog.Info("source defaulted to hostname", "source", sanitized, "hostname", h)
+	} else {
+		slog.Info("source defaulted to hostname", "source", sanitized)
+	}
+	return sanitized
+}
+
 // buildConfig resolves CLI flags into a prober.Config. It handles single
 // (-target) and multi-target (-targets) modes. Failures are returned as
 // errors so the caller can abort before any server starts.
@@ -180,18 +231,21 @@ func buildConfig() (prober.Config, error) {
 		}
 		targets = []prober.Target{{Name: "default", Address: *flTarget}}
 	}
-	cfg := prober.Config{
-		Source:       *flSource,
-		Targets:      targets,
-		Adaptive:     *flAdaptive,
-		BaseInterval: *flBaseInterval,
-		BaseTimeout:  *flBaseTimeout,
-		EchoSecret:   resolveEchoSecret(),
+	source := *flSource
+	if source == "" {
+		source = effectiveSource()
 	}
-	if cfg.Source != "" {
-		if err := prober.ValidateTargetName(cfg.Source); err != nil {
-			return prober.Config{}, fmt.Errorf("invalid source: %w", err)
-		}
+	if err := prober.ValidateTargetName(source); err != nil {
+		return prober.Config{}, fmt.Errorf("invalid source: %w", err)
+	}
+	cfg := prober.Config{
+		Source:            source,
+		Targets:           targets,
+		Adaptive:          *flAdaptive,
+		BaseInterval:      *flBaseInterval,
+		BaseTimeout:       *flBaseTimeout,
+		EchoSecret:        resolveEchoSecret(),
+		ReconnectInterval: *flReconnectInterval,
 	}
 	return cfg, nil
 }
@@ -450,9 +504,21 @@ func (p *program) run() error {
 		}
 	}
 
-	// Validate source label used for server metrics as well (fail fast on bad label).
-	if *flSource != "" {
-		if err := prober.ValidateTargetName(*flSource); err != nil {
+	// Resolve source for server metrics; defaults to hostname and is validated.
+	// For client/both modes cfg.Source already holds the effective source (via buildConfig).
+	// For server-only mode we resolve it here.
+	sourceForServer := *flSource
+	if sourceForServer == "" {
+		if cfg.Source != "" {
+			sourceForServer = cfg.Source
+		} else {
+			sourceForServer = effectiveSource()
+			if err := prober.ValidateTargetName(sourceForServer); err != nil {
+				return fmt.Errorf("invalid source: %w", err)
+			}
+		}
+	} else {
+		if err := prober.ValidateTargetName(sourceForServer); err != nil {
 			return fmt.Errorf("invalid source: %w", err)
 		}
 	}
@@ -481,6 +547,13 @@ func (p *program) run() error {
 	}
 	mx := http.NewServeMux()
 	mx.Handle("/metrics", prober.MetricsAuth(user, pass, promhttp.Handler()))
+	healthzHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok\n"))
+	})
+	mx.Handle("/healthz", healthzHandler)
+	mx.Handle("/readyz", healthzHandler)
 	metricsSrv := &http.Server{
 		Handler:      mx,
 		ReadTimeout:  10 * time.Second,
@@ -510,7 +583,7 @@ func (p *program) run() error {
 	var modeErr error
 	switch mode {
 	case "server":
-		modeErr = prober.RunServer(p.ctx, *flListen, *flSource, allow, echoSecret)
+		modeErr = prober.RunServer(p.ctx, *flListen, sourceForServer, allow, echoSecret)
 	case "client":
 		modeErr = prober.RunClient(p.ctx, cfg)
 	case "both":
@@ -522,7 +595,7 @@ func (p *program) run() error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := prober.RunServer(modeCtx, *flListen, *flSource, allow, echoSecret); err != nil {
+			if err := prober.RunServer(modeCtx, *flListen, sourceForServer, allow, echoSecret); err != nil {
 				// A server that fails to start (e.g. port already in
 				// use) is fatal in both mode: cancelling the client too
 				// fails fast instead of probing silently without an
