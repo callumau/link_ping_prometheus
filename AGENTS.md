@@ -55,7 +55,7 @@ UDP is deliberate: no retransmission, so the loss ratio is true network loss (TC
 - `SeedMetrics(source, targets)` pre-creates series so `/metrics` shows them before the first event.
 - Client metric label set is `{source, target, address}`; `ServerProbesReceived` uses `{source, client}`.
 - Metric `Help` strings are user-facing docs — update README's metrics table when they change. Don't hardcode tunable values in Help text (e.g. the miss threshold) without a test pinning them together.
-- README operational numbers must match code constants: rate-limit caps (`MaxPktsPerIP` = 2000/s per IP, `MaxPktsGlobal` = 10000/s), RTO bounds, bucket edges. Drift between docs and code has happened — check both sides when touching either.
+- README operational numbers must match code constants: rate-limit caps (`MaxPktsPerIP` = 2000/s per IP, `MaxPktsGlobal` = 10000/s), RTO bounds, bucket edges. Drift between docs and code has happened — check both sides when touching either. The README flags table must list every flag registered in `main.go` (`-echo-secret` drifted out once) and the bucket list must match `RTTBuckets` in metrics.go (2.5s/3s drift happened once).
 
 ## Tests
 

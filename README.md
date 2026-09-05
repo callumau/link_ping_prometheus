@@ -41,6 +41,8 @@ degrading?" — it is not a proxy for what TCP applications experience.
 - [Code Structure](#code-structure)
 - [Wire Protocol](#wire-protocol)
 - [Security](#security)
+- [Contributing](#contributing)
+- [License](#license)
 
 ## Typical Deployment
 
@@ -105,7 +107,7 @@ The exporter exposes the following metrics at `/metrics` (default port 2112).
 | `link_probes_sent_total` | Counter | `source`, `target`, `address` | Total UDP probes sent. Probes into a down link still count as sent and time out naturally, so loss reads ~100% during an outage. |
 | `link_probes_timed_out_total` | Counter | `source`, `target`, `address` | Total probes with no echo within the RTO — true network loss. |
 | `link_probes_inflight` | Gauge | `source`, `target`, `address` | Current number of probes sent but waiting for a response or timeout. Grows during stalls. |
-| `link_rtt_seconds` | Histogram | `source`, `target`, `address` | RTT histogram with explicit buckets `{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5}` s plus native histogram support (`NativeHistogramBucketFactor` 1.1). Buckets stop at 2.5s: anything slower than the RTO cap (3s) counts as loss, so higher buckets would never fill. |
+| `link_rtt_seconds` | Histogram | `source`, `target`, `address` | RTT histogram with explicit buckets `{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 3.0}` s plus native histogram support (`NativeHistogramBucketFactor` 1.1). Buckets stop at 3s (the RTO cap): anything slower counts as loss, so higher buckets would never fill. |
 | `link_rtt_seconds_bucket/sum/count` | Histogram | `source`, `target`, `address` | Classic-bucket series; quantiles and means are derived in PromQL over any window. |
 | `link_rtt_jitter_seconds` | Gauge | `source`, `target`, `address` | Smoothed RTT jitter in seconds (RFC 3550 §6.4.1). Resets after a sequence gap (a timed-out probe), so link recovery never spikes the gauge. |
 | `link_rto_seconds` | Gauge | `source`, `target`, `address` | Current adaptive RTO in use (RFC 6298, doubled on consecutive timeouts; floor `max(200ms, 2×SRTT)`). |
@@ -404,6 +406,7 @@ link_ping_prometheus -mode=<mode> [flags]
 | `-log-file-max-backups` | `5` | Max rotated log files to keep |
 | `-log-file-max-age` | `28` | Max days to keep rotated log files |
 | `-svc` | `""` | Windows service action: `install`, `uninstall`, `start`, `stop`, `run` |
+| `-echo-secret` | `""` | HMAC secret authenticating UDP probes (env `LINK_PING_ECHO_SECRET`; must be set on both client and server; expands the wire frame to 32 bytes, see [Wire Protocol](#wire-protocol)) |
 
 Liveness endpoints `GET /healthz` and `GET /readyz` on the same metrics listener return `200 ok` (`text/plain`) unauthenticated, for Kubernetes/container probes. `/metrics` remains protected by Basic Auth/TLS when configured; the health endpoints are never auth-gated and are available over both HTTP and HTTPS.
 
@@ -546,16 +549,18 @@ test/
 
 ## Wire Protocol
 
-UDP datagram, 24 bytes per probe:
+UDP datagram, 24 bytes per probe (32 bytes when `-echo-secret` is set on
+both ends):
 
 | Offset | Size | Field |
 | --- | --- | --- |
 | 0 | 8 | Magic header `LNKPING\x00` |
 | 8 | 8 | Sequence number (little-endian uint64) |
 | 16 | 8 | Client timestamp (Unix ns, little-endian uint64) |
+| 24 | 8 | HMAC-SHA256 tag (first 8 bytes; only with `-echo-secret`) |
 
-The server validates the magic header and exact 24-byte length before
-echoing; anything else is dropped silently. The client additionally
+The server validates the magic header and exact expected length (24 or
+32 bytes) before echoing; anything else is dropped silently. The client additionally
 requires the echoed timestamp to exactly match the value it sent —
 corrupted, replayed, or spoofed responses are discarded and counted as
 loss on timeout, protecting RTT samples from poisoning.
@@ -585,3 +590,20 @@ DNS failure at startup is retried, not fatal.
 - Prefer the `LINK_PING_METRICS_USER` / `LINK_PING_METRICS_PASS` environment variables over CLI flags — flag values are visible in `ps` to other local users.
 - Basic Auth without TLS sends credentials as base64 on the wire; a startup warning is logged in that configuration. Use `-metrics-tls-cert` / `-metrics-tls-key` to serve `/metrics` over HTTPS.
 - The wire protocol carries no sensitive data (sequence numbers and wall-clock timestamps only) and has no TLS — intended for internal network monitoring. Restrict access with a firewall on untrusted networks.
+
+## Contributing
+
+Bug reports and pull requests are welcome. Before opening a PR:
+
+```sh
+go build ./... && go vet ./... && go test -count=1 -race ./...
+```
+
+The integration tests run real UDP traffic on `127.0.0.1` and take a few
+minutes. Keep changes one logical commit each (Conventional Commits style:
+`feat:`, `fix:`, `docs:`). If a change touches metrics, flags, or constants,
+update the README table in the same PR — docs and code drift together.
+
+## License
+
+[GPL-3.0](LICENSE)
