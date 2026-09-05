@@ -281,6 +281,9 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 	m := newTargetMetrics(cfg.Source, t)
 	state := &probeLoopState{}
 	cfg = effectiveCfg
+	// Throttle dial-failure logging: first failure logs immediately, then
+	// at most once per minute (a DNS outage retries every second).
+	var lastDialLog time.Time
 
 	m.linkUp.Set(0)
 	for {
@@ -292,12 +295,18 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 			// addresses (already rejected by Config.Validate). Retry: a
 			// transient lookup failure must not strand the target with
 			// frozen metric series.
-			logger.Error("Failed to open UDP socket; retrying", "err", err)
 			// While the dial-retry loop runs, no probes are in flight and
 			// consecutiveMisses cannot advance, so a re-established session
 			// would keep showing a stale link_up=1 across a prolonged
 			// DNS/interface outage. Probing is structurally impossible here.
 			m.linkUp.Set(0)
+			// A DNS outage retries every second; log the first failure
+			// immediately, then at most once per minute so an Error-level
+			// message does not flood the log for the duration of the outage.
+			if lastDialLog.IsZero() || time.Since(lastDialLog) >= time.Minute {
+				logger.Error("Failed to open UDP socket; retrying", "err", err)
+				lastDialLog = time.Now()
+			}
 			t := time.NewTimer(time.Second)
 			select {
 			// pi-lens-ignore: waitgroup-done-scope
@@ -651,10 +660,15 @@ func runEchoLoop(
 		// would look like a loss to the RFC 3550 gap check and spuriously
 		// reset the jitter estimate. Consume it only after a successful
 		// write.
+		//
+		// Capture the send time here, NOT the `now` used for the timeout
+		// sweep: that timestamp predates the response drain, so using it as
+		// sentTime would inflate every RTT by the tick's drain/sweep cost.
+		sendTime := time.Now()
 		seq := state.seq + 1
 		copy(buf[0:8], MagicBytes)
 		binary.LittleEndian.PutUint64(buf[8:16], seq)
-		ts := uint64(now.UnixNano())
+		ts := uint64(sendTime.UnixNano())
 		binary.LittleEndian.PutUint64(buf[16:24], ts)
 		if cfg.EchoSecret != "" {
 			h := computeHMAC(cfg.EchoSecret, seq, ts)
@@ -682,7 +696,7 @@ func runEchoLoop(
 		writeFails = 0
 		state.seq = seq
 
-		pending[state.seq] = now
+		pending[state.seq] = sendTime
 		m.inflight.Inc()
 		m.sent.Inc()
 	}
