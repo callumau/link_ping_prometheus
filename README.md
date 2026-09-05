@@ -196,7 +196,13 @@ the loss ratio meaningful.
 One deliberate exception: when probes are in flight across the periodic
 5-minute DNS re-dial (only possible with aggressive `-interval` values below
 the RTO), those probes are force-timed-out and count as a small synthetic
-loss each re-dial.
+loss each re-dial. On links whose RTT approaches or exceeds the probe
+interval this produces a small phantom loss floor — roughly `RTO/interval`
+probes per re-dial, i.e. ~0.3% loss on a 700ms-RTT link at the default
+500ms interval. If your loss-ratio alert threshold sits near that floor,
+raise `-reconnect-interval` (e.g. `24h`) so the re-dial happens at most
+daily; DNS changes are then picked up at the next re-dial rather than
+within 5 minutes.
 
 ### Latency
 
@@ -211,9 +217,9 @@ Returns seconds; `* 1000` for ms. No RTT samples exist while the link is
 fully down, so latency is a gap (not 0) during an outage — combine with
 `link_up`.
 
-Explicit buckets cover sub-100ms LAN RTTs (5ms lower bound) up to 2.5s
-of degradation; values beyond 2.5s land in `+Inf`. Buckets stop at 2.5s
-because the RTO cap (3s) bounds measurable RTT: probes slower than that
+Explicit buckets cover sub-100ms LAN RTTs (5ms lower bound) up to the
+adaptive RTO cap at 3s; values beyond 3s land in `+Inf`. Buckets stop at
+3s because the RTO cap bounds measurable RTT: probes slower than that
 are counted as loss, not latency. The native histogram (bucket factor
 1.1) carries fine-grained data; Prometheus scrapes and aggregates it
 transparently when native-histogram support is enabled.
@@ -255,19 +261,44 @@ link_up
 
 ### Outage Alerts
 
+All outage alerts use `for: 5m` so brief events — host reboots, single
+probe blips, a 60s maintenance restart — ride through without paging.
+Anything that survives 5 minutes of continuous failure is a real outage.
+Sub-scrape outages are still captured by the counters: a 30s blip between
+scrapes never touches `link_up`, but it does land in
+`rate(timed_out)/rate(sent)`, so the loss alert is the primary detector
+and `link_up` is the state view for long outages.
+
 ```yaml
+alert: LinkLossHigh
+  expr: 100 * rate(link_probes_timed_out_total[$__rate_interval]) / rate(link_probes_sent_total[$__rate_interval]) > 20
+  for:  5m
+
 alert: LinkDown
   expr: link_up == 0
-  for:  1m
+  for:  5m
 
-alert: LinkLossHigh
-  expr: rate(link_probes_timed_out_total[$__rate_interval]) / rate(link_probes_sent_total[$__rate_interval]) > 0.2
+alert: LinkProbesStalled
+  expr: rate(link_probes_sent_total[$__rate_interval]) == 0
   for:  5m
 
 alert: LinkLatencyDegraded
   expr: histogram_quantile(0.5, rate(link_rtt_seconds_bucket[10m])) > min_over_time(histogram_quantile(0.5, rate(link_rtt_seconds_bucket[10m]))[24h]) * 1.5
   for:  10m
 ```
+
+**`LinkProbesStalled` is required alongside the loss alert.** If the local
+interface or route dies, probe writes fail and neither `sent` nor
+`timed_out` moves — the loss ratio reads 0/0 (no data), not 100%. Only
+`link_up == 0` (after 3 consecutive local send failures) and a flat
+`rate(link_probes_sent_total)` reveal it; without this alert a dead local
+link can look like a quiet, healthy monitor.
+
+**Loss threshold:** 20% over the rate window means roughly 1 in 5 probes
+lost for 5 continuous minutes — a heavily degraded but routing link.
+Tune down (10%) for links where any sustained loss matters; a full outage
+reads ~100% and is caught immediately by `LinkLossHigh` regardless of
+threshold, since the condition persists through the `for` duration.
 
 ## Grafana Alloy Scraping
 
