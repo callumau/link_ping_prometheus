@@ -277,10 +277,10 @@ func TestPrecision_Jitter_AnalyticConvergence(t *testing.T) {
 		t.Fatalf("only %v samples in 10s — cpu load?", n)
 	}
 
-	analytic := 40*time.Millisecond.Seconds() * (1 - math.Pow(15.0/16.0, float64(n)))
+	analytic := 40 * time.Millisecond.Seconds() * (1 - math.Pow(15.0/16.0, float64(n)))
 	j := getGaugeValue(prober.JitterSeconds, targetName, addr)
 	lower := analytic - 0.003 // scheduling noise on the ~0ms leg
-	upper := 0.045           // converged J approaches max |D| ≈ 40ms + noise
+	upper := 0.045            // converged J approaches max |D| ≈ 40ms + noise
 	if j < lower || j > upper {
 		t.Errorf("jitter %v outside RFC 3550 analytic band [%v, %v] for N=%v (fixed point is 40ms)", j, lower, upper, n)
 	}
