@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 const (
@@ -161,6 +163,17 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 	buf := make([]byte, MaxDatagramSize)
 	rl := newRateLimiter(MaxPktsPerIP, MaxPktsGlobal)
 
+	// Pre-resolve per-client metric handles once: only allowlisted IPs
+	// reach these metrics, so the set is bounded by the allowlist (max 256).
+	// Avoids the per-packet WithLabelValues hash+lookup on the hot path —
+	// the same resolve-once convention the client probe loop uses.
+	recvByIP := make(map[string]prometheus.Counter, len(allowed))
+	skewByIP := make(map[string]prometheus.Gauge, len(allowed))
+	for ip := range allowed {
+		recvByIP[ip] = ServerProbesReceived.WithLabelValues(source, ip)
+		skewByIP[ip] = ServerClockSkew.WithLabelValues(source, ip)
+	}
+
 	for {
 		n, raddr, err := pc.ReadFrom(buf)
 		if err != nil {
@@ -216,7 +229,7 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 			// the window is a capture-replay, not a live probe. Clocks
 			// between nodes must be approximately synchronized (NTP).
 			skew := time.Since(time.Unix(0, int64(ts)))
-			ServerClockSkew.WithLabelValues(source, norm).Set(skew.Seconds())
+			skewByIP[norm].Set(skew.Seconds())
 			if skew > maxReplayWindow || skew < -maxReplayWindow {
 				ServerProbesDropped.WithLabelValues(source, "replay").Inc()
 				slog.Warn("replayed or stale probe timestamp rejected (check NTP/clock sync)", "addr", norm, "skew", skew, "window", maxReplayWindow)
@@ -224,7 +237,7 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 			}
 		}
 
-		ServerProbesReceived.WithLabelValues(source, norm).Inc()
+		recvByIP[norm].Inc()
 		if nw, err := pc.WriteTo(buf[:n], raddr); err != nil && ctx.Err() == nil {
 			slog.Debug("UDP write error", "addr", raddr, "bytes", nw, "err", err)
 		}
