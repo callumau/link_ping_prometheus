@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
@@ -39,27 +40,80 @@ var (
 	MaxPktsGlobal = 10000
 )
 
+// MaxClientSeries bounds how many distinct prefix-matched (CIDR)
+// client IPs get their own {source,client} metric series. Beyond it,
+// probes from new sources are dropped (client_overflow) instead of
+// growing the label space. A var so tests can lower it. Exact-IP
+// allowlist entries are unaffected: their handles are pre-resolved.
+var MaxClientSeries = 1024
+
+// Allowlist is the fail-closed set of permitted prober source IPs:
+// exact IPs plus optional CIDR prefixes (e.g. 203.0.113.0/24). Exact
+// IPs keep O(1) matching and pre-resolved metric handles; prefix
+// matches resolve metric handles on demand under MaxClientSeries so
+// metric cardinality stays bounded.
+type Allowlist struct {
+	exact  map[string]struct{}
+	prefix []netip.Prefix
+}
+
 // ParseAllowlist parses a comma-separated list of client IP addresses
-// into a canonical set for the echo responder's fail-closed allowlist.
-// An empty input yields an empty (admit-nothing) set: server mode will
-// not run without at least one allowed prober.
-func ParseAllowlist(s string) (map[string]struct{}, error) {
-	set := make(map[string]struct{})
+// or CIDR prefixes (e.g. "203.0.113.5,10.0.0.0/24") into the echo
+// responder's fail-closed allowlist. An empty input yields an empty
+// (admit-nothing) allowlist: server mode will not run without at least
+// one allowed prober.
+func ParseAllowlist(s string) (*Allowlist, error) {
+	a := &Allowlist{exact: make(map[string]struct{})}
 	for part := range strings.SplitSeq(s, ",") {
 		part = strings.TrimSpace(part)
 		if part == "" {
 			continue
 		}
-		ip := net.ParseIP(part)
-		if ip == nil {
+		if strings.Contains(part, "/") {
+			p, err := netip.ParsePrefix(part)
+			if err != nil {
+				return nil, fmt.Errorf("invalid allowlist CIDR %q: %w", part, err)
+			}
+			a.prefix = append(a.prefix, p.Masked())
+			continue
+		}
+		addr, err := netip.ParseAddr(part)
+		if err != nil {
 			return nil, fmt.Errorf("invalid allowlist IP %q", part)
 		}
-		set[ip.String()] = struct{}{}
+		a.exact[addr.String()] = struct{}{}
 	}
-	if len(set) > 256 {
-		return nil, fmt.Errorf("allowlist too large: %d (max 256)", len(set))
+	if n := len(a.exact) + len(a.prefix); n > 256 {
+		return nil, fmt.Errorf("allowlist too large: %d (max 256)", n)
 	}
-	return set, nil
+	return a, nil
+}
+
+// Len reports the number of allowlist entries (exact IPs + prefixes).
+// Nil-safe: an absent allowlist is empty.
+func (a *Allowlist) Len() int {
+	if a == nil {
+		return 0
+	}
+	return len(a.exact) + len(a.prefix)
+}
+
+// Allows reports whether a source is permitted. norm is the incoming
+// datagram's canonical source IP string (net.IP.String()), ip its
+// parsed address. A nil or empty allowlist admits nothing.
+func (a *Allowlist) Allows(norm string, ip netip.Addr) bool {
+	if a.Len() == 0 {
+		return false
+	}
+	if _, ok := a.exact[norm]; ok {
+		return true
+	}
+	for _, p := range a.prefix {
+		if p.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // rateLimiter is a fixed-window per-IP + global packet rate limiter for
@@ -118,8 +172,8 @@ func (r *rateLimiter) allowWithReason(ip string) (bool, string) {
 // When echoSecret is non-empty, probes must be 32 bytes with HMAC; this
 // mitigates reflector spoofing where static magic alone allows off-path
 // 1:1 reflect to a victim allowlisted IP.
-func RunServer(ctx context.Context, addr string, source string, allowed map[string]struct{}, echoSecret string) error {
-	if len(allowed) == 0 {
+func RunServer(ctx context.Context, addr string, source string, allowed *Allowlist, echoSecret string) error {
+	if allowed.Len() == 0 {
 		return errors.New("server requires a non-empty client allowlist (-allow); fail-closed")
 	}
 	pc, err := net.ListenPacket("udp", addr)
@@ -153,7 +207,7 @@ func RunServer(ctx context.Context, addr string, source string, allowed map[stri
 // When echoSecret is non-empty, only 32-byte HMAC-authenticated datagrams
 // with a fresh timestamp are accepted; this mitigates reflector spoofing
 // (SEC22). When empty, 24-byte backward-compatible datagrams are accepted.
-func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allowed map[string]struct{}, echoSecret string) (retErr error) {
+func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allowed *Allowlist, echoSecret string) (retErr error) {
 	defer func() {
 		if r := recover(); r != nil {
 			retErr = fmt.Errorf("echo server panic: %v", r)
@@ -163,15 +217,40 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 	buf := make([]byte, MaxDatagramSize)
 	rl := newRateLimiter(MaxPktsPerIP, MaxPktsGlobal)
 
-	// Pre-resolve per-client metric handles once: only allowlisted IPs
-	// reach these metrics, so the set is bounded by the allowlist (max 256).
-	// Avoids the per-packet WithLabelValues hash+lookup on the hot path —
-	// the same resolve-once convention the client probe loop uses.
-	recvByIP := make(map[string]prometheus.Counter, len(allowed))
-	skewByIP := make(map[string]prometheus.Gauge, len(allowed))
-	for ip := range allowed {
-		recvByIP[ip] = ServerProbesReceived.WithLabelValues(source, ip)
-		skewByIP[ip] = ServerClockSkew.WithLabelValues(source, ip)
+	// Pre-resolve per-client metric handles for exact allowlist IPs once:
+	// only allowlisted IPs reach these metrics, so the set is bounded by
+	// the exact allowlist (max 256). Avoids the per-packet WithLabelValues
+	// hash+lookup on the hot path — the same resolve-once convention the
+	// client probe loop uses. Prefix-matched clients resolve their handles
+	// on demand under MaxClientSeries (see resolve below).
+	type clientHandles struct {
+		recv prometheus.Counter
+		skew prometheus.Gauge
+	}
+	handles := make(map[string]clientHandles, allowed.Len())
+	for ip := range allowed.exact {
+		handles[ip] = clientHandles{
+			recv: ServerProbesReceived.WithLabelValues(source, ip),
+			skew: ServerClockSkew.WithLabelValues(source, ip),
+		}
+	}
+	var dynMu sync.Mutex
+	dyn := make(map[string]clientHandles)
+	resolve := func(norm string) (clientHandles, bool) {
+		dynMu.Lock()
+		defer dynMu.Unlock()
+		if h, ok := dyn[norm]; ok {
+			return h, true
+		}
+		if len(dyn) >= MaxClientSeries {
+			return clientHandles{}, false
+		}
+		h := clientHandles{
+			recv: ServerProbesReceived.WithLabelValues(source, norm),
+			skew: ServerClockSkew.WithLabelValues(source, norm),
+		}
+		dyn[norm] = h
+		return h, true
 	}
 
 	for {
@@ -197,7 +276,9 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 			continue
 		}
 		norm := ua.IP.String()
-		if _, ok := allowed[norm]; !ok {
+		// ua.IP.String() of a socket-reported IP is always parseable.
+		na, _ := netip.ParseAddr(norm)
+		if !allowed.Allows(norm, na) {
 			ServerProbesDropped.WithLabelValues(source, "allowlist").Inc()
 			continue
 		}
@@ -218,6 +299,20 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 			ServerProbesDropped.WithLabelValues(source, "magic").Inc()
 			continue
 		}
+		// Resolve per-client metric handles after the cheap size/magic
+		// checks, before any HMAC work: exact allowlist IPs hit the
+		// pre-resolved map with no lock; prefix matches go through the
+		// capped dynamic map, so rotating spoofed sources cannot grow the
+		// label space beyond MaxClientSeries (H1 cardinality guard).
+		h, pre := handles[norm]
+		if !pre {
+			res, resOK := resolve(norm)
+			if !resOK {
+				ServerProbesDropped.WithLabelValues(source, "client_overflow").Inc()
+				continue
+			}
+			h = res
+		}
 		if echoSecret != "" {
 			seq := binary.LittleEndian.Uint64(buf[8:16])
 			ts := binary.LittleEndian.Uint64(buf[16:24])
@@ -229,7 +324,7 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 			// the window is a capture-replay, not a live probe. Clocks
 			// between nodes must be approximately synchronized (NTP).
 			skew := time.Since(time.Unix(0, int64(ts)))
-			skewByIP[norm].Set(skew.Seconds())
+			h.skew.Set(skew.Seconds())
 			if skew > maxReplayWindow || skew < -maxReplayWindow {
 				ServerProbesDropped.WithLabelValues(source, "replay").Inc()
 				slog.Warn("replayed or stale probe timestamp rejected (check NTP/clock sync)", "addr", norm, "skew", skew, "window", maxReplayWindow)
@@ -237,7 +332,7 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 			}
 		}
 
-		recvByIP[norm].Inc()
+		h.recv.Inc()
 		if nw, err := pc.WriteTo(buf[:n], raddr); err != nil && ctx.Err() == nil {
 			slog.Debug("UDP write error", "addr", raddr, "bytes", nw, "err", err)
 		}

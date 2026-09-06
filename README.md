@@ -115,7 +115,7 @@ The exporter exposes the following metrics at `/metrics` (default port 2112).
 | `link_rto_seconds` | Gauge | `source`, `target`, `address` | Current adaptive RTO in use (RFC 6298, doubled on consecutive timeouts; floor `max(200ms, 2×SRTT)`). |
 | `link_rtt_srtt_seconds` | Gauge | `source`, `target`, `address` | Smoothed RTT estimate (RFC 6298 SRTT), a window-independent latency signal for dashboards and baseline-shift alerts. Stays 0 with adaptive mode disabled. |
 | `link_server_probes_received_total` | Counter | `source`, `client` | Valid probes received by the server, per remote client IP (server mode only). Cross-check against the client's sent counter. |
-| `link_server_probes_dropped_total` | Counter | `source`, `reason` | Probes dropped by server: `allowlist`, `rate_ip`, `rate_global`, `size`, `magic`, `hmac`, `replay`, `invalid_addr`. `hmac`/`replay` diagnose secret/NTP misconfig vs true loss. |
+| `link_server_probes_dropped_total` | Counter | `source`, `reason` | Probes dropped by server: `allowlist`, `rate_ip`, `rate_global`, `size`, `magic`, `hmac`, `replay`, `invalid_addr`, `client_overflow`. `hmac`/`replay` diagnose secret/NTP misconfig vs true loss; `client_overflow` means more distinct CIDR-allowlisted client IPs than the per-client series cap. |
 | `link_server_clock_skew_seconds` | Gauge | `source`, `client` | Last observed clock skew (server minus client timestamp) for HMAC probes; positive means client behind. Diagnose replay drops from NTP drift per peer. |
 | `link_ping_build_info` | Gauge | `version` | Build version; value is always 1. Git tag for release builds, UTC timestamp to the minute for dev builds. |
 
@@ -409,7 +409,7 @@ link_ping_prometheus -mode=<mode> [flags]
 | --- | --- | --- |
 | `-mode` | `server` | Operation mode: `server`, `client`, `both` |
 | `-listen` | `:4000` | Server listen address |
-| `-allow` | `""` | Server: comma-separated client IP allowlist (fail-closed — required in `server`/`both` mode) |
+| `-allow` | `""` | Server: comma-separated client IP allowlist — plain IPs or CIDR prefixes like `203.0.113.0/24` (fail-closed — required in `server`/`both` mode) |
 | `-target` | `""` | Client: single target `host:port` |
 | `-targets` | `""` | Client: path to JSON targets file |
 | `-metrics` | `127.0.0.1:2112` | Prometheus metrics HTTP listen address (localhost-only by default; use `:2112` to expose for remote scrape — firewall-restrict) |
@@ -601,7 +601,11 @@ DNS failure at startup is retried, not fatal.
 
 - The UDP echo server validates the magic header and exact datagram size
   before echoing to prevent arbitrary payload reflection, and rate-limits
-  echo processing per source IP and globally.
+  echo processing per source IP and globally. The allowlist is fail-closed
+  (no `-allow`, no service) and accepts plain IPs or CIDR prefixes; plain
+  IPs keep per-client metric series pre-resolved, while CIDR-matched
+  clients are capped at 1024 distinct IPs per process (`client_overflow`
+  drops beyond that) so spoofed source rotation cannot grow the label space.
 - Echoed timestamps are validated exactly (see Wire Protocol), so off-path
   corruption and replays cannot fabricate RTT samples.
 - With `-echo-secret` set, the server also rejects probes whose embedded

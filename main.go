@@ -534,7 +534,7 @@ func (p *program) run() error {
 	if err != nil {
 		return err
 	}
-	if mode := *flMode; (mode == "server" || mode == "both") && len(allow) == 0 {
+	if mode := *flMode; (mode == "server" || mode == "both") && allow.Len() == 0 {
 		return errors.New("server mode requires -allow (comma-separated client IP allowlist); fail-closed")
 	}
 
