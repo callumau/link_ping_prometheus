@@ -19,8 +19,16 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"syscall"
 	"time"
 )
+
+// syscallConn is implemented by *net.UDPConn; the platform-specific
+// socket-option helpers (DSCP on Linux, DF on Linux+Windows) use it to
+// reach the raw descriptor.
+type syscallConn interface {
+	SyscallConn() (syscall.RawConn, error)
+}
 
 // Protocol constants.
 const (

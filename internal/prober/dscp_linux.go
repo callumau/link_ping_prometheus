@@ -5,7 +5,6 @@ package prober
 import (
 	"errors"
 	"net"
-	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -38,9 +37,4 @@ func setDSCP(conn net.Conn, dscp int, remote net.Addr) error {
 		return ctlErr
 	}
 	return serr
-}
-
-// syscallConn is implemented by *net.UDPConn.
-type syscallConn interface {
-	SyscallConn() (syscall.RawConn, error)
 }
