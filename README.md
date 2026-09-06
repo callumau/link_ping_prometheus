@@ -433,6 +433,8 @@ link_ping_prometheus -mode=<mode> [flags]
 
 Liveness endpoints `GET /healthz` and `GET /readyz` on the same metrics listener return `200 ok` (`text/plain`) unauthenticated, for Kubernetes/container probes. `/metrics` remains protected by Basic Auth/TLS when configured; the health endpoints are never auth-gated and are available over both HTTP and HTTPS.
 
+`GET /status` on the same listener serves a JSON snapshot of live per-target probe state — `link_up`, in-flight probes, consecutive misses, send failures, RTO/SRTT, last sequence number, and socket age — for debugging a flapping target without log access. Unlike the health endpoints it is auth-gated exactly like `/metrics` (open only when no metrics auth is configured).
+
 Resource footprint: metric handles are resolved once per target at startup (no per-probe label lookups), and the Go heap is soft-capped at 128MB (`GOMEMLIMIT` env overrides) so RSS stays flat on long runs. For >100 targets set `GOMEMLIMIT=256MiB` (or higher) as a system environment variable and restart the service.
 
 ### Targets File
