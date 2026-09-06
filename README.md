@@ -19,6 +19,7 @@ degrading?" — it is not a proxy for what TCP applications experience.
 - [Run with Docker](#run-with-docker)
 - [Metrics](#metrics)
 - [PromQL Examples](#promql-examples)
+- [Alert Rules File](#alert-rules-file)
   - [Quick Reference](#quick-reference)
   - [Link Packet Loss](#link-packet-loss)
   - [Latency](#latency)
@@ -303,6 +304,26 @@ lost for 5 continuous minutes — a heavily degraded but routing link.
 Tune down (10%) for links where any sustained loss matters; a full outage
 reads ~100% and is caught immediately by `LinkLossHigh` regardless of
 threshold, since the condition persists through the `for` duration.
+
+## Alert Rules File
+
+The alerts above ship ready-to-load in `rules/link-monitor.yml`: recording
+rules (`link:loss_ratio`, `link:rtt_seconds_p50/p90/p99`,
+`link:mean_rtt_seconds` — all with matching `rate()` windows) and alerting
+rules (`LinkDown`, `HighPacketLoss`, `SeverePacketLoss`, `LinkProbeStall`,
+`ClientSendErrors`, `ServerDropsObserved`, `ClockSkewApproaching`). Wire
+them into Prometheus so alerting works out of the box instead of every
+operator copying expressions from these docs:
+
+```yaml
+# prometheus.yml
+rule_files:
+  - /etc/prometheus/rules/link-monitor.yml
+```
+
+Validate before shipping: `promtool check rules rules/link-monitor.yml`.
+Alert thresholds (5% warning, 20% critical loss; 5m `for`) are starting
+points — tune per link as with the expressions above.
 
 ## Grafana Alloy Scraping
 
