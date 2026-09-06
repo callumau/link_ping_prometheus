@@ -145,7 +145,7 @@ func TestPrecision_HealthyLink_NoFabricatedLoss_ServerCrossCheck(t *testing.T) {
 	// ServePacketConn increments link_server_probes_received_total — a
 	// hand-rolled test responder never would.
 	pc := listenUDP(t, ctx)
-	allowed := map[string]struct{}{"127.0.0.1": {}}
+	allowed := mustAllow("127.0.0.1")
 	go prober.ServePacketConn(ctx, pc, testSource, allowed, "")
 	addr := pc.LocalAddr().String()
 	clientIP := "127.0.0.1" // server metric labels the bare IP, not IP:port

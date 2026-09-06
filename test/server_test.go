@@ -14,9 +14,19 @@ import (
 	"link_ping_prometheus/internal/prober"
 )
 
+// mustAllow builds a test allowlist; panics on the (constant) parse
+// error so test tables stay one-liners.
+func mustAllow(s string) *prober.Allowlist {
+	a, err := prober.ParseAllowlist(s)
+	if err != nil {
+		panic(err)
+	}
+	return a
+}
+
 // testAllow is the fail-closed client allowlist used by server tests:
 // all dial from the loopback IP, so it is the sole permitted prober.
-var testAllow = map[string]struct{}{net.IPv4(127, 0, 0, 1).String(): {}}
+var testAllow = mustAllow("127.0.0.1")
 
 // startServer starts ServePacketConn on an ephemeral loopback port with
 // the standard test allowlist, returning the port address. The socket is
@@ -519,10 +529,7 @@ func TestServer_GlobalRateLimitStarvesExcess(t *testing.T) {
 	}()
 
 	pc := listenUDP(t, ctx)
-	allowed := map[string]struct{}{
-		net.IPv4(127, 0, 0, 1).String(): {},
-		net.IPv4(127, 0, 0, 2).String(): {},
-	}
+	allowed := mustAllow("127.0.0.1,127.0.0.2")
 	go func() {
 		prober.ServePacketConn(ctx, pc, testSource, allowed, "")
 		close(done)
@@ -780,5 +787,131 @@ func TestServer_PanicReturnsError(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("ServePacketConn did not return after panic within 5s")
+	}
+}
+
+// TestServer_CIDRAllowlist: a CIDR entry admits any source IP inside
+// the prefix and drops sources outside it.
+func TestServer_CIDRAllowlist(t *testing.T) {
+	prober.InitMetrics()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	pc := listenUDP(t, ctx)
+	allowed := mustAllow("127.0.0.2/32")
+	go func() {
+		prober.ServePacketConn(ctx, pc, testSource, allowed, "")
+		close(done)
+	}()
+	addr := pc.LocalAddr().String()
+
+	dialFrom := func(ip net.IP) net.Conn {
+		t.Helper()
+		dst, err := net.ResolveUDPAddr("udp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn, err := net.DialUDP("udp", &net.UDPAddr{IP: ip, Port: 0}, dst)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return conn
+	}
+	echoOnce := func(conn net.Conn) bool {
+		t.Helper()
+		probe := make([]byte, prober.PayloadSize)
+		copy(probe[0:8], prober.MagicBytes)
+		conn.Write(probe)
+		conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+		n, _ := conn.Read(make([]byte, prober.PayloadSize))
+		return n == prober.PayloadSize
+	}
+
+	in := dialFrom(net.IPv4(127, 0, 0, 2))
+	defer in.Close()
+	if !echoOnce(in) {
+		t.Error("source inside the allowlist prefix must be echoed")
+	}
+
+	out := dialFrom(net.IPv4(127, 0, 0, 3))
+	defer out.Close()
+	if echoOnce(out) {
+		t.Error("source outside the allowlist prefix must be dropped")
+	}
+}
+
+// TestServer_ClientSeriesOverflow: prefix-matched clients resolve their
+// per-client metric series on demand up to MaxClientSeries; further
+// distinct sources are dropped with the client_overflow reason instead
+// of growing the label space (H1 cardinality guard).
+func TestServer_ClientSeriesOverflow(t *testing.T) {
+	prober.InitMetrics()
+	old := prober.MaxClientSeries
+	prober.MaxClientSeries = 2
+	defer func() { prober.MaxClientSeries = old }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	pc := listenUDP(t, ctx)
+	allowed := mustAllow("127.0.0.0/8")
+	go func() {
+		prober.ServePacketConn(ctx, pc, testSource, allowed, "")
+		close(done)
+	}()
+	addr := pc.LocalAddr().String()
+
+	dialFrom := func(ip net.IP) net.Conn {
+		t.Helper()
+		dst, err := net.ResolveUDPAddr("udp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn, err := net.DialUDP("udp", &net.UDPAddr{IP: ip, Port: 0}, dst)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return conn
+	}
+	echoOnce := func(conn net.Conn) bool {
+		t.Helper()
+		probe := make([]byte, prober.PayloadSize)
+		copy(probe[0:8], prober.MagicBytes)
+		conn.Write(probe)
+		conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+		n, _ := conn.Read(make([]byte, prober.PayloadSize))
+		return n == prober.PayloadSize
+	}
+
+	var conns []net.Conn
+	defer func() {
+		for _, c := range conns {
+			c.Close()
+		}
+	}()
+	for i, ip := range []net.IP{net.IPv4(127, 0, 0, 1), net.IPv4(127, 0, 0, 2), net.IPv4(127, 0, 0, 3)} {
+		c := dialFrom(ip)
+		conns = append(conns, c)
+		if i < prober.MaxClientSeries {
+			if !echoOnce(c) {
+				t.Errorf("source %s below cap must be echoed", ip)
+			}
+		} else {
+			if echoOnce(c) {
+				t.Errorf("source %s beyond cap must be dropped", ip)
+			}
+		}
+	}
+	if n := getCounterValue(prober.ServerProbesDropped, "client_overflow"); n < 1 {
+		t.Errorf("expected at least 1 client_overflow drop, got %v", n)
 	}
 }
