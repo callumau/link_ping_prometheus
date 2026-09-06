@@ -68,3 +68,9 @@ func (a *AdaptiveStats) CurrentRTO() time.Duration {
 	val := math.Max(math.Min(a.rto, DefaultMaxRTO.Seconds()), floor)
 	return time.Duration(val * float64(time.Second))
 }
+
+// SRTT returns the smoothed RTT estimate (RFC 6298) for export as the
+// link_rtt_srtt_seconds gauge. Zero before the first measurement.
+func (a *AdaptiveStats) SRTT() time.Duration {
+	return time.Duration(a.srtt * float64(time.Second))
+}

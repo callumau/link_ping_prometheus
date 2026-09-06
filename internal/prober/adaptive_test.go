@@ -176,3 +176,22 @@ func TestAdaptiveStats_RTOFloorAndGranularity(t *testing.T) {
 		t.Errorf("RTO must include 4*RTTVAR term, got %f < %f", stats.rto, expect)
 	}
 }
+
+// pi-lens-ignore: go-test-functions
+func TestAdaptiveStats_SRTTAccessor(t *testing.T) {
+	// SRTT is 0 before the first measurement, then follows the EWMA.
+	stats := NewAdaptiveStats(time.Second)
+	if s := stats.SRTT(); s != 0 {
+		t.Errorf("expected SRTT=0 before first Update, got %v", s)
+	}
+	stats.Update(0.100)
+	if s := stats.SRTT(); s != 100*time.Millisecond {
+		t.Errorf("expected SRTT=100ms after first Update, got %v", s)
+	}
+	stats.Update(0.200)
+	// First: SRTT=0.100. Second: SRTT = 0.875*0.100 + 0.125*0.200 = 0.1125.
+	// Float64→ns truncation needs a 1µs tolerance, not an exact match.
+	if s := stats.SRTT(); math.Abs(s.Seconds()-0.1125) > 1e-6 {
+		t.Errorf("expected SRTT=112.5ms after EWMA update, got %v", s)
+	}
+}

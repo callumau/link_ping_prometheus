@@ -64,6 +64,10 @@ var (
 		Name: "link_rto_seconds",
 		Help: "Current adaptive RTO (RFC 6298: SRTT + 4*RTTVAR, doubled on consecutive timeouts). Floor is max(200ms, 2*SRTT) so a link's timeout always has headroom over its measured RTT.",
 	}, []string{"source", "target", "address"})
+	SRTTSeconds = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "link_rtt_srtt_seconds",
+		Help: "Smoothed RTT estimate in seconds (RFC 6298 SRTT). A stable latency signal for dashboards and baseline-shift alerts, without window-dependent histogram math. Non-adaptive mode leaves this at 0.",
+	}, []string{"source", "target", "address"})
 	ServerProbesReceived = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "link_server_probes_received_total",
 		Help: "Total validated probes received by the server, labelled by source and remote client address. Cross-check against the client's link_probes_sent_total: any mismatch is probes that never reached the server.",
@@ -88,7 +92,7 @@ var registerOnce sync.Once
 // Safe to call multiple times; registration happens exactly once.
 func InitMetrics() {
 	registerOnce.Do(func() {
-		prometheus.MustRegister(ProbesSent, ProbesTimedOut, ProbesInflight, RTTSeconds, JitterSeconds, LinkUp, RTOEstimate, ServerProbesReceived, ServerProbesDropped, ServerClockSkew, BuildInfo)
+		prometheus.MustRegister(ProbesSent, ProbesTimedOut, ProbesInflight, RTTSeconds, JitterSeconds, LinkUp, RTOEstimate, SRTTSeconds, ServerProbesReceived, ServerProbesDropped, ServerClockSkew, BuildInfo)
 	})
 }
 
@@ -103,6 +107,7 @@ func SeedMetrics(source string, targets []Target) {
 		m.inflight.Set(0)
 		m.linkUp.Set(0)
 		m.rto.Set(0)
+		m.srtt.Set(0)
 		m.jitter.Set(0)
 	}
 }

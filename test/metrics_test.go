@@ -100,6 +100,7 @@ func TestSeedMetrics(t *testing.T) {
 		"link_probes_inflight",
 		"link_up",
 		"link_rto_seconds",
+		"link_rtt_srtt_seconds",
 		"link_rtt_seconds",
 		"link_rtt_jitter_seconds",
 	}
