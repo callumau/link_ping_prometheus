@@ -350,6 +350,16 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 
 		state.socketStart = time.Now()
 
+		// Optional QoS marking: apply per socket so a periodic re-dial
+		// re-marks it too. Best effort — a failure only warns.
+		if cfg.DSCP > 0 {
+			if err := setDSCP(conn, cfg.DSCP, conn.RemoteAddr()); err != nil {
+				logger.Warn("Failed to mark probes with DSCP; probes continue unmarked", "dscp", cfg.DSCP, "err", err)
+			} else {
+				logger.Info("Probe DSCP marking enabled", "dscp", cfg.DSCP)
+			}
+		}
+
 		// runEchoLoop recovers panics and returns them as errors; a
 		// panic is per-event corruption, not a link condition, so the
 		// target keeps probing rather than dying with frozen series
