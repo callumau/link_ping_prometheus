@@ -68,7 +68,8 @@ var (
 
 	flDSCP = flag.Int("dscp", 0, "Client: DSCP value 0-63 marked on probe packets (0 = no marking, default; e.g. 46 = EF). Best effort, requires OS support (Linux)")
 
-	flPayload = flag.Int("payload", 0, "Client: probe payload bytes beyond the 24/32-byte header (up to 1400), filled with a deterministic pattern and validated on echo; corruption is counted in link_probes_corrupted_total, distinct from loss")
+	flPayload       = flag.Int("payload", 0, "Client: probe payload bytes beyond the 24/32-byte header (up to 1400), filled with a deterministic pattern and validated on echo; corruption is counted in link_probes_corrupted_total, distinct from loss")
+	flTargetsReload = flag.Duration("targets-reload-interval", 0, "Client: poll the -targets file at this interval and apply changes without a restart (0 disables; SIGHUP also reloads on Unix; Windows services need this flag to reload)")
 
 	flMetricsBasicAuthUser = flag.String("metrics-user", "", "Metrics: Basic auth username (empty disables auth; env LINK_PING_METRICS_USER)")
 	flMetricsBasicAuthPass = flag.String("metrics-pass", "", "Metrics: Basic auth password (env LINK_PING_METRICS_PASS; prefer env over CLI to avoid ps exposure)")
@@ -527,6 +528,17 @@ func (p *program) run() error {
 	// registered so server-only mode still serves an empty list.
 	statusReg := prober.NewStatusRegistry()
 	cfg.Status = statusReg
+	// SIGHUP hot-reload of the targets file (Unix; Windows services use
+	// -targets-reload-interval). Signals coalesce: every delivery just
+	// re-reads and re-validates the file, which is idempotent.
+	if *flTargets != "" {
+		cfg.TargetsPath = *flTargets
+		cfg.ReloadInterval = *flTargetsReload
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGHUP)
+		defer signal.Stop(sigCh)
+		cfg.ReloadSignal = sigCh
+	}
 
 	// Resolve source for server metrics; defaults to hostname and is validated.
 	// For client/both modes cfg.Source already holds the effective source (via buildConfig).

@@ -420,6 +420,7 @@ link_ping_prometheus -mode=<mode> [flags]
 | `-reconnect-interval` | `5m` | Client: How long to keep a UDP socket before re-dialing for DNS re-resolution (0 means use default 5m via global; must be `>= -interval` or an error; set e.g. `24h` to effectively disable) |
 | `-dscp` | `0` | Client: DSCP value 0-63 marked on probe packets (e.g. 46 = EF) so QoS-managed networks class them accordingly. 0 = unmarked (default). Best effort, requires OS support (Linux). |
 | `-payload` | `0` | Client: probe payload bytes beyond the 24/32-byte header (up to 1400), filled with a deterministic pattern and validated byte-for-byte on echo. Corruption counts in `link_probes_corrupted_total` — distinct from loss. Detects MTU/data-path corruption a small probe cannot see. |
+| `-targets-reload-interval` | `0` | Client: poll the `-targets` file at this interval and apply changes without a restart (0 disables; SIGHUP also reloads on Unix; Windows services need this flag to reload) |
 | `-adaptive` | `true` | Enable adaptive RTO based on link quality. With `false`, the fixed `-timeout` applies: links whose true RTT exceeds it read as 100% loss with no warning — pick a timeout comfortably above expected RTT |
 | `-source` | `""` | Source label applied to every metric series, e.g. the local site or datacenter (`sydney-dc`) (defaults to hostname) |
 | `-metrics-user` | `""` | Basic auth username for /metrics (empty = disabled; env `LINK_PING_METRICS_USER`) |
@@ -454,6 +455,8 @@ JSON file with an array of `{"name": "...", "address": "host:port"}` objects. Op
 ```
 
 Max 1000 targets, max file size 1 MB. Per-target interval/timeout must be >0 when set; `interval >= timeout` warns (global and per-target) and `reconnect-interval < interval` is an error.
+
+**Hot reload:** send `SIGHUP` to re-read the file without a restart (Unix), or run with `-targets-reload-interval` (e.g. `30s`) for automatic polling — the only option under a Windows service, which has no SIGHUP. On reload: new targets start probing, removed targets stop (their last metric series remain and go stale in Prometheus), and targets whose address/intervals changed restart with the new values. A file that is mid-edit or invalid keeps the previous set running — reload failures are logged at Error level, never fatal.
 
 ### Examples
 
@@ -580,7 +583,7 @@ test/
 ## Wire Protocol
 
 UDP datagram, 24 bytes per probe (32 bytes when `-echo-secret` is set on
-both ends), plus an optional payload extension when `-payload` is set on
+both ends, plus an optional payload extension when `-payload` is set on
 the client):
 
 | Offset | Size | Field |
