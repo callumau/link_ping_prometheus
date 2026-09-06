@@ -1,0 +1,55 @@
+# Hardened systemd unit for link_ping_prometheus.
+#
+# Install:
+#   cp installer/linux/link_ping_prometheus.service /etc/systemd/system/
+#   # CLI flags go in OPTIONS inside /etc/link_ping_prometheus.env, e.g.:
+#   #   OPTIONS="-mode=both -listen=:4000 -allow=203.0.113.5 -metrics=:2112"
+#   # Secrets (LINK_PING_METRICS_USER/LINK_PING_METRICS_PASS,
+#   # LINK_PING_ECHO_SECRET) go in the same file, never in service args.
+#   #   LINK_PING_ECHO_SECRET=...
+#   chmod 600 /etc/link_ping_prometheus.env
+#   systemctl daemon-reload && systemctl enable --now link_ping_prometheus
+#
+# time-sync.target ordering is load-bearing: with -echo-secret set, the
+# server's replay guard uses a 30s timestamp window, so clocks must be
+# roughly NTP-synchronized.
+#
+# Restart=on-failure + RestartSec=5s mirrors the Windows service
+# hardening (SCM OnFailure=restart, 5s delay) in main.go serviceConfig().
+
+[Unit]
+Description=Link Ping Prometheus (UDP link monitor)
+Documentation=https://github.com/callumau/link_ping_prometheus
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/link_ping_prometheus.env
+ExecStart=/usr/local/bin/link_ping_prometheus $OPTIONS
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=20s
+KillSignal=SIGTERM
+# Adjust user/group per distro if needed (nogroup is Debian/Ubuntu).
+User=nobody
+Group=nogroup
+StateDirectory=link-ping
+LogsDirectory=link-ping
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,181 @@
+---
+# Deploy link_ping_prometheus to Linux (systemd) and Windows (SCM)
+# hosts. Binaries must be pre-built and placed here first:
+#   files/link_ping_prometheus-linux-amd64      (dev_build.sh / goreleaser)
+#   files/link_ping_prometheus-windows-amd64.exe
+#
+# Run:
+#   ansible-playbook -i inventory.yml playbook.yml
+# Secrets come from group_vars/all.yml (ansible-vault encrypted) or
+# --extra-vars. They are never passed as CLI flags.
+#
+# Windows note: pywinrm must be installed on the control node
+# (pip install pywinrm).
+
+- name: Deploy link_ping_prometheus on Linux
+  hosts: link_ping_linux
+  become: true
+  vars:
+    link_ping_bin: "{{ link_ping_install_dir }}/link_ping_prometheus"
+    link_ping_targets_path: "{{ link_ping_install_dir }}/targets.json"
+  tasks:
+    - name: Create log directory
+      ansible.builtin.file:
+        path: "{{ link_ping_log_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Install binary
+      ansible.builtin.copy:
+        src: link_ping_prometheus-linux-amd64
+        dest: "{{ link_ping_bin }}"
+        mode: "0755"
+        owner: root
+        group: root
+      notify: Restart link ping
+
+    - name: Render CLI options
+      ansible.builtin.set_fact:
+        link_ping_options: >-
+          -mode={{ link_ping_mode }}
+          -listen={{ link_ping_listen }}
+          -allow={{ link_ping_allow }}
+          -metrics={{ link_ping_metrics_listen }}
+          {{ link_ping_extra_args }}
+
+    - name: Write targets file
+      ansible.builtin.copy:
+        content: "{{ link_ping_targets_json }}"
+        dest: "{{ link_ping_targets_path }}"
+        mode: "0644"
+      when: link_ping_targets_json | length > 0
+      notify: Restart link ping
+
+    - name: Append -targets to options
+      ansible.builtin.set_fact:
+        link_ping_options: >-
+          {{ link_ping_options }}
+          -targets={{ link_ping_targets_path }}
+      when: link_ping_targets_json | length > 0
+
+    - name: Render credential env lines
+      ansible.builtin.set_fact:
+        link_ping_env_lines: >-
+          {{ []
+          + (['LINK_PING_ECHO_SECRET=' ~ link_ping_echo_secret]
+             if link_ping_echo_secret | length > 0 else [])
+          + (['LINK_PING_ECHO_SECRET_OLD=' ~ link_ping_echo_secret_old]
+             if link_ping_echo_secret_old | length > 0 else [])
+          + (['LINK_PING_METRICS_USER=' ~ link_ping_metrics_user]
+             if link_ping_metrics_user | length > 0 else [])
+          + (['LINK_PING_METRICS_PASS=' ~ link_ping_metrics_pass]
+             if link_ping_metrics_pass | length > 0 else []) }}
+
+    - name: Install credential environment file
+      ansible.builtin.copy:
+        content: "{{ link_ping_env_lines | join('\n') }}\n"
+        dest: /etc/link_ping_prometheus.env
+        mode: "0600"
+      when: link_ping_env_lines | length > 0
+      notify: Restart link ping
+
+    - name: Install systemd unit
+      ansible.builtin.copy:
+        src: ../../installer/linux/link_ping_prometheus.service
+        dest: /etc/systemd/system/link_ping_prometheus.service
+        mode: "0644"
+      notify: Restart link ping
+
+    - name: Enable and start service
+      ansible.builtin.systemd:
+        name: link_ping_prometheus
+        daemon_reload: true
+        enabled: true
+        state: started
+
+  handlers:
+    - name: Restart link ping
+      ansible.builtin.systemd:
+        name: link_ping_prometheus
+        state: restarted
+        daemon_reload: true
+
+- name: Deploy link_ping_prometheus on Windows
+  hosts: link_ping_windows
+  vars:
+    # Jinja tilde/folded concatenation keeps these under yamllint's
+    # 80-column budget while producing single unbroken strings.
+    link_ping_dir: "{{ link_ping_windows_install_dir }}"
+    link_ping_win_exe: "{{ link_ping_dir }}\\link_ping_prometheus.exe"
+    link_ping_win_options: >-
+      -mode={{ link_ping_mode }}
+      -listen={{ link_ping_listen }}
+      -allow={{ link_ping_allow }}
+      -metrics={{ link_ping_metrics_listen }}
+      {{ link_ping_extra_args }}
+    svc_env_key: >-
+      HKLM:\SYSTEM\CurrentControlSet\Services\{{ link_ping_service_name
+      }}\Environment
+  tasks:
+    - name: Create install directory
+      ansible.windows.win_file:
+        path: "{{ link_ping_windows_install_dir }}"
+        state: directory
+
+    - name: Install binary
+      ansible.windows.win_copy:
+        src: link_ping_prometheus-windows-amd64.exe
+        dest: "{{ link_ping_win_exe }}"
+
+    - name: Query service state
+      ansible.windows.win_service_info:
+        name: "{{ link_ping_service_name }}"
+      register: svc_info
+
+    - name: Create service (SCM auto-start)
+      ansible.windows.win_shell: >-
+        sc.exe create {{ link_ping_service_name }}
+        binPath= "{{ link_ping_win_exe }} {{ link_ping_win_options }}"
+        start= auto
+      when: svc_info.services | length == 0
+
+    - name: Configure failure recovery (restart after 5s, like main.go)
+      ansible.windows.win_shell: >-
+        sc.exe failure {{ link_ping_service_name }}
+        reset= 86400 actions= restart/5000/restart/5000/restart/5000
+
+    - name: Deliver credentials via the service environment
+      ansible.windows.win_regedit:
+        path: "{{ svc_env_key }}"
+        name: "{{ item.name }}"
+        data: "{{ item.data }}"
+        datatype: string
+        state: present
+      loop:
+        - name: LINK_PING_ECHO_SECRET
+          data: "{{ link_ping_echo_secret }}"
+        - name: LINK_PING_ECHO_SECRET_OLD
+          data: "{{ link_ping_echo_secret_old }}"
+        - name: LINK_PING_METRICS_USER
+          data: "{{ link_ping_metrics_user }}"
+        - name: LINK_PING_METRICS_PASS
+          data: "{{ link_ping_metrics_pass }}"
+      when: item.data | length > 0
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Open UDP echo port (server/both mode)
+      ansible.windows.win_shell: >-
+        netsh advfirewall firewall add rule
+        name="LinkPing UDP 4000" dir=in action=allow
+        protocol=UDP localport=4000
+      when: link_ping_mode in ['server', 'both']
+      changed_when: false
+
+    - name: Start service when not running
+      ansible.windows.win_shell: >-
+        sc.exe start {{ link_ping_service_name }}
+      when:
+        - svc_info.services | length > 0
+        - svc_info.services[0].state != "Running"
+      changed_when: false

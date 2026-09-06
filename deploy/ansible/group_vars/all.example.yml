@@ -1,0 +1,36 @@
+---
+# Defaults for the link_ping_prometheus playbook. Copy this file to
+# group_vars/all.yml and adjust; encrypt it with ansible-vault when it
+# carries secrets:
+#   cp group_vars/all.example.yml group_vars/all.yml
+#   ansible-vault encrypt group_vars/all.yml
+
+# Service identity.
+link_ping_service_name: link_ping_prometheus
+
+# Runtime configuration (CLI flags built by the playbook).
+link_ping_mode: both            # server, client, both
+link_ping_listen: ":4000"       # UDP echo listener (server/both modes)
+link_ping_metrics_listen: ":2112"
+# REQUIRED for server/both: comma-separated client IPs or CIDR
+# prefixes, e.g. "203.0.113.5,10.0.0.0/24".
+link_ping_allow: ""
+# Appended verbatim to the CLI args, e.g. "-adaptive=false -dscp=46".
+link_ping_extra_args: ""
+
+# Optional targets file (raw JSON content); when set it is written to
+# the install dir and wired via -targets, enabling SIGHUP/poll reload.
+link_ping_targets_json: ""
+
+# Secrets — NEVER passed as CLI flags; delivered via the service
+# environment (EnvironmentFile on Linux, SCM Environment registry key
+# on Windows). Leave empty to omit. Encrypt with ansible-vault.
+link_ping_echo_secret: ""
+link_ping_echo_secret_old: ""   # only during a rotation
+link_ping_metrics_user: ""
+link_ping_metrics_pass: ""
+
+# Install locations.
+link_ping_install_dir: "/usr/local/bin"  # Linux; Windows overrides below
+link_ping_windows_install_dir: 'C:\Program Files\LinkPing'
+link_ping_log_dir: "/var/log/link-ping"
