@@ -20,6 +20,8 @@ degrading?" — it is not a proxy for what TCP applications experience.
 - [Metrics](#metrics)
 - [PromQL Examples](#promql-examples)
 - [Alert Rules File](#alert-rules-file)
+- [Deployment (Ansible)](#deployment-ansible)
+- [Grafana Alloy Scraping](#grafana-alloy-scraping)
   - [Quick Reference](#quick-reference)
   - [Link Packet Loss](#link-packet-loss)
   - [Latency](#latency)
@@ -551,6 +553,15 @@ Note: In client/both mode, use an absolute path for `-targets` (e.g., `-targets=
 sudo systemctl daemon-reload
 sudo systemctl enable --now link_ping_prometheus
 ```
+
+## Deployment (Ansible)
+
+For fleets, `deploy/ansible/playbook.yml` deploys the pre-built binary
+and service definition to remote Linux (systemd, using the shipped
+hardened unit above) and Windows (SCM via `sc.exe`, with the same
+failure-recovery ladder as `main.go`) hosts. Secrets are delivered via
+the service environment on both platforms — never service arguments.
+See `deploy/ansible/README.md` for prerequisites and usage.
 
 ## Grafana Dashboard
 
