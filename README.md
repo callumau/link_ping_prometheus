@@ -416,6 +416,7 @@ link_ping_prometheus -mode=<mode> [flags]
 | `-interval` | `500ms` | Client: probe interval (warns if `>= -timeout`; probes will queue) |
 | `-timeout` | `1s` | Client: Base/initial probe timeout (with `-adaptive=false` warns if `<200ms`; spurious loss on moderate-RTT links) |
 | `-reconnect-interval` | `5m` | Client: How long to keep a UDP socket before re-dialing for DNS re-resolution (0 means use default 5m via global; must be `>= -interval` or an error; set e.g. `24h` to effectively disable) |
+| `-dscp` | `0` | Client: DSCP value 0-63 marked on probe packets (e.g. 46 = EF) so QoS-managed networks class them accordingly. 0 = unmarked (default). Best effort, requires OS support (Linux). |
 | `-adaptive` | `true` | Enable adaptive RTO based on link quality. With `false`, the fixed `-timeout` applies: links whose true RTT exceeds it read as 100% loss with no warning — pick a timeout comfortably above expected RTT |
 | `-source` | `""` | Source label applied to every metric series, e.g. the local site or datacenter (`sydney-dc`) (defaults to hostname) |
 | `-metrics-user` | `""` | Basic auth username for /metrics (empty = disabled; env `LINK_PING_METRICS_USER`) |

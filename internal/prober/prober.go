@@ -68,6 +68,10 @@ type Config struct {
 	// re-dialing for DNS re-resolution. Zero means use the global
 	// ReconnectInterval var (test compat).
 	ReconnectInterval time.Duration
+	// DSCP, when 1-63, marks probe packets with that traffic class
+	// (e.g. 46 = EF) so QoS-managed networks class them accordingly.
+	// 0 (default) leaves packets unmarked. Best effort, Linux support.
+	DSCP int
 	// Status, when non-nil, receives a live per-target snapshot each
 	// probe interval for the /status debug endpoint. Nil in server-only
 	// mode and unit tests (Update is nil-receiver-safe).
@@ -88,6 +92,9 @@ func (c Config) Validate() error {
 	}
 	if c.ReconnectInterval < 0 {
 		return fmt.Errorf("reconnect interval must be >= 0, got %v", c.ReconnectInterval)
+	}
+	if c.DSCP < 0 || c.DSCP > 63 {
+		return fmt.Errorf("dscp must be 0-63, got %d", c.DSCP)
 	}
 	if c.ReconnectInterval != 0 && c.ReconnectInterval < c.BaseInterval {
 		return fmt.Errorf("reconnect interval %v must be >= probe interval %v", c.ReconnectInterval, c.BaseInterval)
