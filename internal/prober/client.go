@@ -211,6 +211,7 @@ type targetMetrics struct {
 	jitter   prometheus.Gauge
 	linkUp   prometheus.Gauge
 	rto      prometheus.Gauge
+	srtt     prometheus.Gauge
 }
 
 // newTargetMetrics resolves (and thereby creates) the metric series for
@@ -224,6 +225,7 @@ func newTargetMetrics(source string, t Target) targetMetrics {
 		jitter:   JitterSeconds.WithLabelValues(source, t.Name, t.Address),
 		linkUp:   LinkUp.WithLabelValues(source, t.Name, t.Address),
 		rto:      RTOEstimate.WithLabelValues(source, t.Name, t.Address),
+		srtt:     SRTTSeconds.WithLabelValues(source, t.Name, t.Address),
 	}
 }
 
@@ -590,6 +592,7 @@ func runEchoLoop(
 				if cfg.Adaptive {
 					// pi-lens-ignore: gorm-n-plus-one
 					stats.Update(rttSec)
+					m.srtt.Set(stats.SRTT().Seconds())
 				}
 				state.consecutiveMisses = 0
 				m.linkUp.Set(1)
