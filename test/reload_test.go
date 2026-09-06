@@ -4,7 +4,6 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-	"syscall"
 	"testing"
 	"time"
 
@@ -81,7 +80,7 @@ func TestRunClient_ReloadAddsRemovesTargets(t *testing.T) {
 
 	// Reload: A out, B in.
 	writeTargets("reload_b")
-	hup <- syscall.SIGUSR1
+	hup <- os.Interrupt
 	waitFor(func() bool { return getCounterValue(prober.ProbesSent, "reload_b", addrB) >= 2 }, "new target probed after reload")
 
 	// A must have stopped: sample its sent counter across a window and
@@ -100,7 +99,7 @@ func TestRunClient_ReloadAddsRemovesTargets(t *testing.T) {
 	if err := os.WriteFile(targetsFile, []byte("{not json"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	hup <- syscall.SIGUSR1
+	hup <- os.Interrupt
 	time.Sleep(300 * time.Millisecond)
 	b1 := getCounterValue(prober.ProbesSent, "reload_b", addrB)
 	time.Sleep(400 * time.Millisecond)
@@ -111,7 +110,7 @@ func TestRunClient_ReloadAddsRemovesTargets(t *testing.T) {
 
 	// Reload back to A: B stops, A resumes.
 	writeTargetsFile(t, targetsFile, "reload_c_a", addrA)
-	hup <- syscall.SIGUSR1
+	hup <- os.Interrupt
 	waitFor(func() bool { return getCounterValue(prober.ProbesSent, "reload_c_a", addrA) >= 2 }, "re-added target probed")
 }
 
