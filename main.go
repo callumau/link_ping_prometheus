@@ -503,6 +503,10 @@ func (p *program) run() error {
 			return err
 		}
 	}
+	// Live per-target state for the /status debug endpoint. Always
+	// registered so server-only mode still serves an empty list.
+	statusReg := prober.NewStatusRegistry()
+	cfg.Status = statusReg
 
 	// Resolve source for server metrics; defaults to hostname and is validated.
 	// For client/both modes cfg.Source already holds the effective source (via buildConfig).
@@ -554,6 +558,10 @@ func (p *program) run() error {
 	})
 	mx.Handle("/healthz", healthzHandler)
 	mx.Handle("/readyz", healthzHandler)
+	// /status exposes live per-target probe state (link_up, inflight,
+	// misses, RTO, socket age). Gated like /metrics: open only when no
+	// metrics auth is configured.
+	mx.Handle("/status", prober.MetricsAuth(user, pass, statusReg.Handler()))
 	metricsSrv := &http.Server{
 		Handler:      mx,
 		ReadTimeout:  10 * time.Second,

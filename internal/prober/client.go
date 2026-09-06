@@ -213,6 +213,10 @@ type targetMetrics struct {
 	linkUp   prometheus.Gauge
 	rto      prometheus.Gauge
 	srtt     prometheus.Gauge
+	// name/addr label the /status snapshot; status receives it (nil-safe).
+	name   string
+	addr   string
+	status *StatusRegistry
 }
 
 // newTargetMetrics resolves (and thereby creates) the metric series for
@@ -228,6 +232,8 @@ func newTargetMetrics(source string, t Target) targetMetrics {
 		linkUp:   LinkUp.WithLabelValues(source, t.Name, t.Address),
 		rto:      RTOEstimate.WithLabelValues(source, t.Name, t.Address),
 		srtt:     SRTTSeconds.WithLabelValues(source, t.Name, t.Address),
+		name:     t.Name,
+		addr:     t.Address,
 	}
 }
 
@@ -262,6 +268,11 @@ type probeLoopState struct {
 	prevRTT           float64
 	prevSeq           uint64
 	havePrev          bool
+	// linkUp mirrors the link_up gauge for the /status snapshot (set at
+	// the same sites as the gauge); socketStart is the current socket's
+	// dial time for the age readout.
+	linkUp      bool
+	socketStart time.Time
 }
 
 // probeTarget runs the UDP probe loop for a single target until ctx is
@@ -283,6 +294,7 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 	logger := slog.With("target", t.Name, "address", t.Address)
 	stats := NewAdaptiveStats(effectiveCfg.BaseTimeout)
 	m := newTargetMetrics(cfg.Source, t)
+	m.status = cfg.Status
 	state := &probeLoopState{}
 	cfg = effectiveCfg
 	// Throttle dial-failure logging: first failure logs immediately, then
@@ -304,6 +316,18 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 			// would keep showing a stale link_up=1 across a prolonged
 			// DNS/interface outage. Probing is structurally impossible here.
 			m.linkUp.Set(0)
+			state.linkUp = false
+			// Record the stuck-dialing state so /status shows targets that
+			// cannot even open a socket (DNS outage, firewall).
+			m.status.Update(TargetStatus{
+				Name:              t.Name,
+				Address:           t.Address,
+				ConsecutiveMisses: state.consecutiveMisses,
+				RTOSeconds:        stats.CurrentRTO().Seconds(),
+				JitterSeconds:     state.jitter,
+				SRTTSeconds:       stats.SRTT().Seconds(),
+				LastSeq:           state.seq,
+			})
 			// A DNS outage retries every second; log the first failure
 			// immediately, then at most once per minute so an Error-level
 			// message does not flood the log for the duration of the outage.
@@ -323,6 +347,8 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 			}
 			continue
 		}
+
+		state.socketStart = time.Now()
 
 		// runEchoLoop recovers panics and returns them as errors; a
 		// panic is per-event corruption, not a link condition, so the
@@ -598,6 +624,7 @@ func runEchoLoop(
 				}
 				state.consecutiveMisses = 0
 				m.linkUp.Set(1)
+				state.linkUp = true
 			default:
 				break Drain
 			}
@@ -634,7 +661,24 @@ func runEchoLoop(
 		// state (enterprise health-check convention).
 		if state.consecutiveMisses >= LinkUpMissThreshold {
 			m.linkUp.Set(0)
+			state.linkUp = false
 		}
+
+		// Refresh the /status snapshot once per interval (nil-safe when
+		// no registry is wired).
+		m.status.Update(TargetStatus{
+			Name:              m.name,
+			Address:           m.addr,
+			LinkUp:            state.linkUp,
+			SendFailures:      writeFails,
+			Pending:           len(pending),
+			ConsecutiveMisses: state.consecutiveMisses,
+			RTOSeconds:        timeout.Seconds(),
+			JitterSeconds:     state.jitter,
+			SRTTSeconds:       stats.SRTT().Seconds(),
+			LastSeq:           state.seq,
+			SocketAgeSeconds:  time.Since(state.socketStart).Seconds(),
+		})
 
 		// Reconnect to re-resolve DNS once the socket has lived long
 		// enough. Normally the pending set is empty here, but when the
@@ -696,6 +740,7 @@ func runEchoLoop(
 				logger.Error("Persistent UDP write failures; marking link down",
 					"consecutive_failures", writeFails, "err", err)
 				m.linkUp.Set(0)
+				state.linkUp = false
 			}
 			continue
 		}

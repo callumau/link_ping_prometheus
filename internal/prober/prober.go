@@ -68,6 +68,10 @@ type Config struct {
 	// re-dialing for DNS re-resolution. Zero means use the global
 	// ReconnectInterval var (test compat).
 	ReconnectInterval time.Duration
+	// Status, when non-nil, receives a live per-target snapshot each
+	// probe interval for the /status debug endpoint. Nil in server-only
+	// mode and unit tests (Update is nil-receiver-safe).
+	Status *StatusRegistry
 }
 
 // Validate checks that at least one target is present and that all
