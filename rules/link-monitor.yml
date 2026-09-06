@@ -1,0 +1,129 @@
+---
+# Prometheus rules for link_ping_prometheus.
+#
+# Wire in (prometheus.yml):
+#   rule_files:
+#     - /etc/prometheus/rules/link-monitor.yml
+#
+# The recording rules pre-compute the loss/latency expressions from the
+# README so dashboards and alerts share one definition. Every rate()
+# window matches between numerator and denominator — mismatched windows
+# read wrong across restarts and scrape gaps.
+
+groups:
+  - name: link-monitor.rules
+    interval: 30s
+    rules:
+      - record: link:loss_ratio
+        expr: |
+          100 * rate(link_probes_timed_out_total[5m])
+              / rate(link_probes_sent_total[5m])
+      - record: link:rtt_seconds_p50
+        expr: histogram_quantile(0.50, rate(link_rtt_seconds_bucket[5m]))
+      - record: link:rtt_seconds_p90
+        expr: histogram_quantile(0.90, rate(link_rtt_seconds_bucket[5m]))
+      - record: link:rtt_seconds_p99
+        expr: histogram_quantile(0.99, rate(link_rtt_seconds_bucket[5m]))
+      - record: link:mean_rtt_seconds
+        expr: |
+          rate(link_rtt_seconds_sum[5m])
+              / rate(link_rtt_seconds_count[5m])
+
+  - name: link-monitor.alerts
+    rules:
+      - alert: LinkDown
+        expr: link_up == 0
+        for: 5m
+        labels:
+          severity: critical
+          component: connectivity
+        annotations:
+          summary: >-
+            Link {{ $labels.target }} ({{ $labels.address }}) is DOWN
+            from {{ $labels.source }}
+          description: >-
+            No echo for 5+ minutes. The target is unreachable or so
+            degraded that probes no longer complete. Check the remote
+            echo server and the path between them.
+
+      - alert: HighPacketLoss
+        expr: link:loss_ratio > 5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            Sustained packet loss on {{ $labels.target }} from
+            {{ $labels.source }} ({{ $value | humanize }}%)
+          description: >-
+            True network loss (UDP, no retransmission) above 5% for
+            10 minutes. The link is degraded but not fully down.
+
+      - alert: SeverePacketLoss
+        expr: link:loss_ratio > 20
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: >-
+            Severe packet loss on {{ $labels.target }} from
+            {{ $labels.source }} ({{ $value | humanize }}%)
+          description: >-
+            True network loss above 20% for 5 minutes. Treat as an
+            outage-level link fault even if link_up is still 1.
+
+      - alert: LinkProbeStall
+        expr: link_probes_inflight > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            Probes stuck in flight on {{ $labels.target }} from
+            {{ $labels.source }}
+          description: >-
+            Probes sent but never matched or timed out for 15m — the
+            probe loop or socket is stalled. Loss and RTT readings
+            from this target are unreliable until resolved.
+
+      - alert: ClientSendErrors
+        expr: rate(link_probes_send_errors_total[10m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            Local UDP send failures on {{ $labels.source }} for
+            {{ $labels.target }}
+          description: >-
+            Probes are failing to leave the host (NIC/socket problem),
+            not being lost on the wire. These do not count as network
+            loss but degrade measurement completeness.
+
+      - alert: ServerDropsObserved
+        expr: rate(link_server_probes_dropped_total[10m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            Echo server dropping probes from {{ $labels.client }}
+          description: >-
+            The echo server rejected probes (reason label distinguishes
+            allowlist / rate_ip / rate_global / size / magic / hmac /
+            replay). Check for secret or NTP misconfiguration and rate
+            cap tuning before blaming the network.
+
+      - alert: ClockSkewApproaching
+        expr: abs(link_server_clock_skew_seconds) > 25
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            Clock skew approaching replay window for client
+            {{ $labels.client }}
+          description: >-
+            Observed skew is within 5s of the 30s replay window. NTP
+            drift will soon cause valid probes to be rejected as
+            replays. Resynchronize clocks on the client.
