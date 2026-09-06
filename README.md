@@ -426,7 +426,7 @@ link_ping_prometheus -mode=<mode> [flags]
 | `-dscp` | `0` | Client: DSCP value 0-63 marked on probe packets (e.g. 46 = EF) so QoS-managed networks class them accordingly. 0 = unmarked (default). Best effort, requires OS support (Linux). |
 | `-payload` | `0` | Client: probe payload bytes beyond the 24/32-byte header (up to 1400), filled with a deterministic pattern and validated byte-for-byte on echo. Corruption counts in `link_probes_corrupted_total` — distinct from loss. Detects MTU/data-path corruption a small probe cannot see. |
 | `-targets-reload-interval` | `0` | Client: poll the `-targets` file at this interval and apply changes without a restart (0 disables; SIGHUP also reloads on Unix; Windows services need this flag to reload) |
-| `-mtu-sweep` | `1m` | Client: periodically sweep DF-set probe sizes to find the largest frame the path carries (`link_path_mtu_bytes`, `/status path_mtu_bytes`). 0 disables. Linux and Windows 10+ (older Windows fails the socket option; the sweep disables itself with a one-time warning). Separate counters — never in the loss ratio. |
+| `-mtu-sweep` | `1m` | Client: periodically sweep DF-set probe sizes to find the largest frame the path carries (`link_path_mtu_bytes`, `/status path_mtu_bytes`). 0 disables. Linux, and Windows for IPv4 targets on any Windows Server (2003+ via the DF flag; Server 2019+/Win10 1703+ use full path-MTU discovery); IPv6 targets need Server 2019+/Win10 1703+. Unsupported socket options disable just the sweep with a one-time warning. Separate counters — never in the loss ratio. |
 | `-adaptive` | `true` | Enable adaptive RTO based on link quality. With `false`, the fixed `-timeout` applies: links whose true RTT exceeds it read as 100% loss with no warning — pick a timeout comfortably above expected RTT |
 | `-source` | `""` | Source label applied to every metric series, e.g. the local site or datacenter (`sydney-dc`) (defaults to hostname) |
 | `-metrics-user` | `""` | Basic auth username for /metrics (empty = disabled; env `LINK_PING_METRICS_USER`) |
@@ -442,6 +442,8 @@ link_ping_prometheus -mode=<mode> [flags]
 | `-svc` | `""` | Windows service action: `install`, `uninstall`, `start`, `stop`, `run` |
 | `-echo-secret` | `""` | HMAC secret authenticating UDP probes (env `LINK_PING_ECHO_SECRET`; must be set on both client and server; expands the wire frame to 32 bytes, see [Wire Protocol](#wire-protocol)) |
 | `-echo-secret-old` | `""` | Server: previous HMAC secret still accepted during a zero-downtime rotation, alongside `-echo-secret` (env `LINK_PING_ECHO_SECRET_OLD`; server side only) |
+
+**Why MTU discovery (`-mtu-sweep`) matters:** 24-byte probes prove a path *exists* — they cannot prove it *carries full-size traffic*. VPN tunnels, PPPoE/GRE/VXLAN overlays and broken PMTUD routinely pass small packets while black-holing full-size ones — the classic "monitor says healthy, users say broken" failure. The sweep DF-marks probes on a dedicated socket, binary-searches the largest frame that round-trips, and publishes it as `link_path_mtu_bytes`; a shrinking gauge (or rising `link_mtu_probes_lost_total` while `link_up` stays 1) is that failure's signature. It needs no ICMP and no extra firewall rules, uses separate counters that never enter the loss ratio, and is on by default (1m; `0` disables). Alert on the gauge dropping below its own baseline: `link_path_mtu_bytes < max_over_time(link_path_mtu_bytes[24h])`.
 
 Liveness endpoints `GET /healthz` and `GET /readyz` on the same metrics listener return `200 ok` (`text/plain`) unauthenticated, for Kubernetes/container probes. `/metrics` remains protected by Basic Auth/TLS when configured; the health endpoints are never auth-gated and are available over both HTTP and HTTPS.
 
@@ -508,6 +510,8 @@ link_ping_prometheus.exe -mode=both -targets=targets.json -metrics=":2112" -log-
 - **Delayed auto-start** with dependencies on `Tcpip` (sockets) and `W32Time` (time sync — the HMAC replay window requires roughly NTP-synchronized clocks between nodes).
 - **Lifecycle events in the Windows Event Log** (Application source `link_ping_prometheus`): start, stop, and fatal errors are visible even with no access to the log file.
 - **Credentials never persisted** into the service configuration.
+
+**Windows Server version support:** the agent runs as a service on any Windows the Go runtime supports; SCM recovery, log rotation, HMAC and the UDP echo path have no version-specific requirements. The optional `-mtu-sweep` DF discovery supports IPv4 targets on every Windows Server version (Server 2003+ via the classic `IP_DONTFRAGMENT` option, falling back from the richer `IP_MTU_DISCOVER` path-MTU option available on Server 2019+/Windows 10 1703+); IPv6 targets need Windows Server 2019+ (or Windows 10 1703+). On Windows versions lacking a needed option the sweep alone disables itself with a one-time warning — probing is unaffected.
 
 **Enterprise deployment checklist:**
 
