@@ -153,3 +153,13 @@ func validHMAC(key string, seq, ts uint64, tag []byte) bool {
 	expected := computeHMAC(key, seq, ts)
 	return hmac.Equal(expected[:], tag)
 }
+
+// validHMACAny reports whether the tag matches the primary secret or,
+// during a zero-downtime rotation, the previous secret. secretOld is
+// empty when no rotation is in progress. Constant-time per attempt.
+func validHMACAny(secret, secretOld string, seq, ts uint64, tag []byte) bool {
+	if validHMAC(secret, seq, ts, tag) {
+		return true
+	}
+	return secretOld != "" && validHMAC(secretOld, seq, ts, tag)
+}

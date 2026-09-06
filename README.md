@@ -431,6 +431,7 @@ link_ping_prometheus -mode=<mode> [flags]
 | `-log-file-max-age` | `28` | Max days to keep rotated log files |
 | `-svc` | `""` | Windows service action: `install`, `uninstall`, `start`, `stop`, `run` |
 | `-echo-secret` | `""` | HMAC secret authenticating UDP probes (env `LINK_PING_ECHO_SECRET`; must be set on both client and server; expands the wire frame to 32 bytes, see [Wire Protocol](#wire-protocol)) |
+| `-echo-secret-old` | `""` | Server: previous HMAC secret still accepted during a zero-downtime rotation, alongside `-echo-secret` (env `LINK_PING_ECHO_SECRET_OLD`; server side only) |
 
 Liveness endpoints `GET /healthz` and `GET /readyz` on the same metrics listener return `200 ok` (`text/plain`) unauthenticated, for Kubernetes/container probes. `/metrics` remains protected by Basic Auth/TLS when configured; the health endpoints are never auth-gated and are available over both HTTP and HTTPS.
 
@@ -613,6 +614,15 @@ DNS failure at startup is retried, not fatal.
   timestamp is older or newer than ~30 seconds, so a captured probe cannot be
   replayed indefinitely with a spoofed source. This means both nodes must have
   roughly synchronized clocks — NTP is recommended on monitoring endpoints.
+- Secret rotation without an outage: with the old secret in the service
+  environment of every endpoint, restart the SERVERS with
+  `-echo-secret=<new>` plus `-echo-secret-old=<old>` (or
+  `LINK_PING_ECHO_SECRET` + `LINK_PING_ECHO_SECRET_OLD`) so frames from
+  clients still on either secret are accepted. Then restart the clients
+  with `-echo-secret=<new>`. Finally remove `-echo-secret-old` from the
+  servers — any frame failing both secrets still counts in
+  `link_server_probes_dropped_total{reason="hmac"}` so a half-rotated
+  fleet is visible in metrics.
 - UDP is not amplification-prone (echo is the same size as the request)
   and carries no state, but any internet-facing echo endpoint should be
   firewall-restricted to known monitoring sites.

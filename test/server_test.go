@@ -468,6 +468,72 @@ func TestServer_HMACAuth(t *testing.T) {
 	}
 }
 
+// TestServer_HMACRotation: during a zero-downtime rotation the server
+// accepts frames authenticated under either the new or the previous
+// secret; an unknown secret is still dropped.
+// pi-lens-ignore: go-test-functions
+func TestServer_HMACRotation(t *testing.T) {
+	prober.InitMetrics()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const newSecret = "test-secret-new"
+	const oldSecret = "test-secret"
+
+	pc := listenUDP(t, ctx)
+	done := make(chan struct{})
+	go func() {
+		prober.ServePacketConn(ctx, pc, testSource, testAllow, newSecret, oldSecret)
+		close(done)
+	}()
+	t.Cleanup(func() { <-done })
+	addr := pc.LocalAddr().String()
+
+	conn, err := net.Dial("udp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	now := uint64(time.Now().UnixNano())
+	send := func(frame []byte) int {
+		conn.Write(frame)
+		conn.SetReadDeadline(time.Now().Add(400 * time.Millisecond))
+		n, _ := conn.Read(make([]byte, 1500))
+		return n
+	}
+
+	if n := send(buildHMACFrame(oldSecret, 1, now)); n != prober.PayloadSizeWithHMAC {
+		t.Errorf("old-secret frame must still be echoed during rotation, got %d bytes", n)
+	}
+	if n := send(buildHMACFrame(newSecret, 2, now)); n != prober.PayloadSizeWithHMAC {
+		t.Errorf("new-secret frame must be echoed, got %d bytes", n)
+	}
+	if n := send(buildHMACFrame("test-secret-unknown", 3, now)); n != 0 {
+		t.Errorf("unknown-secret frame must be dropped, got %d bytes", n)
+	}
+
+	// Without the rotation secret configured, an old-secret frame is a
+	// plain hmac drop again.
+	pc2 := listenUDP(t, ctx)
+	done2 := make(chan struct{})
+	go func() {
+		prober.ServePacketConn(ctx, pc2, testSource, testAllow, newSecret)
+		close(done2)
+	}()
+	t.Cleanup(func() { <-done2 })
+	conn2, err := net.Dial("udp", pc2.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn2.Close()
+	conn2.Write(buildHMACFrame(oldSecret, 4, uint64(time.Now().UnixNano())))
+	conn2.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if n, _ := conn2.Read(make([]byte, 1500)); n != 0 {
+		t.Errorf("old-secret frame without -echo-secret-old must be dropped, got %d bytes", n)
+	}
+}
+
 // TestServer_PerIPRateLimitResumesNextWindow: exhausting the per-IP
 // budget must be temporary — probes resume once the fixed window ticks
 // over, so one burst cannot permanently starve a legitimate prober.

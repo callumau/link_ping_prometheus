@@ -74,6 +74,7 @@ var (
 	flMetricsTLSKey        = flag.String("metrics-tls-key", "", "Metrics: TLS private key file (requires -metrics-tls-cert)")
 	flMetricsAllowInsecure = flag.Bool("metrics-allow-insecure", false, "Metrics: allow Basic Auth over plaintext HTTP (otherwise requires TLS when auth is set)")
 	flEchoSecret           = flag.String("echo-secret", "", "Wire: HMAC secret for UDP echo authentication (env LINK_PING_ECHO_SECRET; mitigates reflector spoof when set on both client and server)")
+	flEchoSecretOld       = flag.String("echo-secret-old", "", "Wire: previous HMAC secret, still accepted by the SERVER during a zero-downtime rotation alongside -echo-secret (env LINK_PING_ECHO_SECRET_OLD; server side only)")
 )
 
 // flagDefaultInt returns the registered default value of an int flag so
@@ -165,6 +166,15 @@ func resolveEchoSecret() string {
 		return *flEchoSecret
 	}
 	return os.Getenv("LINK_PING_ECHO_SECRET")
+}
+
+// resolveEchoSecretOld returns the rotation-previous echo HMAC secret
+// from flag or env. Empty when no rotation is in progress.
+func resolveEchoSecretOld() string {
+	if *flEchoSecretOld != "" {
+		return *flEchoSecretOld
+	}
+	return os.Getenv("LINK_PING_ECHO_SECRET_OLD")
 }
 
 func sanitizeHostname(s string) string {
@@ -323,7 +333,7 @@ func handleService(action string) {
 		// are never persisted into the service configuration; they must be
 		// configured via env LINK_PING_METRICS_USER/PASS and LINK_PING_ECHO_SECRET.
 		flag.Visit(func(f *flag.Flag) {
-			if f.Name != "svc" && f.Name != "metrics-user" && f.Name != "metrics-pass" && f.Name != "echo-secret" {
+			if f.Name != "svc" && f.Name != "metrics-user" && f.Name != "metrics-pass" && f.Name != "echo-secret" && f.Name != "echo-secret-old" {
 				v := f.Value.String()
 				switch f.Name {
 				case "targets", "metrics-tls-cert", "metrics-tls-key", "log-file", "log-file-max-mb", "log-file-max-backups", "log-file-max-age":
@@ -347,6 +357,10 @@ func handleService(action string) {
 		if *flEchoSecret != "" {
 			fmt.Println("WARNING: -echo-secret is NOT persisted into the service configuration.")
 			fmt.Println("Configure LINK_PING_ECHO_SECRET in the service environment instead.")
+		}
+		if *flEchoSecretOld != "" {
+			fmt.Println("WARNING: -echo-secret-old is NOT persisted into the service configuration.")
+			fmt.Println("Configure LINK_PING_ECHO_SECRET_OLD in the service environment instead.")
 		}
 		if *flLogFile == "" {
 			// stdout is discarded under the service: without -log-file every
@@ -590,11 +604,12 @@ func (p *program) run() error {
 	}()
 
 	echoSecret := resolveEchoSecret()
+	echoSecretOld := resolveEchoSecretOld()
 	mode := *flMode
 	var modeErr error
 	switch mode {
 	case "server":
-		modeErr = prober.RunServer(p.ctx, *flListen, sourceForServer, allow, echoSecret)
+		modeErr = prober.RunServer(p.ctx, *flListen, sourceForServer, allow, echoSecret, echoSecretOld)
 	case "client":
 		modeErr = prober.RunClient(p.ctx, cfg)
 	case "both":
@@ -606,7 +621,7 @@ func (p *program) run() error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := prober.RunServer(modeCtx, *flListen, sourceForServer, allow, echoSecret); err != nil {
+			if err := prober.RunServer(modeCtx, *flListen, sourceForServer, allow, echoSecret, echoSecretOld); err != nil {
 				// A server that fails to start (e.g. port already in
 				// use) is fatal in both mode: cancelling the client too
 				// fails fast instead of probing silently without an
