@@ -205,6 +205,7 @@ func RunClient(ctx context.Context, cfg Config) error {
 // The handles stay valid for the lifetime of the probe loop.
 type targetMetrics struct {
 	sent     prometheus.Counter
+	sendErr  prometheus.Counter
 	timedOut prometheus.Counter
 	inflight prometheus.Gauge
 	rtt      prometheus.Observer
@@ -219,6 +220,7 @@ type targetMetrics struct {
 func newTargetMetrics(source string, t Target) targetMetrics {
 	return targetMetrics{
 		sent:     ProbesSent.WithLabelValues(source, t.Name, t.Address),
+		sendErr:  SendErrors.WithLabelValues(source, t.Name, t.Address),
 		timedOut: ProbesTimedOut.WithLabelValues(source, t.Name, t.Address),
 		inflight: ProbesInflight.WithLabelValues(source, t.Name, t.Address),
 		rtt:      RTTSeconds.WithLabelValues(source, t.Name, t.Address),
@@ -684,6 +686,7 @@ func runEchoLoop(
 		// matching inflight unit, so any exit-path flush balances).
 		if _, err := conn.Write(buf); err != nil {
 			writeFails++
+			m.sendErr.Inc()
 			if writeFails == maxConsecutiveWriteFails {
 				// Sustained local write failures mean nothing is being
 				// probed while consecutiveMisses stays frozen — the worst
