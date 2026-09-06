@@ -171,8 +171,10 @@ func (r *rateLimiter) allowWithReason(ip string) (bool, string) {
 // not retransmit. Blocks until ctx is cancelled, then closes the socket.
 // When echoSecret is non-empty, probes must be 32 bytes with HMAC; this
 // mitigates reflector spoofing where static magic alone allows off-path
-// 1:1 reflect to a victim allowlisted IP.
-func RunServer(ctx context.Context, addr string, source string, allowed *Allowlist, echoSecret string) error {
+// 1:1 reflect to a victim allowlisted IP. During a rotation,
+// echoSecretOld (when non-empty) is also accepted so clients can switch
+// secrets one endpoint at a time.
+func RunServer(ctx context.Context, addr string, source string, allowed *Allowlist, echoSecret string, echoSecretOld ...string) error {
 	if allowed.Len() == 0 {
 		return errors.New("server requires a non-empty client allowlist (-allow); fail-closed")
 	}
@@ -187,7 +189,7 @@ func RunServer(ctx context.Context, addr string, source string, allowed *Allowli
 		pc.Close()
 	}()
 
-	if err := ServePacketConn(ctx, pc, source, allowed, echoSecret); err != nil {
+	if err := ServePacketConn(ctx, pc, source, allowed, echoSecret, echoSecretOld...); err != nil {
 		return err
 	}
 	return nil
@@ -207,7 +209,9 @@ func RunServer(ctx context.Context, addr string, source string, allowed *Allowli
 // When echoSecret is non-empty, only 32-byte HMAC-authenticated datagrams
 // with a fresh timestamp are accepted; this mitigates reflector spoofing
 // (SEC22). When empty, 24-byte backward-compatible datagrams are accepted.
-func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allowed *Allowlist, echoSecret string) (retErr error) {
+// During a rotation, echoSecretOld (when set) is also accepted so clients
+// can switch to the new secret one endpoint at a time.
+func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allowed *Allowlist, echoSecret string, echoSecretOld ...string) (retErr error) {
 	defer func() {
 		if r := recover(); r != nil {
 			retErr = fmt.Errorf("echo server panic: %v", r)
@@ -314,9 +318,13 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 			h = res
 		}
 		if echoSecret != "" {
+			oldSecret := ""
+			if len(echoSecretOld) > 0 {
+				oldSecret = echoSecretOld[0]
+			}
 			seq := binary.LittleEndian.Uint64(buf[8:16])
 			ts := binary.LittleEndian.Uint64(buf[16:24])
-			if !validHMAC(echoSecret, seq, ts, buf[24:32]) {
+			if !validHMACAny(echoSecret, oldSecret, seq, ts, buf[24:32]) {
 				ServerProbesDropped.WithLabelValues(source, "hmac").Inc()
 				continue
 			}
