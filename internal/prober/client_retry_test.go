@@ -66,8 +66,10 @@ func TestProbeTargetRetriesOnDialFailure(t *testing.T) {
 // send-failure path deterministically (no real socket needed).
 type failingConn struct{}
 
-func (failingConn) Read([]byte) (int, error)         { return 0, net.ErrClosed }
-func (failingConn) Write([]byte) (int, error)        { return 0, errors.New("write udp: operation not permitted") }
+func (failingConn) Read([]byte) (int, error) { return 0, net.ErrClosed }
+func (failingConn) Write([]byte) (int, error) {
+	return 0, errors.New("write udp: operation not permitted")
+}
 func (failingConn) Close() error                     { return nil }
 func (failingConn) LocalAddr() net.Addr              { return nil }
 func (failingConn) RemoteAddr() net.Addr             { return nil }
