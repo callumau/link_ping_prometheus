@@ -70,6 +70,7 @@ var (
 
 	flPayload       = flag.Int("payload", 0, "Client: probe payload bytes beyond the 24/32-byte header (up to 1400), filled with a deterministic pattern and validated on echo; corruption is counted in link_probes_corrupted_total, distinct from loss")
 	flTargetsReload = flag.Duration("targets-reload-interval", 0, "Client: poll the -targets file at this interval and apply changes without a restart (0 disables; SIGHUP also reloads on Unix; Windows services need this flag to reload)")
+	flMTUSweep      = flag.Duration("mtu-sweep", time.Minute, "Client: periodically sweep DF-set probe sizes per target to find the largest frame the path carries (0 disables; Linux only; results in link_path_mtu_bytes and /status; separate counters, never in the loss ratio)")
 
 	flMetricsBasicAuthUser = flag.String("metrics-user", "", "Metrics: Basic auth username (empty disables auth; env LINK_PING_METRICS_USER)")
 	flMetricsBasicAuthPass = flag.String("metrics-pass", "", "Metrics: Basic auth password (env LINK_PING_METRICS_PASS; prefer env over CLI to avoid ps exposure)")
@@ -263,6 +264,7 @@ func buildConfig() (prober.Config, error) {
 		ReconnectInterval: *flReconnectInterval,
 		DSCP:              *flDSCP,
 		Payload:           *flPayload,
+		MTUSweep:          *flMTUSweep,
 	}
 	return cfg, nil
 }

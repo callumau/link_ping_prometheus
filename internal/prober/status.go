@@ -22,6 +22,11 @@ type TargetStatus struct {
 	SRTTSeconds       float64 `json:"srtt_seconds"`
 	LastSeq           uint64  `json:"last_seq"`
 	SocketAgeSeconds  float64 `json:"socket_age_seconds"`
+	// PathMTUBytes is the largest DF frame the MTU sweep proved
+	// round-trips; 0 = no successful sweep yet. LastEchoAgeSeconds is
+	// seconds since the last matched echo, -1 when none has arrived.
+	PathMTUBytes       int     `json:"path_mtu_bytes"`
+	LastEchoAgeSeconds float64 `json:"last_echo_age_seconds"`
 }
 
 // StatusRegistry collects per-target live state from the probe loops.

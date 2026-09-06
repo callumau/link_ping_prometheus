@@ -110,6 +110,9 @@ The exporter exposes the following metrics at `/metrics` (default port 2112).
 | `link_probes_sent_total` | Counter | `source`, `target`, `address` | Total UDP probes sent. Probes into a down link still count as sent and time out naturally, so loss reads ~100% during an outage. |
 | `link_probes_timed_out_total` | Counter | `source`, `target`, `address` | Total probes with no echo within the RTO — true network loss. |
 | `link_probes_corrupted_total` | Counter | `source`, `target`, `address` | Probes whose echo came back with corrupted payload bytes (`-payload` mode only): magic, sequence and timestamp intact, data altered in flight. Data-path corruption, not loss — the round trip completed. |
+| `link_mtu_probes_sent_total` | Counter | `source`, `target`, `address` | DF-set probes sent by the periodic MTU sweep (`-mtu-sweep`). Deliberately separate from the main counters: never in the loss ratio or the sent/rtt/timed_out balance. |
+| `link_mtu_probes_lost_total` | Counter | `source`, `target`, `address` | DF-set MTU probes with no echo: sizes the path does not survive. Rising lost with healthy main probes = PMTUD blackhole (works-small-fails-big). |
+| `link_path_mtu_bytes` | Gauge | `source`, `target`, `address` | Largest probe frame (header + payload, excluding IP/UDP overhead) that round-trips with DF set; 0 until the first successful sweep. A full-size Ethernet path reads 1424. |
 | `link_probes_send_errors_total` | Counter | `source`, `target`, `address` | Probes that failed to send locally (UDP write errors). Never on the wire, so never in `link_probes_sent_total`; sustained rate means a local NIC/socket problem, not network loss. |
 | `link_probes_inflight` | Gauge | `source`, `target`, `address` | Current number of probes sent but waiting for a response or timeout. Grows during stalls. |
 | `link_rtt_seconds` | Histogram | `source`, `target`, `address` | RTT histogram with explicit buckets `{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 3.0}` s plus native histogram support (`NativeHistogramBucketFactor` 1.1). Buckets stop at 3s (the RTO cap): anything slower counts as loss, so higher buckets would never fill. |
@@ -423,6 +426,7 @@ link_ping_prometheus -mode=<mode> [flags]
 | `-dscp` | `0` | Client: DSCP value 0-63 marked on probe packets (e.g. 46 = EF) so QoS-managed networks class them accordingly. 0 = unmarked (default). Best effort, requires OS support (Linux). |
 | `-payload` | `0` | Client: probe payload bytes beyond the 24/32-byte header (up to 1400), filled with a deterministic pattern and validated byte-for-byte on echo. Corruption counts in `link_probes_corrupted_total` — distinct from loss. Detects MTU/data-path corruption a small probe cannot see. |
 | `-targets-reload-interval` | `0` | Client: poll the `-targets` file at this interval and apply changes without a restart (0 disables; SIGHUP also reloads on Unix; Windows services need this flag to reload) |
+| `-mtu-sweep` | `1m` | Client: periodically sweep DF-set probe sizes to find the largest frame the path carries (`link_path_mtu_bytes`, `/status path_mtu_bytes`). 0 disables. Linux only. Separate counters — never in the loss ratio. |
 | `-adaptive` | `true` | Enable adaptive RTO based on link quality. With `false`, the fixed `-timeout` applies: links whose true RTT exceeds it read as 100% loss with no warning — pick a timeout comfortably above expected RTT |
 | `-source` | `""` | Source label applied to every metric series, e.g. the local site or datacenter (`sydney-dc`) (defaults to hostname) |
 | `-metrics-user` | `""` | Basic auth username for /metrics (empty = disabled; env `LINK_PING_METRICS_USER`) |
@@ -441,7 +445,7 @@ link_ping_prometheus -mode=<mode> [flags]
 
 Liveness endpoints `GET /healthz` and `GET /readyz` on the same metrics listener return `200 ok` (`text/plain`) unauthenticated, for Kubernetes/container probes. `/metrics` remains protected by Basic Auth/TLS when configured; the health endpoints are never auth-gated and are available over both HTTP and HTTPS.
 
-`GET /status` on the same listener serves a JSON snapshot of live per-target probe state — `link_up`, in-flight probes, consecutive misses, send failures, RTO/SRTT, last sequence number, and socket age — for debugging a flapping target without log access. Unlike the health endpoints it is auth-gated exactly like `/metrics` (open only when no metrics auth is configured).
+`GET /status` on the same listener serves a JSON snapshot of live per-target probe state — `link_up`, in-flight probes, consecutive misses, send failures, RTO/SRTT, last sequence number, socket age, `path_mtu_bytes` (largest DF frame proven to round-trip; 0 = no successful sweep yet) and `last_echo_age_seconds` (-1 until the first echo) — for debugging a flapping target without log access. Unlike the health endpoints it is auth-gated exactly like `/metrics` (open only when no metrics auth is configured).
 
 Resource footprint: metric handles are resolved once per target at startup (no per-probe label lookups), and the Go heap is soft-capped at 128MB (`GOMEMLIMIT` env overrides) so RSS stays flat on long runs. For >100 targets set `GOMEMLIMIT=256MiB` (or higher) as a system environment variable and restart the service.
 
