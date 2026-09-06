@@ -31,6 +31,10 @@ var (
 		Name: "link_probes_timed_out_total",
 		Help: "Total probes with no echo within the RTO. Loss = rate(timed_out) / rate(sent). No TCP retransmission: this is true network loss.",
 	}, []string{"source", "target", "address"})
+	SendErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "link_probes_send_errors_total",
+		Help: "Total probes that failed to send locally (UDP write errors). They never reach the wire, so they are not counted in link_probes_sent_total; a sustained rate means a local NIC/socket problem, not network loss.",
+	}, []string{"source", "target", "address"})
 	ProbesInflight = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "link_probes_inflight",
 		Help: "Current number of probes sent but waiting for a response or timeout. Grows during stalls.",
@@ -92,7 +96,7 @@ var registerOnce sync.Once
 // Safe to call multiple times; registration happens exactly once.
 func InitMetrics() {
 	registerOnce.Do(func() {
-		prometheus.MustRegister(ProbesSent, ProbesTimedOut, ProbesInflight, RTTSeconds, JitterSeconds, LinkUp, RTOEstimate, SRTTSeconds, ServerProbesReceived, ServerProbesDropped, ServerClockSkew, BuildInfo)
+		prometheus.MustRegister(ProbesSent, ProbesTimedOut, SendErrors, ProbesInflight, RTTSeconds, JitterSeconds, LinkUp, RTOEstimate, SRTTSeconds, ServerProbesReceived, ServerProbesDropped, ServerClockSkew, BuildInfo)
 	})
 }
 
@@ -103,6 +107,7 @@ func SeedMetrics(source string, targets []Target) {
 	for _, t := range targets {
 		m := newTargetMetrics(source, t)
 		m.sent.Add(0)
+		m.sendErr.Add(0)
 		m.timedOut.Add(0)
 		m.inflight.Set(0)
 		m.linkUp.Set(0)
