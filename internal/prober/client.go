@@ -1,6 +1,7 @@
 package prober
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -204,15 +205,16 @@ func RunClient(ctx context.Context, cfg Config) error {
 // (and its mutex) on every probe event — the hottest path in the prober.
 // The handles stay valid for the lifetime of the probe loop.
 type targetMetrics struct {
-	sent     prometheus.Counter
-	sendErr  prometheus.Counter
-	timedOut prometheus.Counter
-	inflight prometheus.Gauge
-	rtt      prometheus.Observer
-	jitter   prometheus.Gauge
-	linkUp   prometheus.Gauge
-	rto      prometheus.Gauge
-	srtt     prometheus.Gauge
+	sent      prometheus.Counter
+	sendErr   prometheus.Counter
+	corrupted prometheus.Counter
+	timedOut  prometheus.Counter
+	inflight  prometheus.Gauge
+	rtt       prometheus.Observer
+	jitter    prometheus.Gauge
+	linkUp    prometheus.Gauge
+	rto       prometheus.Gauge
+	srtt      prometheus.Gauge
 	// name/addr label the /status snapshot; status receives it (nil-safe).
 	name   string
 	addr   string
@@ -223,17 +225,18 @@ type targetMetrics struct {
 // a single target and returns direct handles to them.
 func newTargetMetrics(source string, t Target) targetMetrics {
 	return targetMetrics{
-		sent:     ProbesSent.WithLabelValues(source, t.Name, t.Address),
-		sendErr:  SendErrors.WithLabelValues(source, t.Name, t.Address),
-		timedOut: ProbesTimedOut.WithLabelValues(source, t.Name, t.Address),
-		inflight: ProbesInflight.WithLabelValues(source, t.Name, t.Address),
-		rtt:      RTTSeconds.WithLabelValues(source, t.Name, t.Address),
-		jitter:   JitterSeconds.WithLabelValues(source, t.Name, t.Address),
-		linkUp:   LinkUp.WithLabelValues(source, t.Name, t.Address),
-		rto:      RTOEstimate.WithLabelValues(source, t.Name, t.Address),
-		srtt:     SRTTSeconds.WithLabelValues(source, t.Name, t.Address),
-		name:     t.Name,
-		addr:     t.Address,
+		sent:      ProbesSent.WithLabelValues(source, t.Name, t.Address),
+		sendErr:   SendErrors.WithLabelValues(source, t.Name, t.Address),
+		corrupted: CorruptedProbes.WithLabelValues(source, t.Name, t.Address),
+		timedOut:  ProbesTimedOut.WithLabelValues(source, t.Name, t.Address),
+		inflight:  ProbesInflight.WithLabelValues(source, t.Name, t.Address),
+		rtt:       RTTSeconds.WithLabelValues(source, t.Name, t.Address),
+		jitter:    JitterSeconds.WithLabelValues(source, t.Name, t.Address),
+		linkUp:    LinkUp.WithLabelValues(source, t.Name, t.Address),
+		rto:       RTOEstimate.WithLabelValues(source, t.Name, t.Address),
+		srtt:      SRTTSeconds.WithLabelValues(source, t.Name, t.Address),
+		name:      t.Name,
+		addr:      t.Address,
 	}
 }
 
@@ -421,9 +424,10 @@ func runEchoLoop(
 ) (retErr error) {
 
 	type response struct {
-		seq  uint64
-		ts   uint64
-		recv time.Time
+		seq       uint64
+		ts        uint64
+		recv      time.Time
+		corrupted bool
 	}
 
 	// respCh buffers in-flight responses between the reader and the drain.
@@ -455,6 +459,12 @@ func runEchoLoop(
 		// datagram is not silently truncated to PayloadSize by the kernel
 		// and mistaken for a valid probe (Read truncates to the buffer).
 		buf := make([]byte, MaxDatagramSize)
+		// Scratch for regenerating the expected payload pattern; reused
+		// across packets (single reader goroutine).
+		var payloadScratch []byte
+		if cfg.Payload > 0 {
+			payloadScratch = make([]byte, cfg.Payload)
+		}
 		deadlineFails := 0
 		for {
 			if ctx.Err() != nil {
@@ -490,6 +500,7 @@ func runEchoLoop(
 			if cfg.EchoSecret != "" {
 				expectedSize = PayloadSizeWithHMAC
 			}
+			expectedSize += cfg.Payload
 			if n != expectedSize {
 				continue
 			}
@@ -504,9 +515,20 @@ func runEchoLoop(
 					continue
 				}
 			}
+			resp := response{seq: seq, ts: ts, recv: time.Now()}
+			if cfg.Payload > 0 {
+				// Validate the echoed payload byte-for-byte against the
+				// pattern regenerated from the frame's own seq/ts.
+				plOff := PayloadSize
+				if cfg.EchoSecret != "" {
+					plOff = PayloadSizeWithHMAC
+				}
+				fillPayload(payloadScratch, seq, ts)
+				resp.corrupted = !bytes.Equal(payloadScratch, buf[plOff:plOff+cfg.Payload])
+			}
 
 			select {
-			case respCh <- response{seq: seq, ts: ts, recv: time.Now()}:
+			case respCh <- resp:
 			case <-ctx.Done():
 				return
 			case <-done:
@@ -521,7 +543,7 @@ func runEchoLoop(
 	if cfg.EchoSecret != "" {
 		payloadSize = PayloadSizeWithHMAC
 	}
-	buf := make([]byte, payloadSize)
+	buf := make([]byte, payloadSize+cfg.Payload)
 	pending := make(map[uint64]time.Time)
 	pendingHighWater := 0
 	// started bounds the socket lifetime: once ReconnectInterval has
@@ -595,6 +617,20 @@ func runEchoLoop(
 				}
 				delete(pending, resp.seq)
 				m.inflight.Dec()
+
+				if resp.corrupted {
+					// Payload bytes were altered in flight while magic,
+					// seq and timestamp survived: data-path corruption,
+					// not loss. The balance invariant gains a bucket:
+					// sent = rtt + timed_out + corrupted + inflight.
+					// The round trip completed, so the link is up; the
+					// sample stays out of RTT/jitter/RTO statistics.
+					m.corrupted.Inc()
+					state.consecutiveMisses = 0
+					m.linkUp.Set(1)
+					state.linkUp = true
+					continue
+				}
 
 				rttSec := resp.recv.Sub(sentTime).Seconds()
 
@@ -732,6 +768,11 @@ func runEchoLoop(
 		if cfg.EchoSecret != "" {
 			h := computeHMAC(cfg.EchoSecret, seq, ts)
 			copy(buf[24:32], h[:])
+		}
+		if cfg.Payload > 0 {
+			// Header end is payloadSize (24 or 32): fill the rest with the
+			// deterministic corruption-detection pattern.
+			fillPayload(buf[payloadSize:payloadSize+cfg.Payload], seq, ts)
 		}
 
 		// Send first, then register: registering in-flight only after a

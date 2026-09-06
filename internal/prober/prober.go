@@ -26,8 +26,12 @@ const (
 	MagicBytes          = "LNKPING\x00"
 	PayloadSize         = 24
 	PayloadSizeWithHMAC = 32
-	DefaultAlpha        = 0.125
-	DefaultBeta         = 0.25
+	// MaxPayloadBytes caps the optional client payload beyond the header.
+	// Frames stay well under MaxDatagramSize (1500) so a probe is never
+	// IP-fragmented: header (24/32) + payload ≤ 1424.
+	MaxPayloadBytes = 1400
+	DefaultAlpha    = 0.125
+	DefaultBeta     = 0.25
 	// DefaultClockGranularity is G in RFC 6298: the granularity of the
 	// clock used to measure RTT, used as the lower bound for 4*RTTVAR.
 	DefaultClockGranularity = time.Millisecond
@@ -68,6 +72,11 @@ type Config struct {
 	// re-dialing for DNS re-resolution. Zero means use the global
 	// ReconnectInterval var (test compat).
 	ReconnectInterval time.Duration
+	// Payload, when > 0, sends probes of header+Payload bytes with a
+	// deterministic pattern validated on echo. Corruption is counted in
+	// link_probes_corrupted_total (distinct from loss). Must be ≤
+	// MaxPayloadBytes so probes are never fragmented.
+	Payload int
 	// DSCP, when 1-63, marks probe packets with that traffic class
 	// (e.g. 46 = EF) so QoS-managed networks class them accordingly.
 	// 0 (default) leaves packets unmarked. Best effort, Linux support.
@@ -95,6 +104,9 @@ func (c Config) Validate() error {
 	}
 	if c.DSCP < 0 || c.DSCP > 63 {
 		return fmt.Errorf("dscp must be 0-63, got %d", c.DSCP)
+	}
+	if c.Payload < 0 || c.Payload > MaxPayloadBytes {
+		return fmt.Errorf("payload must be 0-%d bytes, got %d", MaxPayloadBytes, c.Payload)
 	}
 	if c.ReconnectInterval != 0 && c.ReconnectInterval < c.BaseInterval {
 		return fmt.Errorf("reconnect interval %v must be >= probe interval %v", c.ReconnectInterval, c.BaseInterval)
@@ -127,6 +139,23 @@ func validateTargets(targets []Target) error {
 		seen[t.Name] = struct{}{}
 	}
 	return nil
+}
+
+// fillPayload writes a deterministic pattern into the probe payload,
+// derived from the frame's own seq/ts. The client regenerates the
+// pattern from the echoed header and compares byte-for-byte: any
+// in-flight corruption (or reflection of a wrong frame) surfaces as a
+// corrupted frame — counted separately from loss — instead of as a
+// valid-but-wrong RTT sample.
+func fillPayload(buf []byte, seq, ts uint64) {
+	// xorshift64* keyed by seq/ts: cheap, deterministic, well spread.
+	x := seq*0x9E3779B97F4A7C15 ^ ts
+	for i := range buf {
+		x ^= x << 13
+		x ^= x >> 7
+		x ^= x << 17
+		buf[i] = byte(x >> 24)
+	}
 }
 
 // computeHMAC returns truncated HMAC-SHA256 (first 8 bytes) over

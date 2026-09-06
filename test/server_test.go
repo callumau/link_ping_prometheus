@@ -135,8 +135,11 @@ func TestServer_EnforceSizeAndHeader(t *testing.T) {
 
 	reply := make([]byte, 24)
 
-	// 34-byte datagram with a valid magic prefix is not a probe: no echo.
-	oversized := make([]byte, 34)
+	// A datagram beyond the bounded payload window (header +
+	// MaxPayloadBytes) is an arbitrary-payload reflector attempt: no
+	// echo. Bounded extensions (header ≤ size ≤ header+1400) are echoed
+	// whole — covered in TestServer_BoundedPayloadSizeRange.
+	oversized := make([]byte, prober.PayloadSize+prober.MaxPayloadBytes+1)
 	copy(oversized[0:8], prober.MagicBytes)
 	conn.Write(oversized)
 	conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
@@ -979,5 +982,44 @@ func TestServer_ClientSeriesOverflow(t *testing.T) {
 	}
 	if n := getCounterValue(prober.ServerProbesDropped, "client_overflow"); n < 1 {
 		t.Errorf("expected at least 1 client_overflow drop, got %v", n)
+	}
+}
+
+// TestServer_BoundedPayloadRange: the server echoes the header frame
+// plus any bounded payload extension (clients can probe with a payload
+// without coordinating server config) but still rejects oversized
+// arbitrary-payload reflection attempts.
+// pi-lens-ignore: go-test-functions
+func TestServer_BoundedPayloadSizeRange(t *testing.T) {
+	prober.InitMetrics()
+	ctx, cancel := context.WithCancel(context.Background())
+	addr, done := startServerDone(t, ctx)
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	conn, err := net.Dial("udp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// Header + payload extension: echoed whole.
+	withPayload := make([]byte, prober.PayloadSize+64)
+	copy(withPayload[0:8], prober.MagicBytes)
+	conn.Write(withPayload)
+	conn.SetReadDeadline(time.Now().Add(400 * time.Millisecond))
+	if n, _ := conn.Read(make([]byte, 1500)); n != len(withPayload) {
+		t.Errorf("header+64-byte frame must be echoed whole, got %d bytes", n)
+	}
+
+	// Oversized: dropped as an arbitrary-payload reflector attempt.
+	oversized := make([]byte, prober.PayloadSize+prober.MaxPayloadBytes+10)
+	copy(oversized[0:8], prober.MagicBytes)
+	conn.Write(oversized)
+	conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if n, _ := conn.Read(make([]byte, 1500)); n != 0 {
+		t.Errorf("oversized frame must be dropped, got %d bytes", n)
 	}
 }

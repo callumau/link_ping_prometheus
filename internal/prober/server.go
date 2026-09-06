@@ -295,7 +295,12 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 		if echoSecret != "" {
 			expectedSize = PayloadSizeWithHMAC
 		}
-		if n != expectedSize {
+		// Accept the header frame plus any bounded payload extension:
+		// clients can probe with a payload (MTU/data-path corruption
+		// detection) without coordinating server-side config. Reflection
+		// stays 1:1 and bounded well below MaxDatagramSize; anything
+		// larger is an arbitrary-payload reflector attempt.
+		if n < expectedSize || n > expectedSize+MaxPayloadBytes {
 			ServerProbesDropped.WithLabelValues(source, "size").Inc()
 			continue
 		}

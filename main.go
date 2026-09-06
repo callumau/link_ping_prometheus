@@ -68,6 +68,8 @@ var (
 
 	flDSCP = flag.Int("dscp", 0, "Client: DSCP value 0-63 marked on probe packets (0 = no marking, default; e.g. 46 = EF). Best effort, requires OS support (Linux)")
 
+	flPayload = flag.Int("payload", 0, "Client: probe payload bytes beyond the 24/32-byte header (up to 1400), filled with a deterministic pattern and validated on echo; corruption is counted in link_probes_corrupted_total, distinct from loss")
+
 	flMetricsBasicAuthUser = flag.String("metrics-user", "", "Metrics: Basic auth username (empty disables auth; env LINK_PING_METRICS_USER)")
 	flMetricsBasicAuthPass = flag.String("metrics-pass", "", "Metrics: Basic auth password (env LINK_PING_METRICS_PASS; prefer env over CLI to avoid ps exposure)")
 	flMetricsTLSCert       = flag.String("metrics-tls-cert", "", "Metrics: TLS certificate file (requires -metrics-tls-key)")
@@ -259,6 +261,7 @@ func buildConfig() (prober.Config, error) {
 		EchoSecret:        resolveEchoSecret(),
 		ReconnectInterval: *flReconnectInterval,
 		DSCP:              *flDSCP,
+		Payload:           *flPayload,
 	}
 	return cfg, nil
 }
