@@ -1,8 +1,8 @@
 module link_ping_prometheus
 
-go 1.24
+go 1.25.0
 
-toolchain go1.24.11
+toolchain go1.27.1
 
 require (
 	github.com/kardianos/service v1.2.4
@@ -19,6 +19,6 @@ require (
 	github.com/prometheus/common v0.66.1 // indirect
 	github.com/prometheus/procfs v0.17.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.2 // indirect
-	golang.org/x/sys v0.35.0 // indirect
+	golang.org/x/sys v0.47.0 // indirect
 	google.golang.org/protobuf v1.36.8 // indirect
 )
