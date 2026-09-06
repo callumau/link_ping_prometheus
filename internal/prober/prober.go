@@ -18,6 +18,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
 	"time"
 )
 
@@ -85,6 +86,17 @@ type Config struct {
 	// probe interval for the /status debug endpoint. Nil in server-only
 	// mode and unit tests (Update is nil-receiver-safe).
 	Status *StatusRegistry
+	// TargetsPath is the -targets file path for hot-reload. When set,
+	// reloads re-read and re-validate it; a broken file keeps the
+	// previous set running.
+	TargetsPath string
+	// ReloadSignal, when non-nil, triggers a targets reload on receive
+	// (SIGHUP via signal.Notify in main; direct send in tests). A nil
+	// channel never fires. The received value is ignored.
+	ReloadSignal <-chan os.Signal
+	// ReloadInterval, when > 0, polls TargetsPath at this interval for
+	// Windows services (no SIGHUP). 0 disables polling.
+	ReloadInterval time.Duration
 }
 
 // Validate checks that at least one target is present and that all

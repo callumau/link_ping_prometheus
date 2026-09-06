@@ -11,7 +11,6 @@ import (
 	"math"
 	"net"
 	"os"
-	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -187,17 +186,115 @@ func RunClient(ctx context.Context, cfg Config) error {
 
 	SeedMetrics(cfg.Source, cfg.Targets)
 
-	var wg sync.WaitGroup
-	for _, t := range cfg.Targets {
-		wg.Add(1)
-		// pi-lens-ignore: go-goroutine-loop-capture
-		go func(tg Target) {
-			defer wg.Done()
-			probeTarget(ctx, tg, cfg)
-		}(t)
+	// Supervisor over per-target probe goroutines, keyed by target name
+	// so the targets file can be hot-reloaded (SIGHUP, a poll interval,
+	// or an injected ReloadSignal — tests) without restarting the
+	// process. Restarting is disruptive: socket state zeroes and the
+	// Windows service needs manual action.
+	type running struct {
+		tg     Target
+		cancel context.CancelFunc
+		done   chan struct{}
 	}
-	wg.Wait()
-	return nil
+	live := make(map[string]running)
+	start := func(tg Target) {
+		tctx, cancel := context.WithCancel(ctx)
+		r := running{tg: tg, cancel: cancel, done: make(chan struct{})}
+		live[tg.Name] = r
+		go func() {
+			defer close(r.done)
+			probeTarget(tctx, tg, cfg)
+		}()
+	}
+	stop := func(name string) {
+		r, ok := live[name]
+		if !ok {
+			return
+		}
+		delete(live, name)
+		r.cancel()
+		// Bounded join: probeTarget exits promptly on cancel (its own
+		// retry waits are at most 1s). A slow exit must not block a reload.
+		select {
+		case <-r.done:
+		case <-time.After(5 * time.Second):
+			slog.Warn("Removed target probe loop did not stop within 5s", "target", name)
+		}
+	}
+	// apply swaps the running set to match targets: removed targets stop
+	// (their final metric series remain — events just stop and the series
+	// go stale in Prometheus), changed targets restart with the new
+	// values, new targets start fresh. targets must already be validated
+	// (LoadTargets and Config.Validate both do).
+	apply := func(targets []Target) {
+		want := make(map[string]Target, len(targets))
+		for _, tg := range targets {
+			want[tg.Name] = tg
+		}
+		for name, r := range live {
+			w, ok := want[name]
+			if ok && w.Address == r.tg.Address && w.Interval == r.tg.Interval && w.Timeout == r.tg.Timeout {
+				continue
+			}
+			stop(name)
+			if ok {
+				SeedMetrics(cfg.Source, []Target{w})
+				start(w)
+			}
+		}
+		for _, tg := range targets {
+			if _, ok := live[tg.Name]; !ok {
+				SeedMetrics(cfg.Source, []Target{tg})
+				start(tg)
+			}
+		}
+	}
+
+	apply(cfg.Targets)
+
+	reload := func() {
+		if cfg.TargetsPath == "" {
+			slog.Info("Targets reload requested but no -targets file is configured; ignoring")
+			return
+		}
+		targets, err := LoadTargets(cfg.TargetsPath)
+		if err != nil {
+			// A broken file mid-edit must never take the monitor down:
+			// keep probing the previous set.
+			slog.Error("Targets reload failed; keeping previous targets", "path", cfg.TargetsPath, "err", err)
+			return
+		}
+		slog.Info("Targets reloaded", "targets_count", len(targets))
+		apply(targets)
+	}
+
+	if cfg.ReloadSignal == nil && (cfg.ReloadInterval <= 0 || cfg.TargetsPath == "") {
+		// No reload path: original behavior — wait for every probe loop.
+		for _, r := range live {
+			<-r.done
+		}
+		return nil
+	}
+
+	var reloadTick <-chan time.Time
+	if cfg.ReloadInterval > 0 && cfg.TargetsPath != "" {
+		t := time.NewTicker(cfg.ReloadInterval)
+		defer t.Stop()
+		reloadTick = t.C
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			for _, r := range live {
+				<-r.done
+			}
+			return nil
+		case <-cfg.ReloadSignal:
+			reload()
+		case <-reloadTick:
+			reload()
+		}
+	}
 }
 
 // targetMetrics holds pre-resolved Prometheus metric handles for one
