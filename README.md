@@ -107,6 +107,7 @@ The exporter exposes the following metrics at `/metrics` (default port 2112).
 | `link_up` | Gauge | `source`, `target`, `address` | 1 while probes are getting echoes, 0 after 3 consecutive probes time out or probing becomes structurally impossible (persistent local send failures, dial/DNS retry). A single lost probe or brief stall does not flap the state. |
 | `link_probes_sent_total` | Counter | `source`, `target`, `address` | Total UDP probes sent. Probes into a down link still count as sent and time out naturally, so loss reads ~100% during an outage. |
 | `link_probes_timed_out_total` | Counter | `source`, `target`, `address` | Total probes with no echo within the RTO — true network loss. |
+| `link_probes_corrupted_total` | Counter | `source`, `target`, `address` | Probes whose echo came back with corrupted payload bytes (`-payload` mode only): magic, sequence and timestamp intact, data altered in flight. Data-path corruption, not loss — the round trip completed. |
 | `link_probes_send_errors_total` | Counter | `source`, `target`, `address` | Probes that failed to send locally (UDP write errors). Never on the wire, so never in `link_probes_sent_total`; sustained rate means a local NIC/socket problem, not network loss. |
 | `link_probes_inflight` | Gauge | `source`, `target`, `address` | Current number of probes sent but waiting for a response or timeout. Grows during stalls. |
 | `link_rtt_seconds` | Histogram | `source`, `target`, `address` | RTT histogram with explicit buckets `{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 3.0}` s plus native histogram support (`NativeHistogramBucketFactor` 1.1). Buckets stop at 3s (the RTO cap): anything slower counts as loss, so higher buckets would never fill. |
@@ -177,8 +178,9 @@ alerts.
 
 **Sanity check:** `link_probes_sent_total` always equals
 `link_rtt_seconds_count` (received) + `link_probes_timed_out_total` +
-`link_probes_inflight`. If that sum ever differs, counters were lost or
-the client socket stalled.
+`link_probes_inflight` (plus `link_probes_corrupted_total` when `-payload`
+is enabled). If that sum ever differs, counters were lost or the client
+socket stalled.
 
 **Cross-check with the server** (server mode at the remote end):
 `link_server_probes_received_total` counts valid probes per remote client
@@ -417,6 +419,7 @@ link_ping_prometheus -mode=<mode> [flags]
 | `-timeout` | `1s` | Client: Base/initial probe timeout (with `-adaptive=false` warns if `<200ms`; spurious loss on moderate-RTT links) |
 | `-reconnect-interval` | `5m` | Client: How long to keep a UDP socket before re-dialing for DNS re-resolution (0 means use default 5m via global; must be `>= -interval` or an error; set e.g. `24h` to effectively disable) |
 | `-dscp` | `0` | Client: DSCP value 0-63 marked on probe packets (e.g. 46 = EF) so QoS-managed networks class them accordingly. 0 = unmarked (default). Best effort, requires OS support (Linux). |
+| `-payload` | `0` | Client: probe payload bytes beyond the 24/32-byte header (up to 1400), filled with a deterministic pattern and validated byte-for-byte on echo. Corruption counts in `link_probes_corrupted_total` — distinct from loss. Detects MTU/data-path corruption a small probe cannot see. |
 | `-adaptive` | `true` | Enable adaptive RTO based on link quality. With `false`, the fixed `-timeout` applies: links whose true RTT exceeds it read as 100% loss with no warning — pick a timeout comfortably above expected RTT |
 | `-source` | `""` | Source label applied to every metric series, e.g. the local site or datacenter (`sydney-dc`) (defaults to hostname) |
 | `-metrics-user` | `""` | Basic auth username for /metrics (empty = disabled; env `LINK_PING_METRICS_USER`) |
@@ -577,7 +580,8 @@ test/
 ## Wire Protocol
 
 UDP datagram, 24 bytes per probe (32 bytes when `-echo-secret` is set on
-both ends):
+both ends), plus an optional payload extension when `-payload` is set on
+the client):
 
 | Offset | Size | Field |
 | --- | --- | --- |
@@ -585,9 +589,12 @@ both ends):
 | 8 | 8 | Sequence number (little-endian uint64) |
 | 16 | 8 | Client timestamp (Unix ns, little-endian uint64) |
 | 24 | 8 | HMAC-SHA256 tag (first 8 bytes; only with `-echo-secret`) |
+| 24/32 | ≤1400 | Optional pattern payload (only with `-payload`): deterministic bytes derived from seq/ts, validated byte-for-byte by the client on echo. |
 
-The server validates the magic header and exact expected length (24 or
-32 bytes) before echoing; anything else is dropped silently. The client additionally
+The server validates the magic header and accepts the header frame plus
+any bounded payload extension (header ≤ size ≤ header + 1400 bytes)
+before echoing; anything smaller or larger is dropped silently. Payload
+corruption is detected client-side and counted separately from loss. The client additionally
 requires the echoed timestamp to exactly match the value it sent —
 corrupted, replayed, or spoofed responses are discarded and counted as
 loss on timeout, protecting RTT samples from poisoning.
