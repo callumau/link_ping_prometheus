@@ -1,0 +1,22 @@
+---
+# Example inventory for link_ping_prometheus deployments.
+# Copy to inventory.yml and fill in real hosts. Real secrets belong in
+# group_vars/all.yml (encrypted with ansible-vault), not in this file.
+
+all:
+  children:
+    # Client and/or server mode hosts (systemd managed).
+    link_ping_linux:
+      hosts:
+        site-a-monitor:
+          ansible_host: 203.0.113.5
+          ansible_user: admin
+          ansible_become: true
+    # Server/both mode hosts (SCM managed, WinRM).
+    link_ping_windows:
+      hosts:
+        site-b-echo:
+          ansible_host: 203.0.113.10
+          ansible_connection: winrm
+          # EXAMPLE ONLY: pin a trusted CA in production.
+          ansible_winrm_server_cert_validation: ignore
