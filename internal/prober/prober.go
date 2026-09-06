@@ -78,6 +78,11 @@ type Config struct {
 	// link_probes_corrupted_total (distinct from loss). Must be ≤
 	// MaxPayloadBytes so probes are never fragmented.
 	Payload int
+	// MTUSweep, when > 0, runs a periodic DF-bit sweep per target to
+	// discover the largest frame the path carries (link_path_mtu_bytes,
+	// /status path_mtu_bytes). 0 disables. Linux only (DF socket
+	// option); sweep counters are separate from the loss metrics.
+	MTUSweep time.Duration
 	// DSCP, when 1-63, marks probe packets with that traffic class
 	// (e.g. 46 = EF) so QoS-managed networks class them accordingly.
 	// 0 (default) leaves packets unmarked. Best effort, Linux support.
@@ -119,6 +124,9 @@ func (c Config) Validate() error {
 	}
 	if c.Payload < 0 || c.Payload > MaxPayloadBytes {
 		return fmt.Errorf("payload must be 0-%d bytes, got %d", MaxPayloadBytes, c.Payload)
+	}
+	if c.MTUSweep < 0 {
+		return fmt.Errorf("mtu sweep interval must be >= 0, got %v", c.MTUSweep)
 	}
 	if c.ReconnectInterval != 0 && c.ReconnectInterval < c.BaseInterval {
 		return fmt.Errorf("reconnect interval %v must be >= probe interval %v", c.ReconnectInterval, c.BaseInterval)

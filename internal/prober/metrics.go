@@ -39,6 +39,18 @@ var (
 		Name: "link_probes_corrupted_total",
 		Help: "Probes whose echo came back with corrupted payload bytes (-payload mode only): magic, sequence and timestamp intact, data altered in flight. Data-path corruption, not loss — the round trip completed.",
 	}, []string{"source", "target", "address"})
+	MTUProbesSent = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "link_mtu_probes_sent_total",
+		Help: "DF-set probes sent by the periodic MTU sweep (-mtu-sweep). Deliberately separate from the main probe counters: they never enter the loss ratio or the sent/rtt/timed_out balance.",
+	}, []string{"source", "target", "address"})
+	MTUProbesLost = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "link_mtu_probes_lost_total",
+		Help: "DF-set MTU probes with no echo: sizes the path does not survive. Rising lost with healthy main probes means fragmentation-requiring traffic is being blackholed (PMTUD failure) — the classic works-small-fails-big signature.",
+	}, []string{"source", "target", "address"})
+	PathMTUBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "link_path_mtu_bytes",
+		Help: "Largest probe frame (LNKPING header + payload, excluding IP/UDP overhead) that round-trips with DF set; 0 until the first successful sweep. Stays 0 on paths that block DF-set packets. A full-size Ethernet path reads 1424 (the MaxPayloadBytes cap).",
+	}, []string{"source", "target", "address"})
 	ProbesInflight = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "link_probes_inflight",
 		Help: "Current number of probes sent but waiting for a response or timeout. Grows during stalls.",
@@ -102,6 +114,7 @@ func InitMetrics() {
 	registerOnce.Do(func() {
 		prometheus.MustRegister(
 			ProbesSent, ProbesTimedOut, SendErrors, CorruptedProbes, ProbesInflight,
+			MTUProbesSent, MTUProbesLost, PathMTUBytes,
 			RTTSeconds, JitterSeconds, LinkUp, RTOEstimate, SRTTSeconds,
 			ServerProbesReceived, ServerProbesDropped, ServerClockSkew, BuildInfo,
 		)
@@ -117,6 +130,9 @@ func SeedMetrics(source string, targets []Target) {
 		m.sent.Add(0)
 		m.sendErr.Add(0)
 		m.corrupted.Add(0)
+		m.mtuSent.Add(0)
+		m.mtuLost.Add(0)
+		m.pathMTU.Set(0)
 		m.timedOut.Add(0)
 		m.inflight.Set(0)
 		m.linkUp.Set(0)

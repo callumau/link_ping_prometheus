@@ -11,6 +11,7 @@ import (
 	"math"
 	"net"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -312,6 +313,10 @@ type targetMetrics struct {
 	linkUp    prometheus.Gauge
 	rto       prometheus.Gauge
 	srtt      prometheus.Gauge
+	// MTU sweep handles (separate counter namespace; see mtu.go).
+	mtuSent prometheus.Counter
+	mtuLost prometheus.Counter
+	pathMTU prometheus.Gauge
 	// name/addr label the /status snapshot; status receives it (nil-safe).
 	name   string
 	addr   string
@@ -332,6 +337,9 @@ func newTargetMetrics(source string, t Target) targetMetrics {
 		linkUp:    LinkUp.WithLabelValues(source, t.Name, t.Address),
 		rto:       RTOEstimate.WithLabelValues(source, t.Name, t.Address),
 		srtt:      SRTTSeconds.WithLabelValues(source, t.Name, t.Address),
+		mtuSent:   MTUProbesSent.WithLabelValues(source, t.Name, t.Address),
+		mtuLost:   MTUProbesLost.WithLabelValues(source, t.Name, t.Address),
+		pathMTU:   PathMTUBytes.WithLabelValues(source, t.Name, t.Address),
 		name:      t.Name,
 		addr:      t.Address,
 	}
@@ -370,9 +378,14 @@ type probeLoopState struct {
 	havePrev          bool
 	// linkUp mirrors the link_up gauge for the /status snapshot (set at
 	// the same sites as the gauge); socketStart is the current socket's
-	// dial time for the age readout.
+	// dial time for the age readout. lastEcho is the receive time of the
+	// most recent matched echo (main loop goroutine only).
 	linkUp      bool
 	socketStart time.Time
+	lastEcho    time.Time
+	// pathMTU is written by the MTU sweep goroutine and read by the main
+	// loop for the /status snapshot; atomic because of the two goroutines.
+	pathMTU atomic.Int64
 }
 
 // probeTarget runs the UDP probe loop for a single target until ctx is
@@ -397,6 +410,11 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 	m.status = cfg.Status
 	state := &probeLoopState{}
 	cfg = effectiveCfg
+	if cfg.MTUSweep > 0 {
+		// Own socket and counter namespace: MTU probing stays outside the
+		// main loss balance entirely.
+		go runMTUSweep(ctx, t, cfg, m, state, logger)
+	}
 	// Throttle dial-failure logging: first failure logs immediately, then
 	// at most once per minute (a DNS outage retries every second).
 	var lastDialLog time.Time
@@ -726,6 +744,7 @@ func runEchoLoop(
 					state.consecutiveMisses = 0
 					m.linkUp.Set(1)
 					state.linkUp = true
+					state.lastEcho = resp.recv
 					continue
 				}
 
@@ -768,6 +787,7 @@ func runEchoLoop(
 				state.consecutiveMisses = 0
 				m.linkUp.Set(1)
 				state.linkUp = true
+				state.lastEcho = resp.recv
 			default:
 				break Drain
 			}
@@ -808,19 +828,25 @@ func runEchoLoop(
 		}
 
 		// Refresh the /status snapshot once per interval (nil-safe when
-		// no registry is wired).
+		// no registry is wired). LastEchoAge is -1 until the first echo.
+		lastEchoAge := -1.0
+		if !state.lastEcho.IsZero() {
+			lastEchoAge = time.Since(state.lastEcho).Seconds()
+		}
 		m.status.Update(TargetStatus{
-			Name:              m.name,
-			Address:           m.addr,
-			LinkUp:            state.linkUp,
-			SendFailures:      writeFails,
-			Pending:           len(pending),
-			ConsecutiveMisses: state.consecutiveMisses,
-			RTOSeconds:        timeout.Seconds(),
-			JitterSeconds:     state.jitter,
-			SRTTSeconds:       stats.SRTT().Seconds(),
-			LastSeq:           state.seq,
-			SocketAgeSeconds:  time.Since(state.socketStart).Seconds(),
+			Name:               m.name,
+			Address:            m.addr,
+			LinkUp:             state.linkUp,
+			SendFailures:       writeFails,
+			Pending:            len(pending),
+			ConsecutiveMisses:  state.consecutiveMisses,
+			RTOSeconds:         timeout.Seconds(),
+			JitterSeconds:      state.jitter,
+			SRTTSeconds:        stats.SRTT().Seconds(),
+			LastSeq:            state.seq,
+			SocketAgeSeconds:   time.Since(state.socketStart).Seconds(),
+			PathMTUBytes:       int(state.pathMTU.Load()),
+			LastEchoAgeSeconds: lastEchoAge,
 		})
 
 		// Reconnect to re-resolve DNS once the socket has lived long
