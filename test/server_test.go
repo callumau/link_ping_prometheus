@@ -599,18 +599,6 @@ func TestServer_GlobalRateLimitStarvesExcess(t *testing.T) {
 	}()
 	addr := pc.LocalAddr().String()
 
-	dialFrom := func(ip net.IP) net.Conn {
-		t.Helper()
-		dst, err := net.ResolveUDPAddr("udp", addr)
-		if err != nil {
-			t.Fatal(err)
-		}
-		conn, err := net.DialUDP("udp", &net.UDPAddr{IP: ip, Port: 0}, dst)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return conn
-	}
 	echoCount := func(conn net.Conn, sends int) int {
 		t.Helper()
 		probe := make([]byte, prober.PayloadSize)
@@ -628,9 +616,9 @@ func TestServer_GlobalRateLimitStarvesExcess(t *testing.T) {
 		return got
 	}
 
-	c1 := dialFrom(net.IPv4(127, 0, 0, 1))
+	c1 := dialFrom(t, addr, net.IPv4(127, 0, 0, 1))
 	defer c1.Close()
-	c2 := dialFrom(net.IPv4(127, 0, 0, 2))
+	c2 := dialFrom(t, addr, net.IPv4(127, 0, 0, 2))
 	defer c2.Close()
 
 	if n := echoCount(c1, 3); n != 3 {
@@ -869,37 +857,15 @@ func TestServer_CIDRAllowlist(t *testing.T) {
 	}()
 	addr := pc.LocalAddr().String()
 
-	dialFrom := func(ip net.IP) net.Conn {
-		t.Helper()
-		dst, err := net.ResolveUDPAddr("udp", addr)
-		if err != nil {
-			t.Fatal(err)
-		}
-		conn, err := net.DialUDP("udp", &net.UDPAddr{IP: ip, Port: 0}, dst)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return conn
-	}
-	echoOnce := func(conn net.Conn) bool {
-		t.Helper()
-		probe := make([]byte, prober.PayloadSize)
-		copy(probe[0:8], prober.MagicBytes)
-		conn.Write(probe)
-		conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
-		n, _ := conn.Read(make([]byte, prober.PayloadSize))
-		return n == prober.PayloadSize
-	}
-
-	in := dialFrom(net.IPv4(127, 0, 0, 2))
+	in := dialFrom(t, addr, net.IPv4(127, 0, 0, 2))
 	defer in.Close()
-	if !echoOnce(in) {
+	if !echoOnce(t, in) {
 		t.Error("source inside the allowlist prefix must be echoed")
 	}
 
-	out := dialFrom(net.IPv4(127, 0, 0, 3))
+	out := dialFrom(t, addr, net.IPv4(127, 0, 0, 3))
 	defer out.Close()
-	if echoOnce(out) {
+	if echoOnce(t, out) {
 		t.Error("source outside the allowlist prefix must be dropped")
 	}
 }
@@ -929,28 +895,6 @@ func TestServer_ClientSeriesOverflow(t *testing.T) {
 	}()
 	addr := pc.LocalAddr().String()
 
-	dialFrom := func(ip net.IP) net.Conn {
-		t.Helper()
-		dst, err := net.ResolveUDPAddr("udp", addr)
-		if err != nil {
-			t.Fatal(err)
-		}
-		conn, err := net.DialUDP("udp", &net.UDPAddr{IP: ip, Port: 0}, dst)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return conn
-	}
-	echoOnce := func(conn net.Conn) bool {
-		t.Helper()
-		probe := make([]byte, prober.PayloadSize)
-		copy(probe[0:8], prober.MagicBytes)
-		conn.Write(probe)
-		conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
-		n, _ := conn.Read(make([]byte, prober.PayloadSize))
-		return n == prober.PayloadSize
-	}
-
 	var conns []net.Conn
 	defer func() {
 		for _, c := range conns {
@@ -958,14 +902,14 @@ func TestServer_ClientSeriesOverflow(t *testing.T) {
 		}
 	}()
 	for i, ip := range []net.IP{net.IPv4(127, 0, 0, 1), net.IPv4(127, 0, 0, 2), net.IPv4(127, 0, 0, 3)} {
-		c := dialFrom(ip)
+		c := dialFrom(t, addr, ip)
 		conns = append(conns, c)
 		if i < prober.MaxClientSeries {
-			if !echoOnce(c) {
+			if !echoOnce(t, c) {
 				t.Errorf("source %s below cap must be echoed", ip)
 			}
 		} else {
-			if echoOnce(c) {
+			if echoOnce(t, c) {
 				t.Errorf("source %s beyond cap must be dropped", ip)
 			}
 		}

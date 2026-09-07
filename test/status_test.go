@@ -24,27 +24,14 @@ func TestStatusRegistryReflectsProbeLoop(t *testing.T) {
 	addr := udpEcho(t, ctx, func(buf []byte, w func([]byte)) { w(buf) })
 
 	reg := prober.NewStatusRegistry()
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		// pi-lens-ignore: go-context-background-handler
-		_ = prober.RunClient(ctx, prober.Config{
-			Source:       testSource,
-			Targets:      []prober.Target{{Name: "statust", Address: addr}},
-			BaseInterval: 50 * time.Millisecond,
-			BaseTimeout:  1 * time.Second,
-			Adaptive:     true,
-			Status:       reg,
-		})
-	}()
-	defer func() {
-		cancel()
-		select {
-		case <-done:
-		case <-time.After(2 * time.Second):
-			t.Fatal("RunClient did not stop after cancel")
-		}
-	}()
+	runClientAsync(t, ctx, cancel, prober.Config{
+		Source:       testSource,
+		Targets:      []prober.Target{{Name: "statust", Address: addr}},
+		BaseInterval: 50 * time.Millisecond,
+		BaseTimeout:  1 * time.Second,
+		Adaptive:     true,
+		Status:       reg,
+	})
 
 	deadline := time.Now().Add(3 * time.Second)
 	var s *prober.TargetStatus

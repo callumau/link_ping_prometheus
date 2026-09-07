@@ -38,21 +38,7 @@ func TestMTUSweep_FullSizeSurvives(t *testing.T) {
 	reg := prober.NewStatusRegistry()
 	cfg := mtuCfg(addr, reg)
 
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		// pi-lens-ignore: go-context-background-handler
-		_ = prober.RunClient(ctx, cfg)
-	}()
-	defer func() {
-		cancel()
-		select {
-		case <-done:
-		case <-time.After(2 * time.Second):
-			t.Fatal("RunClient did not stop after cancel")
-		}
-	}()
-
+	runClientAsync(t, ctx, cancel, cfg)
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		if getGaugeValue(prober.PathMTUBytes, "mtu_target", addr) == float64(prober.PayloadSize+prober.MaxPayloadBytes) {
@@ -116,21 +102,7 @@ func TestMTUSweep_FindsLimit(t *testing.T) {
 	reg := prober.NewStatusRegistry()
 	cfg := mtuCfg(addr, reg)
 
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		// pi-lens-ignore: go-context-background-handler
-		_ = prober.RunClient(ctx, cfg)
-	}()
-	defer func() {
-		cancel()
-		select {
-		case <-done:
-		case <-time.After(2 * time.Second):
-			t.Fatal("RunClient did not stop after cancel")
-		}
-	}()
-
+	runClientAsync(t, ctx, cancel, cfg)
 	want := prober.PayloadSize + maxPayload
 	deadline := time.Now().Add(6 * time.Second)
 	for time.Now().Before(deadline) {
@@ -167,21 +139,7 @@ func TestMTUSweep_DeadLinkKeepsLastValue(t *testing.T) {
 	reg := prober.NewStatusRegistry()
 	cfg := mtuCfg(addr, reg)
 
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		// pi-lens-ignore: go-context-background-handler
-		_ = prober.RunClient(ctx, cfg)
-	}()
-	defer func() {
-		cancel()
-		select {
-		case <-done:
-		case <-time.After(2 * time.Second):
-			t.Fatal("RunClient did not stop after cancel")
-		}
-	}()
-
+	runClientAsync(t, ctx, cancel, cfg)
 	// First sweep fires immediately: probes sent, none survive. Wait on
 	// lost (not sent) so the two early-abort probes have both timed out.
 	deadline := time.Now().Add(3 * time.Second)

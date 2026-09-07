@@ -172,3 +172,53 @@ func validatedEcho(t *testing.T, ctx context.Context, body func(buf []byte, w fu
 		body(buf, w)
 	})
 }
+
+// runClientAsync launches RunClient in a goroutine and registers a
+// cleanup that cancels ctx and joins the probe loop, failing the test
+// if the client does not stop within 2s. Returns the done channel for
+// tests that need to observe stop timing.
+func runClientAsync(t *testing.T, ctx context.Context, cancel context.CancelFunc, cfg prober.Config) <-chan struct{} {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = prober.RunClient(ctx, cfg)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("RunClient did not stop after cancel")
+		}
+	})
+	return done
+}
+
+// dialFrom opens a UDP connection to addr bound to the given source IP,
+// for tests that exercise per-source server behavior (rate limits,
+// allowlist prefixes).
+func dialFrom(t *testing.T, addr string, ip net.IP) net.Conn {
+	t.Helper()
+	dst, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := net.DialUDP("udp", &net.UDPAddr{IP: ip, Port: 0}, dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return conn
+}
+
+// echoOnce sends one LNKPING probe on conn and reports whether a
+// full-size echo came back within 300ms.
+func echoOnce(t *testing.T, conn net.Conn) bool {
+	t.Helper()
+	probe := make([]byte, prober.PayloadSize)
+	copy(probe[0:8], prober.MagicBytes)
+	conn.Write(probe)
+	conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	n, _ := conn.Read(make([]byte, prober.PayloadSize))
+	return n == prober.PayloadSize
+}
