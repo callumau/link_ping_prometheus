@@ -66,6 +66,9 @@ func (s *scriptedConn) Write(b []byte) (int, error) {
 	if s.hook != nil {
 		fail, panicNow := s.hook(n)
 		if panicNow {
+			// Deliberate injection: the panic-recovery contract is what
+			// this test verifies.
+			// pi-lens-ignore: go-direct-panic
 			panic("injected write panic")
 		}
 		if fail {

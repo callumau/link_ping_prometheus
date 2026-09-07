@@ -117,14 +117,19 @@ func TestResolveMetricsAuth(t *testing.T) {
 func TestFlagDefaultInt(t *testing.T) {
 	// Pins the helper against the current flag defaults so the
 	// "rotation flags require -log-file" guard keeps working.
-	if got := flagDefaultInt("log-file-max-mb"); got != *flLogMaxSize {
-		t.Errorf("flagDefaultInt(log-file-max-mb) = %d, want %d", got, *flLogMaxSize)
-	}
-	if got := flagDefaultInt("log-file-max-backups"); got != *flLogMaxBackups {
-		t.Errorf("flagDefaultInt(log-file-max-backups) = %d, want %d", got, *flLogMaxBackups)
-	}
-	if got := flagDefaultInt("log-file-max-age"); got != *flLogMaxAge {
-		t.Errorf("flagDefaultInt(log-file-max-age) = %d, want %d", got, *flLogMaxAge)
+	for name, want := range map[string]int{
+		"log-file-max-mb":      *flLogMaxSize,
+		"log-file-max-backups": *flLogMaxBackups,
+		"log-file-max-age":     *flLogMaxAge,
+	} {
+		got, err := flagDefaultInt(name)
+		if err != nil {
+			t.Errorf("flagDefaultInt(%s): %v", name, err)
+			continue
+		}
+		if got != want {
+			t.Errorf("flagDefaultInt(%s) = %d, want %d", name, got, want)
+		}
 	}
 }
 

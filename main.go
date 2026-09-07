@@ -83,16 +83,16 @@ var (
 
 // flagDefaultInt returns the registered default value of an int flag so
 // validation logic stays correct if the flag defaults ever change.
-func flagDefaultInt(name string) int {
+func flagDefaultInt(name string) (int, error) {
 	f := flag.Lookup(name)
 	if f == nil {
-		panic("missing int flag " + name)
+		return 0, fmt.Errorf("missing int flag %s", name)
 	}
 	v, err := strconv.Atoi(f.DefValue)
 	if err != nil {
-		panic(fmt.Sprintf("flag %s has non-int default %q", name, f.DefValue))
+		return 0, fmt.Errorf("flag %s has non-int default %q", name, f.DefValue)
 	}
-	return v
+	return v, nil
 }
 
 func main() {
@@ -109,11 +109,20 @@ func main() {
 		fmt.Fprintln(os.Stderr, "log rotation flags must be >= 0")
 		os.Exit(1)
 	}
-	if *flLogFile == "" && (*flLogMaxSize != flagDefaultInt("log-file-max-mb") ||
-		*flLogMaxBackups != flagDefaultInt("log-file-max-backups") ||
-		*flLogMaxAge != flagDefaultInt("log-file-max-age")) {
-		fmt.Fprintln(os.Stderr, "log rotation flags require -log-file")
-		os.Exit(1)
+	if *flLogFile == "" {
+		dfltSize, errSize := flagDefaultInt("log-file-max-mb")
+		dfltBackups, errBackups := flagDefaultInt("log-file-max-backups")
+		dfltAge, errAge := flagDefaultInt("log-file-max-age")
+		if err := errors.Join(errSize, errBackups, errAge); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		if *flLogMaxSize != dfltSize ||
+			*flLogMaxBackups != dfltBackups ||
+			*flLogMaxAge != dfltAge {
+			fmt.Fprintln(os.Stderr, "log rotation flags require -log-file")
+			os.Exit(1)
+		}
 	}
 	logW := io.Writer(os.Stdout)
 	if *flLogFile != "" {

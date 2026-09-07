@@ -1,7 +1,6 @@
 package prober_test
 
 import (
-	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -12,8 +11,7 @@ import (
 func TestMultiTargetProbing(t *testing.T) {
 	prober.InitMetrics()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	addr1 := startEchoServer(ctx, t)
 	addr2 := startEchoServer(ctx, t)
@@ -43,8 +41,7 @@ func TestMultiTargetProbing(t *testing.T) {
 func TestServerDropout(t *testing.T) {
 	prober.InitMetrics()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	pc := listenUDP(t, ctx)
 	serverAddr := pc.LocalAddr().String()
@@ -108,10 +105,9 @@ func TestStress_ManyTargets(t *testing.T) {
 
 	count := 10
 	var targets []prober.Target
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
-	for i := 0; i < count; i++ {
+	for i := range count {
 		addr := startEchoServer(ctx, t)
 		targets = append(targets, prober.Target{
 			Name:    fmt.Sprintf("stress_%d", i),
