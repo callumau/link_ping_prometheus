@@ -318,7 +318,8 @@ The alerts above ship ready-to-load in `rules/link-monitor.yml`: recording
 rules (`link:loss_ratio`, `link:rtt_seconds_p50/p90/p99`,
 `link:mean_rtt_seconds` — all with matching `rate()` windows) and alerting
 rules (`LinkDown`, `HighPacketLoss`, `SeverePacketLoss`, `LinkProbeStall`,
-`ClientSendErrors`, `ServerDropsObserved`, `ClockSkewApproaching`). Wire
+`ClientSendErrors`, `ServerDropsObserved`, `ClockSkewApproaching`,
+`PathMtuDropped`, `MtuSweepUnresolved`). Wire
 them into Prometheus so alerting works out of the box instead of every
 operator copying expressions from these docs:
 

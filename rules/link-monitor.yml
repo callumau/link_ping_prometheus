@@ -127,3 +127,36 @@ groups:
             Observed skew is within 5s of the 30s replay window. NTP
             drift will soon cause valid probes to be rejected as
             replays. Resynchronize clocks on the client.
+
+      - alert: PathMtuDropped
+        expr: link_path_mtu_bytes < max_over_time(link_path_mtu_bytes[24h])
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            Path MTU dropped for {{ $labels.target }} from
+            {{ $labels.source }}
+          description: >-
+            The largest DF-probe frame that round-trips fell below its
+            24h baseline: the path stopped carrying full-size packets
+            (VPN/tunnel MTU shrink or PMTUD breakage) while link_up
+            remains 1 — the works-small-fails-big failure mode.
+
+      - alert: MtuSweepUnresolved
+        expr: >-
+          link_path_mtu_bytes == 0
+          and rate(link_mtu_probes_sent_total[1h]) > 0
+        for: 1h
+        labels:
+          severity: info
+        annotations:
+          summary: >-
+            Path MTU never discovered for {{ $labels.target }} from
+            {{ $labels.source }}
+          description: >-
+            The sweep has been sending DF probes for an hour without a
+            single surviving size: the path blocks DF-set packets, so
+            MTU capability stays unknown. Small-packet probing is
+            unaffected. Does not fire when the sweep is disabled
+            (no DF probes are sent).
