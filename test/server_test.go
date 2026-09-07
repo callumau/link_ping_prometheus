@@ -122,8 +122,7 @@ func TestGarbageData_Server(t *testing.T) {
 
 func TestServer_EnforceSizeAndHeader(t *testing.T) {
 	prober.InitMetrics()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	addr := startServer(t, ctx)
 
@@ -197,7 +196,7 @@ func TestServer_PerIPRateLimit(t *testing.T) {
 	defer conn.Close()
 
 	got := 0
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		conn.Write(probe)
 		conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 		if n, err := conn.Read(make([]byte, prober.PayloadSize)); err == nil && n == prober.PayloadSize {
@@ -221,8 +220,7 @@ func TestServer_PerIPRateLimit(t *testing.T) {
 // pi-lens-ignore: jscpd:duplicate
 func TestServer_ProbeCounterIgnoresInvalid(t *testing.T) {
 	prober.InitMetrics()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	addr := startServer(t, ctx)
 
@@ -311,8 +309,7 @@ func TestServer_NoEchoAfterShutdown(t *testing.T) {
 // pi-lens-ignore: jscpd:duplicate
 func TestServer_AllowlistDropsUnlisted(t *testing.T) {
 	prober.InitMetrics()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	addr := startServer(t, ctx)
 
@@ -357,8 +354,7 @@ func TestServer_AllowlistDropsUnlisted(t *testing.T) {
 // TestServer_FailClosed: RunServer refuses to start with an empty
 // allowlist (an empty set admits no clients).
 func TestServer_FailClosed(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	if err := prober.RunServer(ctx, "127.0.0.1:0", testSource, nil, ""); err == nil {
 		t.Error("RunServer with empty allowlist must fail closed")
 	}
@@ -412,8 +408,7 @@ func startHMACServer(t *testing.T, ctx context.Context, secret string) string {
 // silently dropped.
 func TestServer_HMACAuth(t *testing.T) {
 	prober.InitMetrics()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	const secret = "test-secret"
 	addr := startHMACServer(t, ctx, secret)
@@ -477,8 +472,7 @@ func TestServer_HMACAuth(t *testing.T) {
 // pi-lens-ignore: go-test-functions
 func TestServer_HMACRotation(t *testing.T) {
 	prober.InitMetrics()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	const newSecret = "test-secret-new"
 	const oldSecret = "test-secret"
@@ -564,7 +558,7 @@ func TestServer_PerIPRateLimitResumesNextWindow(t *testing.T) {
 		return n == prober.PayloadSize
 	}
 
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		if !echo(2 * time.Second) {
 			t.Fatalf("probe %d within the per-IP limit must be echoed", i+1)
 		}
@@ -622,7 +616,7 @@ func TestServer_GlobalRateLimitStarvesExcess(t *testing.T) {
 		probe := make([]byte, prober.PayloadSize)
 		copy(probe[0:8], prober.MagicBytes)
 		got := 0
-		for i := 0; i < sends; i++ {
+		for range sends {
 			conn.Write(probe)
 			conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 			if n, _ := conn.Read(make([]byte, prober.PayloadSize)); n == prober.PayloadSize {
@@ -654,8 +648,7 @@ func TestServer_GlobalRateLimitStarvesExcess(t *testing.T) {
 // dropped. Guards off-by-one regressions in the skew comparison.
 func TestServer_ReplayWindowEdges(t *testing.T) {
 	prober.InitMetrics()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	const secret = "edge-secret"
 	addr := startHMACServer(t, ctx, secret)
@@ -729,8 +722,7 @@ func TestServer_ReplayWindowEdges(t *testing.T) {
 // metric cardinality).
 func TestServer_UnlistedValidHMACStillDropped(t *testing.T) {
 	prober.InitMetrics()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	const secret = "order-secret"
 	pc := listenUDP(t, ctx)
@@ -787,8 +779,7 @@ func TestServer_UnlistedValidHMACStillDropped(t *testing.T) {
 // responder — subsequent valid probes still echo.
 func TestServer_MalformedFramesKeepServing(t *testing.T) {
 	prober.InitMetrics()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	addr := startServer(t, ctx)
 	conn, probe := dialProbe(t, addr)
@@ -837,8 +828,7 @@ func (panicConn) ReadFrom([]byte) (int, net.Addr, error) { panic("boom") }
 // shutting down cleanly while appearing healthy.
 func TestServer_PanicReturnsError(t *testing.T) {
 	prober.InitMetrics()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	pc := listenUDP(t, ctx)
 	done := make(chan error, 1)

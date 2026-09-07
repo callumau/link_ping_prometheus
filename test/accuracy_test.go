@@ -111,12 +111,12 @@ func TestRTTBuckets_LandInFiniteBucketsUnderKnownLatency(t *testing.T) {
 	// Cumulative bucket counts: nothing beyond the largest finite edge.
 	var below50, below250, belowMax float64
 	for _, b := range h.GetBucket() {
-		switch ub := b.GetUpperBound(); {
-		case ub == 0.05:
+		switch ub := b.GetUpperBound(); ub {
+		case 0.05:
 			below50 = float64(b.GetCumulativeCount())
-		case ub == 0.25:
+		case 0.25:
 			below250 = float64(b.GetCumulativeCount())
-		case ub == 2.5:
+		case 2.5:
 			belowMax = float64(b.GetCumulativeCount())
 		}
 	}
