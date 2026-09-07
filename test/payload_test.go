@@ -40,21 +40,7 @@ func TestPayload_HealthyEcho(t *testing.T) {
 	cfg.Source = testSource
 	cfg.Payload = 64
 
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		// pi-lens-ignore: go-context-background-handler
-		_ = prober.RunClient(ctx, cfg)
-	}()
-	defer func() {
-		cancel()
-		select {
-		case <-done:
-		case <-time.After(2 * time.Second):
-			t.Fatal("RunClient did not stop after cancel")
-		}
-	}()
-
+	runClientAsync(t, ctx, cancel, cfg)
 	deadline := time.Now().Add(3 * time.Second)
 	var rttCount float64
 	for time.Now().Before(deadline) {
@@ -108,21 +94,7 @@ func TestPayload_CorruptionCountedSeparately(t *testing.T) {
 	startRTT := getHistogramCount(prober.RTTSeconds, targetName, addr)
 	startCorrupted := getCounterValue(prober.CorruptedProbes, targetName, addr)
 
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		// pi-lens-ignore: go-context-background-handler
-		_ = prober.RunClient(ctx, cfg)
-	}()
-	defer func() {
-		cancel()
-		select {
-		case <-done:
-		case <-time.After(2 * time.Second):
-			t.Fatal("RunClient did not stop after cancel")
-		}
-	}()
-
+	runClientAsync(t, ctx, cancel, cfg)
 	deadline := time.Now().Add(3 * time.Second)
 	var corrupted float64
 	for time.Now().Before(deadline) {
