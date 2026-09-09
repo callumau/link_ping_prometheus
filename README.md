@@ -576,6 +576,8 @@ See `deploy/ansible/README.md` for prerequisites and usage.
 
 Prebuilt dashboard at [grafana-dashboard.json](grafana-dashboard.json).
 
+Panels: link status, packet loss, RTT percentiles / average / current, adaptive RTO, jitter, probe throughput, plus the newer signals — smoothed RTT (SRTT), path MTU (DF-probed), DF probe loss, corruption % (with `-payload`) and send errors (local fault vs network loss).
+
 [![Grafana dashboard screenshot](.docs/screenshot01.png)](.docs/screenshot01.png)
 
 ## Code Structure
