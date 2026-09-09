@@ -36,7 +36,7 @@
             "version": "v0",
             "spec": {
               "editorMode": "code",
-              "expr": "abs(link_up{instance=~\"$instance\", target=~\"$target\"} - link_up{instance=~\"$instance\", target=~\"$target\"} offset $__interval) > 0",
+              "expr": "link_up{instance=~\"$instance\", target=~\"$target\"} != link_up{instance=~\"$instance\", target=~\"$target\"} offset $__interval",
               "instant": false,
               "range": true,
               "legendFormat": ""
@@ -1995,7 +1995,7 @@
                       "version": "v0",
                       "spec": {
                         "editorMode": "code",
-                        "expr": "abs(link_up{instance=~\"$instance\", target=~\"$target\"} - link_up{instance=~\"$instance\", target=~\"$target\"} offset $__interval) > 0",
+                        "expr": "link_up{instance=~\"$instance\", target=~\"$target\"} != link_up{instance=~\"$instance\", target=~\"$target\"} offset $__interval",
                         "instant": false,
                         "legendFormat": "{{instance}} — {{target}}",
                         "range": true
