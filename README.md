@@ -120,7 +120,7 @@ The exporter exposes the following metrics at `/metrics` (default port 2112).
 | `link_probes_send_errors_total` | Counter | `source`, `target`, `address` | Probes that failed to send locally (UDP write errors). Never on the wire, so never in `link_probes_sent_total`; sustained rate means a local NIC/socket problem, not network loss. |
 | `link_prober_internal_errors_total` | Counter | `source`, `target`, `address`, `reason` | Prober-internal failures (`reason`: `panic`, `reader_dead`, `dial_retry`, `stop_timeout`) — not link conditions. A rising rate means this target's probe numbers are unreliable; check the agent's own logs and socket state. |
 | `link_probes_inflight` | Gauge | `source`, `target`, `address` | Current number of probes sent but waiting for a response or timeout. Grows during stalls. |
-| `link_rtt_seconds` | Histogram | `source`, `target`, `address` | RTT histogram with explicit buckets `{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 3.0}` s plus native histogram support (`NativeHistogramBucketFactor` 1.1). Buckets stop at 3s, the RTO cap: an echo that misses its RTO is counted as loss and discarded, so higher edges would stay empty — except on a link whose SRTT exceeds 1.5s, where the applied timeout floors at 2×SRTT and is therefore *above* 3s, and its samples land in `+Inf`. |
+| `link_rtt_seconds` | Histogram | `source`, `target`, `address` | RTT histogram with explicit buckets `{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 3.0}` s plus native histogram support (`NativeHistogramBucketFactor` 1.1). Buckets stop at 3s, the RTO cap: an echo that misses its RTO is normally counted as loss and discarded, so higher edges stay empty — except for the samples above 3s that can still occur: a link whose SRTT exceeds 1.5s applies a timeout above the cap (floor `2×SRTT`), a fixed `-timeout` above 3s does the same, and an echo that misses its RTO by up to one probe interval is still recorded (see the timeout row above). |
 | `link_rtt_seconds_bucket/sum/count` | Histogram | `source`, `target`, `address` | Classic-bucket series; quantiles and means are derived in PromQL over any window. |
 | `link_rtt_jitter_seconds` | Gauge | `source`, `target`, `address` | Smoothed RTT jitter in seconds (RFC 3550 §6.4.1). Resets to 0 on the first echo after a sequence gap (a timed-out probe), so link recovery never spikes the gauge; during a total outage it holds its last value until that echo. |
 | `link_rto_seconds` | Gauge | `source`, `target`, `address` | Current adaptive RTO in use (RFC 6298, doubled on consecutive timeouts; floor `max(200ms, 2×SRTT)`). The 3s cap bounds the backoff value, **not** the floor: a link whose SRTT exceeds 1.5s applies a timeout above 3s, deliberately, or it would be read as loss. |
@@ -254,11 +254,12 @@ fully down, so latency is a gap (not 0) during an outage — combine with
 `link_up`.
 
 Explicit buckets cover sub-100ms LAN RTTs (5ms lower bound) up to the
-adaptive RTO cap at 3s; values beyond 3s land in `+Inf`, which on an
-ordinary link means the sample outran its own RTO and is therefore rare.
-The one regular source of `+Inf` samples is a link whose SRTT exceeds
-1.5s: its applied timeout floors at 2×SRTT (above the 3s cap, on purpose)
-and its late-but-real echoes land beyond the largest edge. The native
+adaptive RTO cap at 3s; values beyond 3s land in `+Inf`. On a normal link
+they are rare — an echo that outlives its own RTO by up to one probe
+interval (the deadline is the first tick after it expires) is the regular
+way to land there, and two configurations make it routine: a link whose
+SRTT exceeds 1.5s (its applied timeout floors at 2×SRTT, above the 3s cap,
+on purpose) and a fixed `-timeout` above 3s. The native
 histogram (bucket factor 1.1) carries fine-grained data; Prometheus
 scrapes and aggregates it transparently when native-histogram support is
 enabled.
