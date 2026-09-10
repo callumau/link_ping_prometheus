@@ -113,6 +113,14 @@ func ParseAllowlist(s string) (*Allowlist, error) {
 		if err != nil {
 			return nil, fmt.Errorf("invalid allowlist IP %q", part)
 		}
+		if addr.Zone() != "" {
+			// netip parses "fe80::1%eth0" happily, but a datagram source
+			// never carries a scope zone (net.IP.String() has none), so the
+			// entry can never match: the server would start normally and
+			// drop 100% of that client's probes as allowlist drops. Fails
+			// closed, but silently — reject it loudly instead.
+			return nil, fmt.Errorf("invalid allowlist IP %q: a scope zone can never match a datagram source", part)
+		}
 		a.exact[addr.Unmap().String()] = struct{}{}
 	}
 	if n := len(a.exact) + len(a.prefix); n > 256 {
