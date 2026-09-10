@@ -158,7 +158,7 @@ Copy-paste these.
 | **Jitter** (instantaneous) | `link_rtt_jitter_seconds * 1000` | ms |
 | **Jitter** (window-based) | `(histogram_quantile(0.9, rate(link_rtt_seconds_bucket[$__rate_interval])) - histogram_quantile(0.5, rate(link_rtt_seconds_bucket[$__rate_interval]))) * 1000` | ms |
 | **Link up** | `link_up` | 0/1 |
-| **Baseline shift** (recent p50 vs 24h min) | `histogram_quantile(0.5, rate(link_rtt_seconds_bucket[10m])) > min_over_time(histogram_quantile(0.5, rate(link_rtt_seconds_bucket[10m]))[24h]) * 1.5` | bool |
+| **Baseline shift** (recent p50 vs 24h min) | `link:rtt_seconds_p50 > 1.5 * link:rtt_seconds_p50_24h_min` (shipped recording rules) | bool |
 | **True wire loss** (needs server at remote end) | `100 * (1 - rate(link_server_probes_received_total{client="<ip>"}[$__rate_interval]) / rate(link_probes_sent_total[$__rate_interval]))` | % |
 
 Two rules that trip people up:
@@ -272,9 +272,13 @@ window-based approximation:
 ### Baseline Shift Detection
 
 ```promql
-histogram_quantile(0.5, rate(link_rtt_seconds_bucket[10m]))
-  > min_over_time(histogram_quantile(0.5, rate(link_rtt_seconds_bucket[10m]))[24h]) * 1.5
+link:rtt_seconds_p50 > 1.5 * link:rtt_seconds_p50_24h_min
 ```
+
+The shipped recording rules define both sides: `link:rtt_seconds_p50` (5m
+median) and `link:rtt_seconds_p50_24h_min` (its 24h floor). Written out
+directly, the baseline needs a subquery — `min_over_time((expr)[24h:5m])` —
+because PromQL range selectors do not apply to function calls.
 
 Latency drift on a long-running link shows up as the recent p50 diverging
 from a 24h minimum. Outages show up immediately in `link_up == 0`,
@@ -320,7 +324,7 @@ alert: LinkProbesStalled
   for:  5m
 
 alert: LinkLatencyDegraded
-  expr: histogram_quantile(0.5, rate(link_rtt_seconds_bucket[10m])) > min_over_time(histogram_quantile(0.5, rate(link_rtt_seconds_bucket[10m]))[24h]) * 1.5
+  expr: link:rtt_seconds_p50 > 1.5 * link:rtt_seconds_p50_24h_min
   for:  10m
 ```
 
@@ -620,7 +624,7 @@ It uses the Grafana v2 dashboard resource format
 (`dashboard.grafana.app/v2`) and needs a Grafana version that supports it;
 it also has a `source` variable for filtering panels per site.
 
-Panels: link status, packet loss, RTT percentiles / average / current, adaptive RTO, jitter, probe throughput, plus the newer signals — smoothed RTT (SRTT), path MTU (DF-probed), DF probe loss, corruption % (with `-payload`) and send errors (local fault vs network loss). `link_up` transitions are annotated on every panel and itemized with timestamps in the Link State Changes table.
+Panels: link status, packet loss, RTT percentiles / average / current, adaptive RTO, jitter, probe throughput, plus the newer signals — smoothed RTT (SRTT), path MTU (DF-probed), DF probe loss, corruption % (with `-payload`) and send errors (local fault vs network loss). A **Server & prober health** section covers probes in flight, server probes received / dropped by reason / echo errors, clock skew, prober internal errors and metrics auth failures. `link_up` transitions are annotated on every panel and itemized with timestamps in the Link State Changes table. The `source` variable filters every panel per site, so one dashboard serves the whole fleet.
 
 [![Grafana dashboard screenshot](.docs/screenshot01.png)](.docs/screenshot01.png)
 
@@ -636,14 +640,26 @@ internal/prober/
   server.go                 — UDP echo responder, per-IP/global rate limits
   metrics.go                — Prometheus metric vars, InitMetrics, MetricsAuth
   validate.go               — Target address validation (ValidateTarget)
+  adaptive_test.go          — RTO estimation, dynamic floor, backoff clamp
+  client_recovery_test.go   — reader death, panic restart, write failure, dial retry
+  client_hmac_test.go       — client-side HMAC frames and the HMAC+payload offset
+  bench_test.go             — resolve-once vs per-event label lookup, payload fill
 test/
   helpers_test.go           — Test utilities (metric inspectors, UDP echo server)
   adaptive_test.go          — AdaptiveStats logic and jitter adaptation
   validation_test.go        — LoadTargets, target parsing, Config validation
-  server_test.go            — Server garbage handling, rate limits, shutdown
+  server_test.go            — Server garbage handling, rate limits, allowlist, eviction
   client_test.go            — Robustness: loss, latency, corruption, spoofing, stalls, duplicates
   metrics_test.go           — Basic auth handler, metric seeding
   integration_test.go       — Multi-target, server dropout, stress (10 targets)
+  accuracy_test.go          — Balance invariant, bucket placement, jitter ceiling
+  precision_test.go         — Exact analytic assertions (RTO floor, jitter convergence)
+  jitter_test.go            — RFC 3550 convergence, reset on gap, rebuild
+  mtu_test.go               — Path-MTU sweep and its separate counter namespace
+  payload_test.go           — Corruption detection, counted apart from loss
+  reload_test.go            — Hot reload: purge removed, keep changed, /status parity
+  status_test.go            — Live /status snapshot contents
+  soak_test.go              — Opt-in memory/goroutine soak (SOAK_SECONDS)
 ```
 
 ## Wire Protocol
