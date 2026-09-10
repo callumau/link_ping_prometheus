@@ -37,7 +37,8 @@ const (
 	PayloadSizeWithHMAC = 32
 	// MaxPayloadBytes caps the optional client payload beyond the header.
 	// Frames stay well under MaxDatagramSize (1500) so a probe is never
-	// IP-fragmented: header (24/32) + payload ≤ 1424.
+	// IP-fragmented: header (24, or 32 with -echo-secret) + payload, i.e.
+	// at most 1424 bytes normally and 1432 with HMAC.
 	MaxPayloadBytes = 1400
 	DefaultAlpha    = 0.125
 	DefaultBeta     = 0.25

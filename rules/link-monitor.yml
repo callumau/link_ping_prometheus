@@ -231,8 +231,12 @@ groups:
           description: >-
             The echo server rejected probes (reason label distinguishes
             allowlist / rate_ip / rate_global / size / magic / hmac /
-            replay). Check for secret or NTP misconfiguration and rate
-            cap tuning before blaming the network. Allowlist drops are
+            replay / invalid_addr / client_overflow). Check for secret or
+            NTP misconfiguration and rate cap tuning before blaming the
+            network. client_overflow is NOT a network fault: more distinct
+            CIDR-allowlisted client IPs wanted metric series than
+            MaxClientSeries allows, so those probes were dropped unaltered.
+            Allowlist drops are
             excluded here: an internet-reachable server rejects
             background scanners constantly, so they are expected noise —
             a rising allowlist rate is a topology change, not a fault.

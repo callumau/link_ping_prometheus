@@ -70,12 +70,19 @@ func (a *AdaptiveStats) Backoff() {
 	}
 }
 
-// CurrentRTO returns the clamped RTO as a time.Duration. The floor is
-// dynamic: max(DefaultMinRTO, 2*SRTT). A fixed floor like 200ms is too
-// tight on links whose RTT approaches it (e.g. ~185ms links), causing
-// spurious timeouts and loss inflation; flooring at twice the smoothed
-// RTT guarantees the timeout always has real headroom over the measured
-// RTT while the 200ms minimum still guards LAN links against jitter.
+// CurrentRTO returns the RTO as a time.Duration. The floor is dynamic:
+// max(DefaultMinRTO, 2*SRTT). A fixed floor like 200ms is too tight on links
+// whose RTT approaches it (e.g. ~185ms links), causing spurious timeouts and
+// loss inflation; flooring at twice the smoothed RTT guarantees the timeout
+// always has real headroom over the measured RTT while the 200ms minimum still
+// guards LAN links against jitter.
+//
+// DefaultMaxRTO caps the BACKOFF value, not the floor: on a link whose SRTT
+// exceeds 1.5s the applied timeout is 2*SRTT and therefore above 3s. Capping
+// the floor would reintroduce exactly the spurious timeouts it exists to
+// prevent (a 2s-RTT satellite link), so the floor wins by design —
+// link_rto_seconds documents it and RTT samples above the 3s bucket edge land
+// in +Inf on such links.
 func (a *AdaptiveStats) CurrentRTO() time.Duration {
 	floor := math.Max(DefaultMinRTO.Seconds(), 2*a.srtt)
 	val := math.Max(math.Min(a.rto, DefaultMaxRTO.Seconds()), floor)

@@ -246,3 +246,36 @@ func TestAdaptiveStats_BackoffDoublesTheEffectiveFloor(t *testing.T) {
 			want, DefaultMinRTO, got)
 	}
 }
+
+// TestAdaptiveStats_DynamicFloorMayExceedMaxRTO documents (and pins) the
+// deliberate contract behind link_rto_seconds: DefaultMaxRTO caps the backoff
+// value, but the floor is max(200ms, 2*SRTT), so a link whose SRTT exceeds
+// 1.5s applies a timeout ABOVE 3s. Capping the floor would reintroduce the
+// spurious timeouts the floor exists to prevent on high-RTT links (satellite,
+// long-haul VSAT), and it is why RTT samples above the 3s bucket edge are
+// possible and land in +Inf. A future change to a hard 3s ceiling must fail
+// here and update the metric Help + README in the same commit.
+func TestAdaptiveStats_DynamicFloorMayExceedMaxRTO(t *testing.T) {
+	stats := NewAdaptiveStats(3 * time.Second)
+	for range 30 {
+		stats.Update(2.0) // a stable 2s-RTT link
+	}
+	rto := stats.CurrentRTO()
+	if rto <= DefaultMaxRTO {
+		t.Fatalf("a 2s-SRTT link must apply a timeout above the %v cap (floor is 2*SRTT), got %v", DefaultMaxRTO, rto)
+	}
+	if want := 4 * time.Second; math.Abs(rto.Seconds()-want.Seconds()) > 0.2 {
+		t.Errorf("applied RTO %v should track the 2*SRTT floor (~%v) on a 2s link", rto, want)
+	}
+	// The backoff value itself stays clamped: only the floor lifts the applied
+	// timeout.
+	for range 20 {
+		stats.Backoff()
+	}
+	if stats.rto > DefaultMaxRTO.Seconds() {
+		t.Errorf("backoff value must stay clamped to %v, got %f", DefaultMaxRTO, stats.rto)
+	}
+	if got := stats.CurrentRTO(); math.Abs(got.Seconds()-4.0) > 0.2 {
+		t.Errorf("applied RTO after backoff must still be the 2*SRTT floor (~4s), got %v", got)
+	}
+}
