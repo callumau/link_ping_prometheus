@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -249,11 +250,12 @@ func RunClient(ctx context.Context, cfg Config) error {
 			return false
 		}
 	}
-	// apply swaps the running set to match targets: removed targets stop
-	// and have their series deleted, changed targets restart with the new
-	// values (keeping their series — still the same monitored endpoint),
-	// new targets start fresh. targets must already be validated
-	// (LoadTargets and Config.Validate both do).
+	// apply swaps the running set to match targets: removed targets stop and
+	// have their series deleted, changed targets restart with the new values
+	// (an address change also withdraws the old address's series — a retired IP
+	// must not keep exporting a frozen link_up; an interval/timeout change keeps
+	// them, still the same endpoint), new targets start fresh. targets must
+	// already be validated (LoadTargets and Config.Validate both do).
 	apply := func(targets []Target) {
 		want := make(map[string]Target, len(targets))
 		for _, tg := range targets {
@@ -278,6 +280,15 @@ func RunClient(ctx context.Context, cfg Config) error {
 				continue
 			}
 			if ok {
+				// Same name but a different address is a DIFFERENT endpoint:
+				// withdraw the old address's series, or a retired IP keeps
+				// exporting its last link_up=1 for the life of the process (the
+				// same frozen-green bug the removal purge fixes). An
+				// interval/timeout change keeps the series: still one endpoint,
+				// so its counters must stay continuous.
+				if r.tg.Address != w.Address {
+					deleteTargetSeries(cfg.Source, r.tg)
+				}
 				SeedMetrics(cfg.Source, []Target{w})
 				start(w)
 			}
@@ -427,12 +438,25 @@ func deleteTargetSeries(source string, t Target) {
 // worst failure mode for a monitor.
 const maxConsecutiveWriteFails = 3
 
-// maxConsecutiveReadFails bounds successive non-timeout socket Read errors
-// in the reader goroutine. Some of them (ICMP port-unreachable) are
-// expected and carry no meaning for a datagram socket, but a persistent
-// error must not spin the reader at Debug level forever — the reader exits
-// and the main loop re-dials.
+// maxConsecutiveReadFails bounds successive UNEXPECTED socket Read errors in
+// the reader goroutine. ICMP-derived errors are classified out (see
+// isPeerUnreachable) because a down peer is a normal monitoring condition;
+// what remains is a genuinely misbehaving socket, which must not spin the
+// reader at Debug level forever — the reader exits and the main loop re-dials.
 const maxConsecutiveReadFails = 10
+
+// isPeerUnreachable reports whether err is an ICMP-derived peer/path failure
+// rather than a local socket failure. On a connected UDP socket these arrive
+// as ECONNREFUSED (Linux port-unreachable), ECONNRESET (Windows reports the
+// same condition this way) or EHOSTUNREACH/ENETUNREACH (a router replied with
+// unreachable). The probe times out naturally and must keep its reader.
+// The constants exist for both Unix and Windows in package syscall.
+func isPeerUnreachable(err error) bool {
+	return errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.EHOSTUNREACH) ||
+		errors.Is(err, syscall.ENETUNREACH)
+}
 
 // errReconnect is a sentinel returned by runEchoLoop to request a socket
 // re-dial (DNS re-resolution) once ReconnectInterval has elapsed. It is
@@ -747,9 +771,20 @@ func runEchoLoop(
 				if errors.Is(err, net.ErrClosed) || ctx.Err() != nil {
 					return
 				}
-				// ICMP port-unreachable and similar are not fatal for a
-				// datagram socket: the probe times out naturally. Persistent
-				// errors are a different story — see the bound below.
+				// ICMP-derived errors (port unreachable / host or net
+				// unreachable — Windows reports the port case as a reset) are the
+				// NORMAL signal that the far end or a hop is down: the probe
+				// simply times out. They must not count as reader failures, or a
+				// legitimately DOWN target would kill its reader once a second,
+				// bump link_prober_internal_errors_total and flood the log with
+				// Errors — for a state the monitor is supposed to report calmly.
+				if isPeerUnreachable(err) {
+					readFails = 0
+					logger.Debug("UDP read error (peer unreachable); probe will time out", "err", err)
+					continue
+				}
+				// Anything else persistent is unexpected: bound it so the reader
+				// cannot spin at Debug level forever.
 				readFails++
 				if readFails >= maxConsecutiveReadFails {
 					logger.Error("Persistent UDP read errors; stopping reader",
@@ -899,6 +934,23 @@ func runEchoLoop(
 			// The counter is incremented here; probeTarget owns the log and the
 			// bounded re-dial pause (a persistent reader failure must not spin).
 			m.internalReaderDead.Inc()
+			// A reader death is a real measurement failure: the abandoned probes
+			// got no echo and can never match on this socket. Count them toward
+			// the link-up miss threshold (at least one, even with nothing in
+			// flight) so a PERSISTENT read-side failure cannot leave link_up
+			// frozen at 1 across re-dial cycles, while a single transient blip
+			// costs one miss and does not flap a healthy link. Deliberately
+			// unlike the reconnect flush below, whose probes were cut short by a
+			// planned socket swap rather than lost.
+			if n := len(pending); n > 0 {
+				state.consecutiveMisses += n
+			} else {
+				state.consecutiveMisses++
+			}
+			if state.consecutiveMisses >= LinkUpMissThreshold {
+				m.linkUp.Set(0)
+				state.linkUp = false
+			}
 			flushPending()
 			return errReaderDead
 		case <-intervalTimer.C:
