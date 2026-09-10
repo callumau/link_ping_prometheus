@@ -14,20 +14,32 @@ groups:
   - name: link-monitor.rules
     interval: 30s
     rules:
+      # The traffic guard suppresses NaN/Inf: rate() over an idle window
+      # yields NaN (and sent=0 makes the ratio 0/0), which would otherwise
+      # be stored and alert as a value. The 5m window must match the ratio
+      # windows so numerator and denominator never diverge across gaps.
       - record: link:loss_ratio
         expr: |
-          100 * rate(link_probes_timed_out_total[5m])
-              / rate(link_probes_sent_total[5m])
+          (100 * rate(link_probes_timed_out_total[5m])
+              / rate(link_probes_sent_total[5m]))
+              and (rate(link_probes_sent_total[5m]) > 0)
       - record: link:rtt_seconds_p50
-        expr: histogram_quantile(0.50, rate(link_rtt_seconds_bucket[5m]))
+        expr: >-
+          histogram_quantile(0.50, rate(link_rtt_seconds_bucket[5m]))
+              and (rate(link_probes_sent_total[5m]) > 0)
       - record: link:rtt_seconds_p90
-        expr: histogram_quantile(0.90, rate(link_rtt_seconds_bucket[5m]))
+        expr: >-
+          histogram_quantile(0.90, rate(link_rtt_seconds_bucket[5m]))
+              and (rate(link_probes_sent_total[5m]) > 0)
       - record: link:rtt_seconds_p99
-        expr: histogram_quantile(0.99, rate(link_rtt_seconds_bucket[5m]))
+        expr: >-
+          histogram_quantile(0.99, rate(link_rtt_seconds_bucket[5m]))
+              and (rate(link_probes_sent_total[5m]) > 0)
       - record: link:mean_rtt_seconds
         expr: |
-          rate(link_rtt_seconds_sum[5m])
-              / rate(link_rtt_seconds_count[5m])
+          (rate(link_rtt_seconds_sum[5m])
+              / rate(link_rtt_seconds_count[5m]))
+              and (rate(link_probes_sent_total[5m]) > 0)
 
   - name: link-monitor.alerts
     rules:
@@ -45,6 +57,23 @@ groups:
             No echo for 5+ minutes. The target is unreachable or so
             degraded that probes no longer complete. Check the remote
             echo server and the path between them.
+
+      - alert: LinkMonitorAbsent
+        expr: absent(link_up)
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          # No $labels: absent() returns no series labels to expand.
+          summary: All link_ping series are absent
+          description: >-
+            Nothing is exporting link_up — the agent is down, /metrics
+            is unreachable, or scraping is broken. Missing data cannot
+            fire the loss alerts, so this is the only signal that the
+            monitor itself stopped reporting.
+          # Per-site variant: absent(link_up{source="<site>"})
+          # Job-based alternative (deployment-specific job name):
+          # up{job="<job>"} == 0
 
       - alert: HighPacketLoss
         expr: link:loss_ratio > 5
@@ -72,8 +101,27 @@ groups:
             True network loss above 20% for 5 minutes. Treat as an
             outage-level link fault even if link_up is still 1.
 
+      - alert: LinkProbesStalled
+        expr: rate(link_probes_sent_total[10m]) == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            No probes being sent for {{ $labels.target }} from
+            {{ $labels.source }}
+          description: >-
+            Nothing has been sent for 5m: the local interface or route
+            is dead, or the probe loop is frozen. Neither sent nor
+            timed_out moves, so the loss ratio reads 0/0 (no data) and
+            the loss alert CANNOT catch this — a dead local link would
+            otherwise look like a quiet, healthy monitor.
+
       - alert: LinkProbeStall
-        expr: link_probes_inflight > 0
+        expr: >-
+          (link_probes_inflight > 0)
+          and (rate(link_rtt_seconds_count[15m]) == 0)
+          and (rate(link_probes_timed_out_total[15m]) == 0)
         for: 15m
         labels:
           severity: warning
@@ -82,12 +130,29 @@ groups:
             Probes stuck in flight on {{ $labels.target }} from
             {{ $labels.source }}
           description: >-
-            Probes sent but never matched or timed out for 15m — the
-            probe loop or socket is stalled. Loss and RTT readings
-            from this target are unreliable until resolved.
+            Probes are in flight but neither resolving (no RTT samples)
+            nor timing out for 15m — the probe loop or socket is
+            stalled. A busy link with an inflated adaptive RTO does not
+            trip this: it still resolves or times probes out. Loss and
+            RTT readings from this target are unreliable until resolved.
+
+      - alert: ProbeCorruption
+        expr: increase(link_probes_corrupted_total[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            Corrupted probe payloads on {{ $labels.target }} from
+            {{ $labels.source }}
+          description: >-
+            Echoes returned with altered payload bytes. The round trip
+            completed — link_up stays 1 and loss stays 0 — so silence
+            here means healthy while corrupting. Only non-zero with
+            -payload enabled; a rising count points at a faulty NIC,
+            bad optics, or a memory-corrupting middlebox on the path.
 
       - alert: ClientSendErrors
-        expr: rate(link_probes_send_errors_total[10m]) > 0
+        expr: increase(link_probes_send_errors_total[10m]) >= 3
         for: 10m
         labels:
           severity: warning
@@ -100,8 +165,25 @@ groups:
             not being lost on the wire. These do not count as network
             loss but degrade measurement completeness.
 
+      - alert: ProberInternalErrors
+        expr: increase(link_prober_internal_errors_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            Internal prober errors on {{ $labels.target }} from
+            {{ $labels.source }}
+          description: >-
+            The prober hit an internal failure (reason: panic,
+            reader_dead, dial_retry, stop_timeout) — not a link
+            condition. While these fire, this target's probe numbers
+            are unreliable: check the agent's own logs and socket state
+            instead of blaming the network.
+
       - alert: ServerDropsObserved
-        expr: rate(link_server_probes_dropped_total[10m]) > 0
+        expr: >-
+          increase(link_server_probes_dropped_total{reason!="allowlist"}[10m])
+          >= 3
         for: 10m
         labels:
           severity: warning
@@ -112,7 +194,39 @@ groups:
             The echo server rejected probes (reason label distinguishes
             allowlist / rate_ip / rate_global / size / magic / hmac /
             replay). Check for secret or NTP misconfiguration and rate
-            cap tuning before blaming the network.
+            cap tuning before blaming the network. Allowlist drops are
+            excluded here: an internet-reachable server rejects
+            background scanners constantly, so they are expected noise —
+            a rising allowlist rate is a topology change, not a fault.
+          # Allowlist-only variant:
+          # increase(link_server_probes_dropped_total{reason="allowlist"}[10m])
+          #   >= 3
+
+      - alert: ServerEchoErrors
+        expr: increase(link_server_echo_errors_total[10m]) >= 3
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            Echo server failing to echo validated probes from
+            {{ $labels.source }}
+          description: >-
+            The server accepted the probe but its own UDP write failed,
+            so the client counts it as loss. The wire carried the probe
+            fine — this is a local socket/resource problem on the
+            server. Subtract this rate before attributing a sent/
+            received mismatch to the network.
+
+      - alert: MetricsAuthFailures
+        expr: increase(link_metrics_auth_failures_total[10m]) >= 5
+        labels:
+          severity: warning
+        annotations:
+          summary: Repeated metrics endpoint auth failures
+          description: >-
+            Five or more rejected Basic auth attempts on /metrics or
+            /status in 10m. Either a scraper is misconfigured with the
+            wrong credentials, or something is scanning the endpoints.
 
       - alert: ClockSkewApproaching
         expr: abs(link_server_clock_skew_seconds) > 25
@@ -129,7 +243,10 @@ groups:
             replays. Resynchronize clocks on the client.
 
       - alert: PathMtuDropped
-        expr: link_path_mtu_bytes < max_over_time(link_path_mtu_bytes[24h])
+        expr: >-
+          (link_path_mtu_bytes > 0)
+          and (link_path_mtu_bytes < max_over_time(link_path_mtu_bytes[24h]))
+          and (rate(link_mtu_probes_sent_total[1h]) > 0)
         for: 15m
         labels:
           severity: warning
