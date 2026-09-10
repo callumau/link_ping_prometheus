@@ -28,15 +28,15 @@ const (
 )
 
 var (
-	// dynClientTTL ages out dynamically resolved (prefix-matched) clients
+	// DynClientTTL ages out dynamically resolved (prefix-matched) clients
 	// and their metric series. It must comfortably exceed both the 30s
 	// replay window and any sane scrape interval (~15-60s): evicting a
 	// still-active client deletes its counters, so the next scrape would
 	// read the unaffected rate() as a restart. 10 minutes is far beyond
 	// both, yet bounded enough that a spoofed-source sweep cannot pin the
-	// MaxClientSeries slots forever. A variable (not a constant) so tests
-	// can lower it.
-	dynClientTTL = 10 * time.Minute
+	// MaxClientSeries slots forever. Exported (a var, not a const) for the
+	// same reason as MaxClientSeries: tests lower it to exercise eviction.
+	DynClientTTL = 10 * time.Minute
 )
 
 var (
@@ -309,7 +309,7 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 	type clientHandles struct {
 		recv prometheus.Counter
 		skew prometheus.Gauge
-		// lastSeen ages dynamic entries out (dynClientTTL); unused for
+		// lastSeen ages dynamic entries out (DynClientTTL); unused for
 		// pre-resolved exact-IP handles, which are never evicted.
 		lastSeen time.Time
 	}
@@ -340,7 +340,7 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 			// the vecs retain a series per label set forever otherwise, so
 			// lifetime cardinality would still grow without bound.
 			for ip, eh := range dyn {
-				if now.Sub(eh.lastSeen) >= dynClientTTL {
+				if now.Sub(eh.lastSeen) >= DynClientTTL {
 					ServerProbesReceived.DeleteLabelValues(source, ip)
 					ServerClockSkew.DeleteLabelValues(source, ip)
 					delete(dyn, ip)
