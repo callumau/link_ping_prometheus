@@ -10,6 +10,16 @@
 #   chmod 600 /etc/link_ping_prometheus.env
 #   systemctl daemon-reload && systemctl enable --now link_ping_prometheus
 #
+#   # Hot reload of the targets file (client/both with -targets):
+#   #   systemctl reload link_ping_prometheus
+#   # Fallback for a unit that predates the ExecReload= line below (or a
+#   # systemd too old for it):
+#   #   systemctl kill -s HUP link_ping_prometheus
+#   # SIGHUP only reloads when the unit runs with -targets: without it the
+#   # binary installs no handler, so the signal terminates the process
+#   # (Restart=on-failure restarts it — an unintended bounce, not a reload).
+#   # Windows services have no SIGHUP — use -targets-reload-interval there.
+#
 # time-sync.target ordering is load-bearing: with -echo-secret set, the
 # server's replay guard uses a 30s timestamp window, so clocks must be
 # roughly NTP-synchronized.
@@ -27,6 +37,11 @@ Wants=network-online.target time-sync.target
 Type=simple
 EnvironmentFile=-/etc/link_ping_prometheus.env
 ExecStart=/usr/local/bin/link_ping_prometheus $OPTIONS
+# SIGHUP re-reads the -targets file without a restart (client/both modes).
+# Only run `systemctl reload` on a unit started with -targets: main.go
+# registers the handler only then, so otherwise the signal would kill the
+# process (Restart=on-failure brings it back, but that is a bounce).
+ExecReload=/bin/kill -s HUP $MAINPID
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=20s
