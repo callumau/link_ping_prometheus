@@ -1,5 +1,9 @@
 @echo off
-setlocal EnableExtensions EnableDelayedExpansion
+:: Delayed expansion is deliberately OFF: it corrupts user-typed credentials
+:: containing "!" (cmd consumes the character before reg add sees it), which
+:: produces an install that starts cleanly but fails metrics auth / HMAC.
+:: Nothing in this script uses !VAR! syntax, so plain expansion is safe here.
+setlocal EnableExtensions
 
 :: ============================================================================
 :: link_ping_prometheus - Windows service installer wizard (enterprise)

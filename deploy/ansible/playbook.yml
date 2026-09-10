@@ -59,6 +59,9 @@
       when: link_ping_targets_json | length > 0
 
     - name: Render credential env lines
+      # no_log: the rendered lines contain the metrics password and HMAC
+      # secret; without it they appear in `-v` task output and `--diff`.
+      no_log: true
       ansible.builtin.set_fact:
         link_ping_env_lines: >-
           {{ []
@@ -72,6 +75,9 @@
              if link_ping_metrics_pass | length > 0 else []) }}
 
     - name: Install environment file (OPTIONS plus credentials)
+      # no_log: the rendered file body contains the credentials; without it
+      # `--diff` prints the plaintext secret to the console / CI log.
+      no_log: true
       ansible.builtin.copy:
         # Written unconditionally: the unit runs `link_ping_prometheus
         # $OPTIONS`, and an empty expansion starts the binary on fail-closed
@@ -207,6 +213,9 @@
         reset= 86400 actions= restart/5000/restart/5000/restart/5000
 
     - name: Deliver credentials via the service environment
+      # no_log: `data` carries plaintext secrets; without it they show up in
+      # `-v` task output and in any CI transcript.
+      no_log: true
       ansible.windows.win_regedit:
         path: "{{ svc_env_key }}"
         name: "{{ item.name }}"
