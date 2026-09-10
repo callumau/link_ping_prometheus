@@ -486,20 +486,16 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 			drops.magic.Inc()
 			continue
 		}
-		// Resolve per-client metric handles after the cheap size/magic
-		// checks, before any HMAC work: exact allowlist IPs hit the
-		// pre-resolved map with no lock; prefix matches go through the
-		// capped dynamic map, so rotating spoofed sources cannot grow the
-		// label space beyond MaxClientSeries (H1 cardinality guard).
-		h, pre := handles[norm]
-		if !pre {
-			res, resOK := resolve(norm)
-			if !resOK {
-				drops.clientOverflow.Inc()
-				continue
-			}
-			h = res
-		}
+		// Authentication and the replay guard run BEFORE per-client handle
+		// resolution. resolve() allocates a {source,client} series pair and
+		// consumes one of the MaxClientSeries slots, so resolving first let
+		// unauthenticated frames from inside an allowlisted CIDR grow the
+		// label space and pin every slot, blacking out real clients as
+		// client_overflow (manufactured 100% loss) and inflating /metrics.
+		// Only a frame that authenticated — or, with no secret configured,
+		// one that already passed the cheap size/magic checks — may create a
+		// series.
+		var skew time.Duration
 		if echoSecret != "" {
 			oldSecret := ""
 			if len(echoSecretOld) > 0 {
@@ -514,7 +510,7 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 			// Replay guard: an authenticated frame older or newer than
 			// the window is a capture-replay, not a live probe. Clocks
 			// between nodes must be approximately synchronized (NTP).
-			skew := time.Since(time.Unix(0, int64(ts)))
+			skew = time.Since(time.Unix(0, int64(ts)))
 			if skew > maxReplayWindow || skew < -maxReplayWindow {
 				drops.replay.Inc()
 				// Throttled like the write-error warning: a captured frame
@@ -527,10 +523,6 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 				}
 				continue
 			}
-			// The gauge is set only for in-window frames: a single replayed
-			// authenticated frame would otherwise peg the skew gauge at
-			// hours and trip the ClockSkewApproaching alert.
-			h.skew.Set(skew.Seconds())
 		}
 		// Per-IP budget is charged here, after authentication (or, with no
 		// secret, after size/magic), so only frames that authenticate can
@@ -538,6 +530,25 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 		if reason := rl.chargeIP(norm); reason != "" {
 			drops.rateIP.Inc()
 			continue
+		}
+		// Resolve the per-client metric handles last: exact allowlist IPs hit
+		// the pre-resolved map with no lock, while prefix matches go through
+		// the capped dynamic map (H1 cardinality guard), and a frame dropped
+		// above for rate/HMAC/replay never allocates a series at all.
+		h, pre := handles[norm]
+		if !pre {
+			res, resOK := resolve(norm)
+			if !resOK {
+				drops.clientOverflow.Inc()
+				continue
+			}
+			h = res
+		}
+		if echoSecret != "" {
+			// The gauge is set only for in-window frames: a single replayed
+			// authenticated frame would otherwise peg the skew gauge at
+			// hours and trip the ClockSkewApproaching alert.
+			h.skew.Set(skew.Seconds())
 		}
 
 		h.recv.Inc()
