@@ -90,7 +90,16 @@ func ParseAllowlist(s string) (*Allowlist, error) {
 			// source reports as "10.0.0.1", never "::ffff:10.0.0.1", and
 			// netip does not unmap either address or prefix on its own, so a
 			// 4-in-6 allowlist entry would silently never match.
-			if p.Addr().Is4In6() && p.Bits() >= 96 {
+			if p.Addr().Is4In6() {
+				if p.Bits() < 96 {
+					// A 4-in-6 prefix shorter than /96 covers more than the IPv4
+					// space and can never match an unmapped IPv4 source (netip
+					// requires equal address bit-lengths), so it would silently
+					// admit nothing. Fail loudly instead: write it as IPv4.
+					return nil, fmt.Errorf("invalid allowlist CIDR %q: an IPv4-mapped prefix shorter than /96 can never match an IPv4 source; write it as an IPv4 CIDR", part)
+				}
+				// Note: ::ffff:0:0/96 becomes 0.0.0.0/0, i.e. every IPv4 source —
+				// semantically correct, but a whole-IPv4 allowlist.
 				p = netip.PrefixFrom(p.Addr().Unmap(), p.Bits()-96)
 			}
 			a.prefix = append(a.prefix, p.Masked())
