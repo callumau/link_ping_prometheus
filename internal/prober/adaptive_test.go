@@ -177,6 +177,31 @@ func TestAdaptiveStats_RTOFloorAndGranularity(t *testing.T) {
 	}
 }
 
+// TestAdaptiveStats_ZeroRTTSampleUsesSmoothing: a legitimate 0s RTT
+// sample (sub-nanosecond loopback) is a real measurement, not "no sample
+// yet". The old srtt==0 sentinel made the first-sample branch re-run
+// forever after a 0s reading, so every later estimate was computed with
+// the first-sample formula against a bogus baseline. Pinned via
+// haveSample.
+// pi-lens-ignore: go-test-functions
+func TestAdaptiveStats_ZeroRTTSampleUsesSmoothing(t *testing.T) {
+	stats := NewAdaptiveStats(time.Second)
+	stats.Update(0) // first real sample is 0s
+	if !stats.haveSample {
+		t.Fatal("a 0s RTT sample must count as a real measurement")
+	}
+	stats.Update(0)     // must smooth, not re-run the first-sample branch
+	stats.Update(0.100) // EWMA from srtt=rttvar=0
+
+	// SRTT = (1-1/8)*0 + (1/8)*0.1 = 0.0125; RTTVAR = (1/4)*|0-0.1| = 0.025.
+	if math.Abs(stats.srtt-0.0125) > 1e-9 {
+		t.Errorf("0s samples must not re-enter the first-sample branch; SRTT=%f want 0.0125", stats.srtt)
+	}
+	if math.Abs(stats.rttvar-0.025) > 1e-9 {
+		t.Errorf("0s samples must not re-enter the first-sample branch; RTTVAR=%f want 0.025", stats.rttvar)
+	}
+}
+
 // pi-lens-ignore: go-test-functions
 func TestAdaptiveStats_SRTTAccessor(t *testing.T) {
 	// SRTT is 0 before the first measurement, then follows the EWMA.
@@ -193,5 +218,31 @@ func TestAdaptiveStats_SRTTAccessor(t *testing.T) {
 	// Float64→ns truncation needs a 1µs tolerance, not an exact match.
 	if s := stats.SRTT(); math.Abs(s.Seconds()-0.1125) > 1e-6 {
 		t.Errorf("expected SRTT=112.5ms after EWMA update, got %v", s)
+	}
+}
+
+// TestAdaptiveStats_BackoffDoublesTheEffectiveFloor pins the fix for a link
+// whose SRTT is far below DefaultMinRTO: Backoff must double the EFFECTIVE
+// timeout (the floored one the loop actually applies), not the raw RFC value.
+// With a sub-millisecond SRTT the floor owns the timeout, so doubling only
+// a.rto leaves the applied value at DefaultMinRTO forever and a latency step
+// to 350ms would take ~9 timeout batches to be covered instead of 2.
+func TestAdaptiveStats_BackoffDoublesTheEffectiveFloor(t *testing.T) {
+	stats := NewAdaptiveStats(1 * time.Millisecond)
+	stats.Update(0.0005) // 0.5ms RTT: floor = DefaultMinRTO (200ms)
+
+	if got := stats.CurrentRTO(); got != DefaultMinRTO {
+		t.Fatalf("precondition: applied timeout must be the floor %v, got %v", DefaultMinRTO, got)
+	}
+
+	// First timeout in a series never doubles (RFC 6298), second one does.
+	stats.Backoff()
+	if got := stats.CurrentRTO(); got != DefaultMinRTO {
+		t.Fatalf("first backoff must not raise the floored timeout, got %v", got)
+	}
+	stats.Backoff()
+	if got, want := stats.CurrentRTO(), 2*DefaultMinRTO; got != want {
+		t.Errorf("second backoff must double the EFFECTIVE timeout to %v (raw-rto doubling would leave it at %v), got %v",
+			want, DefaultMinRTO, got)
 	}
 }

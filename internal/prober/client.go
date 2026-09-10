@@ -11,6 +11,7 @@ import (
 	"math"
 	"net"
 	"os"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -216,6 +217,45 @@ func RunClient(ctx context.Context, cfg Config) error {
 		done   chan struct{}
 	}
 	live := make(map[string]running)
+
+	// stragglers holds names whose old probe loop did NOT join within
+	// stop's 5s bound. Such a loop may still be alive and still writing
+	// that target's series, so a later reload must NOT start a second loop
+	// for the name — two loops on one target double-count
+	// link_probes_sent_total and break the loss ratio. The set lives at
+	// RunClient scope (not inside apply) so it survives across reloads; the
+	// cleanup goroutine that finishes the purge removes from it under this
+	// mutex.
+	stragglers := make(map[string]bool)
+	var stragglersMu sync.Mutex
+
+	// markStraggler records name until its timed-out loop exits, then
+	// finishes what stop's timeout path could not: withdraws the series
+	// (when this was a removal or an address change — purgeSeries) and
+	// drops the name so a later reload may start it again. The wait on
+	// r.done is bounded: the loop was already cancelled and its own retry
+	// waits are at most 1s.
+	markStraggler := func(name string, r running, purgeSeries bool) {
+		stragglersMu.Lock()
+		stragglers[name] = true
+		stragglersMu.Unlock()
+		go func() {
+			<-r.done
+			if purgeSeries {
+				deleteTargetSeries(cfg.Source, r.tg)
+			}
+			cfg.Status.Remove(name)
+			stragglersMu.Lock()
+			delete(stragglers, name)
+			stragglersMu.Unlock()
+		}()
+	}
+	isStraggler := func(name string) bool {
+		stragglersMu.Lock()
+		defer stragglersMu.Unlock()
+		return stragglers[name]
+	}
+
 	start := func(tg Target) {
 		tctx, cancel := context.WithCancel(ctx)
 		r := running{tg: tg, cancel: cancel, done: make(chan struct{})}
@@ -261,9 +301,6 @@ func RunClient(ctx context.Context, cfg Config) error {
 		for _, tg := range targets {
 			want[tg.Name] = tg
 		}
-		// Names whose old loop failed to join: it may still be writing their
-		// series, so a replacement must not be started for them.
-		unjoined := make(map[string]bool)
 		for name, r := range live {
 			w, ok := want[name]
 			if ok && w.Address == r.tg.Address && w.Interval == r.tg.Interval && w.Timeout == r.tg.Timeout {
@@ -271,12 +308,18 @@ func RunClient(ctx context.Context, cfg Config) error {
 			}
 			// !ok means the target was removed from the file: purge it.
 			if !stop(name, !ok) {
-				// The old loop failed to join, so it may still be alive on the
-				// same series; starting a replacement would leave two loops
-				// writing one target. Leave the target stopped and surface it.
+				// The old loop did not join: it may still be alive on the same
+				// series, so a replacement must NOT be started for this name
+				// (two loops writing one target double-count sent and break the
+				// loss ratio). Record it as a straggler and hand the purge to a
+				// goroutine that waits for the loop to exit — the timeout path
+				// itself must not block a reload forever. purgeSeries mirrors
+				// the clean path: withdraw the old series on a removal or an
+				// address change, but keep it for an interval/timeout change
+				// (still one endpoint, counters must stay continuous).
 				slog.Error("Probe loop did not stop in time; leaving target stopped", "target", name)
 				ProberInternalErrors.WithLabelValues(cfg.Source, r.tg.Name, r.tg.Address, "stop_timeout").Inc()
-				unjoined[name] = true
+				markStraggler(name, r, !ok || r.tg.Address != w.Address)
 				continue
 			}
 			if ok {
@@ -294,7 +337,7 @@ func RunClient(ctx context.Context, cfg Config) error {
 			}
 		}
 		for _, tg := range targets {
-			if unjoined[tg.Name] {
+			if isStraggler(tg.Name) {
 				continue
 			}
 			if _, ok := live[tg.Name]; !ok {
@@ -317,6 +360,14 @@ func RunClient(ctx context.Context, cfg Config) error {
 			// keep probing the previous set.
 			slog.Error("Targets reload failed; keeping previous targets", "path", cfg.TargetsPath, "err", err)
 			return
+		}
+		if len(targets) == 0 {
+			// Respect the operator's intent (an empty array means "probe
+			// nothing"), but name the consequence: this stops ALL probing and
+			// purges every target's series, so a truncated or half-written
+			// file that happens to parse as [] is loud rather than silent.
+			slog.Warn("Targets file is empty; ALL probing stopped and every target's series will be purged",
+				"path", cfg.TargetsPath)
 		}
 		slog.Info("Targets reloaded", "targets_count", len(targets))
 		apply(targets)
@@ -404,6 +455,42 @@ func newTargetMetrics(source string, t Target) targetMetrics {
 		name:               t.Name,
 		addr:               t.Address,
 	}
+}
+
+// emitTargetStatus writes the /status snapshot for one target. It is the
+// single definition of the snapshot shape, shared by runEchoLoop's
+// per-interval refresh and the link_up transitions that happen OUTSIDE that
+// refresh (persistent write failures, reader death, panic restart). Without
+// the out-of-band emissions /status reports link_up:true for up to a full
+// interval after the gauge already dropped to 0 — the frozen-green failure
+// mode, surfaced at /status instead of in Prometheus. Nil-safe: the
+// registry's Update is nil-receiver-safe.
+func emitTargetStatus(m targetMetrics, state *probeLoopState, stats *AdaptiveStats, rto time.Duration, sendFailures, pending int) {
+	// SocketAge is meaningless before the first dial (zero time.Time) and
+	// LastEchoAge is -1 until the first matched echo.
+	socketAge := 0.0
+	if !state.socketStart.IsZero() {
+		socketAge = time.Since(state.socketStart).Seconds()
+	}
+	lastEchoAge := -1.0
+	if !state.lastEcho.IsZero() {
+		lastEchoAge = time.Since(state.lastEcho).Seconds()
+	}
+	m.status.Update(TargetStatus{
+		Name:               m.name,
+		Address:            m.addr,
+		LinkUp:             state.linkUp,
+		SendFailures:       sendFailures,
+		Pending:            pending,
+		ConsecutiveMisses:  state.consecutiveMisses,
+		RTOSeconds:         rto.Seconds(),
+		JitterSeconds:      state.jitter,
+		SRTTSeconds:        stats.SRTT().Seconds(),
+		LastSeq:            state.seq,
+		SocketAgeSeconds:   socketAge,
+		PathMTUBytes:       int(state.pathMTU.Load()),
+		LastEchoAgeSeconds: lastEchoAge,
+	})
 }
 
 // deleteTargetSeries withdraws every client-side series for a target that
@@ -646,6 +733,10 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 		// than freezing a healthy-looking 1 across repeated restarts.
 		m.linkUp.Set(0)
 		state.linkUp = false
+		// Re-emit /status now that link_up dropped: the per-interval snapshot
+		// lives inside runEchoLoop, which just exited, so without this /status
+		// would keep reporting link_up:true through the restart pause.
+		emitTargetStatus(m, state, stats, stats.CurrentRTO(), 0, 0)
 		t := time.NewTimer(time.Second)
 		select {
 		// pi-lens-ignore: waitgroup-done-scope
@@ -850,14 +941,102 @@ func runEchoLoop(
 	// so the caller re-dials and re-resolves DNS.
 	started := time.Now()
 
+	// drainResponses consumes every response the reader has already buffered
+	// and matches them against pending. It is the single definition of the
+	// drain step, shared by the main loop and the two failure exits (reader
+	// death, panic restart) so those exits can drain BEFORE flushing the rest
+	// as loss — otherwise an echo already sitting in respCh would be charged
+	// as packet loss. Non-blocking: it returns once respCh is empty.
+	drainResponses := func() {
+		for {
+			select {
+			case resp := <-respCh:
+				sentTime, ok := pending[resp.seq]
+				if !ok {
+					continue
+				}
+				if resp.ts != uint64(sentTime.UnixNano()) {
+					// Echoed payload does not match what we sent:
+					// corruption, replay, or spoofing. Leave the probe
+					// pending so it is counted as a loss on timeout.
+					logger.Debug("Rejected response with mismatched timestamp", "seq", resp.seq)
+					continue
+				}
+				delete(pending, resp.seq)
+				m.inflight.Dec()
+
+				if resp.corrupted {
+					// Payload bytes were altered in flight while magic,
+					// seq and timestamp survived: data-path corruption,
+					// not loss. The balance invariant gains a bucket:
+					// sent = rtt + timed_out + corrupted + inflight.
+					// The round trip completed, so the link is up; the
+					// sample stays out of RTT/jitter/RTO statistics.
+					m.corrupted.Inc()
+					state.consecutiveMisses = 0
+					m.linkUp.Set(1)
+					state.linkUp = true
+					state.lastEcho = resp.recv
+					continue
+				}
+
+				rttSec := resp.recv.Sub(sentTime).Seconds()
+
+				// With a fixed (non-adaptive) timeout, a true RTT above the
+				// timeout makes every probe read as loss — indistinguishable
+				// from a dead link. Warn once so the operator can tell them
+				// apart; adaptive RTO tracks the real RTT instead.
+				if !cfg.Adaptive && !warnedSlowRTT && rttSec > cfg.BaseTimeout.Seconds() {
+					warnedSlowRTT = true
+					logger.Warn("Observed RTT exceeds fixed timeout; such probes all read as loss",
+						"rtt_seconds", rttSec, "timeout", cfg.BaseTimeout.String(),
+						"fix", "enable adaptive RTO or raise -timeout")
+				}
+
+				m.rtt.Observe(rttSec)
+
+				// Jitter over consecutive RTT samples (RFC 3550 §6.4.1):
+				// J += (|D(i-1,i)| - J)/16. Any gap in sequence numbers
+				// starts the estimate over, keeping post-outage recovery
+				// from spiking the gauge. The comparison uses the
+				// response's own sequence number: the loop's seq is the
+				// last-sent probe, so with multiple probes in flight
+				// (interval < RTO) it would mislabel every response after
+				// the first in a drain as a gap and pin jitter at 0.
+				if state.havePrev && resp.seq == state.prevSeq+1 {
+					state.jitter += (math.Abs(rttSec-state.prevRTT) - state.jitter) / 16
+				} else {
+					state.jitter = 0
+				}
+				state.prevRTT, state.prevSeq, state.havePrev = rttSec, resp.seq, true
+				m.jitter.Set(state.jitter)
+
+				if cfg.Adaptive {
+					// pi-lens-ignore: gorm-n-plus-one
+					stats.Update(rttSec)
+					m.srtt.Set(stats.SRTT().Seconds())
+				}
+				state.consecutiveMisses = 0
+				m.linkUp.Set(1)
+				state.linkUp = true
+				state.lastEcho = resp.recv
+			default:
+				return
+			}
+		}
+	}
+
 	defer func() {
 		if r := recover(); r != nil {
 			logger.Error("Panic in echo loop; continuing", "panic", r)
 			retErr = fmt.Errorf("panic in echo loop: %v", r)
-			// Abandoned probes can never match on this socket, so they
-			// are losses, not silent drops: count them as timed out so
-			// sent = rtt_count + timed_out + inflight keeps balancing
-			// across the restart (same treatment as the reconnect flush).
+			// Drain any echo already received before flushing: it was
+			// delivered, not lost, and charging it as a timeout would
+			// fabricate loss. The remaining abandoned probes can never match
+			// on this socket, so they are counted as timed out to keep
+			// sent = rtt_count + timed_out + inflight balancing across the
+			// restart (same treatment as the reconnect flush).
+			drainResponses()
 			m.timedOut.Add(float64(len(pending)))
 		}
 		// Probes still in flight die with the loop on cancellation
@@ -934,6 +1113,10 @@ func runEchoLoop(
 			// The counter is incremented here; probeTarget owns the log and the
 			// bounded re-dial pause (a persistent reader failure must not spin).
 			m.internalReaderDead.Inc()
+			// Drain echoes the reader delivered before it died: they WERE
+			// received, so the flush below must not charge them as loss (or as
+			// link-up misses). Deliberately before the miss count.
+			drainResponses()
 			// A reader death is a real measurement failure: the abandoned probes
 			// got no echo and can never match on this socket. Count them toward
 			// the link-up miss threshold (at least one, even with nothing in
@@ -952,88 +1135,15 @@ func runEchoLoop(
 				state.linkUp = false
 			}
 			flushPending()
+			// Re-emit the snapshot so /status reflects the dropped link_up
+			// immediately rather than up to a full interval later.
+			emitTargetStatus(m, state, stats, timeout, writeFails, len(pending))
 			return errReaderDead
 		case <-intervalTimer.C:
 		}
 		next = next.Add(interval)
 
-	Drain:
-		for {
-			select {
-			case resp := <-respCh:
-				sentTime, ok := pending[resp.seq]
-				if !ok {
-					continue
-				}
-				if resp.ts != uint64(sentTime.UnixNano()) {
-					// Echoed payload does not match what we sent:
-					// corruption, replay, or spoofing. Leave the probe
-					// pending so it is counted as a loss on timeout.
-					logger.Debug("Rejected response with mismatched timestamp", "seq", resp.seq)
-					continue
-				}
-				delete(pending, resp.seq)
-				m.inflight.Dec()
-
-				if resp.corrupted {
-					// Payload bytes were altered in flight while magic,
-					// seq and timestamp survived: data-path corruption,
-					// not loss. The balance invariant gains a bucket:
-					// sent = rtt + timed_out + corrupted + inflight.
-					// The round trip completed, so the link is up; the
-					// sample stays out of RTT/jitter/RTO statistics.
-					m.corrupted.Inc()
-					state.consecutiveMisses = 0
-					m.linkUp.Set(1)
-					state.linkUp = true
-					state.lastEcho = resp.recv
-					continue
-				}
-
-				rttSec := resp.recv.Sub(sentTime).Seconds()
-
-				// With a fixed (non-adaptive) timeout, a true RTT above the
-				// timeout makes every probe read as loss — indistinguishable
-				// from a dead link. Warn once so the operator can tell them
-				// apart; adaptive RTO tracks the real RTT instead.
-				if !cfg.Adaptive && !warnedSlowRTT && rttSec > cfg.BaseTimeout.Seconds() {
-					warnedSlowRTT = true
-					logger.Warn("Observed RTT exceeds fixed timeout; such probes all read as loss",
-						"rtt_seconds", rttSec, "timeout", cfg.BaseTimeout.String(),
-						"fix", "enable adaptive RTO or raise -timeout")
-				}
-
-				m.rtt.Observe(rttSec)
-
-				// Jitter over consecutive RTT samples (RFC 3550 §6.4.1):
-				// J += (|D(i-1,i)| - J)/16. Any gap in sequence numbers
-				// starts the estimate over, keeping post-outage recovery
-				// from spiking the gauge. The comparison uses the
-				// response's own sequence number: the loop's seq is the
-				// last-sent probe, so with multiple probes in flight
-				// (interval < RTO) it would mislabel every response after
-				// the first in a drain as a gap and pin jitter at 0.
-				if state.havePrev && resp.seq == state.prevSeq+1 {
-					state.jitter += (math.Abs(rttSec-state.prevRTT) - state.jitter) / 16
-				} else {
-					state.jitter = 0
-				}
-				state.prevRTT, state.prevSeq, state.havePrev = rttSec, resp.seq, true
-				m.jitter.Set(state.jitter)
-
-				if cfg.Adaptive {
-					// pi-lens-ignore: gorm-n-plus-one
-					stats.Update(rttSec)
-					m.srtt.Set(stats.SRTT().Seconds())
-				}
-				state.consecutiveMisses = 0
-				m.linkUp.Set(1)
-				state.linkUp = true
-				state.lastEcho = resp.recv
-			default:
-				break Drain
-			}
-		}
+		drainResponses()
 
 		now := time.Now()
 		var timeoutOccurred bool
@@ -1071,25 +1181,7 @@ func runEchoLoop(
 
 		// Refresh the /status snapshot once per interval (nil-safe when
 		// no registry is wired). LastEchoAge is -1 until the first echo.
-		lastEchoAge := -1.0
-		if !state.lastEcho.IsZero() {
-			lastEchoAge = time.Since(state.lastEcho).Seconds()
-		}
-		m.status.Update(TargetStatus{
-			Name:               m.name,
-			Address:            m.addr,
-			LinkUp:             state.linkUp,
-			SendFailures:       writeFails,
-			Pending:            len(pending),
-			ConsecutiveMisses:  state.consecutiveMisses,
-			RTOSeconds:         timeout.Seconds(),
-			JitterSeconds:      state.jitter,
-			SRTTSeconds:        stats.SRTT().Seconds(),
-			LastSeq:            state.seq,
-			SocketAgeSeconds:   time.Since(state.socketStart).Seconds(),
-			PathMTUBytes:       int(state.pathMTU.Load()),
-			LastEchoAgeSeconds: lastEchoAge,
-		})
+		emitTargetStatus(m, state, stats, timeout, writeFails, len(pending))
 
 		// Reconnect to re-resolve DNS once the socket has lived long
 		// enough. Normally the pending set is empty here, but when the
@@ -1153,6 +1245,9 @@ func runEchoLoop(
 					"consecutive_failures", writeFails, "err", err)
 				m.linkUp.Set(0)
 				state.linkUp = false
+				// Re-emit /status so the dropped link_up is visible immediately
+				// rather than up to a full interval later.
+				emitTargetStatus(m, state, stats, timeout, writeFails, len(pending))
 			}
 			continue
 		}

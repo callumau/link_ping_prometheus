@@ -11,6 +11,11 @@ type AdaptiveStats struct {
 	rttvar              float64
 	rto                 float64
 	consecutiveTimeouts int
+	// haveSample distinguishes "no RTT measurement yet" from a real 0s
+	// sample. The old srtt==0 sentinel made a legitimate sub-nanosecond
+	// loopback RTT re-enter the first-sample branch on every Update,
+	// pinning SRTT/RTTVAR to the first-sample formula forever.
+	haveSample bool
 }
 
 // NewAdaptiveStats returns an AdaptiveStats with RTO initialised to
@@ -32,9 +37,10 @@ func NewAdaptiveStats(baseTimeout time.Duration) *AdaptiveStats {
 //     of the RTT measurement (RFC 6298 section 2.4).
 func (a *AdaptiveStats) Update(rttSeconds float64) {
 	a.consecutiveTimeouts = 0
-	if a.srtt == 0 {
+	if !a.haveSample {
 		a.srtt = rttSeconds
 		a.rttvar = rttSeconds / 2
+		a.haveSample = true
 	} else {
 		a.rttvar = (1-DefaultBeta)*a.rttvar + DefaultBeta*math.Abs(a.srtt-rttSeconds)
 		a.srtt = (1-DefaultAlpha)*a.srtt + DefaultAlpha*rttSeconds
@@ -53,7 +59,14 @@ func (a *AdaptiveStats) Update(rttSeconds float64) {
 func (a *AdaptiveStats) Backoff() {
 	a.consecutiveTimeouts++
 	if a.consecutiveTimeouts > 1 {
-		a.rto = math.Min(a.rto*2, DefaultMaxRTO.Seconds())
+		// Double the EFFECTIVE timeout, not the raw a.rto. The loop applies
+		// CurrentRTO(), whose dynamic floor max(DefaultMinRTO, 2*SRTT) can
+		// sit above a.rto on a low-SRTT link; doubling only a.rto would
+		// leave the floor in charge, so the applied timeout would barely
+		// move (a 350ms step would need ~9 timeout batches instead of 2)
+		// and a degraded link could never climb back above its real RTT.
+		floor := math.Max(DefaultMinRTO.Seconds(), 2*a.srtt)
+		a.rto = math.Min(math.Max(a.rto, floor)*2, DefaultMaxRTO.Seconds())
 	}
 }
 

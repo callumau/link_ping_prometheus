@@ -58,9 +58,12 @@ const (
 
 // ReconnectInterval bounds how long a client keeps one UDP socket before
 // re-dialing so a target hostname that changes IP via DNS is re-resolved.
-// The re-dial only happens with no probes in flight, so it never abandons
-// an in-flight probe or breaks the sent/rtt/timedout/inflight balance. A
-// variable (not a constant) so tests can lower it.
+// The re-dial normally happens with no probes in flight, but when the probe
+// interval is shorter than the RTO probes are perpetually in flight; those
+// are abandoned by the socket swap and counted as timed out
+// (link_probes_timed_out_total), which keeps the
+// sent/rtt/timedout/inflight balance intact across the re-dial. A variable
+// (not a constant) so tests can lower it.
 var ReconnectInterval = 5 * time.Minute
 
 // Config holds the client probing configuration.
@@ -112,6 +115,12 @@ type Config struct {
 	ReloadInterval time.Duration
 }
 
+// minProbeInterval is the smallest accepted probe interval. Below it the
+// in-flight set grows to ~RTO/interval entries and every tick sweeps
+// O(len(pending)) timeouts, pegging a core — and the loss ratio becomes
+// meaningless. Rejected at config load with an error naming the flag.
+const minProbeInterval = time.Millisecond
+
 // Validate checks that at least one target is present and that all
 // target addresses are well-formed.
 func (c Config) Validate() error {
@@ -120,6 +129,9 @@ func (c Config) Validate() error {
 	}
 	if c.BaseInterval <= 0 {
 		return fmt.Errorf("probe interval must be positive, got %v", c.BaseInterval)
+	}
+	if c.BaseInterval < minProbeInterval {
+		return fmt.Errorf("probe interval (-interval) must be at least %v, got %v", minProbeInterval, c.BaseInterval)
 	}
 	if c.BaseTimeout <= 0 {
 		return fmt.Errorf("probe timeout must be positive, got %v", c.BaseTimeout)
@@ -157,6 +169,9 @@ func validateTargets(targets []Target) error {
 		}
 		if t.Interval < 0 {
 			return fmt.Errorf("target %q: interval must be >= 0, got %v", t.Name, t.Interval)
+		}
+		if t.Interval != 0 && t.Interval < minProbeInterval {
+			return fmt.Errorf("target %q: interval must be at least %v, got %v", t.Name, minProbeInterval, t.Interval)
 		}
 		if t.Timeout < 0 {
 			return fmt.Errorf("target %q: timeout must be >= 0, got %v", t.Name, t.Timeout)
