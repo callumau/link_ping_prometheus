@@ -71,6 +71,39 @@ func TestBalanceInvariant_ExactAccountingUnderLoss(t *testing.T) {
 	}
 }
 
+// TestLossDeadline_FirstTickAfterRTO pins the documented deadline semantics:
+// a probe is retired by the first probe tick AFTER its RTO expires (the drain
+// runs before the sweep), so with interval > timeout an echo landing between
+// the RTO and that tick is still recorded as latency, not loss. This is the
+// behavior the link_probes_timed_out_total Help text and the README describe;
+// switching to a hard RTO deadline would be a semantic change and must update
+// both plus this test.
+func TestLossDeadline_FirstTickAfterRTO(t *testing.T) {
+	prober.InitMetrics()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 150ms sits between the 100ms RTO and the 200ms tick that would retire it.
+	addr := validatedEcho(t, ctx, func(buf []byte, w func([]byte)) {
+		time.Sleep(150 * time.Millisecond)
+		w(buf)
+	})
+	targetName, cfg := namedCfg("loss_deadline", addr, 200*time.Millisecond, 100*time.Millisecond)
+
+	startTimeouts := getCounterValue(prober.ProbesTimedOut, targetName, addr)
+	runClientFor(ctx, cfg, 2*time.Second)
+	cancel()
+	time.Sleep(200 * time.Millisecond)
+
+	if rtt := getHistogramCount(prober.RTTSeconds, targetName, addr); rtt < 2 {
+		t.Fatalf("an echo landing between the RTO and the next tick must be recorded as latency, got %v samples", rtt)
+	}
+	if to := getCounterValue(prober.ProbesTimedOut, targetName, addr) - startTimeouts; to > 1 {
+		t.Errorf("probes whose echo arrived before the first post-RTO tick must not count as loss, got %v timeouts", to)
+	}
+}
+
 // TestRTTBuckets_LandInFiniteBucketsUnderKnownLatency: with an 80ms
 // injected delay, the histogram mean must track it AND the samples must
 // land inside the finite bucket range (nothing relegated to +Inf only),
@@ -183,11 +216,13 @@ func TestNonAdaptive_SlowLinkReadsAsTimeoutsNotSilence(t *testing.T) {
 	defer cancel()
 
 	addr := validatedEcho(t, ctx, func(buf []byte, w func([]byte)) {
-		time.Sleep(150 * time.Millisecond) // well past the 100ms fixed timeout
+		// Past the 50ms timeout AND past the first tick that retires it
+		// (100ms), so the outcome cannot ride on timer lateness.
+		time.Sleep(150 * time.Millisecond)
 		w(buf)
 	})
 
-	targetName, cfg := namedCfg("slow_fixed_test", addr, 100*time.Millisecond, 100*time.Millisecond)
+	targetName, cfg := namedCfg("slow_fixed_test", addr, 100*time.Millisecond, 50*time.Millisecond)
 
 	startSent := getCounterValue(prober.ProbesSent, targetName, addr)
 	startTimeout := getCounterValue(prober.ProbesTimedOut, targetName, addr)

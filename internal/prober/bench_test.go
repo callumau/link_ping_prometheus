@@ -1,6 +1,7 @@
 package prober
 
 import (
+	"net/netip"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -64,4 +65,32 @@ func BenchmarkFillPayload(b *testing.B) {
 		fillPayload(buf, uint64(i), uint64(i))
 	}
 	benchSink = uint64(buf[0]) ^ uint64(buf[len(buf)-1])
+}
+
+// BenchmarkAllowlistContains measures the first check every datagram pays,
+// from an untrusted source and before any crypto: the allowlist decision. It
+// documents the netip.Addr keying — taking the source as a value plus Unmap
+// costs ~9ns with zero allocations, where the earlier
+// IP.String()-then-ParseAddr form measured ~89ns and one 16-byte allocation
+// per packet (same containment test). At the MaxPktsGlobal cap that is ~10k
+// allocations/sec removed from the pre-auth path, i.e. less work an attacker
+// can force on a latency-measuring box. A regression back to string keying
+// shows up here as allocs/op > 0.
+func BenchmarkAllowlistContains(b *testing.B) {
+	al, err := ParseAllowlist("203.0.113.5,10.0.0.0/8,2001:db8::/32")
+	if err != nil {
+		b.Fatal(err)
+	}
+	exact := netip.MustParseAddr("203.0.113.5")
+	prefix := netip.MustParseAddr("10.4.5.6")
+	v6 := netip.MustParseAddr("2001:db8::1")
+	src := netip.MustParseAddr("203.0.113.7")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ok := al.Contains(exact) && al.Contains(prefix) && al.Contains(v6) && !al.Contains(src)
+		if !ok {
+			b.Fatal("allowlist lookup regressed: a configured entry stopped matching")
+		}
+	}
 }
