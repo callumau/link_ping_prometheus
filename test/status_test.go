@@ -3,6 +3,7 @@ package prober_test
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,6 +12,53 @@ import (
 
 	"link_ping_prometheus/internal/prober"
 )
+
+// TestStatusSocketAgeWhileDialing pins the signal the /readyz gate reads: a
+// target stuck in the dial-retry loop (DNS outage, firewall) publishes
+// socket_age_seconds == 0, while a target that has held a working socket
+// publishes > 0 (asserted in TestStatusRegistryReflectsProbeLoop). /readyz
+// returns 503 only while NO target has ever had a working socket, so publishing
+// a socket age before a successful dial would make a stuck agent report ready.
+// Uses an unresolvable host; skips if this environment resolves it or resolves
+// too slowly.
+func TestStatusSocketAgeWhileDialing(t *testing.T) {
+	prober.InitMetrics()
+
+	const unresolvableHost = "link-ping-status.invalid"
+	if _, err := net.LookupHost(unresolvableHost); err == nil {
+		t.Skipf("%s resolves here, so the dial-failure path is unreachable", unresolvableHost)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	reg := prober.NewStatusRegistry()
+	runClientAsync(t, ctx, cancel, prober.Config{
+		Source:       testSource,
+		Targets:      []prober.Target{{Name: "dialstuck", Address: unresolvableHost + ":4000"}},
+		BaseInterval: 50 * time.Millisecond,
+		BaseTimeout:  time.Second,
+		Status:       reg,
+	})
+
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if snap := reg.Snapshot(); len(snap) == 1 {
+			if snap[0].SocketAgeSeconds != 0 {
+				t.Errorf("target stuck in the dial-retry loop must publish socket_age_seconds == 0, got %f", snap[0].SocketAgeSeconds)
+			}
+			if snap[0].LinkUp {
+				t.Error("target stuck in the dial-retry loop must not publish link_up=true")
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	// Reaching here means the dial-failure path never published a snapshot:
+	// unlike a slow resolver, that is a real regression (the publish happens on
+	// the first failed dial), so fail rather than skip it away.
+	t.Fatalf("dial failure never reached /status within 15s: the dial-retry path must publish socket_age_seconds=0 and link_up=false")
+}
 
 // TestStatusRegistryReflectsProbeLoop: with a Status registry wired into
 // the config, the probe loop publishes live per-target state and the

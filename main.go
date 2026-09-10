@@ -47,25 +47,37 @@ import (
 // `go build` (and CI test builds) leaves it as "dev".
 var version = "dev"
 
-// minScavengeUnreleased is the amount of heap the runtime must be holding
-// beyond what it already returned to the OS before a scavenge is worth its
-// stop-the-world-adjacent cost. An already-lean process must pay nothing.
+// minScavengeUnreleased is the amount of idle heap the runtime must still be
+// holding beyond what it already returned to the OS before a scavenge is worth
+// its stop-the-world-adjacent cost. An already-lean process must pay nothing.
+// It is a byte count, not a duration.
 const minScavengeUnreleased = 4 << 20
 
-// unreleasedHeap returns heap bytes the process still holds outside what
-// runtime/debug has already given back to the OS. Clamped at 0: Sys can
-// dip below HeapReleased transiently, and an unsigned subtraction would
-// otherwise wrap to an enormous "unreleased" value and force a scavenge
-// on every tick.
-func unreleasedHeap(m runtime.MemStats) uint64 {
-	if m.Sys <= m.HeapReleased {
+// maxConcurrentScrapes bounds simultaneous /metrics gathers. A large fleet's
+// response is ~10-15MB of text and every concurrent scrape builds its own copy,
+// so unbounded overlap multiplies both the live heap and the wall time of each
+// response (risking a truncated scrape, i.e. the monitor reporting ITSELF
+// down). Excess scrapes get a 503 instead; Prometheus retries.
+const maxConcurrentScrapes = 2
+
+// releasableHeap returns the idle heap bytes a scavenge could actually return
+// to the OS, i.e. HeapIdle minus what has already been released. Deliberately
+// NOT Sys-HeapReleased: Sys covers the whole process and stays far above any
+// sane threshold for as long as the agent runs, which made the "skip an
+// already-lean process" guard a no-op that scavenged on every tick. Clamped at
+// 0: HeapReleased can transiently exceed HeapIdle, and an unsigned subtraction
+// would otherwise wrap to an enormous value and force a scavenge every tick.
+func releasableHeap(m runtime.MemStats) uint64 {
+	if m.HeapIdle <= m.HeapReleased {
 		return 0
 	}
-	return m.Sys - m.HeapReleased
+	return m.HeapIdle - m.HeapReleased
 }
 
+// shouldScavenge reports whether the process holds at least minUnreleased
+// unreleased idle heap bytes.
 func shouldScavenge(m runtime.MemStats, minUnreleased uint64) bool {
-	return unreleasedHeap(m) >= minUnreleased
+	return releasableHeap(m) >= minUnreleased
 }
 
 // startHeapScavenger returns the unused heap high-water mark to the OS on a
@@ -73,7 +85,7 @@ func shouldScavenge(m runtime.MemStats, minUnreleased uint64) bool {
 // so a scrape-driven high-water mark survives indefinitely while the agent is
 // idle — visible on Windows as steady commit/RSS growth. every <= 0 disables
 // it. The goroutine exits with ctx so it stops on shutdown in every mode.
-func startHeapScavenger(ctx context.Context, every, minUnreleased time.Duration, logger *slog.Logger) {
+func startHeapScavenger(ctx context.Context, every time.Duration, minUnreleased uint64, logger *slog.Logger) {
 	if every <= 0 {
 		return
 	}
@@ -88,15 +100,16 @@ func startHeapScavenger(ctx context.Context, every, minUnreleased time.Duration,
 			}
 			var before runtime.MemStats
 			runtime.ReadMemStats(&before)
-			if !shouldScavenge(before, uint64(minUnreleased)) {
+			if !shouldScavenge(before, minUnreleased) {
 				continue
 			}
 			debug.FreeOSMemory()
 			var after runtime.MemStats
 			runtime.ReadMemStats(&after)
 			logger.Debug("heap scavenge",
-				"sys_before_mb", before.Sys>>20, "released_before_mb", before.HeapReleased>>20,
-				"sys_after_mb", after.Sys>>20, "released_after_mb", after.HeapReleased>>20)
+				"releasable_before_mb", releasableHeap(before)>>20,
+				"idle_before_mb", before.HeapIdle>>20, "released_before_mb", before.HeapReleased>>20,
+				"idle_after_mb", after.HeapIdle>>20, "released_after_mb", after.HeapReleased>>20)
 		}
 	}()
 }
@@ -395,6 +408,32 @@ func serviceConfig() *service.Config {
 	}
 }
 
+// absolutizeFlagValue returns the value to persist for a flag at service
+// install time. Only the path flags are rewritten to absolute paths: the SCM
+// starts the service with an unrelated working directory, so a relative path
+// would resolve somewhere else at run time. Every other flag — notably the
+// integer log-rotation flags log-file-max-mb/-backups/-age — is returned
+// verbatim: absolutizing a bare number produced "C:\cwd\50", which made the
+// service exit 2 at flag.Parse with stderr discarded under the SCM, i.e. an
+// invisible crash loop.
+func absolutizeFlagValue(name, value string) string {
+	switch name {
+	case "targets", "metrics-tls-cert", "metrics-tls-key", "log-file":
+	default:
+		return value
+	}
+	if value == "" || filepath.IsAbs(value) {
+		return value
+	}
+	abs, err := filepath.Abs(value)
+	if err != nil {
+		// Unresolvable working directory: keep the value as given rather
+		// than dropping the flag entirely.
+		return value
+	}
+	return abs
+}
+
 // handleService manages the Windows service lifecycle via the
 // kardianos/service package. It reconstructs CLI arguments at install
 // time, excluding -svc itself and sensitive flags (-metrics-user,
@@ -414,15 +453,7 @@ func handleService(action string) {
 		// configured via env LINK_PING_METRICS_USER/PASS and LINK_PING_ECHO_SECRET.
 		flag.Visit(func(f *flag.Flag) {
 			if f.Name != "svc" && f.Name != "metrics-user" && f.Name != "metrics-pass" && f.Name != "echo-secret" && f.Name != "echo-secret-old" {
-				v := f.Value.String()
-				switch f.Name {
-				case "targets", "metrics-tls-cert", "metrics-tls-key", "log-file", "log-file-max-mb", "log-file-max-backups", "log-file-max-age":
-					if v != "" && !filepath.IsAbs(v) {
-						if abs, err := filepath.Abs(v); err == nil {
-							v = abs
-						}
-					}
-				}
+				v := absolutizeFlagValue(f.Name, f.Value.String())
 				args = append(args, fmt.Sprintf("-%s=%s", f.Name, v))
 			}
 		})
@@ -575,10 +606,60 @@ func (p *program) Stop(s service.Service) error {
 // growth. For a small fleet the whole response is smaller than one compressor,
 // so plain is the lighter default; large fleets should enable it.
 func metricsHandler(gzip bool) http.Handler {
-	return promhttp.HandlerFor(prometheus.DefaultGatherer, promhttp.HandlerOpts{DisableCompression: !gzip})
+	h := promhttp.HandlerFor(prometheus.DefaultGatherer, promhttp.HandlerOpts{
+		DisableCompression:  !gzip,
+		MaxRequestsInFlight: maxConcurrentScrapes,
+	})
+	// Restore the scrape instrumentation that promhttp.Handler() used to
+	// register and HandlerFor() does not: without
+	// promhttp_metric_handler_requests_total{code="503"} and
+	// _requests_in_flight, a scrape rejected by the concurrency cap above is
+	// invisible. Safe to call on every handler build (tests, repeated
+	// registrations): it reuses the already-registered collector instead of
+	// panicking.
+	return promhttp.InstrumentMetricHandler(prometheus.DefaultRegisterer, h)
 }
 
-func (p *program) startMetricsServer(addr, user, pass, cert, key string, statusReg *prober.StatusRegistry, gzip bool) (*http.Server, <-chan struct{}, error) {
+// readyToProbe reports whether a running agent can actually do its job, i.e.
+// /readyz's notion of readiness as opposed to /healthz's liveness.
+// SocketAgeSeconds is nonzero only while the target currently holds a socket:
+// the dial-retry path publishes 0 and a failed re-dial resets it, so this is
+// "can probe right now", not "has ever probed". An agent stuck resolving DNS or
+// blocked by a firewall is alive but useless, and an orchestrator must see that.
+func readyToProbe(mode string, targets []prober.TargetStatus) bool {
+	if mode == "server" {
+		// Server-only mode has no targets at all, and a server that cannot
+		// bind dies instead of limping, so it is ready by definition.
+		return true
+	}
+	for _, t := range targets {
+		if t.SocketAgeSeconds > 0 {
+			return true
+		}
+	}
+	// No target yet (registry empty at startup, or every target still in
+	// the dial-retry loop).
+	return false
+}
+
+// readinessHandler answers /readyz: 200 when probing is possible, 503 when a
+// client-side agent has never held a working socket for any target.
+func readinessHandler(mode string, statusReg *prober.StatusRegistry) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		if !readyToProbe(mode, statusReg.Snapshot()) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			// pi-lens-ignore: go-ignored-call-result
+			_, _ = w.Write([]byte("not ready: no target has ever had a working socket\n"))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		// pi-lens-ignore: go-ignored-call-result
+		_, _ = w.Write([]byte("ok\n"))
+	})
+}
+
+func (p *program) startMetricsServer(addr, user, pass, cert, key string, statusReg *prober.StatusRegistry, gzip bool, mode string) (*http.Server, <-chan struct{}, error) {
 	metricsLn, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, nil, fmt.Errorf("metrics server: %w", err)
@@ -593,17 +674,23 @@ func (p *program) startMetricsServer(addr, user, pass, cert, key string, statusR
 	})
 	// /healthz and /readyz are deliberately unauthenticated: they are
 	// liveness/readiness probes that an orchestrator must reach without
-	// credentials, and they expose no data. Do not gate them.
+	// credentials, and they expose no data. Do not gate them. /readyz is NOT
+	// an alias of /healthz (it was): liveness means the process is running,
+	// readiness means it is actually probing.
 	mx.Handle("/healthz", healthzHandler)
-	mx.Handle("/readyz", healthzHandler)
+	mx.Handle("/readyz", readinessHandler(mode, statusReg))
 	// /status exposes live per-target probe state (link_up, inflight,
 	// misses, RTO, socket age). Gated like /metrics: open only when no
 	// metrics auth is configured.
 	mx.Handle("/status", prober.MetricsAuth(user, pass, statusReg.Handler()))
 	metricsSrv := &http.Server{
-		Handler:      mx,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
+		Handler:     mx,
+		ReadTimeout: 10 * time.Second,
+		// 30s, not 10s: a large fleet on a slow link can need longer than 10s
+		// to write a multi-megabyte scrape body, and a truncated response
+		// reads as the monitor itself being down. Reads stay at 10s so a slow
+		// client still cannot hold a connection.
+		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
 		// Bounded header read: ReadTimeout alone starts only after the
 		// headers land, so a slowloris client could otherwise hold a
@@ -725,7 +812,7 @@ func (p *program) run() error {
 	// failure (port taken, permission denied) aborts startup instead of
 	// leaving the agent running with no /metrics endpoint — a silent
 	// partial failure for a monitoring agent.
-	metricsSrv, metricsDone, err := p.startMetricsServer(*flMetrics, user, pass, cert, key, statusReg, *flMetricsGzip)
+	metricsSrv, metricsDone, err := p.startMetricsServer(*flMetrics, user, pass, cert, key, statusReg, *flMetricsGzip, *flMode)
 	if err != nil {
 		return err
 	}

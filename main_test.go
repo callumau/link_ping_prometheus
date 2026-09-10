@@ -5,6 +5,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
@@ -47,6 +49,45 @@ func TestMetricsCompressionToggle(t *testing.T) {
 	}
 }
 
+// TestMetricsHandlerInstrumentsScrapes pins the scrape instrumentation that
+// promhttp.HandlerFor alone does not register (promhttp.Handler used to):
+// without promhttp_metric_handler_requests_total{code="503"} and
+// _requests_in_flight a scrape rejected by the concurrency cap is invisible.
+// Building the handler twice must not panic either - InstrumentMetricHandler
+// reuses the already-registered collector, which is what keeps repeated test
+// runs (-count>1) and repeated scrapes safe.
+func TestMetricsHandlerInstrumentsScrapes(t *testing.T) {
+	prober.InitMetrics()
+	scrape := func(h http.Handler) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	rec := scrape(metricsHandler(false))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		"promhttp_metric_handler_requests_total",
+		// The in-flight gauge counts the scrape serving it, so its value is
+		// exactly 1 and is safe to pin.
+		"promhttp_metric_handler_requests_in_flight 1",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("/metrics body is missing %q (scrape instrumentation lost)", want)
+		}
+	}
+
+	// A second handler build (another call site, or a -count>1 run) must
+	// re-register cleanly rather than panic.
+	if rec := scrape(metricsHandler(true)); rec.Code != http.StatusOK {
+		t.Fatalf("second handler build: status = %d, want 200", rec.Code)
+	}
+}
+
 // TestServiceConfigHardening pins the SCM hardening options: recovery
 // restart, delayed auto-start, and network/time dependencies. These were
 // shipped unconfigured once (a crash left the service stopped forever) —
@@ -74,36 +115,43 @@ func TestServiceConfigHardening(t *testing.T) {
 	}
 }
 
+// TestReleasableHeap pins the scavenge trigger's input: idle heap the runtime
+// has not yet returned to the OS. The trigger used Sys-HeapReleased, which
+// covers the whole process and is therefore always above the threshold, so the
+// documented "skip an already-lean process" guard never fired.
 // pi-lens-ignore: go-test-functions
-func TestUnreleasedHeap(t *testing.T) {
+func TestReleasableHeap(t *testing.T) {
 	tests := []struct {
 		name string
 		m    runtime.MemStats
 		want uint64
 	}{
 		{
-			// Fully released heap: nothing left to give back.
-			"all released",
-			runtime.MemStats{Sys: 10 << 20, HeapReleased: 10 << 20},
+			// Already-lean process: Sys is large (stacks, GC metadata, mmap'd
+			// spans), but every idle span has been released - nothing to give
+			// back, so nothing to scavenge.
+			"all idle heap released",
+			runtime.MemStats{Sys: 100 << 20, HeapIdle: 10 << 20, HeapReleased: 10 << 20},
 			0,
 		},
 		{
-			// Sys can transiently dip below HeapReleased; an unsigned
-			// subtraction would wrap and force a scavenge every tick.
-			"released exceeds sys underflows to zero",
-			runtime.MemStats{Sys: 4 << 20, HeapReleased: 8 << 20},
+			// HeapReleased can transiently exceed HeapIdle; an unsigned
+			// subtraction would wrap and force a scavenge every tick. Released
+			// is strictly GREATER here so the clamp is actually exercised.
+			"released exceeds idle underflows to zero",
+			runtime.MemStats{Sys: 4 << 20, HeapIdle: 8 << 20, HeapReleased: 12 << 20},
 			0,
 		},
 		{
-			"unreleased is sys minus released",
-			runtime.MemStats{Sys: 20 << 20, HeapReleased: 6 << 20},
+			"releasable is idle minus released",
+			runtime.MemStats{Sys: 20 << 20, HeapIdle: 20 << 20, HeapReleased: 6 << 20},
 			14 << 20,
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := unreleasedHeap(tc.m); got != tc.want {
-				t.Errorf("unreleasedHeap(%+v) = %d, want %d", tc.m, got, tc.want)
+			if got := releasableHeap(tc.m); got != tc.want {
+				t.Errorf("releasableHeap(%+v) = %d, want %d", tc.m, got, tc.want)
 			}
 		})
 	}
@@ -117,10 +165,13 @@ func TestShouldScavenge(t *testing.T) {
 		minUnreleased uint64
 		want          bool
 	}{
-		{"below threshold is skipped", runtime.MemStats{Sys: 6 << 20, HeapReleased: 3 << 20}, 4 << 20, false},
-		{"exactly at threshold scavenges", runtime.MemStats{Sys: 8 << 20, HeapReleased: 4 << 20}, 4 << 20, true},
-		{"above threshold scavenges", runtime.MemStats{Sys: 12 << 20, HeapReleased: 2 << 20}, 4 << 20, true},
-		{"lean heap is skipped", runtime.MemStats{Sys: 8 << 20, HeapReleased: 8 << 20}, minScavengeUnreleased, false},
+		// The regression: a long-running agent always holds tens of MB in Sys,
+		// so keying the guard on the process total made it fire on every tick
+		// of an otherwise lean process.
+		{"lean process is skipped despite a large Sys", runtime.MemStats{Sys: 90 << 20, HeapIdle: 8 << 20, HeapReleased: 8 << 20}, minScavengeUnreleased, false},
+		{"below threshold is skipped", runtime.MemStats{HeapIdle: 6 << 20, HeapReleased: 3 << 20}, 4 << 20, false},
+		{"exactly at threshold scavenges", runtime.MemStats{HeapIdle: 8 << 20, HeapReleased: 4 << 20}, 4 << 20, true},
+		{"above threshold scavenges", runtime.MemStats{HeapIdle: 12 << 20, HeapReleased: 2 << 20}, 4 << 20, true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -283,6 +334,101 @@ func TestFlagDefaultInt(t *testing.T) {
 		if got != want {
 			t.Errorf("flagDefaultInt(%s) = %d, want %d", name, got, want)
 		}
+	}
+}
+
+// TestAbsolutizeFlagValue pins the service-install argument rewriting: path
+// flags must be persisted absolute (the SCM's working directory is unrelated
+// to the install directory), while every other flag - notably the integer
+// log-rotation flags - must be persisted verbatim. Absolutizing
+// log-file-max-mb=50 produced "C:\cwd\50", so the service exited 2 at
+// flag.Parse with stderr discarded under the SCM: a crash loop with no
+// diagnostics at all.
+func TestAbsolutizeFlagValue(t *testing.T) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	absLog := filepath.Join(cwd, "logs", "agent.log")
+
+	tests := []struct{ name, flag, value, want string }{
+		{"int size flag is untouched", "log-file-max-mb", "50", "50"},
+		{"int backups flag is untouched", "log-file-max-backups", "0", "0"},
+		{"int age flag is untouched", "log-file-max-age", "28", "28"},
+		{"relative log path is absolutized", "log-file", filepath.Join("logs", "agent.log"), absLog},
+		{"relative targets path is absolutized", "targets", "targets.json", filepath.Join(cwd, "targets.json")},
+		{"already absolute path is unchanged", "metrics-tls-cert", absLog, absLog},
+		{"empty path value stays empty", "log-file", "", ""},
+		{"non-path flag is untouched", "mode", "client", "client"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := absolutizeFlagValue(tc.flag, tc.value); got != tc.want {
+				t.Errorf("absolutizeFlagValue(%q, %q) = %q, want %q", tc.flag, tc.value, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestReadyzSemantics pins the liveness/readiness split: /healthz stays
+// always-200, while /readyz must report 503 for a client-side agent that has
+// never held a working socket (DNS outage, firewall) - alive but probing
+// nothing is exactly the failure mode an orchestrator must be able to see.
+// socket_age_seconds is set only after a successful dial, so it is the signal
+// the gate reads.
+func TestReadyzSemantics(t *testing.T) {
+	// A target still in the dial-retry loop publishes a target entry with
+	// socket_age_seconds == 0; one with a live socket publishes > 0.
+	dialStuck := []prober.TargetStatus{{Name: "a"}}
+	working := []prober.TargetStatus{{Name: "a"}, {Name: "b", SocketAgeSeconds: 12.5}}
+
+	tests := []struct {
+		name    string
+		mode    string
+		targets []prober.TargetStatus
+		want    int
+	}{
+		{"server mode is ready without targets", "server", nil, http.StatusOK},
+		{"client with an empty registry is not ready", "client", nil, http.StatusServiceUnavailable},
+		{"client still dialing is not ready", "client", dialStuck, http.StatusServiceUnavailable},
+		{"client with one working socket is ready", "client", working, http.StatusOK},
+		{"both mode with one working socket is ready", "both", working, http.StatusOK},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := prober.NewStatusRegistry()
+			for _, s := range tc.targets {
+				reg.Update(s)
+			}
+			rec := httptest.NewRecorder()
+			readinessHandler(tc.mode, reg).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+			if rec.Code != tc.want {
+				t.Errorf("/readyz in mode %s = %d, want %d (body %q)", tc.mode, rec.Code, tc.want, rec.Body.String())
+			}
+		})
+	}
+}
+
+// TestStartMetricsServerTimeouts pins the HTTP timeouts: a multi-megabyte
+// scrape over a slow link needs more than 10s to write, and a truncated
+// response reads as the monitor itself being down. Reads stay short so a slow
+// client still cannot hold a connection.
+func TestStartMetricsServerTimeouts(t *testing.T) {
+	p := &program{}
+	srv, done, err := p.startMetricsServer("127.0.0.1:0", "", "", "", "", prober.NewStatusRegistry(), false, "client")
+	if err != nil {
+		t.Fatalf("startMetricsServer: %v", err)
+	}
+	t.Cleanup(func() {
+		// pi-lens-ignore: go-ignored-call-result
+		_ = srv.Close()
+		<-done
+	})
+	if srv.WriteTimeout != 30*time.Second {
+		t.Errorf("WriteTimeout = %v, want 30s (10s truncates large scrapes)", srv.WriteTimeout)
+	}
+	if srv.ReadTimeout != 10*time.Second || srv.ReadHeaderTimeout != 10*time.Second {
+		t.Errorf("ReadTimeout/ReadHeaderTimeout = %v/%v, want 10s/10s", srv.ReadTimeout, srv.ReadHeaderTimeout)
 	}
 }
 
