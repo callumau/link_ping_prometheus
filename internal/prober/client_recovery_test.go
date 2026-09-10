@@ -151,6 +151,23 @@ func (c *readFailConn) SetDeadline(time.Time) error      { return nil }
 func (c *readFailConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *readFailConn) SetWriteDeadline(time.Time) error { return nil }
 
+// firstDeadlineOKConn wraps a real UDP conn and lets the FIRST
+// SetReadDeadline through, failing every subsequent call. The reader thus
+// delivers one real echo into respCh and then dies on the bounded
+// deadline-failure path while that echo is still buffered — the setup for
+// the reader-death drain test.
+type firstDeadlineOKConn struct {
+	net.Conn
+	calls atomic.Int64
+}
+
+func (c *firstDeadlineOKConn) SetReadDeadline(t time.Time) error {
+	if c.calls.Add(1) == 1 {
+		return c.Conn.SetReadDeadline(t)
+	}
+	return errors.New("injected SetReadDeadline failure after first success")
+}
+
 // scriptedConn wraps a real UDP conn (used for Read/deadlines/Close) and
 // routes Write calls through hook(n), where n is the 1-based write count.
 // hook returns whether the write should fail or panic.
@@ -255,6 +272,151 @@ func TestEchoLoop_PanicFlushCountsTimeouts(t *testing.T) {
 	if sent != rtt+tout+infl {
 		t.Errorf("balance invariant broken after panic: sent=%v rtt=%v timed_out=%v inflight=%v",
 			sent, rtt, tout, infl)
+	}
+}
+
+// TestEchoLoop_ReaderDeathDrainsReceivedEcho: an echo the reader already
+// delivered into respCh before it died was RECEIVED, so the reader-death
+// exit must drain it as an RTT sample rather than charge it as loss via the
+// flush. Falsification: drop the drainResponses() call before flushPending()
+// in the readerDone case and this test sees rtt=0 with timed_out=1.
+// pi-lens-ignore: go-test-functions
+func TestEchoLoop_ReaderDeathDrainsReceivedEcho(t *testing.T) {
+	InitMetrics()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	addr := wbEchoServer(t, ctx, nil)
+	realConn, err := dialUDP(ctx, "udp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := &firstDeadlineOKConn{Conn: realConn}
+
+	const src, name = "test", "reader_death_drain"
+	m := newTargetMetrics(src, Target{Name: name, Address: addr})
+	// Long interval: the main loop must still be waiting on its timer when
+	// the reader dies, so the buffered echo is in respCh at that moment.
+	cfg := Config{Source: src, BaseInterval: 400 * time.Millisecond, BaseTimeout: 2 * time.Second}
+
+	if err := runEchoLoop(ctx, conn, cfg, NewAdaptiveStats(cfg.BaseTimeout), m, &probeLoopState{}, slog.Default()); !errors.Is(err, errReaderDead) {
+		t.Fatalf("expected errReaderDead from the reader-death exit, got %v", err)
+	}
+
+	if rtt := wbHistCount(src, name, addr); rtt != 1 {
+		t.Errorf("the received echo must be counted as an RTT sample, got rtt_samples=%v", rtt)
+	}
+	if tout := wbCounter(ProbesTimedOut, src, name, addr); tout != 0 {
+		t.Errorf("a received echo must not be charged as loss on reader death, got timed_out=%v", tout)
+	}
+	if infl := wbGauge(ProbesInflight, src, name, addr); infl != 0 {
+		t.Errorf("inflight must drain to 0, got %v", infl)
+	}
+}
+
+// TestEchoLoop_WriteFailureRefreshStatus: when link_up drops to 0 on the
+// Nth consecutive write failure, /status must reflect it immediately, not
+// up to a full interval later — a /status reporting link_up:true while the
+// gauge is 0 is the frozen-green bug. The link is first proven UP through
+// real echoes (so state.linkUp is genuinely true), then writes are failed;
+// the interval is long so the stale window is wide enough to detect.
+// pi-lens-ignore: go-test-functions
+func TestEchoLoop_WriteFailureRefreshStatus(t *testing.T) {
+	InitMetrics()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	addr := wbEchoServer(t, ctx, nil)
+	realConn, err := dialUDP(ctx, "udp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var failWrites atomic.Bool
+	conn := &scriptedConn{Conn: realConn, hook: func(int64) (bool, bool) {
+		return failWrites.Load(), false
+	}}
+
+	const src, name = "test", "status_transition"
+	reg := NewStatusRegistry()
+	m := newTargetMetrics(src, Target{Name: name, Address: addr})
+	m.status = reg
+
+	cfg := Config{Source: src, BaseInterval: 500 * time.Millisecond, BaseTimeout: time.Second}
+	done := make(chan struct{})
+	go func() {
+		runEchoLoop(ctx, conn, cfg, NewAdaptiveStats(cfg.BaseTimeout), m, &probeLoopState{}, slog.Default())
+		close(done)
+	}()
+
+	// Phase 1: the link genuinely comes up through real echoes.
+	upDeadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(upDeadline) && wbGauge(LinkUp, src, name, addr) != 1 {
+		// pi-lens-ignore: go-time-sleep-test
+		time.Sleep(5 * time.Millisecond)
+	}
+	if wbGauge(LinkUp, src, name, addr) != 1 {
+		cancel()
+		<-done
+		t.Fatalf("link never came up before the write-failure phase")
+	}
+
+	// Phase 2: fail every write; after maxConsecutiveWriteFails the gauge
+	// drops to 0 and /status must agree well inside the 500ms tick.
+	// Positive control first: /status must reflect the up state, so the
+	// false below is a real transition, not a startup shortcut.
+	upStatusDeadline := time.Now().Add(2 * time.Second)
+	upStatus := false
+	for time.Now().Before(upStatusDeadline) && !upStatus {
+		for _, s := range reg.Snapshot() {
+			if s.Name == name && s.LinkUp {
+				upStatus = true
+			}
+		}
+		// pi-lens-ignore: go-time-sleep-test
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !upStatus {
+		cancel()
+		<-done
+		t.Fatal("precondition: /status never reported link_up:true while the link was up")
+	}
+
+	failWrites.Store(true)
+	dropDeadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(dropDeadline) && wbGauge(LinkUp, src, name, addr) != 0 {
+		// pi-lens-ignore: go-time-sleep-test
+		time.Sleep(5 * time.Millisecond)
+	}
+	if wbGauge(LinkUp, src, name, addr) != 0 {
+		cancel()
+		<-done
+		t.Fatalf("link_up never dropped after %d consecutive write failures", maxConsecutiveWriteFails)
+	}
+
+	agree := false
+	agreeDeadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(agreeDeadline) && !agree {
+		for _, s := range reg.Snapshot() {
+			if s.Name == name && !s.LinkUp {
+				agree = true
+			}
+		}
+		// pi-lens-ignore: go-time-sleep-test
+		time.Sleep(2 * time.Millisecond)
+	}
+	if !agree {
+		cancel()
+		<-done
+		t.Errorf("/status still reports link_up:true after the gauge dropped to 0: %+v", reg.Snapshot())
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("echo loop did not stop after cancel")
 	}
 }
 
@@ -645,9 +807,14 @@ func TestProbeTarget_ReaderDeathRedials(t *testing.T) {
 	addr := wbRealEchoServer(t, ctx, "")
 	const src, name = "test", "reader_dead"
 	// 10ms interval so the short-lived reader (3×15ms) still sees several
-	// probes in flight before it dies, and a short reconnect cycle so the
-	// re-dial happens inside the test window.
-	cfg := Config{Source: src, BaseInterval: 10 * time.Millisecond, BaseTimeout: 300 * time.Millisecond, ReconnectInterval: 150 * time.Millisecond}
+	// probes in flight before it dies. ReconnectInterval must stay short: the
+	// reconnect is what installs the failing conn via the seam, and the reader
+	// death that follows is what pauses the loop in probeTarget (1s) — during
+	// that pause the /status assertion below can only be satisfied by the
+	// reader-death emit, since the last per-tick snapshot still carried the
+	// pre-death link_up.
+	reg := NewStatusRegistry()
+	cfg := Config{Source: src, BaseInterval: 10 * time.Millisecond, BaseTimeout: 300 * time.Millisecond, ReconnectInterval: 150 * time.Millisecond, Status: reg}
 	done := make(chan struct{})
 	go func() {
 		probeTarget(ctx, Target{Name: name, Address: addr}, cfg)
@@ -691,6 +858,26 @@ func TestProbeTarget_ReaderDeathRedials(t *testing.T) {
 		cancel()
 		<-done
 		t.Fatalf("link_up stayed %v across persistent reader deaths — a frozen green is the worst failure mode", up)
+	}
+	// /status must reflect the drop IMMEDIATELY, not on some later tick: we are
+	// inside probeTarget's 1s re-dial pause, so the only writer that can publish
+	// link_up=false now is the reader-death emit. Without it the registry keeps
+	// the last per-tick snapshot (link_up=true) for the whole pause, which is
+	// the stale-debug-endpoint bug this pins.
+	statusDeadline := time.Now().Add(500 * time.Millisecond)
+	statusDown := false
+	for time.Now().Before(statusDeadline) && !statusDown {
+		for _, s := range reg.Snapshot() {
+			if s.Name == name && !s.LinkUp {
+				statusDown = true
+			}
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if !statusDown {
+		cancel()
+		<-done
+		t.Fatalf("/status never reported link_up:false after the reader death: %+v", reg.Snapshot())
 	}
 	if got := wbCounterLabels(ProberInternalErrors, src, name, addr, "reader_dead"); got < 1 {
 		t.Errorf("reader death must be counted in link_prober_internal_errors_total{reason=reader_dead}, got %v", got)
