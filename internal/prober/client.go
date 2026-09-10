@@ -177,12 +177,29 @@ func RunClient(ctx context.Context, cfg Config) error {
 	}
 
 	// Warn when this client's probe rate would exceed the echo server's
-	// per-IP cap: the server silently drops over-cap probes, which the
-	// client would read as artificial packet loss.
-	if pps := float64(len(cfg.Targets)) / cfg.BaseInterval.Seconds(); pps > float64(MaxPktsPerIP) {
+	// per-IP or global cap: the server silently drops over-cap probes,
+	// which the client would read as artificial packet loss. The rate sums
+	// each target's EFFECTIVE interval (per-target override, else the
+	// global) so a target with a short interval is not undercounted.
+	var pps float64
+	for _, tg := range cfg.Targets {
+		interval := cfg.BaseInterval
+		if tg.Interval != 0 {
+			interval = tg.Interval
+		}
+		if interval > 0 {
+			pps += 1 / interval.Seconds()
+		}
+	}
+	if pps > float64(MaxPktsPerIP) {
 		slog.Warn("Probe rate exceeds the server per-IP echo cap; probes will be dropped and loss will read artificially high",
 			"expected_pkts_per_sec", pps, "server_cap_per_ip", MaxPktsPerIP,
 			"fix", "raise MaxPktsPerIP on the server or reduce targets/interval")
+	}
+	if pps > float64(MaxPktsGlobal) {
+		slog.Warn("Probe rate exceeds the server global echo cap; probes will be dropped and loss will read artificially high",
+			"expected_pkts_per_sec", pps, "server_cap_global", MaxPktsGlobal,
+			"fix", "raise MaxPktsGlobal on the server or reduce targets/interval")
 	}
 
 	SeedMetrics(cfg.Source, cfg.Targets)
@@ -207,10 +224,14 @@ func RunClient(ctx context.Context, cfg Config) error {
 			probeTarget(tctx, tg, cfg)
 		}()
 	}
-	stop := func(name string) {
+	// stop cancels a target's loop and joins it with a bound. It returns
+	// false when the join timed out (the loop may still be writing that
+	// target's series). purge additionally withdraws every metric series so
+	// a REMOVED target stops being exported — see deleteTargetSeries.
+	stop := func(name string, purge bool) bool {
 		r, ok := live[name]
 		if !ok {
-			return
+			return true
 		}
 		delete(live, name)
 		r.cancel()
@@ -218,32 +239,53 @@ func RunClient(ctx context.Context, cfg Config) error {
 		// retry waits are at most 1s). A slow exit must not block a reload.
 		select {
 		case <-r.done:
+			if purge {
+				deleteTargetSeries(cfg.Source, r.tg)
+				cfg.Status.Remove(name)
+			}
+			return true
 		case <-time.After(5 * time.Second):
 			slog.Warn("Removed target probe loop did not stop within 5s", "target", name)
+			return false
 		}
 	}
 	// apply swaps the running set to match targets: removed targets stop
-	// (their final metric series remain — events just stop and the series
-	// go stale in Prometheus), changed targets restart with the new
-	// values, new targets start fresh. targets must already be validated
+	// and have their series deleted, changed targets restart with the new
+	// values (keeping their series — still the same monitored endpoint),
+	// new targets start fresh. targets must already be validated
 	// (LoadTargets and Config.Validate both do).
 	apply := func(targets []Target) {
 		want := make(map[string]Target, len(targets))
 		for _, tg := range targets {
 			want[tg.Name] = tg
 		}
+		// Names whose old loop failed to join: it may still be writing their
+		// series, so a replacement must not be started for them.
+		unjoined := make(map[string]bool)
 		for name, r := range live {
 			w, ok := want[name]
 			if ok && w.Address == r.tg.Address && w.Interval == r.tg.Interval && w.Timeout == r.tg.Timeout {
 				continue
 			}
-			stop(name)
+			// !ok means the target was removed from the file: purge it.
+			if !stop(name, !ok) {
+				// The old loop failed to join, so it may still be alive on the
+				// same series; starting a replacement would leave two loops
+				// writing one target. Leave the target stopped and surface it.
+				slog.Error("Probe loop did not stop in time; leaving target stopped", "target", name)
+				ProberInternalErrors.WithLabelValues(cfg.Source, r.tg.Name, r.tg.Address, "stop_timeout").Inc()
+				unjoined[name] = true
+				continue
+			}
 			if ok {
 				SeedMetrics(cfg.Source, []Target{w})
 				start(w)
 			}
 		}
 		for _, tg := range targets {
+			if unjoined[tg.Name] {
+				continue
+			}
 			if _, ok := live[tg.Name]; !ok {
 				SeedMetrics(cfg.Source, []Target{tg})
 				start(tg)
@@ -317,6 +359,11 @@ type targetMetrics struct {
 	mtuSent prometheus.Counter
 	mtuLost prometheus.Counter
 	pathMTU prometheus.Gauge
+	// Internal-error handles, pre-resolved with their reason so the failure
+	// paths do not pay a label lookup (and never race the vec mutex).
+	internalPanic      prometheus.Counter
+	internalReaderDead prometheus.Counter
+	internalDialRetry  prometheus.Counter
 	// name/addr label the /status snapshot; status receives it (nil-safe).
 	name   string
 	addr   string
@@ -327,22 +374,51 @@ type targetMetrics struct {
 // a single target and returns direct handles to them.
 func newTargetMetrics(source string, t Target) targetMetrics {
 	return targetMetrics{
-		sent:      ProbesSent.WithLabelValues(source, t.Name, t.Address),
-		sendErr:   SendErrors.WithLabelValues(source, t.Name, t.Address),
-		corrupted: CorruptedProbes.WithLabelValues(source, t.Name, t.Address),
-		timedOut:  ProbesTimedOut.WithLabelValues(source, t.Name, t.Address),
-		inflight:  ProbesInflight.WithLabelValues(source, t.Name, t.Address),
-		rtt:       RTTSeconds.WithLabelValues(source, t.Name, t.Address),
-		jitter:    JitterSeconds.WithLabelValues(source, t.Name, t.Address),
-		linkUp:    LinkUp.WithLabelValues(source, t.Name, t.Address),
-		rto:       RTOEstimate.WithLabelValues(source, t.Name, t.Address),
-		srtt:      SRTTSeconds.WithLabelValues(source, t.Name, t.Address),
-		mtuSent:   MTUProbesSent.WithLabelValues(source, t.Name, t.Address),
-		mtuLost:   MTUProbesLost.WithLabelValues(source, t.Name, t.Address),
-		pathMTU:   PathMTUBytes.WithLabelValues(source, t.Name, t.Address),
-		name:      t.Name,
-		addr:      t.Address,
+		sent:               ProbesSent.WithLabelValues(source, t.Name, t.Address),
+		sendErr:            SendErrors.WithLabelValues(source, t.Name, t.Address),
+		corrupted:          CorruptedProbes.WithLabelValues(source, t.Name, t.Address),
+		timedOut:           ProbesTimedOut.WithLabelValues(source, t.Name, t.Address),
+		inflight:           ProbesInflight.WithLabelValues(source, t.Name, t.Address),
+		rtt:                RTTSeconds.WithLabelValues(source, t.Name, t.Address),
+		jitter:             JitterSeconds.WithLabelValues(source, t.Name, t.Address),
+		linkUp:             LinkUp.WithLabelValues(source, t.Name, t.Address),
+		rto:                RTOEstimate.WithLabelValues(source, t.Name, t.Address),
+		srtt:               SRTTSeconds.WithLabelValues(source, t.Name, t.Address),
+		mtuSent:            MTUProbesSent.WithLabelValues(source, t.Name, t.Address),
+		mtuLost:            MTUProbesLost.WithLabelValues(source, t.Name, t.Address),
+		pathMTU:            PathMTUBytes.WithLabelValues(source, t.Name, t.Address),
+		internalPanic:      ProberInternalErrors.WithLabelValues(source, t.Name, t.Address, "panic"),
+		internalReaderDead: ProberInternalErrors.WithLabelValues(source, t.Name, t.Address, "reader_dead"),
+		internalDialRetry:  ProberInternalErrors.WithLabelValues(source, t.Name, t.Address, "dial_retry"),
+		name:               t.Name,
+		addr:               t.Address,
 	}
+}
+
+// deleteTargetSeries withdraws every client-side series for a target that
+// was REMOVED from the targets file. Registration in a Prometheus vec is
+// permanent: staleness only kicks in once a series DISAPPEARS from a
+// scrape, and a still-registered series keeps being exported at its last
+// value — a decommissioned target would export link_up=1 forever. Deleting
+// is the only way to actually withdraw it. A CHANGED target (same name,
+// new address/interval/timeout) keeps its series: it is still the same
+// monitored endpoint, so the counters must stay continuous.
+func deleteTargetSeries(source string, t Target) {
+	labels := prometheus.Labels{"source": source, "target": t.Name, "address": t.Address}
+	ProbesSent.DeletePartialMatch(labels)
+	SendErrors.DeletePartialMatch(labels)
+	CorruptedProbes.DeletePartialMatch(labels)
+	ProberInternalErrors.DeletePartialMatch(labels)
+	ProbesTimedOut.DeletePartialMatch(labels)
+	ProbesInflight.DeletePartialMatch(labels)
+	RTTSeconds.DeletePartialMatch(labels)
+	JitterSeconds.DeletePartialMatch(labels)
+	LinkUp.DeletePartialMatch(labels)
+	RTOEstimate.DeletePartialMatch(labels)
+	SRTTSeconds.DeletePartialMatch(labels)
+	MTUProbesSent.DeletePartialMatch(labels)
+	MTUProbesLost.DeletePartialMatch(labels)
+	PathMTUBytes.DeletePartialMatch(labels)
 }
 
 // maxConsecutiveWriteFails bounds how many successive local send errors
@@ -351,10 +427,23 @@ func newTargetMetrics(source string, t Target) targetMetrics {
 // worst failure mode for a monitor.
 const maxConsecutiveWriteFails = 3
 
+// maxConsecutiveReadFails bounds successive non-timeout socket Read errors
+// in the reader goroutine. Some of them (ICMP port-unreachable) are
+// expected and carry no meaning for a datagram socket, but a persistent
+// error must not spin the reader at Debug level forever — the reader exits
+// and the main loop re-dials.
+const maxConsecutiveReadFails = 10
+
 // errReconnect is a sentinel returned by runEchoLoop to request a socket
 // re-dial (DNS re-resolution) once ReconnectInterval has elapsed. It is
 // not a panic and is returned only when no probes are in flight.
 var errReconnect = errors.New("periodic reconnect")
+
+// errReaderDead is returned by runEchoLoop when its reader goroutine has
+// died: with nobody reading the socket every probe is a guaranteed
+// timeout, so the caller re-dials immediately instead of probing a socket
+// whose responses are silently discarded.
+var errReaderDead = errors.New("UDP reader stopped")
 
 // dialUDP dials a UDP socket. Kept as a package variable so tests can
 // substitute a failing dialer to exercise the dial-retry path
@@ -435,21 +524,32 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 			// DNS/interface outage. Probing is structurally impossible here.
 			m.linkUp.Set(0)
 			state.linkUp = false
+			m.internalDialRetry.Inc()
 			// Record the stuck-dialing state so /status shows targets that
-			// cannot even open a socket (DNS outage, firewall).
+			// cannot even open a socket (DNS outage, firewall). Carry the MTU
+			// and last-echo age too so /status agrees with the gauges instead
+			// of rendering 0/-1 unknowns while the agent keeps retrying.
+			lastEchoAge := -1.0
+			if !state.lastEcho.IsZero() {
+				lastEchoAge = time.Since(state.lastEcho).Seconds()
+			}
 			m.status.Update(TargetStatus{
-				Name:              t.Name,
-				Address:           t.Address,
-				ConsecutiveMisses: state.consecutiveMisses,
-				RTOSeconds:        stats.CurrentRTO().Seconds(),
-				JitterSeconds:     state.jitter,
-				SRTTSeconds:       stats.SRTT().Seconds(),
-				LastSeq:           state.seq,
+				Name:               t.Name,
+				Address:            t.Address,
+				ConsecutiveMisses:  state.consecutiveMisses,
+				RTOSeconds:         stats.CurrentRTO().Seconds(),
+				JitterSeconds:      state.jitter,
+				SRTTSeconds:        stats.SRTT().Seconds(),
+				LastSeq:            state.seq,
+				PathMTUBytes:       int(state.pathMTU.Load()),
+				LastEchoAgeSeconds: lastEchoAge,
 			})
 			// A DNS outage retries every second; log the first failure
 			// immediately, then at most once per minute so an Error-level
 			// message does not flood the log for the duration of the outage.
-			if lastDialLog.IsZero() || time.Since(lastDialLog) >= time.Minute {
+			// During shutdown ctx is cancelled and the failure is expected:
+			// do not report it as an error.
+			if ctx.Err() == nil && (lastDialLog.IsZero() || time.Since(lastDialLog) >= time.Minute) {
 				logger.Error("Failed to open UDP socket; retrying", "err", err)
 				lastDialLog = time.Now()
 			}
@@ -481,8 +581,9 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 		// runEchoLoop recovers panics and returns them as errors; a
 		// panic is per-event corruption, not a link condition, so the
 		// target keeps probing rather than dying with frozen series
-		// (stale counters make loss rate() queries go NaN). RTO state,
-		// link_up and jitter survive the restart; the pause bounds a
+		// (stale counters make loss rate() queries go NaN). RTO state and
+		// jitter survive the restart; link_up is dropped to 0 while the
+		// restart pause leaves nothing probing. The pause bounds a
 		// panic-storm cycle.
 		err = runEchoLoop(ctx, conn, cfg, stats, m, state, logger)
 		if err == nil || ctx.Err() != nil {
@@ -492,7 +593,35 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 			// Periodic re-dial to re-resolve DNS; not an error.
 			continue
 		}
+		if errors.Is(err, errReaderDead) {
+			// Re-dial at once, but bound the retry: a socket that kills its
+			// reader immediately (persistent SetReadDeadline failures) would
+			// otherwise spin dial -> reader-death with no pause. The internal
+			// error counter already recorded the event; throttle the log like
+			// the dial failures.
+			if ctx.Err() == nil && (lastDialLog.IsZero() || time.Since(lastDialLog) >= time.Minute) {
+				logger.Error("UDP reader stopped; re-dialing socket")
+				lastDialLog = time.Now()
+			}
+			t := time.NewTimer(time.Second)
+			select {
+			// pi-lens-ignore: waitgroup-done-scope
+			case <-ctx.Done():
+				if !t.Stop() {
+					<-t.C
+				}
+				return
+			case <-t.C:
+			}
+			continue
+		}
 		logger.Error("Echo loop panicked; restarting probe loop", "err", err)
+		m.internalPanic.Inc()
+		// A panic-restart means nothing is being probed during the pause:
+		// keep link_up honest (the next matched echo restores it) rather
+		// than freezing a healthy-looking 1 across repeated restarts.
+		m.linkUp.Set(0)
+		state.linkUp = false
 		t := time.NewTimer(time.Second)
 		select {
 		// pi-lens-ignore: waitgroup-done-scope
@@ -567,9 +696,15 @@ func runEchoLoop(
 	done := make(chan struct{})
 	defer close(done)
 
+	// readerDone is closed by the reader goroutine on ANY exit so the main
+	// loop can tell that responses are no longer being consumed and re-dial
+	// instead of probing into a void.
+	readerDone := make(chan struct{})
+
 	defer conn.Close()
 
 	go func() {
+		defer close(readerDone)
 		// Read into a buffer larger than the payload so an oversized
 		// datagram is not silently truncated to PayloadSize by the kernel
 		// and mistaken for a valid probe (Read truncates to the buffer).
@@ -581,6 +716,11 @@ func runEchoLoop(
 			payloadScratch = make([]byte, cfg.Payload)
 		}
 		deadlineFails := 0
+		// readFails bounds consecutive non-timeout Read errors: they can be
+		// persistent (a dead interface surfaces each poll as an error) and a
+		// bare `continue` would busy-spin at Debug level. Reset on any
+		// successful read or timeout.
+		readFails := 0
 		for {
 			if ctx.Err() != nil {
 				return
@@ -601,16 +741,25 @@ func runEchoLoop(
 			n, err := conn.Read(buf)
 			if err != nil {
 				if os.IsTimeout(err) {
+					readFails = 0
 					continue
 				}
 				if errors.Is(err, net.ErrClosed) || ctx.Err() != nil {
 					return
 				}
 				// ICMP port-unreachable and similar are not fatal for a
-				// datagram socket: the probe times out naturally.
+				// datagram socket: the probe times out naturally. Persistent
+				// errors are a different story — see the bound below.
+				readFails++
+				if readFails >= maxConsecutiveReadFails {
+					logger.Error("Persistent UDP read errors; stopping reader",
+						"consecutive_failures", readFails, "err", err)
+					return
+				}
 				logger.Debug("UDP read error", "err", err)
 				continue
 			}
+			readFails = 0
 			expectedSize := PayloadSize
 			if cfg.EchoSecret != "" {
 				expectedSize = PayloadSizeWithHMAC
@@ -684,8 +833,28 @@ func runEchoLoop(
 		}
 	}()
 
+	// flushPending abandons every in-flight probe as a loss: they can never
+	// match on this socket, so counting them as timed out keeps the
+	// sent = rtt + timed_out + inflight balance intact across a re-dial.
+	// Shared by the reconnect and dead-reader exits (the panic recovery
+	// defer does the same).
+	flushPending := func() {
+		if n := len(pending); n > 0 {
+			m.timedOut.Add(float64(n))
+			m.inflight.Sub(float64(n))
+			pending = make(map[uint64]time.Time)
+		}
+	}
+
+	// Monotonic schedule: the tick period must be the probe interval, not
+	// interval + this loop's own work (drain, timeout sweep, frame build,
+	// write), which is material at 1-10ms intervals. `next` is the absolute
+	// deadline of the next probe; the timer waits the remaining time to it.
+	// Starting at now keeps the first probe immediate (the pre-existing
+	// behavior); the schedule takes over from the second tick.
 	intervalTimer := time.NewTimer(0)
 	defer intervalTimer.Stop()
+	next := time.Now()
 
 	for {
 		interval := cfg.BaseInterval
@@ -706,14 +875,35 @@ func runEchoLoop(
 			default:
 			}
 		}
-		intervalTimer.Reset(interval)
+		delay := time.Until(next)
+		if delay < 0 {
+			// Fell behind (the loop's work exceeded the interval): skip the
+			// missed slots entirely rather than firing a burst of catch-up
+			// probes, and resynchronize the schedule to now.
+			next = time.Now()
+			delay = 0
+		}
+		intervalTimer.Reset(delay)
 
 		select {
 		// pi-lens-ignore: waitgroup-done-scope
 		case <-ctx.Done():
 			return nil
+		case <-readerDone:
+			// The reader was the only path that could resolve a probe; with
+			// it gone, every in-flight probe is a guaranteed loss and every
+			// later send would go unanswered until the next reconnect.
+			if ctx.Err() != nil {
+				return nil // reader torn down by shutdown
+			}
+			// The counter is incremented here; probeTarget owns the log and the
+			// bounded re-dial pause (a persistent reader failure must not spin).
+			m.internalReaderDead.Inc()
+			flushPending()
+			return errReaderDead
 		case <-intervalTimer.C:
 		}
+		next = next.Add(interval)
 
 	Drain:
 		for {
@@ -865,11 +1055,7 @@ func runEchoLoop(
 			reconnectInterval = cfg.ReconnectInterval
 		}
 		if reconnectInterval != 0 && time.Since(started) >= reconnectInterval {
-			for s := range pending {
-				m.timedOut.Inc()
-				m.inflight.Dec()
-				delete(pending, s)
-			}
+			flushPending()
 			return errReconnect
 		}
 

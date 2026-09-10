@@ -11,9 +11,12 @@ import (
 // served as JSON at /status so operators can debug a flapping target
 // without log access.
 type TargetStatus struct {
-	Name              string  `json:"name"`
-	Address           string  `json:"address"`
-	LinkUp            bool    `json:"link_up"`
+	Name    string `json:"name"`
+	Address string `json:"address"`
+	LinkUp  bool   `json:"link_up"`
+	// SendFailures is the CURRENT consecutive local write-failure streak
+	// (reset to 0 by the first successful send), not a lifetime total. The
+	// JSON field name is kept as-is for existing consumers.
 	SendFailures      int     `json:"send_failures"`
 	Pending           int     `json:"probes_inflight"`
 	ConsecutiveMisses int     `json:"consecutive_misses"`
@@ -52,6 +55,18 @@ func (r *StatusRegistry) Update(s TargetStatus) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.targets[s.Name] = s
+}
+
+// Remove drops a target's snapshot so a target deleted from the targets
+// file does not linger as a ghost at /status. Nil-receiver safe, like
+// Update: callers never need a nil check.
+func (r *StatusRegistry) Remove(name string) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.targets, name)
 }
 
 // Snapshot returns all target states sorted by name. An empty registry

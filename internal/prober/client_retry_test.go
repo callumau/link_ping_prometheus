@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"os"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -62,11 +63,17 @@ func TestProbeTargetRetriesOnDialFailure(t *testing.T) {
 }
 
 // failingConn is a net.Conn whose Write always fails and whose Read
-// returns net.ErrClosed immediately, exercising the persistent
-// send-failure path deterministically (no real socket needed).
+// behaves like a live-but-idle socket: it reports a read timeout after a
+// short delay. The reader goroutine therefore stays alive, so the test
+// exercises the persistent send-failure path rather than reader death
+// (which is covered separately with its own stub).
 type failingConn struct{}
 
-func (failingConn) Read([]byte) (int, error) { return 0, net.ErrClosed }
+func (failingConn) Read([]byte) (int, error) {
+	// pi-lens-ignore: go-time-sleep-test
+	time.Sleep(5 * time.Millisecond)
+	return 0, os.ErrDeadlineExceeded
+}
 func (failingConn) Write([]byte) (int, error) {
 	return 0, errors.New("write udp: operation not permitted")
 }
