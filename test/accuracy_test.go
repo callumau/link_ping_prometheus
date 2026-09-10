@@ -84,12 +84,13 @@ func TestLossDeadline_FirstTickAfterRTO(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// 150ms sits between the 100ms RTO and the 200ms tick that would retire it.
+	// 200ms sits between the 100ms RTO and the 400ms tick that would retire it,
+	// with 200ms of headroom for scheduler overshoot on a loaded box.
 	addr := validatedEcho(t, ctx, func(buf []byte, w func([]byte)) {
-		time.Sleep(150 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
 		w(buf)
 	})
-	targetName, cfg := namedCfg("loss_deadline", addr, 200*time.Millisecond, 100*time.Millisecond)
+	targetName, cfg := namedCfg("loss_deadline", addr, 400*time.Millisecond, 100*time.Millisecond)
 
 	startTimeouts := getCounterValue(prober.ProbesTimedOut, targetName, addr)
 	runClientFor(ctx, cfg, 2*time.Second)

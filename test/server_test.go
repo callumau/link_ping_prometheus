@@ -1015,11 +1015,13 @@ func TestServer_UnauthenticatedSourceCannotSpendSeriesSlot(t *testing.T) {
 	defer bad.Close()
 	frame := buildHMACFrame(secret, 1, uint64(time.Now().UnixNano()))
 	frame[31] ^= 0xFF
+	// Baseline BEFORE the write: reading it afterwards races the server's read
+	// loop (it may have counted the drop already, making the wait below
+	// vacuous and the failure spurious).
+	before := getCounterValue(prober.ServerProbesDropped, "hmac")
 	bad.Write(frame)
 
-	// Wait for proof the server processed it: the hmac drop counter only
-	// moves once the frame reached authentication.
-	before := getCounterValue(prober.ServerProbesDropped, "hmac")
+	// The counter is moved only after the frame reached authentication.
 	deadline := time.Now().Add(2 * time.Second)
 	for getCounterValue(prober.ServerProbesDropped, "hmac") == before && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
@@ -1504,6 +1506,7 @@ func TestServer_EchoWriteErrorsCounted(t *testing.T) {
 	defer conn.Close()
 
 	before := getCounterValue(prober.ServerEchoErrors)
+	receivedBefore := getCounterValue(prober.ServerProbesReceived, "127.0.0.1")
 	conn.Write(probe)
 	conn.SetReadDeadline(time.Now().Add(400 * time.Millisecond))
 	if n, _ := conn.Read(make([]byte, 1500)); n != 0 {
@@ -1520,6 +1523,12 @@ func TestServer_EchoWriteErrorsCounted(t *testing.T) {
 	if pc.writes.Load() < 1 {
 		t.Error("the server never attempted the echo write")
 	}
+	// The other half of the contract: the probe WAS received (it arrived), so
+	// only the echo failed — that is what lets an operator subtract this rate
+	// from a sent/received mismatch instead of blaming the network.
+	if got := getCounterValue(prober.ServerProbesReceived, "127.0.0.1"); got < receivedBefore+1 {
+		t.Errorf("a probe that arrived but could not be echoed must still count as received: got %v, want >= %v", got, receivedBefore+1)
+	}
 
 	cancel()
 	select {
@@ -1535,9 +1544,11 @@ func TestServer_EchoWriteErrorsCounted(t *testing.T) {
 // TestServer_ExactClientSeriesNeverEvicted: exact-allowlist handles are
 // pre-resolved and must never be swept. Deleting a live client's series resets
 // its counters, which a Prometheus rate() reads as a restart, so the TTL
-// sweeper must only ever touch the dynamic (CIDR) map. Uses a lowered
-// DynClientTTL and waits past a whole dynSweepInterval (1s) so a regression
-// that walked the exact map would have evicted the series by then.
+// sweeper must only ever touch the dynamic (CIDR) map. This is a structural
+// guard (the exact handle never enters `dyn`, so only a sweeper that walked
+// `handles` as well could evict it) and it uses a lowered DynClientTTL plus a
+// wait past a whole dynSweepInterval (1s), so such a regression would be
+// caught here.
 func TestServer_ExactClientSeriesNeverEvicted(t *testing.T) {
 	prober.InitMetrics()
 	oldTTL := prober.DynClientTTL
@@ -1596,10 +1607,11 @@ func TestServer_ExactClientSeriesNeverEvicted(t *testing.T) {
 // TestServer_HMACSizeWindowAndDropReasons: under HMAC the accepted frame window
 // is measured from PayloadSizeWithHMAC (32), not PayloadSize (24) — otherwise
 // -payload probes to an authenticated server would be blackholed — and one
-// byte past the payload cap is dropped. Every drop reason is named in
-// link_server_probes_dropped_total's Help, the README and the shipped alert,
-// so the counters themselves are pinned here: a mislabelled drop is what turns
-// "secret/NTP misconfig" into "the network is broken".
+// byte past the payload cap is dropped. The size/magic/hmac drop counters are
+// named in link_server_probes_dropped_total's Help, the README and the shipped
+// alert, so a mislabelled drop — which is what turns "secret/NTP misconfig"
+// into "the network is broken" — fails here. (Rate/replay reasons are covered
+// by the tests above.)
 func TestServer_HMACSizeWindowAndDropReasons(t *testing.T) {
 	prober.InitMetrics()
 	ctx, cancel := context.WithCancel(context.Background())

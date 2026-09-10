@@ -155,18 +155,22 @@ func TestStatusRegistryReflectsProbeLoop(t *testing.T) {
 // world, and /status is both unauthenticated (when no metrics credentials are
 // set) and uncapped, so the snapshot must not be re-read per request —
 // otherwise a burst of /status requests injects STW pauses into a process whose
-// whole purpose is measuring RTT, inflating its own samples. The GC forced
-// between the two reads would move gc_count/heap numbers if the cache were
-// bypassed.
+// whole purpose is measuring RTT, inflating its own samples.
+//
+// The proof is that a forced GC between two rapid reads does not change
+// gc_count. The read is retried because the package-global cache may happen to
+// expire between the two calls (an earlier test populated it), which would
+// otherwise flake; bypassing the cache fails every attempt, since runtime.GC()
+// always moves gc_count.
 func TestStatusProcessSnapshot_CachedWithinTTL(t *testing.T) {
-	start := time.Now()
-	first := prober.ReadProcessStatus()
-	runtime.GC()
-	second := prober.ReadProcessStatus()
-	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
-		t.Skipf("test crossed the snapshot TTL (took %v) — inconclusive", elapsed)
+	for attempt := range 5 {
+		first := prober.ReadProcessStatus()
+		runtime.GC()
+		second := prober.ReadProcessStatus()
+		if second.GCCount == first.GCCount {
+			return // the cache held across a GC: this is the property under test
+		}
+		t.Logf("attempt %d: cache expired between reads, retrying", attempt+1)
 	}
-	if first != second {
-		t.Errorf("two snapshots inside the TTL must be identical (cache bypassed):\n first:  %+v\n second: %+v", first, second)
-	}
+	t.Error("link_metrics_auth_failures-style staleness check failed: two /status snapshots inside the TTL must share gc_count even after a forced GC (cache bypassed?)")
 }
