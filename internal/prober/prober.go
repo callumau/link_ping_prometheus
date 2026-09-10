@@ -92,8 +92,11 @@ type Config struct {
 	Payload int
 	// MTUSweep, when > 0, runs a periodic DF-bit sweep per target to
 	// discover the largest frame the path carries (link_path_mtu_bytes,
-	// /status path_mtu_bytes). 0 disables. Linux only (DF socket
-	// option); sweep counters are separate from the loss metrics.
+	// /status path_mtu_bytes). 0 disables. Linux and Windows (IPv4 from
+	// Server 2003 via the DF flag, 1703+/Server 2019+ through full path-MTU
+	// discovery; IPv6 needs the latter); a platform without the socket
+	// option disables just the sweep with a one-time warning. Sweep
+	// counters are separate from the loss metrics.
 	MTUSweep time.Duration
 	// DSCP, when 1-63, marks probe packets with that traffic class
 	// (e.g. 46 = EF) so QoS-managed networks class them accordingly.
