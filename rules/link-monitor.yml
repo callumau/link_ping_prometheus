@@ -40,6 +40,13 @@ groups:
           (rate(link_rtt_seconds_sum[5m])
               / rate(link_rtt_seconds_count[5m]))
               and (rate(link_probes_sent_total[5m]) > 0)
+      # 24h floor of the median RTT, used by LinkLatencyDegraded as the
+      # baseline. A subquery is required: a range selector cannot be applied
+      # to a function call directly. Needs 24h of history to be meaningful.
+      - record: link:rtt_seconds_p50_24h_min
+        expr: >-
+          min_over_time(
+          (histogram_quantile(0.5, rate(link_rtt_seconds_bucket[5m])))[24h:5m])
 
   - name: link-monitor.alerts
     rules:
@@ -71,6 +78,11 @@ groups:
             is unreachable, or scraping is broken. Missing data cannot
             fire the loss alerts, so this is the only signal that the
             monitor itself stopped reporting.
+            CAVEAT: link_up exists only in client/both mode, so a
+            scrape job that runs -mode=server would fire this forever.
+            Scope it per site (absent(link_up{source="<site>"})) or use
+            the job-based up{job="<job>"} == 0 variant below, and load
+            this file only for scrape jobs that run the client.
           # Per-site variant: absent(link_up{source="<site>"})
           # Job-based alternative (deployment-specific job name):
           # up{job="<job>"} == 0
@@ -101,7 +113,28 @@ groups:
             True network loss above 20% for 5 minutes. Treat as an
             outage-level link fault even if link_up is still 1.
 
+      - alert: LinkLatencyDegraded
+        # Baseline-shift detector: the recent median against its own 24h
+        # minimum (link:rtt_seconds_p50_24h_min). Requires client mode and
+        # 24h of history. This is the PromQL equivalent of the dashboard's
+        # baseline-shift panel, so both share one definition.
+        expr: link:rtt_seconds_p50 > 1.5 * link:rtt_seconds_p50_24h_min
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            Median RTT on {{ $labels.target }} from {{ $labels.source }}
+            is 50% above its 24h baseline
+          description: >-
+            The recent p50 has drifted more than 1.5x above the lowest
+            p50 of the last 24h: a routing/traffic shift or a
+            progressively degrading path, visible before loss appears.
+            Needs 24h of history before it can fire.
+
       - alert: LinkProbesStalled
+        # Assumes -interval is well under the 10m window; a target probed
+        # less often than that would read as stalled while healthy.
         expr: rate(link_probes_sent_total[10m]) == 0
         for: 5m
         labels:
@@ -118,10 +151,14 @@ groups:
             otherwise look like a quiet, healthy monitor.
 
       - alert: LinkProbeStall
+        # A corrupted echo resolves the probe without touching rtt_count or
+        # timed_out_total (the round trip completed), so sustained corruption
+        # with interval < RTO would otherwise satisfy all three clauses.
         expr: >-
           (link_probes_inflight > 0)
           and (rate(link_rtt_seconds_count[15m]) == 0)
           and (rate(link_probes_timed_out_total[15m]) == 0)
+          and (increase(link_probes_corrupted_total[15m]) == 0)
         for: 15m
         labels:
           severity: warning
@@ -189,7 +226,8 @@ groups:
           severity: warning
         annotations:
           summary: >-
-            Echo server dropping probes from {{ $labels.client }}
+            Echo server dropping probes ({{ $labels.reason }}) on
+            {{ $labels.source }}
           description: >-
             The echo server rejected probes (reason label distinguishes
             allowlist / rate_ip / rate_global / size / magic / hmac /
