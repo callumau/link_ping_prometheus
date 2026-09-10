@@ -83,7 +83,7 @@ Echo server at the remote site (fail-closed: `-allow` is required):
 docker run -d --name link-ping-server --restart=always \
   -p 4000:4000/udp -p 2112:2112 \
   ghcr.io/callumau/link_ping_prometheus:latest \
-  -mode=server -listen=":4000" -allow=203.0.113.5
+  -mode=server -listen=":4000" -allow=203.0.113.5 -metrics=":2112"
 ```
 
 Client probing site B from site A (metrics only, no probe port needed):
@@ -92,8 +92,12 @@ Client probing site B from site A (metrics only, no probe port needed):
 docker run -d --name link-ping-client --restart=always \
   -p 2112:2112 \
   ghcr.io/callumau/link_ping_prometheus:latest \
-  -mode=client -target="203.0.113.10:4000" -source="sydney-dc"
+  -mode=client -target="203.0.113.10:4000" -source="sydney-dc" -metrics=":2112"
 ```
+
+`-metrics=":2112"` is required in both examples: the binary's default
+bind is `127.0.0.1:2112`, which is unreachable through the container's
+published `-p 2112:2112` port.
 
 All [flags](#usage) work the same as the bare binary; file-based flags
 (`-targets` JSON, TLS cert/key) need those files mounted into the scratch
@@ -113,15 +117,18 @@ The exporter exposes the following metrics at `/metrics` (default port 2112).
 | `link_mtu_probes_lost_total` | Counter | `source`, `target`, `address` | DF-set MTU probes with no echo: sizes the path does not survive. Rising lost with healthy main probes = PMTUD blackhole (works-small-fails-big). |
 | `link_path_mtu_bytes` | Gauge | `source`, `target`, `address` | Largest probe frame (header + payload, excluding IP/UDP overhead) that round-trips with DF set; 0 until the first successful sweep. A full-size Ethernet path reads 1424. |
 | `link_probes_send_errors_total` | Counter | `source`, `target`, `address` | Probes that failed to send locally (UDP write errors). Never on the wire, so never in `link_probes_sent_total`; sustained rate means a local NIC/socket problem, not network loss. |
+| `link_prober_internal_errors_total` | Counter | `source`, `target`, `address`, `reason` | Prober-internal failures (`reason`: `panic`, `reader_dead`, `dial_retry`, `stop_timeout`) — not link conditions. A rising rate means this target's probe numbers are unreliable; check the agent's own logs and socket state. |
 | `link_probes_inflight` | Gauge | `source`, `target`, `address` | Current number of probes sent but waiting for a response or timeout. Grows during stalls. |
 | `link_rtt_seconds` | Histogram | `source`, `target`, `address` | RTT histogram with explicit buckets `{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 3.0}` s plus native histogram support (`NativeHistogramBucketFactor` 1.1). Buckets stop at 3s (the RTO cap): anything slower counts as loss, so higher buckets would never fill. |
 | `link_rtt_seconds_bucket/sum/count` | Histogram | `source`, `target`, `address` | Classic-bucket series; quantiles and means are derived in PromQL over any window. |
 | `link_rtt_jitter_seconds` | Gauge | `source`, `target`, `address` | Smoothed RTT jitter in seconds (RFC 3550 §6.4.1). Resets after a sequence gap (a timed-out probe), so link recovery never spikes the gauge. |
 | `link_rto_seconds` | Gauge | `source`, `target`, `address` | Current adaptive RTO in use (RFC 6298, doubled on consecutive timeouts; floor `max(200ms, 2×SRTT)`). |
 | `link_rtt_srtt_seconds` | Gauge | `source`, `target`, `address` | Smoothed RTT estimate (RFC 6298 SRTT), a window-independent latency signal for dashboards and baseline-shift alerts. Stays 0 with adaptive mode disabled. |
-| `link_server_probes_received_total` | Counter | `source`, `client` | Valid probes received by the server, per remote client IP (server mode only). Cross-check against the client's sent counter. |
+| `link_server_probes_received_total` | Counter | `source`, `client` | Valid probes received by the server, per remote client IP (server mode only). Cross-check against the client's sent counter — mismatches may also be echo write failures, see `link_server_echo_errors_total`. |
+| `link_server_echo_errors_total` | Counter | `source` | Validated probes the server failed to echo back (local UDP write error). The client counts these as loss, so subtract this rate before attributing a received/sent mismatch to the network. |
 | `link_server_probes_dropped_total` | Counter | `source`, `reason` | Probes dropped by server: `allowlist`, `rate_ip`, `rate_global`, `size`, `magic`, `hmac`, `replay`, `invalid_addr`, `client_overflow`. `hmac`/`replay` diagnose secret/NTP misconfig vs true loss; `client_overflow` means more distinct CIDR-allowlisted client IPs than the per-client series cap. |
 | `link_server_clock_skew_seconds` | Gauge | `source`, `client` | Last observed clock skew (server minus client timestamp) for HMAC probes; positive means client behind. Diagnose replay drops from NTP drift per peer. |
+| `link_metrics_auth_failures_total` | Counter | (none) | Rejected HTTP Basic auth attempts on `/metrics` and `/status`. A rising rate means a misconfigured scraper or credential scanning. |
 | `link_ping_build_info` | Gauge | `version` | Build version; value is always 1. Git tag for release builds, UTC timestamp to the minute for dev builds. |
 
 Percentiles and loss are **not** pre-computed in the exporter — Prometheus
@@ -189,7 +196,10 @@ socket stalled.
 **Cross-check with the server** (server mode at the remote end):
 `link_server_probes_received_total` counts valid probes per remote client
 IP. Any mismatch with `link_probes_sent_total` is probes that never
-reached the server — genuinely lost on the wire:
+reached the server — genuinely lost on the wire. The one exception is
+`link_server_echo_errors_total`: a validated probe the server failed to
+write back did reach the server but never returned, so the client counts
+it as loss. Subtract that rate before blaming the network:
 
 ```promql
 100 * (1 - rate(link_server_probes_received_total{client="203.0.113.5"}[$__rate_interval])
@@ -235,6 +245,13 @@ are counted as loss, not latency. The native histogram (bucket factor
 1.1) carries fine-grained data; Prometheus scrapes and aggregates it
 transparently when native-histogram support is enabled.
 
+RTT samples are conservative by construction: a probe is timed when the
+reader goroutine drains the echo, so reader-side buffering can only
+inflate a sample, never deflate it. The echo server is also
+single-threaded, so at very high aggregate probe rates the measured RTT
+includes server queueing — keep the total probe rate well under the
+documented per-IP and global rate caps.
+
 ### Jitter
 
 ```promql
@@ -272,22 +289,31 @@ link_up
 
 ### Outage Alerts
 
-All outage alerts use `for: 5m` so brief events — host reboots, single
-probe blips, a 60s maintenance restart — ride through without paging.
-Anything that survives 5 minutes of continuous failure is a real outage.
+All outage alerts use a `for:` of at least 5m (loss and latency
+warnings 10m) so brief events — host reboots, single probe blips, a 60s
+maintenance restart — ride through without paging.
+Anything that survives that window of continuous failure is a real outage.
 Sub-scrape outages are still captured by the counters: a 30s blip between
 scrapes never touches `link_up`, but it does land in
 `rate(timed_out)/rate(sent)`, so the loss alert is the primary detector
 and `link_up` is the state view for long outages.
 
 ```yaml
-alert: LinkLossHigh
+alert: HighPacketLoss
+  expr: 100 * rate(link_probes_timed_out_total[$__rate_interval]) / rate(link_probes_sent_total[$__rate_interval]) > 5
+  for:  10m
+
+alert: SeverePacketLoss
   expr: 100 * rate(link_probes_timed_out_total[$__rate_interval]) / rate(link_probes_sent_total[$__rate_interval]) > 20
   for:  5m
 
 alert: LinkDown
   expr: link_up == 0
   for:  5m
+
+alert: LinkMonitorAbsent
+  expr: absent(link_up)
+  for:  10m
 
 alert: LinkProbesStalled
   expr: rate(link_probes_sent_total[$__rate_interval]) == 0
@@ -308,7 +334,7 @@ link can look like a quiet, healthy monitor.
 **Loss threshold:** 20% over the rate window means roughly 1 in 5 probes
 lost for 5 continuous minutes — a heavily degraded but routing link.
 Tune down (10%) for links where any sustained loss matters; a full outage
-reads ~100% and is caught immediately by `LinkLossHigh` regardless of
+reads ~100% and is caught immediately by `SeverePacketLoss` regardless of
 threshold, since the condition persists through the `for` duration.
 
 ## Alert Rules File
@@ -316,9 +342,11 @@ threshold, since the condition persists through the `for` duration.
 The alerts above ship ready-to-load in `rules/link-monitor.yml`: recording
 rules (`link:loss_ratio`, `link:rtt_seconds_p50/p90/p99`,
 `link:mean_rtt_seconds` — all with matching `rate()` windows) and alerting
-rules (`LinkDown`, `HighPacketLoss`, `SeverePacketLoss`, `LinkProbeStall`,
-`ClientSendErrors`, `ServerDropsObserved`, `ClockSkewApproaching`,
-`PathMtuDropped`, `MtuSweepUnresolved`). Wire
+rules (`LinkDown`, `LinkMonitorAbsent`, `HighPacketLoss` 5%/10m,
+`SeverePacketLoss` 20%/5m, `LinkProbesStalled`, `LinkProbeStall`,
+`ProbeCorruption`, `ClientSendErrors`, `ProberInternalErrors`,
+`MetricsAuthFailures`, `ServerDropsObserved`, `ServerEchoErrors`,
+`ClockSkewApproaching`, `PathMtuDropped`, `MtuSweepUnresolved`). Wire
 them into Prometheus so alerting works out of the box instead of every
 operator copying expressions from these docs:
 
@@ -329,8 +357,18 @@ rule_files:
 ```
 
 Validate before shipping: `promtool check rules rules/link-monitor.yml`.
-Alert thresholds (5% warning, 20% critical loss; 5m `for`) are starting
+Alert thresholds (5% warning for 10m, 20% critical for 5m) are starting
 points — tune per link as with the expressions above.
+
+The shipped set also covers the failure modes the loss ratio cannot:
+`LinkProbesStalled` (nothing being sent), `LinkProbeStall` (probes stuck in
+flight), and `LinkMonitorAbsent` (`absent(link_up)` — the agent or scrape
+target is gone entirely, so missing data can never fire the other alerts).
+`ProberInternalErrors`, `ServerEchoErrors`, `ProbeCorruption`, and
+`MetricsAuthFailures` flag prober-local failures: while
+`link_prober_internal_errors_total` or `link_server_echo_errors_total` is
+rising, the affected target's numbers are unreliable — fix the cause
+before trusting its loss ratio.
 
 ## Grafana Alloy Scraping
 
@@ -445,9 +483,9 @@ link_ping_prometheus -mode=<mode> [flags]
 
 **Why MTU discovery (`-mtu-sweep`) matters:** 24-byte probes prove a path *exists* — they cannot prove it *carries full-size traffic*. VPN tunnels, PPPoE/GRE/VXLAN overlays and broken PMTUD routinely pass small packets while black-holing full-size ones — the classic "monitor says healthy, users say broken" failure. The sweep DF-marks probes on a dedicated socket, binary-searches the largest frame that round-trips, and publishes it as `link_path_mtu_bytes`; a shrinking gauge (or rising `link_mtu_probes_lost_total` while `link_up` stays 1) is that failure's signature. It needs no ICMP and no extra firewall rules, uses separate counters that never enter the loss ratio, and is on by default (1m; `0` disables). Alert on `link_path_mtu_bytes < max_over_time(link_path_mtu_bytes[24h])` or `rate(link_mtu_probes_lost_total[10m]) > 0`; `link_up` deliberately stays 1 through an MTU shrink (24-byte probes keep flowing), so the gauge — not `link_up` — is the MTU-specific alarm.
 
-Liveness endpoints `GET /healthz` and `GET /readyz` on the same metrics listener return `200 ok` (`text/plain`) unauthenticated, for Kubernetes/container probes. `/metrics` remains protected by Basic Auth/TLS when configured; the health endpoints are never auth-gated and are available over both HTTP and HTTPS.
+Liveness endpoints `GET /healthz` and `GET /readyz` on the same metrics listener return `200 ok` (`text/plain`) for Kubernetes/container probes. They are deliberately unauthenticated — only `/metrics` and `/status` are gated — and are available over both HTTP and HTTPS.
 
-`GET /status` on the same listener serves a JSON snapshot of live per-target probe state — `link_up`, in-flight probes, consecutive misses, send failures, RTO/SRTT, last sequence number, socket age, `path_mtu_bytes` (largest DF frame proven to round-trip; 0 = no successful sweep yet) and `last_echo_age_seconds` (-1 until the first echo) — for debugging a flapping target without log access. Unlike the health endpoints it is auth-gated exactly like `/metrics` (open only when no metrics auth is configured).
+`GET /status` on the same listener serves a JSON snapshot of live per-target probe state — `link_up`, in-flight probes, consecutive misses, the current consecutive send-failure streak (`send_failures`, reset on any successful write; not a cumulative count), RTO/SRTT, last sequence number, socket age, `path_mtu_bytes` (largest DF frame proven to round-trip; 0 = no successful sweep yet) and `last_echo_age_seconds` (-1 until the first echo) — for debugging a flapping target without log access. Unlike the health endpoints it is auth-gated exactly like `/metrics` (open only when no metrics auth is configured).
 
 Resource footprint: metric handles are resolved once per target at startup (no per-probe label lookups), and the Go heap is soft-capped at 128MB (`GOMEMLIMIT` env overrides) so RSS stays flat on long runs. For >100 targets set `GOMEMLIMIT=256MiB` (or higher) as a system environment variable and restart the service.
 
@@ -464,7 +502,7 @@ JSON file with an array of `{"name": "...", "address": "host:port"}` objects. Op
 
 Max 1000 targets, max file size 1 MB. Per-target interval/timeout must be >0 when set; `interval >= timeout` warns (global and per-target) and `reconnect-interval < interval` is an error.
 
-**Hot reload:** send `SIGHUP` to re-read the file without a restart (Unix), or run with `-targets-reload-interval` (e.g. `30s`) for automatic polling — the only option under a Windows service, which has no SIGHUP. On reload: new targets start probing, removed targets stop (their last metric series remain and go stale in Prometheus), and targets whose address/intervals changed restart with the new values. A file that is mid-edit or invalid keeps the previous set running — reload failures are logged at Error level, never fatal.
+**Hot reload:** send `SIGHUP` to re-read the file without a restart (Unix), or run with `-targets-reload-interval` (e.g. `30s`) for automatic polling — the only option under a Windows service, which has no SIGHUP. On reload: new targets start probing, removed targets stop and their series are deleted from `/metrics` (Prometheus marks the vanished series stale, so `link_up`-keyed alerts stop firing for them — an `absent()`/`up` alert covers a fully dead client), and targets whose address/intervals changed restart with the new values. A file that is mid-edit or invalid keeps the previous set running — reload failures are logged at Error level, never fatal.
 
 ### Examples
 
@@ -498,7 +536,7 @@ Both:
 
 #### Windows
 
-Use `-svc` to install/uninstall/start/stop/run. The tool records runtime flags at install time (excluding `-svc`, `-metrics-user`, `-metrics-pass`, and `-echo-secret`). Metrics auth credentials are **not** persisted into the service configuration; set `LINK_PING_METRICS_USER` / `LINK_PING_METRICS_PASS` in the service environment instead (a warning is printed at install time).
+Use `-svc` to install/uninstall/start/stop/run. The tool records runtime flags at install time (excluding `-svc`, `-metrics-user`, `-metrics-pass`, `-echo-secret`, and `-echo-secret-old`). Metrics auth credentials and HMAC secrets are **not** persisted into the service configuration; set `LINK_PING_METRICS_USER` / `LINK_PING_METRICS_PASS` and `LINK_PING_ECHO_SECRET` / `LINK_PING_ECHO_SECRET_OLD` in the service environment instead (a warning is printed at install time).
 
 ```sh
 link_ping_prometheus.exe -mode=both -targets=targets.json -metrics=":2112" -log-file="C:\ProgramData\link_ping\link_ping.log" -svc=install
@@ -544,7 +582,8 @@ Create `/etc/systemd/system/link_ping_prometheus.service`:
 ```ini
 [Unit]
 Description=Link Ping Prometheus (UDP link monitor)
-After=network.target
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
 
 [Service]
 ExecStart=/usr/local/bin/link_ping_prometheus -mode=server -listen=":4000" -allow=203.0.113.5 -metrics=":2112"
@@ -555,7 +594,10 @@ User=nobody
 WantedBy=multi-user.target
 ```
 
-Note: In client/both mode, use an absolute path for `-targets` (e.g., `-targets=/etc/link_ping_prometheus/targets.json`).
+`time-sync.target` ordering is load-bearing: with `-echo-secret` set the
+server's replay guard uses a 30s timestamp window, so clocks must be
+roughly NTP-synchronized. Note: In client/both mode, use an absolute path
+for `-targets` (e.g., `-targets=/etc/link_ping_prometheus/targets.json`).
 
 ```sh
 sudo systemctl daemon-reload
@@ -574,6 +616,9 @@ See `deploy/ansible/README.md` for prerequisites and usage.
 ## Grafana Dashboard
 
 Prebuilt dashboard at [grafana-dashboard.json](grafana-dashboard.json).
+It uses the Grafana v2 dashboard resource format
+(`dashboard.grafana.app/v2`) and needs a Grafana version that supports it;
+it also has a `source` variable for filtering panels per site.
 
 Panels: link status, packet loss, RTT percentiles / average / current, adaptive RTO, jitter, probe throughput, plus the newer signals — smoothed RTT (SRTT), path MTU (DF-probed), DF probe loss, corruption % (with `-payload`) and send errors (local fault vs network loss). `link_up` transitions are annotated on every panel and itemized with timestamps in the Link State Changes table.
 
@@ -625,16 +670,21 @@ loss on timeout, protecting RTT samples from poisoning.
 
 The server rate-limits echo processing to 2000 packets/s per remote IP
 and 10000 packets/s globally (fixed one-second window); excess datagrams
-are dropped. The probe loop keeps a single connected UDP socket per
+are dropped. The window is fixed, not sliding, so a burst straddling a
+window boundary can admit up to 2× the cap — treat the caps as ceilings,
+not a precise rate. The probe loop keeps a single connected UDP socket per
 target, but re-dials every 5 minutes by default (`-reconnect-interval`, only when no probes are in flight)
 so a target hostname that changes IP via DNS is re-resolved; a transient
 DNS failure at startup is retried, not fatal.
 
 ## Security
 
-- The UDP echo server validates the magic header and exact datagram size
-  before echoing to prevent arbitrary payload reflection, and rate-limits
-  echo processing per source IP and globally. The allowlist is fail-closed
+- The UDP echo server validates the magic header and accepts the header
+  frame plus any bounded payload extension (`header ≤ size ≤ header +
+  1400`) before echoing it verbatim; out-of-range datagrams are dropped.
+  Reflection is 1:1 — the echo is never larger than the probe, so the
+  server is not an amplifier — and it rate-limits echo processing per
+  source IP and globally. The allowlist is fail-closed
   (no `-allow`, no service) and accepts plain IPs or CIDR prefixes; plain
   IPs keep per-client metric series pre-resolved, while CIDR-matched
   clients are capped at 1024 distinct IPs per process (`client_overflow`
