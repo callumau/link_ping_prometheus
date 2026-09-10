@@ -3,12 +3,49 @@ package main
 import (
 	"context"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"runtime"
 	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"link_ping_prometheus/internal/prober"
 )
+
+// TestMetricsCompressionToggle pins the /metrics compression wiring. With the
+// default (-metrics-gzip off) a scraper offering gzip must still receive an
+// identity response: promhttp pools a ~0.7MB flate compressor per P, which is
+// more live heap than a small fleet's response is worth. With the flag on the
+// response must be gzip-encoded.
+func TestMetricsCompressionToggle(t *testing.T) {
+	prober.InitMetrics()
+	for _, tc := range []struct {
+		name string
+		gzip bool
+		want string
+	}{
+		{"off by default", false, ""},
+		{"enabled", true, "gzip"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+			req.Header.Set("Accept-Encoding", "gzip")
+			rec := httptest.NewRecorder()
+			metricsHandler(tc.gzip).ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", rec.Code)
+			}
+			if got := rec.Header().Get("Content-Encoding"); got != tc.want {
+				t.Errorf("Content-Encoding = %q, want %q", got, tc.want)
+			}
+			if rec.Body.Len() == 0 {
+				t.Error("empty /metrics body")
+			}
+		})
+	}
+}
 
 // TestServiceConfigHardening pins the SCM hardening options: recovery
 // restart, delayed auto-start, and network/time dependencies. These were

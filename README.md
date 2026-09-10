@@ -477,6 +477,7 @@ link_ping_prometheus -mode=<mode> [flags]
 | `-metrics-tls-cert` | `""` | TLS certificate file for /metrics (requires `-metrics-tls-key`) |
 | `-metrics-tls-key` | `""` | TLS private key file for /metrics (requires `-metrics-tls-cert`) |
 | `-metrics-allow-insecure` | `false` | Allow Basic Auth without TLS (otherwise auth over plaintext HTTP is rejected) |
+| `-metrics-gzip` | `false` | Gzip-compress `/metrics` responses when the scraper offers it. Off by default because promhttp pools a gzip writer per CPU and each holds ~0.7MB of flate state, so compression costs up to ~0.7MB x `GOMAXPROCS` of live heap — more than a small fleet's whole response. Enable it for many targets. |
 | `-mem-scavenge` | `5m` | Runtime: force a heap scavenge at this interval so the unused heap high-water mark is returned to the OS (0 disables; skipped when less than 4MB is unreleased). See [Memory & Runtime Tuning](#memory--runtime-tuning). |
 | `-json-logs` | `false` | Output logs in JSON format |
 | `-log-file` | `""` | Append logs to this file in addition to stdout (required for Windows service logging, where stdout is discarded) |
@@ -509,6 +510,8 @@ Every `/metrics` scrape allocates (gather trees, text encoding, optional gzip) a
 - A quiet agent (sparse scrapes) measured *worse* at `GOGC=50`: RSS 19.8MB vs 16.7MB, `gc_sys` 2.77MB vs 1.47MB, and ~5x the allocation churn, because it GCs a small heap more often.
 
 So set `GOGC=50` for scrape-heavy deployments and leave it unset (or raise it) for a quiet one. `GOMAXPROCS=1` was the lowest-footprint configuration measured (RSS 14.6MB vs 16.7MB) at the cost of GC parallelism.
+
+`-metrics-gzip` is off by default for the same reason: `promhttp` pools one gzip writer per CPU and each writer holds a `flate` compressor of roughly 0.7MB (`hashHead` 1<<17 + `hashPrev` 1<<15 plus a 32KB window), so compression can retain up to ~0.7MB x `GOMAXPROCS` of live heap across scrapes — more than the entire `/metrics` body of a small fleet. Measured with 400 plain versus 400 compressed scrapes on one target: live heap 1.24MB vs 3.98MB and `heap_sys` 10.8MB vs 14.7MB. Enable it (`-metrics-gzip=true`) when the response is large enough for the bandwidth saving to matter.
 
 ### Targets File
 
