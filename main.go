@@ -139,7 +139,7 @@ var (
 
 	flPayload       = flag.Int("payload", 0, "Client: probe payload bytes beyond the 24/32-byte header (up to 1400), filled with a deterministic pattern and validated on echo; corruption is counted in link_probes_corrupted_total, distinct from loss")
 	flTargetsReload = flag.Duration("targets-reload-interval", 0, "Client: poll the -targets file at this interval and apply changes without a restart (0 disables; SIGHUP also reloads on Unix; Windows services need this flag to reload)")
-	flMTUSweep      = flag.Duration("mtu-sweep", time.Minute, "Client: periodically sweep DF-set probe sizes per target to find the largest frame the path carries (0 disables; Linux and Windows 10+; results in link_path_mtu_bytes and /status; separate counters, never in the loss ratio)")
+	flMTUSweep      = flag.Duration("mtu-sweep", time.Minute, "Client: periodically sweep DF-set probe sizes per target to find the largest frame the path carries (0 disables; Linux, or Windows with IPv4 on 2003+ / IPv6 on 1703+; results in link_path_mtu_bytes and /status; separate counters, never in the loss ratio)")
 	flMemScavenge   = flag.Duration("mem-scavenge", 5*time.Minute, "Process: force a heap scavenge at this interval so the unused heap high-water mark is returned to the OS (0 disables). Scrapes ratchet the heap high-water up and the runtime does not return it while the agent is otherwise idle; on Windows that reads as RSS/commit growth.")
 
 	flMetricsBasicAuthUser = flag.String("metrics-user", "", "Metrics: Basic auth username (empty disables auth; env LINK_PING_METRICS_USER)")
@@ -633,20 +633,15 @@ func metricsHandlerFor(g prometheus.Gatherer, gzip bool) http.Handler {
 // the dial-retry path publishes 0 and a failed re-dial resets it, so this is
 // "can probe right now", not "has ever probed". An agent stuck resolving DNS or
 // blocked by a firewall is alive but useless, and an orchestrator must see that.
-func readyToProbe(mode string, targets []prober.TargetStatus) bool {
+// Reads the registry in place (see StatusRegistry.AnyReady) rather than
+// snapshotting it: /readyz is unauthenticated and uncapped.
+func readyToProbe(mode string, statusReg *prober.StatusRegistry) bool {
 	if mode == "server" {
 		// Server-only mode has no targets at all, and a server that cannot
 		// bind dies instead of limping, so it is ready by definition.
 		return true
 	}
-	for _, t := range targets {
-		if t.SocketAgeSeconds > 0 {
-			return true
-		}
-	}
-	// No target yet (registry empty at startup, or every target still in
-	// the dial-retry loop).
-	return false
+	return statusReg.AnyReady()
 }
 
 // readinessHandler answers /readyz: 200 when probing is possible, 503 when a
@@ -654,7 +649,7 @@ func readyToProbe(mode string, targets []prober.TargetStatus) bool {
 func readinessHandler(mode string, statusReg *prober.StatusRegistry) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		if !readyToProbe(mode, statusReg.Snapshot()) {
+		if !readyToProbe(mode, statusReg) {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			// pi-lens-ignore: go-ignored-call-result
 			_, _ = w.Write([]byte("not ready: no target has ever had a working socket\n"))
