@@ -71,6 +71,26 @@ func (r *StatusRegistry) Remove(name string) {
 	delete(r.targets, name)
 }
 
+// AnyReady reports whether any target currently holds a working socket
+// (socket_age_seconds > 0) — the condition /readyz is built on. It iterates in
+// place and returns on the first hit: /readyz is deliberately unauthenticated
+// AND uncapped, so copying and sorting the whole registry per request (an
+// orchestrator probes it every few seconds; ~100KB plus a sort at 1000
+// targets) is real garbage on a process whose job is measuring RTT.
+func (r *StatusRegistry) AnyReady() bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, s := range r.targets {
+		if s.SocketAgeSeconds > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // Snapshot returns all target states sorted by name. An empty registry
 // yields an empty, non-nil slice so the JSON endpoint renders "targets": [].
 func (r *StatusRegistry) Snapshot() []TargetStatus {
