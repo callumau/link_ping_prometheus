@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"net/http"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -39,6 +41,10 @@ var (
 		Name: "link_probes_corrupted_total",
 		Help: "Probes whose echo came back with corrupted payload bytes (-payload mode only): magic, sequence and timestamp intact, data altered in flight. Data-path corruption, not loss — the round trip completed.",
 	}, []string{"source", "target", "address"})
+	ProberInternalErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "link_prober_internal_errors_total",
+		Help: "Prober-internal failures (reason: panic, reader_dead, dial_retry, stop_timeout) — not link conditions. A rising rate means this target's probe numbers are unreliable; check the agent's own logs and socket state.",
+	}, []string{"source", "target", "address", "reason"})
 	MTUProbesSent = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "link_mtu_probes_sent_total",
 		Help: "DF-set probes sent by the periodic MTU sweep (-mtu-sweep). Deliberately separate from the main probe counters: they never enter the loss ratio or the sent/rtt/timed_out balance.",
@@ -90,8 +96,12 @@ var (
 	}, []string{"source", "target", "address"})
 	ServerProbesReceived = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "link_server_probes_received_total",
-		Help: "Total validated probes received by the server, labelled by source and remote client address. Cross-check against the client's link_probes_sent_total: any mismatch is probes that never reached the server.",
+		Help: "Total validated probes received by the server, labelled by source and remote client address. Cross-check against the client's link_probes_sent_total: any mismatch is probes that never reached the server (or that the server could not echo — see link_server_echo_errors_total).",
 	}, []string{"source", "client"})
+	ServerEchoErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "link_server_echo_errors_total",
+		Help: "Validated probes the server failed to echo back (local UDP write error). The client counts these as loss, so subtract this rate before attributing a received/sent mismatch to the network.",
+	}, []string{"source"})
 	ServerProbesDropped = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "link_server_probes_dropped_total",
 		Help: "Total probes dropped by the server, labelled by source and reason (allowlist, rate_ip, rate_global, size, magic, hmac, replay, invalid_addr, client_overflow). Distinguishes misconfig (wrong secret, clock skew) and overload from true network loss.",
@@ -100,6 +110,10 @@ var (
 		Name: "link_server_clock_skew_seconds",
 		Help: "Last observed clock skew in seconds (server time minus client timestamp) for HMAC-authenticated probes. Positive means client is behind. Used to diagnose NTP drift causing replay drops.",
 	}, []string{"source", "client"})
+	MetricsAuthFailures = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "link_metrics_auth_failures_total",
+		Help: "Rejected HTTP Basic auth attempts on /metrics and /status. A rising rate means a misconfigured scraper or credential scanning.",
+	})
 	BuildInfo = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "link_ping_build_info",
 		Help: "Build information; value is always 1 and the version label holds the build version (git tag for releases, UTC timestamp to the minute for dev builds).",
@@ -114,9 +128,11 @@ func InitMetrics() {
 	registerOnce.Do(func() {
 		prometheus.MustRegister(
 			ProbesSent, ProbesTimedOut, SendErrors, CorruptedProbes, ProbesInflight,
+			ProberInternalErrors,
 			MTUProbesSent, MTUProbesLost, PathMTUBytes,
 			RTTSeconds, JitterSeconds, LinkUp, RTOEstimate, SRTTSeconds,
-			ServerProbesReceived, ServerProbesDropped, ServerClockSkew, BuildInfo,
+			ServerProbesReceived, ServerProbesDropped, ServerEchoErrors, ServerClockSkew,
+			MetricsAuthFailures, BuildInfo,
 		)
 	})
 }
@@ -151,13 +167,21 @@ func MetricsAuth(user, pass string, next http.Handler) http.Handler {
 	// Hash the reference credentials once at handler creation; the
 	// request-path hashes are computed per request.
 	uhRef, phRef := sha256.Sum256([]byte(user)), sha256.Sum256([]byte(pass))
+	// lastAuthLog throttles the failure warning to once per minute: an
+	// unauthenticated scanner must not be able to flood the log. The
+	// counter still records every failure.
+	var lastAuthLog atomic.Int64
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		u, p, ok := r.BasicAuth()
 		// Hash before comparing: ConstantTimeCompare returns immediately on
 		// length mismatch, which would otherwise leak credential length.
 		uh, ph := sha256.Sum256([]byte(u)), sha256.Sum256([]byte(p))
 		if !ok || subtle.ConstantTimeCompare(uh[:], uhRef[:]) != 1 || subtle.ConstantTimeCompare(ph[:], phRef[:]) != 1 {
-			slog.Warn("metrics auth failed", "remote", r.RemoteAddr)
+			MetricsAuthFailures.Inc()
+			now := time.Now().UnixNano()
+			if last := lastAuthLog.Load(); now-last >= int64(time.Minute) && lastAuthLog.CompareAndSwap(last, now) {
+				slog.Warn("metrics auth failed (further failures logged at most once per minute)", "remote", r.RemoteAddr)
+			}
 			w.Header().Set("WWW-Authenticate", `Basic realm="metrics"`)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
