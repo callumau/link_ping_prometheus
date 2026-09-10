@@ -39,9 +39,12 @@ jobs:
 
       # Fail the build on reachable stdlib/dependency vulnerabilities
       # (the /metrics HTTP server keeps net/http reachable in every mode).
+      # Pinned deliberately: this job also runs untrusted PR code, so a
+      # mutable @latest would let an upstream release execute here. Bump
+      # the version in its own commit.
       - name: Govulncheck
         run: |
-          go install golang.org/x/vuln/cmd/govulncheck@latest
+          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
           govulncheck ./...
 
       - name: Run Tests (race detector)

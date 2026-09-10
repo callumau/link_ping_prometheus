@@ -25,16 +25,30 @@ ansible-playbook -i inventory.yml playbook.yml --ask-vault-pass
 ## What it does
 
 - **Linux:** installs the binary to `/usr/local/bin`, writes the
-  shipped hardened systemd unit (`installer/linux/`), renders CLI flags
-  into `OPTIONS` inside `/etc/link_ping_prometheus.env` (0600), writes
+  shipped hardened systemd unit (`installer/linux/`), writes
+  `/etc/link_ping_prometheus.env` (0600) containing the rendered CLI
+  flags as `OPTIONS=...` plus any credential env vars, writes
   `targets.json` when `link_ping_targets_json` is set, then enables and
-  starts the service.
-- **Windows:** copies the binary, creates the service with
-  `sc.exe` (auto start), applies the same failure-recovery ladder as
-  `main.go` (`sc.exe failure ... restart/5000`), delivers secrets via
-  the SCM `Environment` registry key (never the command line), opens
-  UDP 4000 in the firewall for server/both mode, and starts the
-  service only if it is not already running.
+  starts the service. The file is always written — the unit expands
+  `$OPTIONS`, so an absent file would start the binary on fail-closed
+  defaults and crash-loop it.
+- **Windows:** copies the binary, creates the service by running
+  `link_ping_prometheus.exe <options> -svc=install` — the only path that
+  applies the hardened SCM config from `main.go` (`DelayedAutoStart`
+  plus the load-bearing Tcpip/W32Time dependencies and the OnFailure
+  restart ladder) — ACLs `C:\ProgramData\link_ping_prometheus\logs` to
+  SYSTEM/Administrators and passes `-log-file=...\service.log` (stdout
+  is discarded under the SCM), delivers secrets via the SCM
+  `Environment` registry key (never the command line), opens UDP 4000
+  in the firewall for server/both mode, and starts the service only if
+  it is not already running. The `sc.exe failure` ladder is restated
+  afterwards; it is idempotent and only makes the baked-in values
+  explicit. The play also re-applies `DelayedAutoStart` and the
+  Tcpip/W32Time dependencies with `sc.exe config`, so a service that was
+  created by an older play is hardened too. Note that `-svc=install`
+  snapshots the flags into the service `binPath`: changing options on an
+  existing service requires a reinstall (uninstall + install) — the play
+  does not rewrite `binPath` for an existing service.
 
 ## Secrets
 
@@ -44,3 +58,16 @@ through the service environment (EnvironmentFile on Linux, SCM
 Environment registry key on Windows), never as service arguments —
 matching the credential-handling rules in the README's Security
 section. Encrypt the vars file with ansible-vault.
+
+**Windows caveat:**
+`HKLM\SYSTEM\CurrentControlSet\Services\<service>\Environment` is
+readable by all local users, so values placed there are only as private
+as interactive logon on the host. Where a secret has to be protected
+rather than merely kept off the command line, use the batch installer's
+ACL'd delivery (`installer/windows/install-service.bat`, which prompts
+for the values and documents the same caveat) or a dedicated service
+account instead of this play.
+
+**Linux caveat:** `/etc/link_ping_prometheus.env` holds both `OPTIONS`
+and the credential env vars under mode 0600, and is rewritten (with a
+service restart) whenever its content changes.
