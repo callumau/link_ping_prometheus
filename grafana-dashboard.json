@@ -36,10 +36,13 @@
             "version": "v0",
             "spec": {
               "editorMode": "code",
-              "expr": "link_up{instance=~\"$instance\", target=~\"$target\"} != link_up{instance=~\"$instance\", target=~\"$target\"} offset $__interval",
+              "expr": "link_up{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"} != link_up{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"} offset $__interval",
               "instant": false,
               "range": true,
               "legendFormat": ""
+            },
+            "labels": {
+              "grafana.app/export-label": "prometheus-1"
             }
           },
           "enable": true,
@@ -74,7 +77,7 @@
                       "version": "v0",
                       "spec": {
                         "editorMode": "code",
-                        "expr": "histogram_quantile(0.5, rate(link_rtt_seconds_bucket{instance=~\"$instance\", target=~\"$target\"}[$__rate_interval])) * 1000",
+                        "expr": "histogram_quantile(0.5, rate(link_rtt_seconds_bucket{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"}[$__rate_interval])) * 1000",
                         "instant": false,
                         "legendFormat": "{{target}}",
                         "range": true
@@ -150,7 +153,7 @@
         "kind": "Panel",
         "spec": {
           "id": 10,
-          "title": "Adaptive RTO",
+          "title": "Adaptive RTO (history)",
           "description": "Probe timeout in use over time (ms). Rises on consecutive timeouts so loss detection recovers from latency jumps; floor tracks 2x smoothed RTT.",
           "links": [],
           "data": {
@@ -166,7 +169,7 @@
                       "version": "v0",
                       "spec": {
                         "editorMode": "code",
-                        "expr": "link_rto_seconds{instance=~\"$instance\", target=~\"$target\"}",
+                        "expr": "link_rto_seconds{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"} * 1000",
                         "legendFormat": "{{target}}",
                         "range": true
                       },
@@ -206,7 +209,7 @@
               },
               "fieldConfig": {
                 "defaults": {
-                  "unit": "s",
+                  "unit": "ms",
                   "decimals": 2,
                   "thresholds": {
                     "mode": "absolute",
@@ -285,8 +288,8 @@
                       "version": "v0",
                       "spec": {
                         "editorMode": "code",
-                        "expr": "link_rtt_jitter_seconds * 1000",
-                        "legendFormat": "Jitter",
+                        "expr": "link_rtt_jitter_seconds{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"} * 1000",
+                        "legendFormat": "{{target}}",
                         "range": true
                       },
                       "labels": {
@@ -412,7 +415,7 @@
                       "version": "v0",
                       "spec": {
                         "editorMode": "code",
-                        "expr": "link_up{instance=~\"$instance\", target=~\"$target\"}",
+                        "expr": "link_up{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"}",
                         "instant": true,
                         "legendFormat": "{{target}}",
                         "range": false
@@ -518,7 +521,7 @@
                       "version": "v0",
                       "spec": {
                         "editorMode": "code",
-                        "expr": "clamp_max(100 * rate(link_probes_timed_out_total{instance=~\"$instance\", target=~\"$target\"}[$__rate_interval]) / rate(link_probes_sent_total{instance=~\"$instance\", target=~\"$target\"}[$__rate_interval]), 100)",
+                        "expr": "clamp_max(100 * rate(link_probes_timed_out_total{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"}[$__rate_interval]) / rate(link_probes_sent_total{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"}[$__rate_interval]), 100)",
                         "instant": true,
                         "legendFormat": "{{target}}",
                         "range": false
@@ -614,7 +617,7 @@
                       "version": "v0",
                       "spec": {
                         "editorMode": "code",
-                        "expr": "link_rto_seconds{instance=~\"$instance\", target=~\"$target\"} * 1000",
+                        "expr": "link_rto_seconds{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"} * 1000",
                         "instant": true,
                         "legendFormat": "{{target}}",
                         "range": false
@@ -710,7 +713,7 @@
                       "version": "v0",
                       "spec": {
                         "editorMode": "code",
-                        "expr": "histogram_quantile(0.5, rate(link_rtt_seconds_bucket{instance=~\"$instance\", target=~\"$target\"}[$__rate_interval]))",
+                        "expr": "histogram_quantile(0.5, rate(link_rtt_seconds_bucket{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"}[$__rate_interval])) * 1000",
                         "legendFormat": "{{target}} p50",
                         "range": true
                       },
@@ -731,7 +734,7 @@
                       "version": "v0",
                       "spec": {
                         "editorMode": "code",
-                        "expr": "histogram_quantile(0.9, rate(link_rtt_seconds_bucket{instance=~\"$instance\", target=~\"$target\"}[$__rate_interval]))",
+                        "expr": "histogram_quantile(0.9, rate(link_rtt_seconds_bucket{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"}[$__rate_interval])) * 1000",
                         "legendFormat": "{{target}} p90",
                         "range": true
                       },
@@ -752,7 +755,7 @@
                       "version": "v0",
                       "spec": {
                         "editorMode": "code",
-                        "expr": "histogram_quantile(0.99, rate(link_rtt_seconds_bucket{instance=~\"$instance\", target=~\"$target\"}[$__rate_interval]))",
+                        "expr": "histogram_quantile(0.99, rate(link_rtt_seconds_bucket{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"}[$__rate_interval])) * 1000",
                         "legendFormat": "{{target}} p99",
                         "range": true
                       },
@@ -792,7 +795,7 @@
               },
               "fieldConfig": {
                 "defaults": {
-                  "unit": "s",
+                  "unit": "ms",
                   "decimals": 2,
                   "thresholds": {
                     "mode": "absolute",
@@ -927,7 +930,7 @@
         "kind": "Panel",
         "spec": {
           "id": 6,
-          "title": "Packet Loss",
+          "title": "Packet Loss (history)",
           "description": "Packet loss % over time, 5-minute window: 100 * rate(timed_out)/rate(sent). Reads ~100% during a full outage. Pick a rate window >= the outage you want to see as a full 100% block.",
           "links": [],
           "data": {
@@ -943,7 +946,7 @@
                       "version": "v0",
                       "spec": {
                         "editorMode": "code",
-                        "expr": "clamp_max(100 * rate(link_probes_timed_out_total{instance=~\"$instance\", target=~\"$target\"}[$__rate_interval]) / rate(link_probes_sent_total{instance=~\"$instance\", target=~\"$target\"}[$__rate_interval]), 100)",
+                        "expr": "clamp_max(100 * rate(link_probes_timed_out_total{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"}[$__rate_interval]) / rate(link_probes_sent_total{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"}[$__rate_interval]), 100)",
                         "legendFormat": "{{target}}",
                         "range": true
                       },
@@ -1076,7 +1079,7 @@
                       "version": "v0",
                       "spec": {
                         "editorMode": "code",
-                        "expr": "rate(link_rtt_seconds_sum{instance=~\"$instance\", target=~\"$target\"}[$__rate_interval]) / rate(link_rtt_seconds_count{instance=~\"$instance\", target=~\"$target\"}[$__rate_interval])",
+                        "expr": "rate(link_rtt_seconds_sum{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"}[$__rate_interval]) / rate(link_rtt_seconds_count{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"}[$__rate_interval]) * 1000",
                         "legendFormat": "{{target}}",
                         "range": true
                       },
@@ -1116,7 +1119,7 @@
               },
               "fieldConfig": {
                 "defaults": {
-                  "unit": "s",
+                  "unit": "ms",
                   "decimals": 2,
                   "thresholds": {
                     "mode": "absolute",
@@ -1195,7 +1198,7 @@
                       "version": "v0",
                       "spec": {
                         "editorMode": "code",
-                        "expr": "link_up{instance=~\"$instance\", target=~\"$target\"}",
+                        "expr": "link_up{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"}",
                         "legendFormat": "Status",
                         "range": true
                       },
@@ -1333,7 +1336,7 @@
                       "version": "v0",
                       "spec": {
                         "editorMode": "code",
-                        "expr": "rate(link_probes_sent_total{instance=~\"$instance\", target=~\"$target\"}[$__rate_interval])",
+                        "expr": "rate(link_probes_sent_total{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"}[$__rate_interval])",
                         "legendFormat": "Sent",
                         "range": true
                       },
@@ -1354,7 +1357,7 @@
                       "version": "v0",
                       "spec": {
                         "editorMode": "code",
-                        "expr": "rate(link_probes_timed_out_total{instance=~\"$instance\", target=~\"$target\"}[$__rate_interval])",
+                        "expr": "rate(link_probes_timed_out_total{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"}[$__rate_interval])",
                         "legendFormat": "Timeout",
                         "range": true
                       },
@@ -1394,7 +1397,7 @@
               },
               "fieldConfig": {
                 "defaults": {
-                  "unit": "short",
+                  "unit": "pps",
                   "decimals": 2,
                   "thresholds": {
                     "mode": "absolute",
@@ -1516,10 +1519,13 @@
                       "version": "v0",
                       "spec": {
                         "editorMode": "code",
-                        "expr": "link_rtt_srtt_seconds{instance=~\"$instance\", target=~\"$target\"}",
+                        "expr": "link_rtt_srtt_seconds{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"}",
                         "instant": false,
                         "legendFormat": "{{target}}",
                         "range": true
+                      },
+                      "labels": {
+                        "grafana.app/export-label": "prometheus-1"
                       }
                     },
                     "refId": "A",
@@ -1607,10 +1613,13 @@
                       "version": "v0",
                       "spec": {
                         "editorMode": "code",
-                        "expr": "link_path_mtu_bytes{instance=~\"$instance\", target=~\"$target\"}",
+                        "expr": "link_path_mtu_bytes{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"}",
                         "instant": false,
                         "legendFormat": "{{target}}",
                         "range": true
+                      },
+                      "labels": {
+                        "grafana.app/export-label": "prometheus-1"
                       }
                     },
                     "refId": "A",
@@ -1706,10 +1715,13 @@
                       "version": "v0",
                       "spec": {
                         "editorMode": "code",
-                        "expr": "rate(link_mtu_probes_lost_total{instance=~\"$instance\", target=~\"$target\"}[$__rate_interval])",
+                        "expr": "rate(link_mtu_probes_lost_total{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"}[$__rate_interval])",
                         "instant": false,
                         "legendFormat": "{{target}}",
                         "range": true
+                      },
+                      "labels": {
+                        "grafana.app/export-label": "prometheus-1"
                       }
                     },
                     "refId": "A",
@@ -1790,7 +1802,7 @@
         "spec": {
           "id": 15,
           "title": "Corruption %",
-          "description": "Echoes whose payload failed the byte-pattern check (-payload mode): data-path corruption, NOT loss — the round trip completed. Windows on numerator and denominator match.",
+          "description": "Echoes whose payload failed the byte-pattern check (-payload mode): data-path corruption, NOT loss — the round trip completed.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -1805,10 +1817,13 @@
                       "version": "v0",
                       "spec": {
                         "editorMode": "code",
-                        "expr": "100 * rate(link_probes_corrupted_total{instance=~\"$instance\", target=~\"$target\"}[$__rate_interval]) / rate(link_probes_sent_total{instance=~\"$instance\", target=~\"$target\"}[$__rate_interval])",
+                        "expr": "100 * rate(link_probes_corrupted_total{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"}[$__rate_interval]) / rate(link_probes_sent_total{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"}[$__rate_interval])",
                         "instant": false,
                         "legendFormat": "{{target}}",
                         "range": true
+                      },
+                      "labels": {
+                        "grafana.app/export-label": "prometheus-1"
                       }
                     },
                     "refId": "A",
@@ -1904,10 +1919,13 @@
                       "version": "v0",
                       "spec": {
                         "editorMode": "code",
-                        "expr": "rate(link_probes_send_errors_total{instance=~\"$instance\", target=~\"$target\"}[$__rate_interval])",
+                        "expr": "rate(link_probes_send_errors_total{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"}[$__rate_interval])",
                         "instant": false,
                         "legendFormat": "{{target}}",
                         "range": true
+                      },
+                      "labels": {
+                        "grafana.app/export-label": "prometheus-1"
                       }
                     },
                     "refId": "A",
@@ -1995,10 +2013,13 @@
                       "version": "v0",
                       "spec": {
                         "editorMode": "code",
-                        "expr": "link_up{instance=~\"$instance\", target=~\"$target\"} != link_up{instance=~\"$instance\", target=~\"$target\"} offset $__interval",
+                        "expr": "link_up{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"} != link_up{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"} offset $__interval",
                         "instant": false,
                         "legendFormat": "{{instance}} — {{target}}",
                         "range": true
+                      },
+                      "labels": {
+                        "grafana.app/export-label": "prometheus-1"
                       }
                     },
                     "refId": "A",
@@ -2099,10 +2120,13 @@
                       "version": "v0",
                       "spec": {
                         "editorMode": "code",
-                        "expr": "count(link_up{instance=~\"$instance\", target=~\"$target\"} == 0) or vector(0)",
+                        "expr": "count(link_up{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"} == 0) or vector(0)",
                         "instant": true,
                         "legendFormat": "{{instance}}",
                         "range": false
+                      },
+                      "labels": {
+                        "grafana.app/export-label": "prometheus-1"
                       }
                     },
                     "refId": "A",
@@ -2157,6 +2181,715 @@
                   "color": {
                     "mode": "thresholds",
                     "fixedColor": "#5794F2"
+                  }
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-19": {
+        "kind": "Panel",
+        "spec": {
+          "id": 19,
+          "title": "Server & prober health",
+          "description": "Server-side and prober-internal counters. They cross-check the client-side panels above; none of them feed the loss ratio or the sent/rtt/timed_out balance.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "text",
+            "version": "13.2.0-30616302309",
+            "spec": {
+              "options": {
+                "code": {
+                  "language": "plaintext",
+                  "showLineNumbers": false,
+                  "showMiniMap": false
+                },
+                "content": "Server-side, prober-internal and endpoint counters — cross-checks on the panels above, not link-quality signals.",
+                "mode": "markdown"
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "color": {
+                    "mode": "thresholds"
+                  },
+                  "mappings": [],
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "value": 0,
+                        "color": "text"
+                      }
+                    ]
+                  }
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-20": {
+        "kind": "Panel",
+        "spec": {
+          "id": 20,
+          "title": "Probes In Flight",
+          "description": "Probes written but not yet echoed or timed out (link_probes_inflight). Rises while the link stalls; if it stays pinned while RTT and timeout rates are both flat, the probe loop is stuck.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "spec": {
+                        "editorMode": "code",
+                        "expr": "link_probes_inflight{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"}",
+                        "instant": false,
+                        "legendFormat": "{{target}}",
+                        "range": true
+                      },
+                      "labels": {
+                        "grafana.app/export-label": "prometheus-1"
+                      }
+                    },
+                    "refId": "A",
+                    "hidden": false
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "13.2.0-30616302309",
+            "spec": {
+              "options": {
+                "legend": {
+                  "calcs": [
+                    "mean",
+                    "lastNotNull"
+                  ],
+                  "displayMode": "table",
+                  "placement": "right",
+                  "showLegend": true
+                },
+                "tooltip": {
+                  "hideZeros": false,
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "short",
+                  "decimals": 0,
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "value": 0,
+                        "color": "green"
+                      }
+                    ]
+                  },
+                  "color": {
+                    "mode": "palette-classic",
+                    "seriesBy": "max"
+                  },
+                  "custom": {
+                    "axisPlacement": "auto",
+                    "drawStyle": "line",
+                    "fillOpacity": 10,
+                    "lineWidth": 1,
+                    "showPoints": "never",
+                    "spanNulls": false,
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    }
+                  }
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-21": {
+        "kind": "Panel",
+        "spec": {
+          "id": 21,
+          "title": "Server Probes Dropped",
+          "description": "Probes the echo server rejected per second, by reason (link_server_probes_dropped_total). hmac/replay mean a secret or clock-skew misconfig, rate_ip/rate_global mean overload, allowlist means a topology change — none of these is network loss.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "spec": {
+                        "editorMode": "code",
+                        "expr": "rate(link_server_probes_dropped_total{source=~\"$source\"}[$__rate_interval])",
+                        "instant": false,
+                        "legendFormat": "{{reason}}",
+                        "range": true
+                      },
+                      "labels": {
+                        "grafana.app/export-label": "prometheus-1"
+                      }
+                    },
+                    "refId": "A",
+                    "hidden": false
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "13.2.0-30616302309",
+            "spec": {
+              "options": {
+                "legend": {
+                  "calcs": [
+                    "mean",
+                    "lastNotNull"
+                  ],
+                  "displayMode": "table",
+                  "placement": "right",
+                  "showLegend": true
+                },
+                "tooltip": {
+                  "hideZeros": false,
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "pps",
+                  "decimals": 2,
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "value": 0,
+                        "color": "green"
+                      }
+                    ]
+                  },
+                  "color": {
+                    "mode": "palette-classic",
+                    "seriesBy": "max"
+                  },
+                  "custom": {
+                    "axisPlacement": "auto",
+                    "drawStyle": "line",
+                    "fillOpacity": 10,
+                    "lineWidth": 1,
+                    "showPoints": "never",
+                    "spanNulls": false,
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    }
+                  }
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-22": {
+        "kind": "Panel",
+        "spec": {
+          "id": 22,
+          "title": "Server Clock Skew",
+          "description": "Server clock minus the client probe timestamp, per client (link_server_clock_skew_seconds). Within 5s of the ±30s replay window, valid probes start being dropped as replays; resynchronize NTP.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "spec": {
+                        "editorMode": "code",
+                        "expr": "link_server_clock_skew_seconds{source=~\"$source\"}",
+                        "instant": false,
+                        "legendFormat": "{{client}}",
+                        "range": true
+                      },
+                      "labels": {
+                        "grafana.app/export-label": "prometheus-1"
+                      }
+                    },
+                    "refId": "A",
+                    "hidden": false
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "13.2.0-30616302309",
+            "spec": {
+              "options": {
+                "legend": {
+                  "calcs": [
+                    "mean",
+                    "lastNotNull"
+                  ],
+                  "displayMode": "table",
+                  "placement": "right",
+                  "showLegend": true
+                },
+                "tooltip": {
+                  "hideZeros": false,
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "s",
+                  "decimals": 3,
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "value": 0,
+                        "color": "green"
+                      }
+                    ]
+                  },
+                  "color": {
+                    "mode": "palette-classic",
+                    "seriesBy": "max"
+                  },
+                  "custom": {
+                    "axisPlacement": "auto",
+                    "drawStyle": "line",
+                    "fillOpacity": 10,
+                    "lineWidth": 1,
+                    "showPoints": "never",
+                    "spanNulls": false,
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    }
+                  }
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-23": {
+        "kind": "Panel",
+        "spec": {
+          "id": 23,
+          "title": "Server Probes Received",
+          "description": "Validated probes received by the server per second, by client (link_server_probes_received_total). Cross-check against the client-side link_probes_sent_total: a persistent gap is probes that never arrived, or ones the server failed to echo.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "spec": {
+                        "editorMode": "code",
+                        "expr": "rate(link_server_probes_received_total{source=~\"$source\"}[$__rate_interval])",
+                        "instant": false,
+                        "legendFormat": "{{client}}",
+                        "range": true
+                      },
+                      "labels": {
+                        "grafana.app/export-label": "prometheus-1"
+                      }
+                    },
+                    "refId": "A",
+                    "hidden": false
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "13.2.0-30616302309",
+            "spec": {
+              "options": {
+                "legend": {
+                  "calcs": [
+                    "mean",
+                    "lastNotNull"
+                  ],
+                  "displayMode": "table",
+                  "placement": "right",
+                  "showLegend": true
+                },
+                "tooltip": {
+                  "hideZeros": false,
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "pps",
+                  "decimals": 2,
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "value": 0,
+                        "color": "green"
+                      }
+                    ]
+                  },
+                  "color": {
+                    "mode": "palette-classic",
+                    "seriesBy": "max"
+                  },
+                  "custom": {
+                    "axisPlacement": "auto",
+                    "drawStyle": "line",
+                    "fillOpacity": 10,
+                    "lineWidth": 1,
+                    "showPoints": "never",
+                    "spanNulls": false,
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    }
+                  }
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-24": {
+        "kind": "Panel",
+        "spec": {
+          "id": 24,
+          "title": "Prober Internal Errors",
+          "description": "Prober-internal failures per second, by reason (link_prober_internal_errors_total: panic, reader_dead, dial_retry, stop_timeout). Not link conditions — while these move, this target's probe numbers are unreliable.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "spec": {
+                        "editorMode": "code",
+                        "expr": "rate(link_prober_internal_errors_total{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"}[$__rate_interval])",
+                        "instant": false,
+                        "legendFormat": "{{target}} {{reason}}",
+                        "range": true
+                      },
+                      "labels": {
+                        "grafana.app/export-label": "prometheus-1"
+                      }
+                    },
+                    "refId": "A",
+                    "hidden": false
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "13.2.0-30616302309",
+            "spec": {
+              "options": {
+                "legend": {
+                  "calcs": [
+                    "mean",
+                    "lastNotNull"
+                  ],
+                  "displayMode": "table",
+                  "placement": "right",
+                  "showLegend": true
+                },
+                "tooltip": {
+                  "hideZeros": false,
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "pps",
+                  "decimals": 2,
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "value": 0,
+                        "color": "green"
+                      }
+                    ]
+                  },
+                  "color": {
+                    "mode": "palette-classic",
+                    "seriesBy": "max"
+                  },
+                  "custom": {
+                    "axisPlacement": "auto",
+                    "drawStyle": "line",
+                    "fillOpacity": 10,
+                    "lineWidth": 1,
+                    "showPoints": "never",
+                    "spanNulls": false,
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    }
+                  }
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-25": {
+        "kind": "Panel",
+        "spec": {
+          "id": 25,
+          "title": "Server Echo Errors",
+          "description": "Validated probes the server failed to echo, per second (link_server_echo_errors_total, a local UDP write failure). The client counts these as loss, so subtract this rate before blaming the network for a sent/received mismatch.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "spec": {
+                        "editorMode": "code",
+                        "expr": "rate(link_server_echo_errors_total{source=~\"$source\"}[$__rate_interval])",
+                        "instant": false,
+                        "legendFormat": "{{source}}",
+                        "range": true
+                      },
+                      "labels": {
+                        "grafana.app/export-label": "prometheus-1"
+                      }
+                    },
+                    "refId": "A",
+                    "hidden": false
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "13.2.0-30616302309",
+            "spec": {
+              "options": {
+                "legend": {
+                  "calcs": [
+                    "mean",
+                    "lastNotNull"
+                  ],
+                  "displayMode": "table",
+                  "placement": "right",
+                  "showLegend": true
+                },
+                "tooltip": {
+                  "hideZeros": false,
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "pps",
+                  "decimals": 2,
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "value": 0,
+                        "color": "green"
+                      }
+                    ]
+                  },
+                  "color": {
+                    "mode": "palette-classic",
+                    "seriesBy": "max"
+                  },
+                  "custom": {
+                    "axisPlacement": "auto",
+                    "drawStyle": "line",
+                    "fillOpacity": 10,
+                    "lineWidth": 1,
+                    "showPoints": "never",
+                    "spanNulls": false,
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    }
+                  }
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-26": {
+        "kind": "Panel",
+        "spec": {
+          "id": 26,
+          "title": "Metrics Auth Failures",
+          "description": "Rejected HTTP Basic auth attempts on /metrics and /status per second (link_metrics_auth_failures_total). A rising rate is a misconfigured scraper or credential scanning against the monitor itself, not a link fault.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "spec": {
+                        "editorMode": "code",
+                        "expr": "rate(link_metrics_auth_failures_total[$__rate_interval])",
+                        "instant": false,
+                        "legendFormat": "Auth failures",
+                        "range": true
+                      },
+                      "labels": {
+                        "grafana.app/export-label": "prometheus-1"
+                      }
+                    },
+                    "refId": "A",
+                    "hidden": false
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "13.2.0-30616302309",
+            "spec": {
+              "options": {
+                "legend": {
+                  "calcs": [
+                    "mean",
+                    "lastNotNull"
+                  ],
+                  "displayMode": "table",
+                  "placement": "right",
+                  "showLegend": true
+                },
+                "tooltip": {
+                  "hideZeros": false,
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "pps",
+                  "decimals": 2,
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "value": 0,
+                        "color": "green"
+                      }
+                    ]
+                  },
+                  "color": {
+                    "mode": "palette-classic",
+                    "seriesBy": "max"
+                  },
+                  "custom": {
+                    "axisPlacement": "auto",
+                    "drawStyle": "line",
+                    "fillOpacity": 10,
+                    "lineWidth": 1,
+                    "showPoints": "never",
+                    "spanNulls": false,
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    }
                   }
                 },
                 "overrides": []
@@ -2403,6 +3136,110 @@
                 "name": "panel-17"
               }
             }
+          },
+          {
+            "kind": "GridLayoutItem",
+            "spec": {
+              "x": 0,
+              "y": 53,
+              "width": 24,
+              "height": 3,
+              "element": {
+                "kind": "ElementReference",
+                "name": "panel-19"
+              }
+            }
+          },
+          {
+            "kind": "GridLayoutItem",
+            "spec": {
+              "x": 0,
+              "y": 56,
+              "width": 6,
+              "height": 6,
+              "element": {
+                "kind": "ElementReference",
+                "name": "panel-20"
+              }
+            }
+          },
+          {
+            "kind": "GridLayoutItem",
+            "spec": {
+              "x": 6,
+              "y": 56,
+              "width": 6,
+              "height": 6,
+              "element": {
+                "kind": "ElementReference",
+                "name": "panel-21"
+              }
+            }
+          },
+          {
+            "kind": "GridLayoutItem",
+            "spec": {
+              "x": 12,
+              "y": 56,
+              "width": 6,
+              "height": 6,
+              "element": {
+                "kind": "ElementReference",
+                "name": "panel-22"
+              }
+            }
+          },
+          {
+            "kind": "GridLayoutItem",
+            "spec": {
+              "x": 18,
+              "y": 56,
+              "width": 6,
+              "height": 6,
+              "element": {
+                "kind": "ElementReference",
+                "name": "panel-23"
+              }
+            }
+          },
+          {
+            "kind": "GridLayoutItem",
+            "spec": {
+              "x": 0,
+              "y": 62,
+              "width": 12,
+              "height": 7,
+              "element": {
+                "kind": "ElementReference",
+                "name": "panel-24"
+              }
+            }
+          },
+          {
+            "kind": "GridLayoutItem",
+            "spec": {
+              "x": 12,
+              "y": 62,
+              "width": 6,
+              "height": 7,
+              "element": {
+                "kind": "ElementReference",
+                "name": "panel-25"
+              }
+            }
+          },
+          {
+            "kind": "GridLayoutItem",
+            "spec": {
+              "x": 18,
+              "y": 62,
+              "width": 6,
+              "height": 7,
+              "element": {
+                "kind": "ElementReference",
+                "name": "panel-26"
+              }
+            }
           }
         ]
       }
@@ -2434,6 +3271,42 @@
     },
     "title": "Link Monitor",
     "variables": [
+      {
+        "kind": "QueryVariable",
+        "spec": {
+          "name": "source",
+          "current": {
+            "text": "",
+            "value": ""
+          },
+          "label": "Source",
+          "hide": "dontHide",
+          "refresh": "onDashboardLoad",
+          "skipUrlSync": false,
+          "description": "Logical source/site label of the link; separates sites that share one scrape instance",
+          "query": {
+            "kind": "DataQuery",
+            "group": "prometheus",
+            "version": "v0",
+            "spec": {
+              "qryType": 1,
+              "query": "label_values(link_up,source)",
+              "refId": "PrometheusVariableQueryEditor-VariableQuery"
+            },
+            "labels": {
+              "grafana.app/export-label": "prometheus-1"
+            }
+          },
+          "regex": "",
+          "regexApplyTo": "value",
+          "sort": "disabled",
+          "definition": "label_values(link_up,source)",
+          "options": [],
+          "multi": true,
+          "includeAll": true,
+          "allowCustomValue": false
+        }
+      },
       {
         "kind": "QueryVariable",
         "spec": {
@@ -2500,8 +3373,8 @@
           "sort": "disabled",
           "definition": "label_values(link_up,target)",
           "options": [],
-          "multi": false,
-          "includeAll": false,
+          "multi": true,
+          "includeAll": true,
           "allowCustomValue": true
         }
       }
