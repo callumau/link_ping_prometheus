@@ -125,7 +125,7 @@ The exporter exposes the following metrics at `/metrics` (default port 2112).
 | `link_rtt_jitter_seconds` | Gauge | `source`, `target`, `address` | Smoothed RTT jitter in seconds (RFC 3550 §6.4.1). Resets after a sequence gap (a timed-out probe), so link recovery never spikes the gauge. |
 | `link_rto_seconds` | Gauge | `source`, `target`, `address` | Current adaptive RTO in use (RFC 6298, doubled on consecutive timeouts; floor `max(200ms, 2×SRTT)`). |
 | `link_rtt_srtt_seconds` | Gauge | `source`, `target`, `address` | Smoothed RTT estimate (RFC 6298 SRTT), a window-independent latency signal for dashboards and baseline-shift alerts. Stays 0 with adaptive mode disabled. |
-| `link_server_probes_received_total` | Counter | `source`, `client` | Valid probes received by the server, per remote client IP (server mode only). Cross-check against the client's sent counter — mismatches may also be echo write failures, see `link_server_echo_errors_total`. |
+| `link_server_probes_received_total` | Counter | `source`, `client` | Valid probes received by the server, per remote client IP (server mode only). Cross-check against the client's sent counter — mismatches may also be echo write failures, see `link_server_echo_errors_total`. Includes MTU-sweep probes (they carry the same header frame), so subtract `rate(link_mtu_probes_sent_total)` before reading a mismatch as wire loss. |
 | `link_server_echo_errors_total` | Counter | `source` | Validated probes the server failed to echo back (local UDP write error). The client counts these as loss, so subtract this rate before attributing a received/sent mismatch to the network. |
 | `link_server_probes_dropped_total` | Counter | `source`, `reason` | Probes dropped by server: `allowlist`, `rate_ip`, `rate_global`, `size`, `magic`, `hmac`, `replay`, `invalid_addr`, `client_overflow`. `hmac`/`replay` diagnose secret/NTP misconfig vs true loss; `client_overflow` means more distinct CIDR-allowlisted client IPs than the per-client series cap. |
 | `link_server_clock_skew_seconds` | Gauge | `source`, `client` | Last observed clock skew (server minus client timestamp) for HMAC probes; positive means client behind. Diagnose replay drops from NTP drift per peer. |
@@ -137,7 +137,9 @@ Percentiles and loss are **not** pre-computed in the exporter — Prometheus
 histogram, so any time window (1m, 1h, 24h) can be queried. Jitter is the
 one exception: it is a smoothed running estimate in the probe binary,
 because a gauge derived from consecutive-sample deltas cannot be
-reconstructed over arbitrary windows in PromQL.
+reconstructed over arbitrary windows in PromQL. The Prometheus client's own
+`promhttp_metric_handler_requests_*` counters (scrapes by HTTP status) are
+exported alongside the `link_*` series.
 
 ## PromQL Examples
 
@@ -160,7 +162,7 @@ Copy-paste these.
 | **Jitter** (window-based) | `(histogram_quantile(0.9, rate(link_rtt_seconds_bucket[$__rate_interval])) - histogram_quantile(0.5, rate(link_rtt_seconds_bucket[$__rate_interval]))) * 1000` | ms |
 | **Link up** | `link_up` | 0/1 |
 | **Baseline shift** (recent p50 vs 24h min) | `link:rtt_seconds_p50 > 1.5 * link:rtt_seconds_p50_24h_min` (shipped recording rules) | bool |
-| **True wire loss** (needs server at remote end) | `100 * (1 - rate(link_server_probes_received_total{client="<ip>"}[$__rate_interval]) / rate(link_probes_sent_total[$__rate_interval]))` | % |
+| **True wire loss** (needs server at remote end) | `100 * (1 - (rate(link_server_probes_received_total{client="<ip>"}[$__rate_interval]) - rate(link_mtu_probes_sent_total[$__rate_interval])) / rate(link_probes_sent_total[$__rate_interval]))` | % |
 
 Two rules that trip people up:
 
@@ -197,15 +199,24 @@ socket stalled.
 **Cross-check with the server** (server mode at the remote end):
 `link_server_probes_received_total` counts valid probes per remote client
 IP. Any mismatch with `link_probes_sent_total` is probes that never
-reached the server — genuinely lost on the wire. The one exception is
-`link_server_echo_errors_total`: a validated probe the server failed to
-write back did reach the server but never returned, so the client counts
-it as loss. Subtract that rate before blaming the network:
+reached the server — genuinely lost on the wire. Two corrections apply
+before that mismatch can be called network loss. `link_server_echo_errors_total`:
+a validated probe the server failed to write back did reach the server but
+never returned, so the client counts it as loss — subtract that rate.
+`link_mtu_probes_sent_total`: the DF MTU sweep sends the same header frame
+to the same address, so the server counts those probes too and on a default
+`-mtu-sweep=1m` deployment `received` can exceed `sent`. Subtract the sweep
+before reading a mismatch as loss:
 
 ```promql
-100 * (1 - rate(link_server_probes_received_total{client="203.0.113.5"}[$__rate_interval])
+100 * (1 - (rate(link_server_probes_received_total{client="203.0.113.5"}[$__rate_interval])
+            - rate(link_mtu_probes_sent_total[$__rate_interval]))
            / rate(link_probes_sent_total{target="site-b"}[$__rate_interval]))
 ```
+
+Sweep probes are visible to the server and must be subtracted here before
+calling anything network loss — they are a separate counter namespace on the
+client, not in `link_probes_sent_total`.
 
 **Why the loss ratio stays honest:** the adaptive RTO is RFC 6298
 (`SRTT + 4×RTTVAR`, doubled on consecutive timeouts so it recovers when
@@ -463,7 +474,7 @@ link_ping_prometheus -mode=<mode> [flags]
 | `-target` | `""` | Client: single target `host:port` |
 | `-targets` | `""` | Client: path to JSON targets file |
 | `-metrics` | `127.0.0.1:2112` | Prometheus metrics HTTP listen address (localhost-only by default; use `:2112` to expose for remote scrape — firewall-restrict) |
-| `-interval` | `500ms` | Client: probe interval (warns if `>= -timeout`; probes will queue) |
+| `-interval` | `500ms` | Client: probe interval (warns if `>= -timeout`; probes will queue). Values below `1ms` are rejected: the pending window grows as `RTO/interval`, so sub-millisecond intervals allocate without bound. |
 | `-timeout` | `1s` | Client: Base/initial probe timeout (with `-adaptive=false` warns if `<200ms`; spurious loss on moderate-RTT links) |
 | `-reconnect-interval` | `5m` | Client: How long to keep a UDP socket before re-dialing for DNS re-resolution (0 means use default 5m via global; must be `>= -interval` or an error; set e.g. `24h` to effectively disable) |
 | `-dscp` | `0` | Client: DSCP value 0-63 marked on probe packets (e.g. 46 = EF) so QoS-managed networks class them accordingly. 0 = unmarked (default). Best effort, requires OS support (Linux). |
@@ -478,19 +489,19 @@ link_ping_prometheus -mode=<mode> [flags]
 | `-metrics-tls-key` | `""` | TLS private key file for /metrics (requires `-metrics-tls-cert`) |
 | `-metrics-allow-insecure` | `false` | Allow Basic Auth without TLS (otherwise auth over plaintext HTTP is rejected) |
 | `-metrics-gzip` | `false` | Gzip-compress `/metrics` responses when the scraper offers it. Off by default because promhttp pools a gzip writer per CPU and each holds ~0.7MB of flate state, so compression costs up to ~0.7MB x `GOMAXPROCS` of live heap — more than a small fleet's whole response. Enable it for many targets. |
-| `-mem-scavenge` | `5m` | Runtime: force a heap scavenge at this interval so the unused heap high-water mark is returned to the OS (0 disables; skipped when less than 4MB is unreleased). See [Memory & Runtime Tuning](#memory--runtime-tuning). |
+| `-mem-scavenge` | `5m` | Runtime: force a heap scavenge at this interval so the unused heap high-water mark is returned to the OS (0 disables; skipped unless at least 4MB of releasable heap is held, see [Memory & Runtime Tuning](#memory--runtime-tuning)). |
 | `-json-logs` | `false` | Output logs in JSON format |
 | `-log-file` | `""` | Append logs to this file in addition to stdout (required for Windows service logging, where stdout is discarded) |
 | `-log-file-max-mb` | `10` | Max log file size in MB before rotation (0 disables rotation) |
 | `-log-file-max-backups` | `5` | Max rotated log files to keep |
 | `-log-file-max-age` | `28` | Max days to keep rotated log files |
 | `-svc` | `""` | Windows service action: `install`, `uninstall`, `start`, `stop`, `run` |
-| `-echo-secret` | `""` | HMAC secret authenticating UDP probes (env `LINK_PING_ECHO_SECRET`; must be set on both client and server; expands the wire frame to 32 bytes, see [Wire Protocol](#wire-protocol)) |
+| `-echo-secret` | `""` | HMAC secret authenticating UDP probes (env `LINK_PING_ECHO_SECRET`; must be set on **both** client and server — a server without it accepts the client's HMAC frame as a plain payload probe, see [Wire Protocol](#wire-protocol); expands the wire frame to 32 bytes) |
 | `-echo-secret-old` | `""` | Server: previous HMAC secret still accepted during a zero-downtime rotation, alongside `-echo-secret` (env `LINK_PING_ECHO_SECRET_OLD`; server side only) |
 
 **Why MTU discovery (`-mtu-sweep`) matters:** 24-byte probes prove a path *exists* — they cannot prove it *carries full-size traffic*. VPN tunnels, PPPoE/GRE/VXLAN overlays and broken PMTUD routinely pass small packets while black-holing full-size ones — the classic "monitor says healthy, users say broken" failure. The sweep DF-marks probes on a dedicated socket, binary-searches the largest frame that round-trips, and publishes it as `link_path_mtu_bytes`; a shrinking gauge (or rising `link_mtu_probes_lost_total` while `link_up` stays 1) is that failure's signature. It needs no ICMP and no extra firewall rules, uses separate counters that never enter the loss ratio, and is on by default (1m; `0` disables). Alert on `link_path_mtu_bytes < max_over_time(link_path_mtu_bytes[24h])` or `rate(link_mtu_probes_lost_total[10m]) > 0`; `link_up` deliberately stays 1 through an MTU shrink (24-byte probes keep flowing), so the gauge — not `link_up` — is the MTU-specific alarm.
 
-Liveness endpoints `GET /healthz` and `GET /readyz` on the same metrics listener return `200 ok` (`text/plain`) for Kubernetes/container probes. They are deliberately unauthenticated — only `/metrics` and `/status` are gated — and are available over both HTTP and HTTPS.
+Liveness endpoints `GET /healthz` and `GET /readyz` on the same metrics listener return `200 ok` (`text/plain`) for Kubernetes/container probes. They are deliberately unauthenticated — only `/metrics` and `/status` are gated — and are available over both HTTP and HTTPS. `/healthz` is always 200; `/readyz` returns `503` while a client-mode agent has no target with a working socket (server-only mode is always 200), so a rollout waits for a real link. `/metrics` itself serves at most 2 concurrent scrapes — a third concurrent request gets `503`, and responses are bounded by a 30s write timeout — so a scrape storm cannot multiply gather trees against `GOMEMLIMIT`.
 
 `GET /status` on the same listener serves a JSON snapshot of live per-target probe state — `link_up`, in-flight probes, consecutive misses, the current consecutive send-failure streak (`send_failures`, reset on any successful write; not a cumulative count), RTO/SRTT, last sequence number, socket age, `path_mtu_bytes` (largest DF frame proven to round-trip; 0 = no successful sweep yet) and `last_echo_age_seconds` (-1 until the first echo) — for debugging a flapping target without log access. It also returns a `process` object with Go runtime memory and GC stats — `heap_alloc_bytes`, `heap_sys_bytes`, `heap_idle_bytes`, `heap_released_bytes`, `stack_inuse_bytes`, `gc_sys_bytes`, `sys_bytes`, `gc_count` and `goroutines` — so heap growth is observable remotely without a debugger. Unlike the health endpoints it is auth-gated exactly like `/metrics` (open only when no metrics auth is configured).
 
@@ -502,7 +513,7 @@ Resource footprint: metric handles are resolved once per target at startup (no p
 
 Every `/metrics` scrape allocates (gather trees, text encoding, optional gzip) and ratchets Go's heap high-water mark upward; the runtime does not return it while the agent is otherwise idle because scavenging is allocation-rate driven. On Windows the visible number is commit/working set, so this ratchet shows up there as steady growth.
 
-`-mem-scavenge` (default `5m`, `0` disables) forces a scavenge on that interval so the high-water mark goes back to the OS; it is skipped when less than 4MB is unreleased, and `/status` exposes the same picture as its `process` object for observing it remotely.
+`-mem-scavenge` (default `5m`, `0` disables) forces a scavenge on that interval so the high-water mark goes back to the OS; it is skipped unless at least 4MB of *releasable* heap is held (`HEAP_IDLE - HEAP_RELEASED`), the figure the scavenge can actually return, not total process memory — an already-lean process pays nothing. `/status` exposes the same picture as its `process` object for observing it remotely.
 
 `GOGC` is the other lever, and the right value depends on the scrape load (both measured on one target):
 
@@ -526,7 +537,7 @@ JSON file with an array of `{"name": "...", "address": "host:port"}` objects. Op
 
 Max 1000 targets, max file size 1 MB. Per-target interval/timeout must be >0 when set; `interval >= timeout` warns (global and per-target) and `reconnect-interval < interval` is an error.
 
-**Hot reload:** send `SIGHUP` to re-read the file without a restart (Unix), or run with `-targets-reload-interval` (e.g. `30s`) for automatic polling — the only option under a Windows service, which has no SIGHUP. On reload: new targets start probing, removed targets stop and their series are deleted from `/metrics` (Prometheus marks the vanished series stale, so `link_up`-keyed alerts stop firing for them — an `absent()`/`up` alert covers a fully dead client), and targets whose address/intervals changed restart with the new values. A file that is mid-edit or invalid keeps the previous set running — reload failures are logged at Error level, never fatal.
+**Hot reload:** send `SIGHUP` to re-read the file without a restart (Unix), or run with `-targets-reload-interval` (e.g. `30s`) for automatic polling — the only option under a Windows service, which has no SIGHUP. On reload: new targets start probing, removed targets stop and their series are deleted from `/metrics` (Prometheus marks the vanished series stale, so `link_up`-keyed alerts stop firing for them — an `absent()`/`up` alert covers a fully dead client), and targets whose address/intervals changed restart with the new values. A file that is mid-edit or invalid keeps the previous set running — reload failures are logged at Error level, never fatal. A reload whose file parses to an empty array logs a warning that all probing has stopped. A probe loop that fails to join within 5s is left stopped (its socket may still be draining) and its series are purged once it does exit, so a stuck loop cannot leave a frozen `link_up=1` behind.
 
 ### Examples
 
@@ -704,6 +715,15 @@ requires the echoed timestamp to exactly match the value it sent —
 corrupted, replayed, or spoofed responses are discarded and counted as
 loss on timeout, protecting RTT samples from poisoning.
 
+`-echo-secret` must be set on **both** ends. A server running without it
+cannot distinguish a 32-byte HMAC frame from a payload probe — 32 falls
+inside the accepted `header ≤ size ≤ header + 1400` range — so it echoes
+the frame unverified. A half-configured fleet therefore reads healthy with
+no probe authenticated: nothing lands in
+`link_server_probes_dropped_total{reason="hmac"}`, and the allowlist is the
+only thing gating the reflector. The server logs a startup warning when
+`-echo-secret` is unset.
+
 The server rate-limits echo processing to 2000 packets/s per remote IP
 and 10000 packets/s globally (fixed one-second window); excess datagrams
 are dropped. The window is fixed, not sliding, so a burst straddling a
@@ -731,6 +751,12 @@ DNS failure at startup is retried, not fatal.
   timestamp is older or newer than ~30 seconds, so a captured probe cannot be
   replayed indefinitely with a spoofed source. This means both nodes must have
   roughly synchronized clocks — NTP is recommended on monitoring endpoints.
+- `-echo-secret` only protects the link when **both** ends set it. A server
+  without it accepts the client's 32-byte HMAC frame as a bounded payload
+  probe and echoes it back, so the client reads a healthy link with no
+  `hmac` drop reason and no reflector authentication — the allowlist is then
+  the only control. The server logs a startup warning when the secret is
+  unset; a partially-configured fleet is exactly what that warning surfaces.
 - Secret rotation without an outage: with the old secret in the service
   environment of every endpoint, restart the SERVERS with
   `-echo-secret=<new>` plus `-echo-secret-old=<old>` (or
