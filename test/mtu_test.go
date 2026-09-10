@@ -22,6 +22,19 @@ func mtuCfg(addr string, status *prober.StatusRegistry) prober.Config {
 	}
 }
 
+// mainBalanceGap reads the main probe counters once and returns
+// sent − (rtt_count + timed_out + inflight). These are separate atomics, so
+// a counter transition landing mid-read can leave a ±1 residue; callers
+// retry a few times. MTU-sweep probes must never enter these counters, so
+// while a sweep has run the gap is exactly 0.
+func mainBalanceGap(name, addr string) float64 {
+	sent := getCounterValue(prober.ProbesSent, name, addr)
+	rtt := getHistogramCount(prober.RTTSeconds, name, addr)
+	timedOut := getCounterValue(prober.ProbesTimedOut, name, addr)
+	inflight := getGaugeValue(prober.ProbesInflight, name, addr)
+	return sent - rtt - timedOut - inflight
+}
+
 // TestMTUSweep_FullSizeSurvives: on an echo-everything path the sweep
 // proves the maximum frame on the first probe; path_mtu_bytes converges
 // to header+MaxPayloadBytes and surfaces in /status. MTU counters move
@@ -54,6 +67,26 @@ func TestMTUSweep_FullSizeSurvives(t *testing.T) {
 	}
 	if n := getCounterValue(prober.MTUProbesLost, "mtu_target", addr); n != 0 {
 		t.Errorf("healthy full-size path must have 0 lost MTU probes, got %v", n)
+	}
+
+	// A sweep has run (MTUProbesSent > 0 above), so the MAIN balance must
+	// still hold exactly: sent == rtt_count + timed_out + inflight. A
+	// regression that routed DF-sweep probes through link_probes_sent_total
+	// would inflate sent — the loss denominator — without a matching rtt or
+	// timeout sample and break this immediately. The read is retried because
+	// the four counters are separate atomics (a transition landing mid-read
+	// leaves a ±1 residue); a real regression is persistent, not transient.
+	balDeadline := time.Now().Add(2 * time.Second)
+	balanced := false
+	for time.Now().Before(balDeadline) {
+		if mainBalanceGap("mtu_target", addr) == 0 {
+			balanced = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !balanced {
+		t.Errorf("main balance broken while MTU sweeps run: sent-(rtt+timed_out+inflight) = %v (MTU probes must stay out of the loss counters)", mainBalanceGap("mtu_target", addr))
 	}
 
 	// /status carries the same value (snapshot refreshes on the main

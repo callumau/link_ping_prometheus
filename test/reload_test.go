@@ -7,13 +7,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"link_ping_prometheus/internal/prober"
 )
 
 // TestRunClient_ReloadAddsRemovesTargets: a reload applies file changes
-// live — new targets start probing, removed targets stop (with inflight
-// drained to zero, keeping the balance invariant) — and a broken file
-// mid-edit keeps the previous set probing.
+// live — new targets start probing, removed targets stop and have their
+// metric series DELETED (Prometheus staleness; see deleteTargetSeries) and
+// are dropped from /status, a merely-CHANGED target keeps its series and
+// keeps probing, and a broken file mid-edit keeps the previous set probing.
 // pi-lens-ignore: go-test-functions
 func TestRunClient_ReloadAddsRemovesTargets(t *testing.T) {
 	prober.InitMetrics()
@@ -39,6 +42,7 @@ func TestRunClient_ReloadAddsRemovesTargets(t *testing.T) {
 	}
 	writeTargets() // empty file so the first reload introduces B
 
+	reg := prober.NewStatusRegistry()
 	hup := make(chan os.Signal, 1)
 	cfg := prober.Config{
 		Source:       testSource,
@@ -47,6 +51,7 @@ func TestRunClient_ReloadAddsRemovesTargets(t *testing.T) {
 		BaseTimeout:  time.Second,
 		TargetsPath:  targetsFile,
 		ReloadSignal: hup,
+		Status:       reg,
 	}
 
 	runClientAsync(t, ctx, cancel, cfg)
@@ -69,16 +74,39 @@ func TestRunClient_ReloadAddsRemovesTargets(t *testing.T) {
 	hup <- os.Interrupt
 	waitFor(func() bool { return getCounterValue(prober.ProbesSent, "reload_b", addrB) >= 2 }, "new target probed after reload")
 
-	// A must have stopped: sample its sent counter across a window and
-	// require zero growth, and its inflight gauge must have drained.
-	a1 := getCounterValue(prober.ProbesSent, "reload_a", addrA)
-	time.Sleep(400 * time.Millisecond)
-	a2 := getCounterValue(prober.ProbesSent, "reload_a", addrA)
-	if a2 != a1 {
-		t.Errorf("removed target must stop probing: sent %v -> %v in 400ms", a1, a2)
+	// A REMOVED target's series must be DELETED from the registry, not left
+	// at its last value: Prometheus staleness only kicks in once a series
+	// disappears from a scrape, so a still-registered series freezes at its
+	// last value (e.g. link_up=1 forever on a decommissioned endpoint). This
+	// MUST be checked without touching the vec: getCounterValue/
+	// getGaugeValue resolve via WithLabelValues, which re-creates a deleted
+	// series as 0 and makes the "is it gone?" assertion impossible to fail.
+	for _, family := range []string{"link_probes_sent_total", "link_up", "link_rtt_seconds", "link_probes_inflight"} {
+		if metricSeriesExists(t, family, testSource, "reload_a", addrA) {
+			t.Errorf("removed target's %s series is still registered — deletion (Prometheus staleness) is broken", family)
+		}
 	}
-	if n := getGaugeValue(prober.ProbesInflight, "reload_a", addrA); n != 0 {
-		t.Errorf("removed target inflight must drain to 0 (balance invariant), got %v", n)
+	// It must also be gone from /status, or a removed target lingers as a
+	// ghost row.
+	for _, s := range reg.Snapshot() {
+		if s.Name == "reload_a" {
+			t.Errorf("removed target still present in /status snapshot: %+v", s)
+		}
+	}
+
+	// A CHANGED target (same name, new per-target interval) is still the
+	// same monitored endpoint: its series must survive the loop restart and
+	// its counters must keep growing. apply() must purge a target only when
+	// it was removed from the file, never when it merely changed.
+	if !metricSeriesExists(t, "link_probes_sent_total", testSource, "reload_b", addrB) {
+		t.Fatal("reload_b series must exist before the change reload")
+	}
+	sentBefore := getCounterValue(prober.ProbesSent, "reload_b", addrB)
+	writeTargetsInterval(t, targetsFile, "reload_b", addrB, "100ms")
+	hup <- os.Interrupt
+	waitFor(func() bool { return getCounterValue(prober.ProbesSent, "reload_b", addrB) > sentBefore+2 }, "changed target keeps probing")
+	if !metricSeriesExists(t, "link_probes_sent_total", testSource, "reload_b", addrB) {
+		t.Errorf("a CHANGED target (same name, new interval) must keep its metric series, but it was deleted")
 	}
 
 	// A broken file mid-edit keeps the previous set running.
@@ -107,4 +135,54 @@ func writeTargetsFile(t *testing.T, path, name, addr string) {
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// writeTargetsInterval writes a single-target file with an explicit
+// per-target interval — the change-detection key apply() compares to decide
+// whether a target merely changed (keep series) or was removed (purge).
+func writeTargetsInterval(t *testing.T, path, name, addr, interval string) {
+	t.Helper()
+	content := `[{"name":"` + name + `","address":"` + addr + `","interval":"` + interval + `"}]`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// metricSeriesExists reports whether the named metric family currently has a
+// series with exactly {source,target,address}. It uses Gather(), which only
+// reflects series already registered — unlike WithLabelValues, which CREATES a
+// zero-valued series on read and would make a "series was deleted" assertion
+// impossible to fail.
+func metricSeriesExists(t *testing.T, family, source, target, address string) bool {
+	t.Helper()
+	fams, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("gather metrics: %v", err)
+	}
+	want := map[string]string{"source": source, "target": target, "address": address}
+	for _, f := range fams {
+		if f.GetName() != family {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			got := make(map[string]string, len(m.GetLabel()))
+			for _, lp := range m.GetLabel() {
+				got[lp.GetName()] = lp.GetValue()
+			}
+			if len(got) != len(want) {
+				continue
+			}
+			match := true
+			for k, v := range want {
+				if got[k] != v {
+					match = false
+					break
+				}
+			}
+			if match {
+				return true
+			}
+		}
+	}
+	return false
 }

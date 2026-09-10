@@ -98,6 +98,13 @@ func TestJitterGauge_ConstantRTTStaysZero(t *testing.T) {
 	time.Sleep(1500 * time.Millisecond)
 	cancel()
 
+	// Guard against a vacuous pass: with no echo ever matched the gauge sits
+	// at its 0 default and the assertion below cannot fail. Fewer than a
+	// handful of consecutive samples makes the check meaningless too.
+	if n := getHistogramCount(prober.RTTSeconds, "jitter_const", addr); n < 5 {
+		t.Fatalf("only %v echoes matched — jitter==0 would be vacuous (cpu load?)", n)
+	}
+
 	j := getGaugeValue(prober.JitterSeconds, "jitter_const", addr)
 	if j > 0.001 {
 		t.Errorf("constant-RTT jitter should be ~0, got %v s", j)
@@ -115,8 +122,11 @@ func TestJitterGauge_ConvergesAndResetsOnGap(t *testing.T) {
 	defer cancel()
 
 	// Serial handler: every received probe sleeps 40ms (even count) or
-	// 0ms (odd count) before echoing. When dropNow is set, exactly one
-	// probe is dropped to create the sequence-number gap.
+	// 0ms (odd count) before echoing. dropNow arms a ONE-SHOT drop:
+	// CompareAndSwap consumes it on the next even count, so exactly one
+	// sequence gap occurs. A permanently-armed drop (the old Load()
+	// check) drops every even probe forever, pinning the estimate at 0 and
+	// making the "rebuilds slowly — no spike" assertion unfalsifiable.
 	var count atomic.Int64
 	var dropNow atomic.Bool
 	addr := udpEcho(t, ctx, func(buf []byte, w func([]byte)) {
@@ -124,8 +134,8 @@ func TestJitterGauge_ConvergesAndResetsOnGap(t *testing.T) {
 			return
 		}
 		n := count.Add(1)
-		if dropNow.Load() && n%2 == 0 {
-			return
+		if n%2 == 0 && dropNow.CompareAndSwap(true, false) {
+			return // the single dropped probe
 		}
 		if n%2 == 0 {
 			time.Sleep(40 * time.Millisecond)
@@ -143,33 +153,59 @@ func TestJitterGauge_ConvergesAndResetsOnGap(t *testing.T) {
 		t.Errorf("jitter on 40ms-swing link should be ~0.04 s, got %v", j)
 	}
 
-	// Phase 2: drop one probe, then wait for it to time out and for the
-	// next echo to land — the first sample after the gap resets J to 0.
+	// Phase 2: arm the one-shot drop, then catch the reset. The first
+	// response AFTER the gap sets J to 0 for one inter-probe window
+	// (~interval) before the following sample rebuilds it, so poll faster
+	// than the interval to observe that window.
 	dropNow.Store(true)
 	deadline := time.Now().Add(5 * time.Second)
+	resetSeen := false
+	for time.Now().Before(deadline) {
+		if getGaugeValue(prober.JitterSeconds, "jitter_var", addr) <= 0.001 {
+			resetSeen = true
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if !resetSeen {
+		t.Fatalf("jitter never reset to 0 after the sequence gap (cpu load?)")
+	}
+	// Anchor the rebuild count at the reset sample (the histogram Observe
+	// runs in the same block as the jitter Set, so the reset sample is
+	// already counted here).
+	base := getHistogramCount(prober.RTTSeconds, "jitter_var", addr)
+	// The gap must be real: the one-shot dropped probe has to time out.
 	for getCounterValue(prober.ProbesTimedOut, "jitter_var", addr) < 1 && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond)
 	}
 	if getCounterValue(prober.ProbesTimedOut, "jitter_var", addr) < 1 {
-		t.Fatal("dropped probe never timed out")
-	}
-	prev := getHistogramCount(prober.RTTSeconds, "jitter_var", addr)
-	for getHistogramCount(prober.RTTSeconds, "jitter_var", addr) == prev && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
-	j = getGaugeValue(prober.JitterSeconds, "jitter_var", addr)
-	if j > 0.002 {
-		t.Errorf("jitter must reset to 0 on sequence gap, got %v", j)
+		t.Fatal("one-shot dropped probe never timed out — no sequence gap was created")
 	}
 
-	// Phase 3: estimate rebuilds slowly from 0 — no spike.
-	time.Sleep(300 * time.Millisecond)
-	j = getGaugeValue(prober.JitterSeconds, "jitter_var", addr)
-	if j > 0.015 {
-		t.Errorf("jitter must rebuild from 0 after gap, got %v (want < 0.015)", j)
+	// Phase 3: the estimate REBUILDS from the post-gap reset — strictly
+	// positive again, and inside the RFC 3550 band for the observed
+	// consecutive sample count (J_N = 40ms·(1−(15/16)^N)). A regression
+	// that pins J at 0 after a gap fails the > 0 check; one that re-seeds
+	// it with a stale delta fails the analytic ceiling.
+	const rebuildSamples = 8
+	p3deadline := time.Now().Add(5 * time.Second)
+	n := 0
+	for time.Now().Before(p3deadline) {
+		if n = int(getHistogramCount(prober.RTTSeconds, "jitter_var", addr) - base); n >= rebuildSamples {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	if math.IsNaN(j) || j < 0 {
-		t.Errorf("jitter must be non-negative, got %v", j)
+	if n < rebuildSamples {
+		t.Fatalf("only %d samples after the gap in 5s — cpu load?", n)
+	}
+	j = getGaugeValue(prober.JitterSeconds, "jitter_var", addr)
+	if math.IsNaN(j) || j <= 0 {
+		t.Errorf("jitter must rebuild to a positive value after a sequence gap, got %v", j)
+	}
+	analytic := 40 * time.Millisecond.Seconds() * (1 - math.Pow(15.0/16.0, float64(n)))
+	if j > analytic+0.004 {
+		t.Errorf("jitter %v above the RFC 3550 rebuild band %v for N=%d — the estimate must climb slowly from the post-gap reset", j, analytic+0.004, n)
 	}
 
 	cancel()
