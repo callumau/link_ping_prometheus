@@ -23,12 +23,13 @@ func ValidateTarget(address string) error {
 	if host == "" {
 		return fmt.Errorf("target address %q has no host", address)
 	}
-	// strconv.Atoi accepts a leading sign, so "+80" would otherwise pass
-	// here and then fail at dial time with no load-time validation error;
-	// require a plain ASCII-digit port. Leading zeros stay valid (they
-	// dial to the same port).
+	// strconv.Atoi accepts a leading '+' and Go's net port parser strips
+	// it, so '+80' is genuinely dialable and must validate; Atoi still
+	// rejects non-numeric ports, and the 1..65535 range below rejects
+	// '-80' and out-of-range values. Leading zeros stay valid (they dial to
+	// the same port).
 	p, err := strconv.Atoi(port)
-	if err != nil || !isDigits(port) || p < 1 || p > 65535 {
+	if err != nil || p < 1 || p > 65535 {
 		return fmt.Errorf("target address %q has invalid port %q (must be 1-65535)", address, port)
 	}
 	if !isValidHost(host) {
@@ -77,10 +78,16 @@ func isValidHost(host string) bool {
 			}
 		}
 	}
-	// Strip exactly one trailing dot: the label loop would reject the
-	// empty final label of an FQDN ("host.example.com."), while a bare
-	// "." or a "host.." still fails below.
-	host = strings.TrimSuffix(host, ".")
+	// Strip exactly one trailing dot — but only for DNS names, never for
+	// IP literals: "1.2.3.4." would strip to a valid IP and pass the label
+	// loop below, yet the dotted IP form is not dialable. net.ParseIP was
+	// checked on the un-stripped host first, so reaching this point with an
+	// IP after the strip means the trailing dot was the only difference.
+	trimmed := strings.TrimSuffix(host, ".")
+	if net.ParseIP(trimmed) != nil {
+		return false
+	}
+	host = trimmed
 	if len(host) > 253 {
 		return false
 	}
@@ -100,32 +107,24 @@ func isValidHost(host string) bool {
 	return true
 }
 
-// isDigits reports whether s is a non-empty run of ASCII digits. Used
-// for the port so a signed value cannot pass syntax validation and then
-// fail only at dial time.
-func isDigits(s string) bool {
-	if s == "" {
-		return false
-	}
-	for i := 0; i < len(s); i++ {
-		if s[i] < '0' || s[i] > '9' {
-			return false
-		}
-	}
-	return true
-}
+// maxZoneLen bounds an IPv6 scope zone. A real zone is an interface name
+// (Linux caps those at 15 bytes) or a small numeric interface id; 255 is
+// a generous syntax bound that still rejects absurd inputs without
+// coupling validation to any one OS's name limit.
+const maxZoneLen = 255
 
 // validZone reports whether zone is a plausible IPv6 scope identifier:
-// non-empty and limited to ASCII alphanumerics, '_' and '-' (the
-// character set of network interface names). Anything else is not a
-// dialable zone and must not validate.
+// non-empty, bounded, and limited to ASCII alphanumerics plus '_', '-'
+// and '.' (the character set of network interface names; the dot allows
+// VLAN sub-interfaces such as eth0.100). Anything else is not a dialable
+// zone and must not validate.
 func validZone(zone string) bool {
-	if zone == "" {
+	if zone == "" || len(zone) > maxZoneLen {
 		return false
 	}
 	for i := 0; i < len(zone); i++ {
 		c := zone[i]
-		if !isASCIILetterDigit(c) && c != '_' && c != '-' {
+		if !isASCIILetterDigit(c) && c != '_' && c != '-' && c != '.' {
 			return false
 		}
 	}

@@ -171,22 +171,30 @@ func TestMTUSweep_DeadLinkKeepsLastValue(t *testing.T) {
 	})
 	reg := prober.NewStatusRegistry()
 	cfg := mtuCfg(addr, reg)
+	// Give the first sweep room to finish before the next one starts: the
+	// three dead-link probes each cost one 300ms timeout, so a 1s sweep
+	// interval leaves a comfortable window to observe the exact 3/3 counts
+	// without the second sweep polluting them.
+	cfg.MTUSweep = time.Second
 
 	runClientAsync(t, ctx, cancel, cfg)
-	// First sweep fires immediately: probes sent, none survive. Wait on
-	// lost (not sent) so the two early-abort probes have both timed out.
+	// First sweep fires immediately: the full-size probe is retried once
+	// (2 attempts), then the header-only abort probe runs (1 attempt). All
+	// three vanish, so exactly 3 sent and 3 lost; wait for the last probe
+	// to time out before asserting the exact pair.
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if getCounterValue(prober.MTUProbesLost, "mtu_target", addr) >= 2 {
+		if getCounterValue(prober.MTUProbesLost, "mtu_target", addr) == 3 &&
+			getCounterValue(prober.MTUProbesSent, "mtu_target", addr) == 3 {
 			break
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
-	if n := getCounterValue(prober.MTUProbesSent, "mtu_target", addr); n < 2 {
-		t.Fatalf("expected >=2 MTU probes attempted, got %v", n)
+	if n := getCounterValue(prober.MTUProbesSent, "mtu_target", addr); n != 3 {
+		t.Fatalf("expected exactly 3 MTU probes attempted (2 full-size retries + 1 header-only), got %v", n)
 	}
-	if n := getCounterValue(prober.MTUProbesLost, "mtu_target", addr); n < 2 {
-		t.Errorf("failed DF probes must count lost, got %v", n)
+	if n := getCounterValue(prober.MTUProbesLost, "mtu_target", addr); n != 3 {
+		t.Errorf("failed DF probes must count lost exactly 3, got %v", n)
 	}
 	if got := getGaugeValue(prober.PathMTUBytes, "mtu_target", addr); got != 0 {
 		t.Errorf("no surviving probe must leave path_mtu_bytes unknown (0), got %v", got)

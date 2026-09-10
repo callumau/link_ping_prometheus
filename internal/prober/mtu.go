@@ -53,7 +53,7 @@ func runMTUSweep(ctx context.Context, t Target, cfg Config, m targetMetrics, sta
 			}
 			return
 		}
-		largest, ok := sweepOnce(conn, cfg, m, headerSize)
+		largest, ok := sweepOnce(ctx, conn, cfg, m, headerSize)
 		conn.Close()
 		if ok {
 			// Report the full probe frame size (header + payload);
@@ -84,11 +84,14 @@ func runMTUSweep(ctx context.Context, t Target, cfg Config, m targetMetrics, sta
 // header-only probe aborts, leaving the gauge at its last known value).
 // Each failed probe costs one base timeout of wait, so a sweep is
 // milliseconds on healthy links.
-func sweepOnce(conn net.Conn, cfg Config, m targetMetrics, headerSize int) (int, bool) {
+func sweepOnce(ctx context.Context, conn net.Conn, cfg Config, m targetMetrics, headerSize int) (int, bool) {
 	deadline := cfg.BaseTimeout
 	buf := make([]byte, headerSize+MaxPayloadBytes)
 	var seq uint64
 	probe := func(payload int) bool {
+		if ctx.Err() != nil {
+			return false
+		}
 		seq++
 		ts := uint64(time.Now().UnixNano())
 		copy(buf[0:8], MagicBytes)
@@ -124,7 +127,15 @@ func sweepOnce(conn net.Conn, cfg Config, m targetMetrics, headerSize int) (int,
 	// down from a size that actually fits, and path_mtu_bytes would flap
 	// between sweeps.
 	probeSurvives := func(payload int) bool {
-		return probe(payload) || probe(payload)
+		if probe(payload) {
+			return true
+		}
+		// Cancelled mid-sweep: do not pay the retry timeout after the
+		// caller asked us to stop.
+		if ctx.Err() != nil {
+			return false
+		}
+		return probe(payload)
 	}
 
 	// Fast path: a healthy full-size path answers on the first probe — the
@@ -142,6 +153,9 @@ func sweepOnce(conn net.Conn, cfg Config, m targetMetrics, headerSize int) (int,
 	lo, hi := 1, MaxPayloadBytes-1
 	best := 0
 	for lo <= hi {
+		if ctx.Err() != nil {
+			return -1, false
+		}
 		mid := int(uint(lo+hi) >> 1)
 		if probeSurvives(mid) {
 			best = mid
