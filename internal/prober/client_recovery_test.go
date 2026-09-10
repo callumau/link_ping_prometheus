@@ -488,8 +488,11 @@ func TestEchoLoop_LateEchoCannotFreezeLinkUp(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Echoes are delayed well past the third failing write (3 x 50ms), so
-	// the two probes that did reach the wire resolve AFTER the drop.
+	// Echoes are delayed well past the third failing write (3 x 20ms = 60ms),
+	// so both probes that reached the wire resolve ~240ms AFTER the drop. A
+	// wider margin than 3 x interval is what keeps the test meaningful on a
+	// loaded box: under a stall that pushed the streak past the echoes, the old
+	// code would drop the gauge afterwards anyway and pass.
 	addr := wbEchoServer(t, ctx, func([]byte) {
 		// pi-lens-ignore: go-time-sleep-test
 		time.Sleep(300 * time.Millisecond)
@@ -506,7 +509,7 @@ func TestEchoLoop_LateEchoCannotFreezeLinkUp(t *testing.T) {
 	m := newTargetMetrics(src, Target{Name: name, Address: addr})
 	m.linkUp.Set(1) // simulate a previously healthy session
 
-	cfg := Config{Source: src, BaseInterval: 50 * time.Millisecond, BaseTimeout: time.Second}
+	cfg := Config{Source: src, BaseInterval: 20 * time.Millisecond, BaseTimeout: time.Second}
 	done := make(chan struct{})
 	go func() {
 		runEchoLoop(ctx, conn, cfg, NewAdaptiveStats(cfg.BaseTimeout), m, &probeLoopState{}, slog.Default())
@@ -529,6 +532,11 @@ func TestEchoLoop_LateEchoCannotFreezeLinkUp(t *testing.T) {
 	}
 	if inflight := wbGauge(ProbesInflight, src, name, addr); inflight != 0 {
 		t.Errorf("inflight must drain to 0 once the pre-failure probes resolved, got %v", inflight)
+	}
+	// Non-vacuous guard: the failure streak really reached the threshold, so
+	// the late echo had a drop to undo.
+	if n := wbCounter(SendErrors, src, name, addr); n < maxConsecutiveWriteFails {
+		t.Fatalf("only %v write failures recorded — the streak under test never happened", n)
 	}
 
 	cancel()
