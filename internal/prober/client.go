@@ -265,9 +265,16 @@ func RunClient(ctx context.Context, cfg Config) error {
 			stragglersMu.Lock()
 			delete(stragglers, name)
 			stragglersMu.Unlock()
+			// Wake the supervisor. Deliberately a BLOCKING send: the flag is
+			// cleared before signalling, so a dropped wake-up could leave this
+			// name permanently unprobed if its clear landed after the
+			// supervisor's apply had already skipped it (one wake-up can be
+			// outstanding at a time, and the supervisor is either in its
+			// select or inside a bounded apply, so this blocks briefly).
 			select {
 			case freed <- struct{}{}:
-			default:
+			case <-ctx.Done():
+				// RunClient is shutting down; nobody consumes the wake-up.
 			}
 		}()
 	}
