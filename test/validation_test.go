@@ -1,7 +1,9 @@
 package prober_test
 
 import (
+	"context"
 	"encoding/json"
+	"net"
 	"os"
 	"testing"
 	"time"
@@ -62,8 +64,10 @@ func TestValidateTarget_PortAndHostRules(t *testing.T) {
 		"good-host.example.com:80",
 		"good-host.example.com.:80", // FQDN root dot is dialable
 		"[fe80::1%eth0]:5000",       // IPv6 zone literal is dialable
+		"[fe80::1%eth0.100]:5000",   // dotted VLAN sub-interface zone is dialable
 		"a:1",
 		"host:65535",
+		"host:+80", // Go's net port parser strips a leading '+' and dials it, so rejecting it would refuse a dialable address
 	}
 	for _, addr := range valid {
 		if err := prober.ValidateTarget(addr); err != nil {
@@ -78,12 +82,12 @@ func TestValidateTarget_PortAndHostRules(t *testing.T) {
 		"host:65536",           // port too high
 		"host:abc",             // non-numeric port
 		"host:",                // empty port
-		"host:+80",             // signed port: strconv.Atoi would accept it, net.Dial would not
 		"host: 80",             // whitespace in the port
 		"host:80 ",             // trailing whitespace in the port
 		"-bad.com:80",          // leading hyphen
 		"bad-.com:80",          // trailing hyphen
 		"bad_host.com:80",      // underscore not valid in DNS
+		"1.2.3.4.:80",          // IP literal with an FQDN root dot is not dialable
 		"[fe80::1%]:5000",      // empty zone is not dialable
 		"[fe80::1%eth 0]:5000", // junk in the zone
 		"example.com%eth0:80",  // zone suffix on a DNS name
@@ -261,5 +265,52 @@ func TestLoadTargets_DuplicateNames(t *testing.T) {
 
 	if _, err := prober.LoadTargets(tmpfile.Name()); err == nil {
 		t.Error("expected error for duplicate target names, got nil")
+	}
+}
+
+// TestServer_DynamicClientSeriesExpiresNoTraffic: the dedicated sweeper
+// must age out an idle CIDR client even when no further probe arrives to
+// trigger resolve()'s time-gated sweep. A single client that disappears
+// would otherwise keep its series (and a frozen link_server_clock_skew
+// alert) forever.
+func TestServer_DynamicClientSeriesExpiresNoTraffic(t *testing.T) {
+	prober.InitMetrics()
+	oldTTL := prober.DynClientTTL
+	prober.DynClientTTL = 200 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	defer func() {
+		cancel()
+		<-done // join before restoring the shared var
+		prober.DynClientTTL = oldTTL
+	}()
+
+	pc := listenUDP(t, ctx)
+	allowed := mustAllow("127.0.0.0/8") // CIDR entry -> dynamic client path
+	go func() {
+		prober.ServePacketConn(ctx, pc, testSource, allowed, "")
+		close(done)
+	}()
+	addr := pc.LocalAddr().String()
+
+	c := dialFrom(t, addr, net.IPv4(127, 0, 0, 2))
+	defer c.Close()
+	if !echoOnce(t, c) {
+		t.Fatal("CIDR client must be echoed")
+	}
+	for _, family := range []string{"link_server_probes_received_total", "link_server_clock_skew_seconds"} {
+		if !serverSeriesExists(t, family, map[string]string{"source": testSource, "client": "127.0.0.2"}) {
+			t.Fatalf("%s series must exist for the admitted dynamic client", family)
+		}
+	}
+
+	// No further traffic from any client: wait past DynClientTTL plus the
+	// sweeper's first tick, then assert the idle client's series is gone.
+	time.Sleep(1400 * time.Millisecond)
+	for _, family := range []string{"link_server_probes_received_total", "link_server_clock_skew_seconds"} {
+		if serverSeriesExists(t, family, map[string]string{"source": testSource, "client": "127.0.0.2"}) {
+			t.Errorf("%s series must be deleted once the client is idle past DynClientTTL with no further traffic", family)
+		}
 	}
 }

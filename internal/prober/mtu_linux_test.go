@@ -41,3 +41,21 @@ func TestSetDontFragment_MarksV4Socket(t *testing.T) {
 		t.Errorf("expected IP_MTU_DISCOVER=%d (PMTUDISC_DO), got %d", unix.IP_PMTUDISC_DO, got)
 	}
 }
+
+// TestSocketOptionHelpers_NonSyscallConnReturnsError pins the comma-ok
+// syscallConn guards in setDontFragment and setDSCP: a net.Conn that is
+// not a *net.UDPConn must yield a bounded error, never a type-assertion
+// panic in the probe loop. net.Pipe's conn implements net.Conn but not
+// SyscallConn, so it exercises exactly that branch.
+func TestSocketOptionHelpers_NonSyscallConnReturnsError(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	if err := setDontFragment(c1); err == nil {
+		t.Error("setDontFragment must return an error for a non-SyscallConn net.Conn")
+	}
+	if err := setDSCP(c1, 46, c1.RemoteAddr()); err == nil {
+		t.Error("setDSCP must return an error for a non-SyscallConn net.Conn")
+	}
+}

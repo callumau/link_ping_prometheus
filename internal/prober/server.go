@@ -395,6 +395,40 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 		return h, true
 	}
 
+	// A dedicated sweeper ticks regardless of traffic: resolve()'s gate
+	// only runs when another prefix-matched probe arrives, so a lone CIDR
+	// client that disappears would otherwise keep its series (and a frozen
+	// link_server_clock_skew alert) forever. The stop channel is closed by
+	// the defer below once the read loop returns; ctx cancellation alone
+	// closes pc and lets the read loop exit, after which this join runs, so
+	// ServePacketConn never leaks the goroutine into a later test.
+	dynStop := make(chan struct{})
+	dynDone := make(chan struct{})
+	defer func() {
+		close(dynStop)
+		<-dynDone
+	}()
+	go func() {
+		defer close(dynDone)
+		ticker := time.NewTicker(dynSweepInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-dynStop:
+				return
+			case now := <-ticker.C:
+				dynMu.Lock()
+				// Record the sweep time so resolve()'s once-per-second gate
+				// does not walk the map a second time on the next probe.
+				lastSweep = now
+				sweepExpired(now)
+				dynMu.Unlock()
+			}
+		}
+	}()
+
 	for {
 		n, raddr, err := pc.ReadFrom(buf)
 		if err != nil {
