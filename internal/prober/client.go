@@ -13,7 +13,6 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -537,12 +536,18 @@ const maxConsecutiveReadFails = 10
 // as ECONNREFUSED (Linux port-unreachable), ECONNRESET (Windows reports the
 // same condition this way) or EHOSTUNREACH/ENETUNREACH (a router replied with
 // unreachable). The probe times out naturally and must keep its reader.
-// The constants exist for both Unix and Windows in package syscall.
+//
+// The errno set is per-platform (peerUnreachableErrnos, in the
+// unreachable_*.go files): Windows reports raw winsock codes, so a single
+// cross-platform list built from the portable syscall constants would compile
+// everywhere and never match there.
 func isPeerUnreachable(err error) bool {
-	return errors.Is(err, syscall.ECONNREFUSED) ||
-		errors.Is(err, syscall.ECONNRESET) ||
-		errors.Is(err, syscall.EHOSTUNREACH) ||
-		errors.Is(err, syscall.ENETUNREACH)
+	for _, target := range peerUnreachableErrnos {
+		if errors.Is(err, target) {
+			return true
+		}
+	}
+	return false
 }
 
 // errReconnect is a sentinel returned by runEchoLoop to request a socket

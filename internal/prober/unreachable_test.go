@@ -1,3 +1,5 @@
+//go:build !windows
+
 package prober
 
 import (
@@ -21,6 +23,9 @@ import (
 // toward the reader's bounded exit (maxConsecutiveReadFails), so a mutation
 // that made every error classify as peer-unreachable (or none) is caught
 // here.
+//
+// Unix-only: Windows reports raw winsock codes instead of these portable
+// syscall errnos, and is covered by unreachable_windows_test.go.
 func TestIsPeerUnreachable(t *testing.T) {
 	cases := []struct {
 		name string
