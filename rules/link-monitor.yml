@@ -154,9 +154,19 @@ groups:
         # A corrupted echo resolves the probe without touching rtt_count or
         # timed_out_total (the round trip completed), so sustained corruption
         # with interval < RTO would otherwise satisfy all three clauses.
+        #
+        # The RTT leg is the only one whose series may not exist yet: a target
+        # that has never had an echo has no link_rtt_seconds series at all, so
+        # a plain `rate(link_rtt_seconds_count[15m]) == 0` is empty (not 0) and
+        # the whole `and` chain vanishes for exactly the stuck-from-birth case
+        # this alert is for. `or (link_probes_sent_total * 0)` supplies a
+        # zero-valued series with the target's own labels (sent is always
+        # seeded), so the clause is true when no RTT sample has ever been
+        # recorded and false as soon as one arrives.
         expr: >-
           (link_probes_inflight > 0)
-          and (rate(link_rtt_seconds_count[15m]) == 0)
+          and ((rate(link_rtt_seconds_count[15m])
+              or (link_probes_sent_total * 0)) == 0)
           and (rate(link_probes_timed_out_total[15m]) == 0)
           and (increase(link_probes_corrupted_total[15m]) == 0)
         for: 15m
