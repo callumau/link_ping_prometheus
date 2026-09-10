@@ -119,6 +119,8 @@ func TestPayload_CorruptionCountedSeparately(t *testing.T) {
 
 	startRTT := getHistogramCount(prober.RTTSeconds, targetName, addr)
 	startCorrupted := getCounterValue(prober.CorruptedProbes, targetName, addr)
+	startSent := getCounterValue(prober.ProbesSent, targetName, addr)
+	startTimedOut := getCounterValue(prober.ProbesTimedOut, targetName, addr)
 
 	runClientAsync(t, ctx, cancel, cfg)
 	deadline := time.Now().Add(3 * time.Second)
@@ -140,5 +142,22 @@ func TestPayload_CorruptionCountedSeparately(t *testing.T) {
 	}
 	if up := getGaugeValue(prober.LinkUp, targetName, addr); up != 1 {
 		t.Errorf("a completing-but-corrupted round trip must keep link_up=1, got %v", up)
+	}
+
+	// Balance with the corruption bucket: every probe resolves as exactly one
+	// of rtt / timed_out / corrupted (or is abandoned at cancel). Without this
+	// leg a regression counting a corrupted echo as BOTH corruption and a
+	// timeout — or as neither — would stay invisible.
+	cancel()
+	time.Sleep(200 * time.Millisecond)
+	sent := getCounterValue(prober.ProbesSent, targetName, addr) - startSent
+	timedOut := getCounterValue(prober.ProbesTimedOut, targetName, addr) - startTimedOut
+	corruptedTotal := getCounterValue(prober.CorruptedProbes, targetName, addr) - startCorrupted
+	residual := sent - rtt - timedOut - corruptedTotal
+	if residual < 0 || residual > 5 {
+		t.Errorf("balance with corruption: sent %v = rtt %v + timeout %v + corrupted %v leaves residual %v (allowed 0..5 abandoned at cancel)", sent, rtt, timedOut, corruptedTotal, residual)
+	}
+	if inflight := getGaugeValue(prober.ProbesInflight, targetName, addr); inflight != 0 {
+		t.Errorf("inflight must drain to 0 after cancel, got %v", inflight)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -220,4 +221,77 @@ func metricSeriesExists(t *testing.T, family, source, target, address string) bo
 		}
 	}
 	return false
+}
+
+// TestReload_EmptyArrayStopsProbingAndPurges: an empty array is a documented
+// state — probe nothing and withdraw every series, so a truncated or
+// half-written targets file that happens to parse as [] cannot leave frozen
+// link_up=1 series behind. Probing stopped is proven with the test's OWN frame
+// counter, not with the absence of a series: a still-running loop keeps
+// incrementing its cached handle into a series that is no longer gathered, so
+// "the series is gone" alone is not evidence that the probing stopped.
+func TestReload_EmptyArrayStopsProbingAndPurges(t *testing.T) {
+	prober.InitMetrics()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var received atomic.Int64
+	addr := udpEcho(t, ctx, func(buf []byte, w func([]byte)) {
+		received.Add(1)
+		w(buf)
+	})
+
+	targetsFile := filepath.Join(t.TempDir(), "targets.json")
+	writeJSON := func(content string) {
+		t.Helper()
+		if err := os.WriteFile(targetsFile, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeJSON(`[{"name":"empty_reload","address":"` + addr + `"}]`)
+
+	reg := prober.NewStatusRegistry()
+	hup := make(chan os.Signal, 1)
+	cfg := prober.Config{
+		Source:       testSource,
+		Targets:      []prober.Target{{Name: "empty_reload", Address: addr}},
+		BaseInterval: 50 * time.Millisecond,
+		BaseTimeout:  time.Second,
+		TargetsPath:  targetsFile,
+		ReloadSignal: hup,
+		Status:       reg,
+	}
+	runClientAsync(t, ctx, cancel, cfg)
+
+	waitFor := func(cond func() bool, what string) {
+		t.Helper()
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if cond() {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		t.Fatalf("timeout waiting for: %s", what)
+	}
+	waitFor(func() bool { return received.Load() >= 3 }, "initial probes on the wire")
+
+	writeJSON("[]")
+	hup <- os.Interrupt
+	waitFor(func() bool {
+		return !metricSeriesExists(t, "link_probes_sent_total", testSource, "empty_reload", addr)
+	}, "series purged by the empty-array reload")
+
+	// Non-vacuous stop check: nothing may reach the echo server afterwards.
+	after := received.Load()
+	time.Sleep(300 * time.Millisecond)
+	if n := received.Load(); n != after {
+		t.Errorf("empty-array reload must stop all probing: %d frames arrived after the purge", n-after)
+	}
+	for _, s := range reg.Snapshot() {
+		if s.Name == "empty_reload" {
+			t.Errorf("empty-array reload must drop the target from /status, still present: %+v", s)
+		}
+	}
 }

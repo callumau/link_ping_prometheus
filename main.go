@@ -598,15 +598,22 @@ func (p *program) Stop(s service.Service) error {
 // lazily so a bind failure reaches the caller as an error and aborts
 // startup. String arguments are captured values, not flag reads: the
 // serve goroutine may outlive flag mutation by tests or shutdown code.
-// metricsHandler builds the /metrics handler. gzip=false disables response
-// compression on purpose: promhttp pools a gzip.Writer per P and each writer
-// holds a flate compressor of roughly 0.7MB (hashHead 1<<17 + hashPrev 1<<15
-// plus a 32KB window), so compression costs up to ~0.7MB x GOMAXPROCS of live
-// heap that only a GC reclaims - measured as the dominant scrape-driven heap
-// growth. For a small fleet the whole response is smaller than one compressor,
-// so plain is the lighter default; large fleets should enable it.
+// metricsHandler builds the /metrics handler for the default gatherer.
 func metricsHandler(gzip bool) http.Handler {
-	h := promhttp.HandlerFor(prometheus.DefaultGatherer, promhttp.HandlerOpts{
+	return metricsHandlerFor(prometheus.DefaultGatherer, gzip)
+}
+
+// metricsHandlerFor builds the /metrics handler for an arbitrary gatherer.
+// gzip=false disables response compression on purpose: promhttp pools a
+// gzip.Writer per P and each writer holds a flate compressor of roughly 0.7MB
+// (hashHead 1<<17 + hashPrev 1<<15 plus a 32KB window), so compression costs up
+// to ~0.7MB x GOMAXPROCS of live heap that only a GC reclaims - measured as the
+// dominant scrape-driven heap growth. For a small fleet the whole response is
+// smaller than one compressor, so plain is the lighter default; large fleets
+// should enable it. The gatherer is a parameter so the concurrency cap it
+// applies (MaxRequestsInFlight) can be exercised deterministically in tests.
+func metricsHandlerFor(g prometheus.Gatherer, gzip bool) http.Handler {
+	h := promhttp.HandlerFor(g, promhttp.HandlerOpts{
 		DisableCompression:  !gzip,
 		MaxRequestsInFlight: maxConcurrentScrapes,
 	})
