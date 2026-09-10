@@ -200,3 +200,58 @@ func TestMTUSweep_DeadLinkKeepsLastValue(t *testing.T) {
 		t.Errorf("no surviving probe must leave path_mtu_bytes unknown (0), got %v", got)
 	}
 }
+
+// TestMTUSweep_DeadlineFollowsAdaptiveRTO: on a link whose RTT exceeds the
+// configured -timeout, the main loop adapts its RTO upward; the DF sweep must
+// wait at least as long as the main loop does. With a static -timeout deadline
+// every DF probe times out, path_mtu_bytes stays 0 for the process lifetime,
+// and MtuSweepUnresolved mis-reports the path as DF-blocked — on exactly the
+// long-haul link class the dynamic RTO floor exists for.
+func TestMTUSweep_DeadlineFollowsAdaptiveRTO(t *testing.T) {
+	prober.InitMetrics()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 250ms per frame: above the 100ms configured timeout, below the RTO the
+	// adaptive loop settles on (its floor is 2*SRTT = 500ms).
+	const delay = 250 * time.Millisecond
+	addr := udpEcho(t, ctx, func(buf []byte, w func([]byte)) {
+		time.Sleep(delay)
+		w(buf)
+	})
+
+	reg := prober.NewStatusRegistry()
+	cfg := prober.Config{
+		Source: testSource,
+		Targets: []prober.Target{
+			{Name: "mtu_adaptive", Address: addr},
+		},
+		// Interval > delay: the echo responder handles frames serially, so a
+		// shorter interval would queue probes and inflate every RTT.
+		BaseInterval: 400 * time.Millisecond,
+		BaseTimeout:  100 * time.Millisecond,
+		Adaptive:     true,
+		MTUSweep:     200 * time.Millisecond,
+		Status:       reg,
+	}
+	runClientAsync(t, ctx, cancel, cfg)
+
+	want := float64(prober.PayloadSize + prober.MaxPayloadBytes)
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		if getGaugeValue(prober.PathMTUBytes, "mtu_adaptive", addr) == want {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if got := getGaugeValue(prober.PathMTUBytes, "mtu_adaptive", addr); got != want {
+		rto := getGaugeValue(prober.RTOEstimate, "mtu_adaptive", addr)
+		t.Fatalf("path_mtu_bytes must converge once the adaptive RTO (%vs) exceeds the RTT: want %v, got %v — a static -timeout deadline leaves the sweep unable to probe", rto, want, got)
+	}
+	// Setup guard: the applied RTO really did rise above -timeout, which is
+	// what the sweep had to follow for this case to be meaningful.
+	if rto := getGaugeValue(prober.RTOEstimate, "mtu_adaptive", addr); rto <= cfg.BaseTimeout.Seconds() {
+		t.Fatalf("test setup: applied RTO %vs must exceed -timeout %v", rto, cfg.BaseTimeout.Seconds())
+	}
+}

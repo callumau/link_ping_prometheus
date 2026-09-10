@@ -268,9 +268,10 @@ func RunClient(ctx context.Context, cfg Config) error {
 			<-r.done
 			// Wake the supervisor. Deliberately a BLOCKING send: a dropped
 			// wake-up could leave this name permanently unprobed if its exit
-			// raced the supervisor's apply (one wake-up can be outstanding at
-			// a time, and the supervisor is either in its select or inside a
-			// bounded apply, so this blocks briefly).
+			// raced the supervisor's apply. The channel buffers one value, so
+			// with two stragglers one sender is briefly parked until the
+			// supervisor returns to its select (which it always does: apply is
+			// bounded by stragglerStopTimeout per target).
 			select {
 			case freed <- name:
 			case <-ctx.Done():
@@ -659,6 +660,12 @@ type probeLoopState struct {
 	// pathMTU is written by the MTU sweep goroutine and read by the main
 	// loop for the /status snapshot; atomic because of the two goroutines.
 	pathMTU atomic.Int64
+	// rtoNs is the timeout the main loop is currently applying, in
+	// nanoseconds, published for the MTU sweep's probe deadline (see
+	// mtuDeadline): the sweep must wait as long as the main loop does, or an
+	// adaptive link whose RTT exceeds the configured -timeout could never
+	// discover anything. Atomic for the same two-goroutine reason.
+	rtoNs atomic.Int64
 }
 
 // probeTarget runs the UDP probe loop for a single target until ctx is
@@ -1168,6 +1175,11 @@ func runEchoLoop(
 
 		// pi-lens-ignore: typos, typos:unknown
 		m.rto.Set(timeout.Seconds())
+		// Publish the applied timeout for the MTU sweep's probe deadline (see
+		// mtuDeadline): on an adaptive link the RTO can be well above
+		// cfg.BaseTimeout, and a sweep that waited only -timeout would fail
+		// every DF probe there.
+		state.rtoNs.Store(int64(timeout))
 
 		// Stop may race a firing timer; when Stop returns false the
 		// channel is drained so Reset starts clean.
