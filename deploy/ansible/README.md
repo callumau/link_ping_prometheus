@@ -99,6 +99,14 @@ Environment registry key on Windows), never as service arguments —
 matching the credential-handling rules in the README's Security
 section. Encrypt the vars file with ansible-vault.
 
+**Debugging hidden output:** the three secret-bearing tasks (rendering the
+credential lines, writing the env file, and the Windows registry entries)
+are marked `no_log: true` so credentials never reach task output or a
+`--diff` transcript. A failure in one of them is therefore reported only
+as "output has been hidden due to no_log"; re-run that one host once with
+`ANSIBLE_NO_LOG=false` (and no `--diff`) to see the real error, then drop
+the override.
+
 **Windows caveat:**
 `HKLM\SYSTEM\CurrentControlSet\Services\<service>\Environment` is
 readable by all local users, so values placed there are only as private
