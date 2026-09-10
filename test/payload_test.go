@@ -1,7 +1,10 @@
 package prober_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -32,8 +35,25 @@ func TestPayload_HealthyEcho(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Echo-all: the whole datagram (header + pattern payload) returns.
-	addr := udpEcho(t, ctx, func(buf []byte, w func([]byte)) { w(buf) })
+	// Echo-all: the whole datagram (header + pattern payload) returns, but
+	// first check the client's payload against payloadPattern regenerated
+	// from the frame's OWN seq/ts — an independent reimplementation of the
+	// fillPayload spec. Flags are atomic because the responder runs in its
+	// own goroutine; the assertions run on the test goroutine after cancel.
+	var patternChecked, patternMismatch atomic.Bool
+	addr := udpEcho(t, ctx, func(buf []byte, w func([]byte)) {
+		if len(buf) > prober.PayloadSize {
+			seq := binary.LittleEndian.Uint64(buf[8:16])
+			ts := binary.LittleEndian.Uint64(buf[16:24])
+			want := make([]byte, len(buf)-prober.PayloadSize)
+			payloadPattern(want, seq, ts)
+			patternChecked.Store(true)
+			if !bytes.Equal(want, buf[prober.PayloadSize:]) {
+				patternMismatch.Store(true)
+			}
+		}
+		w(buf)
+	})
 
 	const targetName = "payload_ok"
 	cfg := cfgWith(true, 50*time.Millisecond, time.Second, prober.Target{Name: targetName, Address: addr})
@@ -55,6 +75,12 @@ func TestPayload_HealthyEcho(t *testing.T) {
 	}
 	if n := getCounterValue(prober.CorruptedProbes, targetName, addr); n != 0 {
 		t.Errorf("intact echoes must not count as corrupted, got %v", n)
+	}
+	if !patternChecked.Load() {
+		t.Fatal("server never saw a payload-bearing probe — pattern check vacuous (cpu load?)")
+	}
+	if patternMismatch.Load() {
+		t.Errorf("client payload does not match the deterministic spec pattern regenerated from the frame's own seq/ts")
 	}
 	sent := getCounterValue(prober.ProbesSent, targetName, addr)
 	timedOut := getCounterValue(prober.ProbesTimedOut, targetName, addr)
