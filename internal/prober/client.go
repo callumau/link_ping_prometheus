@@ -929,6 +929,9 @@ func runEchoLoop(
 
 	var warnedSlowRTT bool
 	writeFails := 0
+	// warnedWriteDown makes the Error log fire once per failure streak
+	// (the drop itself is re-asserted on every failing tick).
+	warnedWriteDown := false
 	payloadSize := PayloadSize
 	if cfg.EchoSecret != "" {
 		payloadSize = PayloadSizeWithHMAC
@@ -974,8 +977,10 @@ func runEchoLoop(
 					// sample stays out of RTT/jitter/RTO statistics.
 					m.corrupted.Inc()
 					state.consecutiveMisses = 0
-					m.linkUp.Set(1)
-					state.linkUp = true
+					if writeFails < maxConsecutiveWriteFails {
+						m.linkUp.Set(1)
+						state.linkUp = true
+					}
 					state.lastEcho = resp.recv
 					continue
 				}
@@ -1017,8 +1022,18 @@ func runEchoLoop(
 					m.srtt.Set(stats.SRTT().Seconds())
 				}
 				state.consecutiveMisses = 0
-				m.linkUp.Set(1)
-				state.linkUp = true
+				// Re-arm link_up only while local sends are healthy. An echo
+				// that lands after the write-failure streak reached the
+				// threshold proves the far end was reachable, NOT that this
+				// socket can still send: re-arming unconditionally used to
+				// freeze link_up at 1 forever, because the down transition
+				// below fires once (writeFails keeps growing past the
+				// threshold, so an equality test never matches again) and
+				// the pending set empties, leaving no misses to count.
+				if writeFails < maxConsecutiveWriteFails {
+					m.linkUp.Set(1)
+					state.linkUp = true
+				}
 				state.lastEcho = resp.recv
 			default:
 				return
@@ -1235,23 +1250,34 @@ func runEchoLoop(
 		if _, err := conn.Write(buf); err != nil {
 			writeFails++
 			m.sendErr.Inc()
-			if writeFails == maxConsecutiveWriteFails {
-				// Sustained local write failures mean nothing is being
-				// probed while consecutiveMisses stays frozen — the worst
-				// failure mode is link_up stuck at 1. Escalate once at
-				// Error (Debug is invisible at default verbosity) and
-				// reflect reality in the gauge.
-				logger.Error("Persistent UDP write failures; marking link down",
-					"consecutive_failures", writeFails, "err", err)
+			if writeFails >= maxConsecutiveWriteFails {
+				if !warnedWriteDown {
+					// Sustained local write failures mean nothing is being
+					// probed while consecutiveMisses stays frozen — the worst
+					// failure mode is link_up stuck at 1. Escalate once at
+					// Error (Debug is invisible at default verbosity) and
+					// reflect reality in the gauge.
+					warnedWriteDown = true
+					logger.Error("Persistent UDP write failures; marking link down",
+						"consecutive_failures", writeFails, "err", err)
+				}
+				// Idempotent on purpose: unlike the old `==` transition this
+				// re-asserts reality on every failing tick, so an echo drained
+				// by an earlier stage of this same iteration can never leave
+				// the gauge green while no probe can leave the host.
+				wasUp := state.linkUp
 				m.linkUp.Set(0)
 				state.linkUp = false
-				// Re-emit /status so the dropped link_up is visible immediately
-				// rather than up to a full interval later.
-				emitTargetStatus(m, state, stats, timeout, writeFails, len(pending))
+				if wasUp {
+					// Re-emit /status so the dropped link_up is visible immediately
+					// rather than up to a full interval later.
+					emitTargetStatus(m, state, stats, timeout, writeFails, len(pending))
+				}
 			}
 			continue
 		}
 		writeFails = 0
+		warnedWriteDown = false
 		state.seq = seq
 
 		pending[state.seq] = sendTime

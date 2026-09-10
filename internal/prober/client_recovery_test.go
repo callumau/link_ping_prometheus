@@ -470,6 +470,75 @@ func TestEchoLoop_LinkDownOnSustainedWriteFailures(t *testing.T) {
 		maxConsecutiveWriteFails, wbGauge(LinkUp, src, name, addr))
 }
 
+// TestEchoLoop_LateEchoCannotFreezeLinkUp: a late echo arriving AFTER the
+// write-failure streak has dropped link_up must not re-arm it. Sustained
+// local send failures mean probing is structurally impossible, so the gauge
+// must stay 0 — a frozen link_up=1 with an empty pending set produces no
+// timeouts, no RTT samples and a 0/0 loss ratio, i.e. a dead monitor that
+// looks healthy.
+//
+// Falsification: restore the old `writeFails == maxConsecutiveWriteFails`
+// transition (whose one-shot drop can be undone by an unconditional
+// link_up re-arm on echo) and this test ends at link_up=1 with nothing that
+// can ever drop it again.
+// pi-lens-ignore: go-test-functions
+func TestEchoLoop_LateEchoCannotFreezeLinkUp(t *testing.T) {
+	InitMetrics()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Echoes are delayed well past the third failing write (3 x 50ms), so
+	// the two probes that did reach the wire resolve AFTER the drop.
+	addr := wbEchoServer(t, ctx, func([]byte) {
+		// pi-lens-ignore: go-time-sleep-test
+		time.Sleep(300 * time.Millisecond)
+	})
+	realConn, err := dialUDP(ctx, "udp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := &scriptedConn{Conn: realConn, hook: func(n int64) (bool, bool) {
+		return n > 2, false // the first two writes succeed, every later one fails
+	}}
+
+	const src, name = "test", "write_fail_late_echo"
+	m := newTargetMetrics(src, Target{Name: name, Address: addr})
+	m.linkUp.Set(1) // simulate a previously healthy session
+
+	cfg := Config{Source: src, BaseInterval: 50 * time.Millisecond, BaseTimeout: time.Second}
+	done := make(chan struct{})
+	go func() {
+		runEchoLoop(ctx, conn, cfg, NewAdaptiveStats(cfg.BaseTimeout), m, &probeLoopState{}, slog.Default())
+		close(done)
+	}()
+
+	// Long enough for the streak to drop the gauge (~200ms), for both
+	// delayed echoes to be drained (>=350ms) and for further failing
+	// writes to prove the gauge stays down.
+	// pi-lens-ignore: go-time-sleep-test
+	time.Sleep(900 * time.Millisecond)
+
+	// Non-vacuous guard: the delayed echoes really were matched, so the
+	// re-arm path this test constrains was exercised.
+	if n := wbHistCount(src, name, addr); n == 0 {
+		t.Fatal("no echoes were matched — the late-echo scenario did not take effect (cpu load?)")
+	}
+	if up := wbGauge(LinkUp, src, name, addr); up != 0 {
+		t.Errorf("link_up must read 0 while every write fails, even after a late echo: got %v", up)
+	}
+	if inflight := wbGauge(ProbesInflight, src, name, addr); inflight != 0 {
+		t.Errorf("inflight must drain to 0 once the pre-failure probes resolved, got %v", inflight)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("echo loop did not stop after cancel")
+	}
+}
+
 // TestEchoLoop_WriteFailureDoesNotBurnSeq: a failed write never put the
 // datagram on the wire, so it must not consume a sequence number — the
 // server must observe contiguous seqs, and the RFC 3550 jitter estimate
