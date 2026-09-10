@@ -61,6 +61,7 @@ set "ENV_KEY=HKLM\SYSTEM\CurrentControlSet\Services\%SERVICE_NAME%\Environment"
 reg delete "%ENV_KEY%" /v LINK_PING_METRICS_USER /f >nul 2>&1
 reg delete "%ENV_KEY%" /v LINK_PING_METRICS_PASS /f >nul 2>&1
 reg delete "%ENV_KEY%" /v LINK_PING_ECHO_SECRET /f >nul 2>&1
+reg delete "%ENV_KEY%" /v LINK_PING_ECHO_SECRET_OLD /f >nul 2>&1
 
 :: === Optional: remove ProgramData logs =======================================
 echo.

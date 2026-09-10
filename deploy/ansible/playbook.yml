@@ -71,12 +71,17 @@
           + (['LINK_PING_METRICS_PASS=' ~ link_ping_metrics_pass]
              if link_ping_metrics_pass | length > 0 else []) }}
 
-    - name: Install credential environment file
+    - name: Install environment file (OPTIONS plus credentials)
       ansible.builtin.copy:
-        content: "{{ link_ping_env_lines | join('\n') }}\n"
+        # Written unconditionally: the unit runs `link_ping_prometheus
+        # $OPTIONS`, and an empty expansion starts the binary on fail-closed
+        # defaults (-mode=server, no -allow), so Restart=on-failure
+        # crash-loops it. Credentials stay env vars, never CLI flags.
+        content: >-
+          {{ ((['OPTIONS="' ~ (link_ping_options | trim) ~ '"']
+               + link_ping_env_lines) | join('\n')) ~ '\n' }}
         dest: /etc/link_ping_prometheus.env
         mode: "0600"
-      when: link_ping_env_lines | length > 0
       notify: Restart link ping
 
     - name: Install systemd unit
@@ -107,11 +112,15 @@
     # 80-column budget while producing single unbroken strings.
     link_ping_dir: "{{ link_ping_windows_install_dir }}"
     link_ping_win_exe: "{{ link_ping_dir }}\\link_ping_prometheus.exe"
+    # stdout is discarded under the SCM, so -log-file is the only sink
+    # that survives; the batch installer uses this same location.
+    link_ping_win_log_dir: 'C:\ProgramData\link_ping_prometheus\logs'
     link_ping_win_options: >-
       -mode={{ link_ping_mode }}
       -listen={{ link_ping_listen }}
       -allow={{ link_ping_allow }}
       -metrics={{ link_ping_metrics_listen }}
+      -log-file={{ link_ping_win_log_dir }}\service.log
       {{ link_ping_extra_args }}
     svc_env_key: >-
       HKLM:\SYSTEM\CurrentControlSet\Services\{{ link_ping_service_name
@@ -127,19 +136,52 @@
         src: link_ping_prometheus-windows-amd64.exe
         dest: "{{ link_ping_win_exe }}"
 
+    - name: Create log directory
+      ansible.windows.win_file:
+        path: "{{ link_ping_win_log_dir }}"
+        state: directory
+
+    - name: Restrict log directory ACLs
+      # Same restriction as installer/windows/install-service.bat: drop the
+      # inherited ACEs and keep SYSTEM/Administrators. The service runs as
+      # LocalSystem, so no per-service-SID grant is needed.
+      ansible.windows.win_shell: >-
+        icacls "{{ link_ping_win_log_dir }}"
+        /inheritance:r
+        /grant "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F"
+      changed_when: false
+
     - name: Query service state
       ansible.windows.win_service_info:
         name: "{{ link_ping_service_name }}"
       register: svc_info
 
-    - name: Create service (SCM auto-start)
+    - name: Install service via the binary (-svc=install applies SCM hardening)
+      # -svc=install is the only path that bakes in DelayedAutoStart, the
+      # Tcpip/W32Time dependencies (clock sync is load-bearing for the HMAC
+      # replay window) and the OnFailure restart ladder; it also snapshots
+      # link_ping_win_options into the service definition. Needs an admin
+      # WinRM account, exactly like the batch installer's elevated prompt.
       ansible.windows.win_shell: >-
-        sc.exe create {{ link_ping_service_name }}
-        binPath= "{{ link_ping_win_exe }} {{ link_ping_win_options }}"
-        start= auto
+        & "{{ link_ping_win_exe }}" {{ link_ping_win_options }} -svc=install
       when: svc_info.services | length == 0
 
+    - name: Apply SCM hardening (also set by -svc=install when new)
+      # Restated here so an EXISTING service (e.g. created by an older play,
+      # or via sc.exe create) is hardened too: automatic start must be
+      # delayed past network-stack availability, and the W32Time dependency
+      # is load-bearing for the HMAC replay window (AGENTS.md). binPath is
+      # deliberately not touched — changing flags on an existing service
+      # needs a reinstall (see deploy/ansible/README.md).
+      ansible.windows.win_shell: >-
+        sc.exe config {{ link_ping_service_name }}
+        start= delayed-auto
+        depend= Tcpip/W32Time
+      changed_when: false
+
     - name: Configure failure recovery (restart after 5s, like main.go)
+      # -svc=install already sets OnFailure=restart/5s; restating it here is
+      # idempotent and keeps the value visible in host state.
       ansible.windows.win_shell: >-
         sc.exe failure {{ link_ping_service_name }}
         reset= 86400 actions= restart/5000/restart/5000/restart/5000
@@ -172,10 +214,18 @@
       when: link_ping_mode in ['server', 'both']
       changed_when: false
 
+    - name: Query service state after install
+      # svc_info was captured BEFORE the install task ran, so a fresh host
+      # would otherwise never start the newly installed service (the old
+      # gate required a pre-existing service).
+      ansible.windows.win_service_info:
+        name: "{{ link_ping_service_name }}"
+      register: svc_info_after
+
     - name: Start service when not running
       ansible.windows.win_shell: >-
         sc.exe start {{ link_ping_service_name }}
       when:
-        - svc_info.services | length > 0
-        - svc_info.services[0].state != "Running"
+        - svc_info_after.services | length > 0
+        - svc_info_after.services[0].state != "Running"
       changed_when: false

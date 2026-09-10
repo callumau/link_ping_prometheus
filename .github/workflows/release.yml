@@ -37,7 +37,8 @@ jobs:
           cache: false
 
       - name: Run Tests
-        run: go test -v ./...
+        # -count=1 bypasses the Go test cache; -race matches ci.yml.
+        run: go test -count=1 -race -v ./...
 
       # v4.6.0 (SHA-pinned for supply-chain safety)
       - name: Log in to GHCR
