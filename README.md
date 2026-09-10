@@ -212,9 +212,13 @@ to the same address, so the server counts those probes too and on a default
 before reading a mismatch as loss:
 
 ```promql
-100 * (1 - (rate(link_server_probes_received_total{client="203.0.113.5"}[$__rate_interval])
-            - rate(link_mtu_probes_sent_total[$__rate_interval]))
-           / rate(link_probes_sent_total{target="site-b"}[$__rate_interval]))
+# Labels differ between the two families (the server side carries
+# {source,client}, the client side {source,target,address}), so a bare
+# subtraction matches nothing; aggregate both sides instead. Narrow the
+# selectors per site in a multi-site deployment.
+100 * (1 - (sum(rate(link_server_probes_received_total{client="203.0.113.5"}[$__rate_interval]))
+            - sum(rate(link_mtu_probes_sent_total[$__rate_interval])))
+           / sum(rate(link_probes_sent_total{target="site-b"}[$__rate_interval])))
 ```
 
 Sweep probes are visible to the server and must be subtracted here before
@@ -680,17 +684,36 @@ Panels: link status, packet loss, RTT percentiles / average / current, adaptive 
 ```text
 main.go                     — CLI wrapper, flag parsing, service lifecycle
 main_test.go                — lifecycle race, auth/TLS flag validation tests
+main_metrics_test.go        — /metrics body decoding (gzip on/off)
 internal/prober/
-  prober.go                 — Config, protocol constants
+  prober.go                 — Config, protocol constants, HMAC helpers, pending-window cap
   adaptive.go               — RFC 6298 RTO estimation (AdaptiveStats)
   client.go                 — Target, LoadTargets, RunClient, UDP probe loop
-  server.go                 — UDP echo responder, per-IP/global rate limits
+  server.go                 — UDP echo responder, allowlist, rate limits, client series
   metrics.go                — Prometheus metric vars, InitMetrics, MetricsAuth
+  status.go                 — /status registry (target snapshots + process memory)
   validate.go               — Target address validation (ValidateTarget)
+  mtu.go                    — DF path-MTU sweep (shared search + state)
+  mtu_linux.go              — IP_MTU_DISCOVER/IPV6_MTU_DISCOVER socket option
+  mtu_windows.go            — Windows PMTUD with an IP_DONTFRAGMENT fallback ladder
+  mtu_other.go              — sweep disabled on platforms without a DF option
+  dscp_linux.go             — DSCP marking (IP_TOS/IPV6_TCLASS)
+  dscp_other.go             — no-op elsewhere
+  unreachable_other.go      — ICMP-derived read errnos (Unix)
+  unreachable_windows.go    — ICMP-derived read errnos (winsock codes)
   adaptive_test.go          — RTO estimation, dynamic floor, backoff clamp
   client_recovery_test.go   — reader death, panic restart, write failure, dial retry
+  client_retry_test.go      — dial failure retry, send-error accounting
+  client_straggler_test.go  — reload stragglers: restart when wanted, purge when removed
   client_hmac_test.go       — client-side HMAC frames and the HMAC+payload offset
-  bench_test.go             — resolve-once vs per-event label lookup, payload fill
+  validation_test.go        — Config/target validation incl. the pending-window cap
+  allowlist_test.go         — allowlist parser accepts and rejects
+  unreachable_test.go       — peer-unreachable classification (Unix)
+  unreachable_windows_test.go — same for winsock codes
+  mtu_linux_test.go         — DF socket option applied to a v4 socket
+  dscp_test.go              — DSCP socket option
+  validate_dscp_test.go     — DSCP range validation
+  bench_test.go             — resolve-once vs per-event label lookup, payload fill, allowlist
 test/
   helpers_test.go           — Test utilities (metric inspectors, UDP echo server)
   adaptive_test.go          — AdaptiveStats logic and jitter adaptation
@@ -699,13 +722,14 @@ test/
   client_test.go            — Robustness: loss, latency, corruption, spoofing, stalls, duplicates
   metrics_test.go           — Basic auth handler, metric seeding
   integration_test.go       — Multi-target, server dropout, stress (10 targets)
-  accuracy_test.go          — Balance invariant, bucket placement, jitter ceiling
+  accuracy_test.go          — Balance invariant, bucket placement, jitter ceiling, loss deadline
   precision_test.go         — Exact analytic assertions (RTO floor, jitter convergence)
   jitter_test.go            — RFC 3550 convergence, reset on gap, rebuild
   mtu_test.go               — Path-MTU sweep and its separate counter namespace
   payload_test.go           — Corruption detection, counted apart from loss
   reload_test.go            — Hot reload: purge removed, keep changed, /status parity
-  status_test.go            — Live /status snapshot contents
+  status_test.go            — Live /status snapshot contents, process object, cache
+  timeout_override_test.go  — Per-target interval/timeout overrides
   soak_test.go              — Opt-in memory/goroutine soak (SOAK_SECONDS)
 ```
 
