@@ -37,6 +37,15 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      # The prober carries Windows-only files (winsock errno classification,
+      # DF socket options, the service). This job runs on ubuntu, so Go never
+      # even type-checks them: a build-tagged file that does not compile for
+      # its own platform would ship unnoticed.
+      - name: Vet and build (windows)
+        run: |
+          GOOS=windows go vet ./...
+          GOOS=windows go build ./...
+
       # Fail the build on reachable stdlib/dependency vulnerabilities
       # (the /metrics HTTP server keeps net/http reachable in every mode).
       # Pinned deliberately: this job also runs untrusted PR code, so a
