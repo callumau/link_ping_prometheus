@@ -26,6 +26,7 @@ func runMTUSweep(ctx context.Context, t Target, cfg Config, m targetMetrics, sta
 		headerSize = PayloadSizeWithHMAC
 	}
 	var warnedDF bool
+	var warnedDSCP bool
 	for {
 		select {
 		case <-ctx.Done():
@@ -53,7 +54,20 @@ func runMTUSweep(ctx context.Context, t Target, cfg Config, m targetMetrics, sta
 			}
 			return
 		}
-		largest, ok := sweepOnce(ctx, conn, cfg, m, headerSize)
+		// Mark the sweep socket like the main probes: -dscp exists so QoS-managed
+		// networks treat probes as the traffic class they emulate, and on a policed
+		// path an unmarked DF probe can be shaped or dropped differently from the
+		// marked main probes — the sweep would then report a smaller MTU than the
+		// path actually provides. Best effort, warned once.
+		if cfg.DSCP > 0 {
+			if err := setDSCP(conn, cfg.DSCP, conn.RemoteAddr()); err != nil {
+				if !warnedDSCP {
+					warnedDSCP = true
+					logger.Warn("MTU sweep probes cannot be DSCP-marked; sweep continues unmarked", "dscp", cfg.DSCP, "err", err)
+				}
+			}
+		}
+		largest, ok := sweepOnce(ctx, conn, cfg, m, state, headerSize)
 		conn.Close()
 		if ok {
 			// Report the full probe frame size (header + payload);
@@ -73,6 +87,25 @@ func runMTUSweep(ctx context.Context, t Target, cfg Config, m targetMetrics, sta
 	}
 }
 
+// mtuDeadline is the wait a single DF probe gets: the timeout the main loop is
+// currently applying. In adaptive mode that is the smoothed RTO, NOT the
+// configured -timeout — on a link whose RTT exceeds -timeout (the long-haul
+// case the dynamic RTO floor exists for) a static deadline would make every DF
+// probe time out, so the sweep could never discover anything and
+// MtuSweepUnresolved would blame DF blocking for a path that carries
+// full-size frames fine. The main loop publishes the applied timeout into
+// state.rtoNs after each tick (atomic); it is 0 before the first tick, which
+// falls back to cfg.BaseTimeout.
+func mtuDeadline(cfg Config, state *probeLoopState) time.Duration {
+	deadline := cfg.BaseTimeout
+	if ns := state.rtoNs.Load(); ns > 0 {
+		if rto := time.Duration(ns); rto > deadline {
+			deadline = rto
+		}
+	}
+	return deadline
+}
+
 // sweepOnce binary-searches [0, MaxPayloadBytes] for the largest payload
 // that echoes back on the DF socket. A failed size is retried once
 // before it counts as "does not survive": a single dropped probe on a
@@ -82,15 +115,18 @@ func runMTUSweep(ctx context.Context, t Target, cfg Config, m targetMetrics, sta
 // size. ~2*log2(MaxPayloadBytes) probes when the path is smaller; 3 when
 // the link is down (the full-size probe and its retry fail, then the
 // header-only probe aborts, leaving the gauge at its last known value).
-// Each failed probe costs one base timeout of wait, so a sweep is
+// Each failed probe costs one probe deadline of wait, so a sweep is
 // milliseconds on healthy links.
-func sweepOnce(ctx context.Context, conn net.Conn, cfg Config, m targetMetrics, headerSize int) (int, bool) {
-	deadline := cfg.BaseTimeout
+func sweepOnce(ctx context.Context, conn net.Conn, cfg Config, m targetMetrics, state *probeLoopState, headerSize int) (int, bool) {
+	deadline := mtuDeadline(cfg, state)
 	buf := make([]byte, headerSize+MaxPayloadBytes)
 	var seq uint64
-	probe := func(payload int) bool {
+
+	// send writes one DF probe carrying payload bytes and returns the
+	// sequence it used; 0 means the write failed (already counted lost).
+	send := func(payload int) uint64 {
 		if ctx.Err() != nil {
-			return false
+			return 0
 		}
 		seq++
 		ts := uint64(time.Now().UnixNano())
@@ -109,25 +145,57 @@ func sweepOnce(ctx context.Context, conn net.Conn, cfg Config, m targetMetrics, 
 		m.mtuSent.Inc()
 		if _, err := conn.Write(buf[:headerSize+payload]); err != nil {
 			m.mtuLost.Inc()
-			return false
+			return 0
 		}
+		return seq
+	}
+
+	// waitEcho waits for an echo of THIS payload size whose sequence is one we
+	// actually sent for it. Checking the sequence matters because one socket
+	// serves the whole sweep: a late echo of a larger size would otherwise be
+	// consumed as this probe's read (failing its length check) and be read as
+	// "this smaller size does not survive", stepping the search down below the
+	// real MTU. Accepting every sequence sent for this payload keeps the retry
+	// semantics: an echo of the first attempt arriving during the retry still
+	// proves survival.
+	waitEcho := func(payload int, seqs ...uint64) bool {
 		if err := conn.SetReadDeadline(time.Now().Add(deadline)); err != nil {
 			m.mtuLost.Inc()
 			return false
 		}
-		n, err := conn.Read(buf)
-		if err != nil || n != headerSize+payload {
-			m.mtuLost.Inc()
-			return false
+		for {
+			n, err := conn.Read(buf)
+			if err != nil {
+				m.mtuLost.Inc()
+				return false
+			}
+			if n != headerSize+payload || string(buf[0:8]) != MagicBytes {
+				continue // a foreign or other-size datagram: keep waiting for ours
+			}
+			got := binary.LittleEndian.Uint64(buf[8:16])
+			for _, s := range seqs {
+				if got == s {
+					return true
+				}
+			}
 		}
-		return true
+	}
+	// probeOnce is a single attempt with no retry: used for the header-only
+	// abort probe, where paying the loser's timeout twice would be pointless.
+	probeOnce := func(payload int) bool {
+		s := send(payload)
+		return s != 0 && waitEcho(payload, s)
 	}
 	// probeSurvives retries one loss before believing it: on a lossy path
 	// (1% is enough) a single dropped probe would otherwise step the search
 	// down from a size that actually fits, and path_mtu_bytes would flap
 	// between sweeps.
 	probeSurvives := func(payload int) bool {
-		if probe(payload) {
+		s1 := send(payload)
+		if s1 == 0 {
+			return false
+		}
+		if waitEcho(payload, s1) {
 			return true
 		}
 		// Cancelled mid-sweep: do not pay the retry timeout after the
@@ -135,7 +203,11 @@ func sweepOnce(ctx context.Context, conn net.Conn, cfg Config, m targetMetrics, 
 		if ctx.Err() != nil {
 			return false
 		}
-		return probe(payload)
+		s2 := send(payload)
+		if s2 == 0 {
+			return false
+		}
+		return waitEcho(payload, s1, s2)
 	}
 
 	// Fast path: a healthy full-size path answers on the first probe — the
@@ -143,7 +215,7 @@ func sweepOnce(ctx context.Context, conn net.Conn, cfg Config, m targetMetrics, 
 	if probeSurvives(MaxPayloadBytes) {
 		return MaxPayloadBytes, true
 	}
-	if !probe(0) {
+	if !probeOnce(0) {
 		// Even the header-only DF probe dies: link down or DF-blocked
 		// path. Leave the last known gauge value untouched. No retry here:
 		// this is the abort path, and a dead link must not pay the loser's
