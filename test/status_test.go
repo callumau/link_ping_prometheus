@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -147,5 +148,25 @@ func TestStatusRegistryReflectsProbeLoop(t *testing.T) {
 	}
 	if proc.Goroutines < 1 {
 		t.Errorf("process.goroutines must be >= 1, got %d", proc.Goroutines)
+	}
+}
+
+// TestStatusProcessSnapshot_CachedWithinTTL: runtime.ReadMemStats stops the
+// world, and /status is both unauthenticated (when no metrics credentials are
+// set) and uncapped, so the snapshot must not be re-read per request —
+// otherwise a burst of /status requests injects STW pauses into a process whose
+// whole purpose is measuring RTT, inflating its own samples. The GC forced
+// between the two reads would move gc_count/heap numbers if the cache were
+// bypassed.
+func TestStatusProcessSnapshot_CachedWithinTTL(t *testing.T) {
+	start := time.Now()
+	first := prober.ReadProcessStatus()
+	runtime.GC()
+	second := prober.ReadProcessStatus()
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Skipf("test crossed the snapshot TTL (took %v) — inconclusive", elapsed)
+	}
+	if first != second {
+		t.Errorf("two snapshots inside the TTL must be identical (cache bypassed):\n first:  %+v\n second: %+v", first, second)
 	}
 }
