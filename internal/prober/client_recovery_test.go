@@ -52,6 +52,105 @@ func wbHistCount(source, name, addr string) float64 {
 	return float64(d.GetHistogram().GetSampleCount())
 }
 
+// wbCounterLabels reads a counter series by its full label set. Unlike
+// wbCounter it handles vecs whose label cardinality differs from the
+// client {source,target,address} shape (e.g. ProberInternalErrors, which
+// adds a reason label).
+func wbCounterLabels(vec *prometheus.CounterVec, labels ...string) float64 {
+	var m dto.Metric
+	if err := vec.WithLabelValues(labels...).Write(&m); err != nil {
+		return 0
+	}
+	return m.GetCounter().GetValue()
+}
+
+// wbRealEchoServer starts a production ServePacketConn echo responder on
+// an ephemeral loopback port with a fail-closed allowlist, closing it on
+// ctx cancellation. Unlike wbEchoServer it validates frames exactly like
+// a deployed server (allowlist, size, magic), so link-up tests observe a
+// genuine end-to-end echo rather than an unconditional reflector.
+func wbRealEchoServer(t *testing.T, ctx context.Context, secret string) string {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed, err := ParseAllowlist("127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		<-ctx.Done()
+		pc.Close()
+	}()
+	go func() {
+		ServePacketConn(ctx, pc, "test", allowed, secret)
+	}()
+	return pc.LocalAddr().String()
+}
+
+// deadlineFailConn is a net.Conn whose SetReadDeadline always fails, so
+// the runEchoLoop reader gives up after its 3-failure bound. Read blocks
+// until Close (returning net.ErrClosed); Write succeeds, so the main
+// probe loop keeps sending until it notices the reader is gone. The short
+// sleep before each failure keeps the reader alive across a few 10ms
+// probe intervals, leaving several probes in flight so the reader-death
+// flush (abandoned probes counted as timeouts) is exercised — while still
+// dying well inside probeTarget's 1s re-dial pause the test cancels in.
+type deadlineFailConn struct {
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newDeadlineFailConn() *deadlineFailConn {
+	return &deadlineFailConn{closed: make(chan struct{})}
+}
+
+func (c *deadlineFailConn) Read([]byte) (int, error) {
+	<-c.closed
+	return 0, net.ErrClosed
+}
+
+func (c *deadlineFailConn) Write(b []byte) (int, error) { return len(b), nil }
+
+func (c *deadlineFailConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return nil
+}
+
+func (c *deadlineFailConn) LocalAddr() net.Addr  { return nil }
+func (c *deadlineFailConn) RemoteAddr() net.Addr { return nil }
+func (c *deadlineFailConn) SetDeadline(time.Time) error {
+	return nil
+}
+func (c *deadlineFailConn) SetReadDeadline(time.Time) error {
+	// Deliberate delay: see the type comment. Keeps the reader alive long
+	// enough for probes to be in flight when it dies.
+	// pi-lens-ignore: go-time-sleep-test
+	time.Sleep(15 * time.Millisecond)
+	return errors.New("injected SetReadDeadline failure")
+}
+func (c *deadlineFailConn) SetWriteDeadline(time.Time) error { return nil }
+
+// readFailConn is a net.Conn whose Read returns a persistent non-timeout
+// error every time (and whose SetReadDeadline succeeds, so the reader
+// actually reaches Read). The reader must exit after the bounded
+// maxConsecutiveReadFails instead of spinning forever.
+type readFailConn struct{}
+
+func newReadFailConn() *readFailConn { return &readFailConn{} }
+
+func (c *readFailConn) Read([]byte) (int, error) {
+	return 0, errors.New("injected persistent UDP read error")
+}
+func (c *readFailConn) Write(b []byte) (int, error)      { return len(b), nil }
+func (c *readFailConn) Close() error                     { return nil }
+func (c *readFailConn) LocalAddr() net.Addr              { return nil }
+func (c *readFailConn) RemoteAddr() net.Addr             { return nil }
+func (c *readFailConn) SetDeadline(time.Time) error      { return nil }
+func (c *readFailConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *readFailConn) SetWriteDeadline(time.Time) error { return nil }
+
 // scriptedConn wraps a real UDP conn (used for Read/deadlines/Close) and
 // routes Write calls through hook(n), where n is the 1-based write count.
 // hook returns whether the write should fail or panic.
@@ -420,51 +519,232 @@ func TestProbeTarget_PanicRestartCyclesKeepBalance(t *testing.T) {
 	}
 }
 
-// TestProbeTarget_DialRetryMarksLinkDown: while the dial-retry loop runs,
-// probing is structurally impossible, so a re-established session must
-// not keep showing a stale link_up=1.
+// TestProbeTarget_DialRetryMarksLinkDown drives the REAL link_up
+// transition, not the startup m.linkUp.Set(0): the target first reaches
+// link_up=1 through authentic end-to-end echoes, then the dialer is
+// flipped to fail and the periodic reconnect bounces the loop into the
+// dial-retry path, where probing is structurally impossible. It also
+// asserts that link_probes_sent_total freezes while dialing fails.
+//
+// Falsification: remove the dial-loop m.linkUp.Set(0) in client.go and
+// this test fails. Without it, the pre-outage link_up=1 would survive the
+// failed reconnect indefinitely — no probes are sent while dialing, so
+// consecutiveMisses never advances to drop it — and step (2) would see a
+// frozen link_up=1.
 // pi-lens-ignore: go-test-functions
 func TestProbeTarget_DialRetryMarksLinkDown(t *testing.T) {
 	InitMetrics()
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	addr := wbRealEchoServer(t, ctx, "")
+
+	const src, name = "test", "dialretry_down"
+	// Controllable dialer seam: healthy until the link is proven up, then
+	// hard-failing to force the dial-retry path mid-run.
+	var failDials atomic.Bool
 	old := dialUDP
 	dialUDP = func(ctx context.Context, network, address string) (net.Conn, error) {
-		return nil, errors.New("dial udp: lookup test.invalid: no such host")
+		if failDials.Load() {
+			return nil, errors.New("dial udp: lookup test.invalid: no such host")
+		}
+		return old(ctx, network, address)
 	}
 	defer func() { dialUDP = old }()
 
-	const src, name = "test", "dialretry_down"
-	addr := "test.invalid:4000"
-	m := newTargetMetrics(src, Target{Name: name, Address: addr})
-	m.linkUp.Set(1) // stale healthy state from before the outage
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	cfg := Config{
+		Source:            src,
+		BaseInterval:      30 * time.Millisecond,
+		BaseTimeout:       500 * time.Millisecond,
+		ReconnectInterval: 200 * time.Millisecond,
+	}
 	done := make(chan struct{})
 	go func() {
-		probeTarget(ctx, Target{Name: name, Address: addr}, Config{
-			Source:       src,
-			BaseInterval: 50 * time.Millisecond,
-			BaseTimeout:  100 * time.Millisecond,
-		})
+		probeTarget(ctx, Target{Name: name, Address: addr}, cfg)
 		close(done)
 	}()
 
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if up := wbGauge(LinkUp, src, name, addr); up == 0 {
-			cancel()
-			select {
-			case <-done:
-			case <-time.After(2 * time.Second):
-				t.Fatal("probe loop did not stop after cancel")
-			}
-			return
+	// (1) The link must genuinely come up: a real echo produces an RTT
+	// sample and sets link_up=1.
+	upDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(upDeadline) {
+		if wbHistCount(src, name, addr) > 0 && wbGauge(LinkUp, src, name, addr) == 1 {
+			break
 		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if rtt, up := wbHistCount(src, name, addr), wbGauge(LinkUp, src, name, addr); rtt == 0 || up != 1 {
+		cancel()
+		<-done
+		t.Fatalf("link never came up before the outage: rtt_samples=%v link_up=%v", rtt, up)
+	}
+
+	// (2) Flip the dialer to always fail; the next 200ms reconnect cycle
+	// bounces probeTarget into the dial-retry loop.
+	failDials.Store(true)
+	downDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(downDeadline) {
+		if wbGauge(LinkUp, src, name, addr) == 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if up := wbGauge(LinkUp, src, name, addr); up != 0 {
+		cancel()
+		<-done
+		t.Fatalf("link_up must drop to 0 while stuck in the dial-retry loop, got %v", up)
+	}
+
+	// (3) Probing is structurally impossible while the dialer fails: no
+	// new probe may reach the wire.
+	sentAtDown := wbCounter(ProbesSent, src, name, addr)
+	time.Sleep(500 * time.Millisecond)
+	if got := wbCounter(ProbesSent, src, name, addr); got != sentAtDown {
+		t.Errorf("link_probes_sent_total grew from %v to %v while probing was structurally impossible (dial failing)",
+			sentAtDown, got)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("probe loop did not stop after cancel")
+	}
+}
+
+// TestProbeTarget_ReaderDeathRedials: when the reader goroutine dies
+// (persistent SetReadDeadline failures), every in-flight probe is a
+// guaranteed loss and every later send would go unanswered, so the loop
+// must NOT exit — it must re-dial. The abandoned probes are flushed as
+// timeouts (link_probes_inflight drains to 0), the reason is recorded in
+// link_prober_internal_errors_total, link_up is 0, and cancellation stops
+// the loop cleanly with the sent balance exact.
+// pi-lens-ignore: go-test-functions
+func TestProbeTarget_ReaderDeathRedials(t *testing.T) {
+	InitMetrics()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var dials atomic.Int64
+	old := dialUDP
+	dialUDP = func(context.Context, string, string) (net.Conn, error) {
+		dials.Add(1)
+		return newDeadlineFailConn(), nil
+	}
+	defer func() { dialUDP = old }()
+
+	const src, name, addr = "test", "reader_dead", "127.0.0.1:4000"
+	// 10ms interval: the short-lived reader (3×15ms) still sees several
+	// probes in flight before it dies, so the flush is genuinely exercised.
+	cfg := Config{Source: src, BaseInterval: 10 * time.Millisecond, BaseTimeout: 300 * time.Millisecond}
+	done := make(chan struct{})
+	go func() {
+		probeTarget(ctx, Target{Name: name, Address: addr}, cfg)
+		close(done)
+	}()
+
+	// A second dial proves the loop re-dialed after the bounded pause
+	// instead of exiting on reader death.
+	dialDeadline := time.Now().Add(1800 * time.Millisecond)
+	for time.Now().Before(dialDeadline) && dials.Load() < 2 {
 		time.Sleep(10 * time.Millisecond)
 	}
+	if dials.Load() < 2 {
+		cancel()
+		<-done
+		t.Fatalf("reader death must trigger a re-dial, got %d dials", dials.Load())
+	}
+	if got := wbCounterLabels(ProberInternalErrors, src, name, addr, "reader_dead"); got < 1 {
+		t.Errorf("reader death must be counted in link_prober_internal_errors_total{reason=reader_dead}, got %v", got)
+	}
+	select {
+	case <-done:
+		t.Fatal("probe loop exited on reader death; it must keep re-dialing while ctx is live")
+	default:
+	}
+
+	// Cancel during the bounded dial pause (after the current cycle's
+	// reader has died and flushed): no probe is in flight, so the balance
+	// is exact rather than off by the cancel-time abandoned probe. The
+	// reader dies ~45ms after a dial, so 250ms lands squarely in the 1s
+	// pause with ample margin for a loaded CI machine.
+	time.Sleep(250 * time.Millisecond)
 	cancel()
-	<-done
-	t.Errorf("link_up must drop to 0 while stuck in the dial-retry loop, got %v",
-		wbGauge(LinkUp, src, name, addr))
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("probe loop did not stop after cancel")
+	}
+
+	sent := wbCounter(ProbesSent, src, name, addr)
+	rtt := wbHistCount(src, name, addr)
+	tout := wbCounter(ProbesTimedOut, src, name, addr)
+	infl := wbGauge(ProbesInflight, src, name, addr)
+	if tout < 1 {
+		t.Errorf("the reader-death flush must count in-flight probes as timeouts, got timed_out=%v", tout)
+	}
+	if infl != 0 {
+		t.Errorf("reader-death flush must drain inflight to 0, got %v", infl)
+	}
+	if up := wbGauge(LinkUp, src, name, addr); up != 0 {
+		t.Errorf("link_up must be 0 while the reader is dead, got %v", up)
+	}
+	if sent != rtt+tout+infl {
+		t.Errorf("balance invariant broken after reader death: sent=%v rtt=%v timed_out=%v inflight=%v",
+			sent, rtt, tout, infl)
+	}
+}
+
+// TestProbeTarget_BoundedReadErrorsRedial: a reader whose Read keeps
+// returning a persistent non-timeout error must exit after the bounded
+// maxConsecutiveReadFails count (no busy-spin) and the loop must re-dial.
+// pi-lens-ignore: go-test-functions
+func TestProbeTarget_BoundedReadErrorsRedial(t *testing.T) {
+	InitMetrics()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var dials atomic.Int64
+	old := dialUDP
+	dialUDP = func(context.Context, string, string) (net.Conn, error) {
+		dials.Add(1)
+		return newReadFailConn(), nil
+	}
+	defer func() { dialUDP = old }()
+
+	const src, name, addr = "test", "read_fail", "127.0.0.1:4000"
+	cfg := Config{Source: src, BaseInterval: 30 * time.Millisecond, BaseTimeout: 300 * time.Millisecond}
+	done := make(chan struct{})
+	go func() {
+		probeTarget(ctx, Target{Name: name, Address: addr}, cfg)
+		close(done)
+	}()
+
+	dialDeadline := time.Now().Add(1800 * time.Millisecond)
+	for time.Now().Before(dialDeadline) && dials.Load() < 2 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if dials.Load() < 2 {
+		cancel()
+		<-done
+		t.Fatalf("bounded read-error exit must trigger a re-dial, got %d dials", dials.Load())
+	}
+	if got := wbCounterLabels(ProberInternalErrors, src, name, addr, "reader_dead"); got < 1 {
+		t.Errorf("the bounded read-error exit must be counted as reader_dead, got %v", got)
+	}
+	select {
+	case <-done:
+		t.Fatal("probe loop exited on reader death; it must keep re-dialing while ctx is live")
+	default:
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("probe loop did not stop after cancel")
+	}
 }
