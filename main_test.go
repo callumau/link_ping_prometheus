@@ -2,14 +2,17 @@ package main
 
 import (
 	"context"
+	"flag"
 	dto "github.com/prometheus/client_model/go"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -612,5 +615,107 @@ func TestMetricsHandler_ConcurrencyCapReturns503(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	if rec.Code != http.StatusOK {
 		t.Errorf("cap must release after the burst, got %d", rec.Code)
+	}
+}
+
+// TestREADME_FlagsTableAndBucketsMatchCode ties the user-facing documentation
+// to the code. Both have drifted before: -echo-secret was registered but
+// missing from the flags table, and the bucket list lost its 2.5s/3s edges.
+// A hand-maintained copy in a test would drift too, so this reads README.md
+// itself. The comparison is one-directional (registered ⊆ documented): the
+// README may legitimately show example rows the binary does not register.
+func TestREADME_FlagsTableAndBucketsMatchCode(t *testing.T) {
+	data, err := os.ReadFile("README.md")
+	if err != nil {
+		t.Fatalf("read README.md: %v", err)
+	}
+	doc := string(data)
+
+	rowRe := regexp.MustCompile("(?m)^\\| `(-[a-z0-9-]+)` \\|")
+	documented := make(map[string]bool)
+	for _, m := range rowRe.FindAllStringSubmatch(doc, -1) {
+		documented[m[1]] = true
+	}
+	if len(documented) < 20 {
+		t.Fatalf("parsed only %d flag rows from README.md — the table format changed, so this test would pass vacuously", len(documented))
+	}
+	flag.VisitAll(func(f *flag.Flag) {
+		// go test registers its own -test.* flags in the same FlagSet: not
+		// ours to document.
+		if strings.HasPrefix(f.Name, "test.") {
+			return
+		}
+		if !documented["-"+f.Name] {
+			t.Errorf("flag -%s is registered in main.go but has no row in the README flags table", f.Name)
+		}
+	})
+
+	bucketRe := regexp.MustCompile("explicit buckets `\\{([^}]+)\\}`")
+	m := bucketRe.FindStringSubmatch(doc)
+	if m == nil {
+		t.Fatal("README no longer documents the RTT bucket edges as 'explicit buckets `{...}`'")
+	}
+	var want []float64
+	for _, part := range strings.Split(m[1], ",") {
+		v, err := strconv.ParseFloat(strings.TrimSpace(part), 64)
+		if err != nil {
+			t.Fatalf("unparsable bucket edge %q in README: %v", part, err)
+		}
+		want = append(want, v)
+	}
+	if !slices.Equal(want, prober.RTTBuckets) {
+		t.Errorf("README bucket list %v != prober.RTTBuckets %v — update both in the same commit", want, prober.RTTBuckets)
+	}
+}
+
+// TestStatusEndpointIsGatedLikeMetrics: /status exposes live link state and
+// peer addresses, so it must carry the same Basic auth as /metrics; /healthz
+// and /readyz stay open for orchestrators. Pins the wiring in
+// startMetricsServer, not just the MetricsAuth handler in isolation.
+func TestStatusEndpointIsGatedLikeMetrics(t *testing.T) {
+	prober.InitMetrics()
+	p := &program{}
+	reg := prober.NewStatusRegistry()
+	reg.Update(prober.TargetStatus{Name: "t", Address: "127.0.0.1:4000"})
+	srv, done, err := p.startMetricsServer("127.0.0.1:0", "alice", "s3cret", "", "", reg, false, "client")
+	if err != nil {
+		t.Fatalf("startMetricsServer: %v", err)
+	}
+	t.Cleanup(func() {
+		// pi-lens-ignore: go-ignored-call-result
+		_ = srv.Close()
+		<-done
+	})
+	if srv.Addr == "" {
+		t.Fatal("startMetricsServer must publish the bound address for callers/tests")
+	}
+	get := func(path string, user, pass string) int {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodGet, "http://"+srv.Addr+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if user != "" {
+			req.SetBasicAuth(user, pass)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if got := get("/status", "", ""); got != http.StatusUnauthorized {
+		t.Errorf("/status without credentials = %d, want 401 (it exposes peer addresses and link state)", got)
+	}
+	if got := get("/status", "alice", "s3cret"); got != http.StatusOK {
+		t.Errorf("/status with credentials = %d, want 200", got)
+	}
+	if got := get("/healthz", "", ""); got != http.StatusOK {
+		t.Errorf("/healthz must stay unauthenticated, got %d", got)
+	}
+	if got := get("/readyz", "", ""); got == http.StatusUnauthorized {
+		t.Error("/readyz must stay unauthenticated (orchestrators cannot send credentials)")
 	}
 }

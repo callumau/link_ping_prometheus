@@ -1592,3 +1592,83 @@ func TestServer_ExactClientSeriesNeverEvicted(t *testing.T) {
 		t.Errorf("exact-IP counters must not reset: got %v, want >= %v (evicted and re-created?)", got, before+1)
 	}
 }
+
+// TestServer_HMACSizeWindowAndDropReasons: under HMAC the accepted frame window
+// is measured from PayloadSizeWithHMAC (32), not PayloadSize (24) — otherwise
+// -payload probes to an authenticated server would be blackholed — and one
+// byte past the payload cap is dropped. Every drop reason is named in
+// link_server_probes_dropped_total's Help, the README and the shipped alert,
+// so the counters themselves are pinned here: a mislabelled drop is what turns
+// "secret/NTP misconfig" into "the network is broken".
+func TestServer_HMACSizeWindowAndDropReasons(t *testing.T) {
+	prober.InitMetrics()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const secret = "size-window-secret"
+	pc := listenUDP(t, ctx)
+	allowed := mustAllow("127.0.0.1")
+	done := make(chan struct{})
+	go func() {
+		prober.ServePacketConn(ctx, pc, testSource, allowed, secret)
+		close(done)
+	}()
+	t.Cleanup(func() { <-done })
+	addr := pc.LocalAddr().String()
+
+	conn, err := net.Dial("udp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	now := func() uint64 { return uint64(time.Now().UnixNano()) }
+
+	// send writes one frame, waits up to 400ms for an echo, and reports the
+	// echo size (0 when nothing came back).
+	send := func(frame []byte) int {
+		t.Helper()
+		conn.Write(frame)
+		conn.SetReadDeadline(time.Now().Add(400 * time.Millisecond))
+		n, _ := conn.Read(make([]byte, 2000))
+		return n
+	}
+	// expectDrop asserts the reason counter grows by one for that frame. The
+	// baseline is read BEFORE the write: reading it afterwards races the
+	// server's read loop and makes the wait vacuous.
+	expectDrop := func(reason string, frame []byte) {
+		t.Helper()
+		before := getCounterValue(prober.ServerProbesDropped, reason)
+		if n := send(frame); n != 0 {
+			t.Errorf("%s frame must not be echoed, got %d bytes back", reason, n)
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		for getCounterValue(prober.ServerProbesDropped, reason) < before+1 && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+		}
+		if got := getCounterValue(prober.ServerProbesDropped, reason); got < before+1 {
+			t.Errorf("expected a %q drop, counter stayed at %v", reason, got-before)
+		}
+	}
+
+	// Bounded header+payload frame: accepted, and echoed at its full size.
+	const payload = 64
+	withPayload := append(buildHMACFrame(secret, 1, now()), make([]byte, payload)...)
+	if n := send(withPayload); n != prober.PayloadSizeWithHMAC+payload {
+		t.Errorf("a header+payload frame at an HMAC server must be echoed: got %d bytes, want %d", n, prober.PayloadSizeWithHMAC+payload)
+	}
+
+	// One byte over the payload cap.
+	expectDrop("size", append(buildHMACFrame(secret, 2, now()), make([]byte, prober.MaxPayloadBytes+1)...))
+	// Shorter than the HMAC header: a size drop, never read as a 24-byte frame.
+	expectDrop("size", make([]byte, prober.PayloadSize))
+
+	// Wrong magic.
+	badMagic := buildHMACFrame(secret, 3, now())
+	badMagic[0] ^= 0xFF
+	expectDrop("magic", badMagic)
+
+	// Bad tag.
+	badTag := buildHMACFrame(secret, 4, now())
+	badTag[31] ^= 0xFF
+	expectDrop("hmac", badTag)
+}

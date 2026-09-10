@@ -8,9 +8,20 @@ import (
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 
 	"link_ping_prometheus/internal/prober"
 )
+
+// plainCounterValue reads a label-less counter (MetricsAuthFailures), which the
+// variadic-label getCounterValue helper cannot address.
+func plainCounterValue(c prometheus.Counter) float64 {
+	var m dto.Metric
+	if err := c.Write(&m); err != nil {
+		return 0
+	}
+	return m.GetCounter().GetValue()
+}
 
 // TestLinkUpHelpPinsMissThreshold keeps the user-facing Help text in sync
 // with the tunable constant so changing one without the other fails CI.
@@ -60,12 +71,19 @@ func TestMetricsAuth(t *testing.T) {
 			req.SetBasicAuth(tc.user, tc.pass)
 		}
 		rec := httptest.NewRecorder()
+		before := plainCounterValue(prober.MetricsAuthFailures)
 		h.ServeHTTP(rec, req)
 		if rec.Code != tc.want {
 			t.Errorf("%s: expected %d, got %d", tc.name, tc.want, rec.Code)
 		}
 		if tc.want == http.StatusUnauthorized && rec.Header().Get("WWW-Authenticate") == "" {
 			t.Errorf("%s: missing WWW-Authenticate header on 401", tc.name)
+		}
+		// The failure counter is the alerting signal (MetricsAuthFailures) for
+		// a misconfigured scraper or credential scanning; it must count every
+		// rejection and nothing else.
+		if delta := plainCounterValue(prober.MetricsAuthFailures) - before; (delta > 0) != (tc.want == http.StatusUnauthorized) {
+			t.Errorf("%s: link_metrics_auth_failures_total moved by %v, want %v", tc.name, delta, tc.want == http.StatusUnauthorized)
 		}
 	}
 }

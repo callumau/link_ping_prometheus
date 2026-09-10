@@ -691,7 +691,10 @@ func (p *program) startMetricsServer(addr, user, pass, cert, key string, statusR
 	// metrics auth is configured.
 	mx.Handle("/status", prober.MetricsAuth(user, pass, statusReg.Handler()))
 	metricsSrv := &http.Server{
-		Handler:     mx,
+		Handler: mx,
+		// Addr is informational (Serve uses the already-bound listener) but
+		// lets tests and logs address the live server without guessing.
+		Addr:        metricsLn.Addr().String(),
 		ReadTimeout: 10 * time.Second,
 		// 30s, not 10s: a large fleet on a slow link can need longer than 10s
 		// to write a multi-megabyte scrape body, and a truncated response
