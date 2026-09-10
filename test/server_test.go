@@ -922,6 +922,76 @@ func TestServer_ClientSeriesOverflow(t *testing.T) {
 	}
 }
 
+// TestServer_UnauthenticatedSourceCannotSpendSeriesSlot: dynamic
+// {source,client} series allocation (resolve) must happen only AFTER a frame
+// authenticates. Resolving first let any off-path attacker able to spoof a
+// source inside an allowlisted CIDR allocate a series pair per source and pin
+// every MaxClientSeries slot, so a real CIDR client was dropped as
+// client_overflow — manufactured 100% loss with only a cardinality drop
+// counter to explain it. Pins both halves: no series for the unauthenticated
+// source, and the single slot still free for an authenticated one.
+//
+// Uses loopback aliases nothing else in the suite touches so the
+// non-mutating Gather() assertion cannot be satisfied by an earlier test's
+// series (metrics are process-global and never reset).
+func TestServer_UnauthenticatedSourceCannotSpendSeriesSlot(t *testing.T) {
+	prober.InitMetrics()
+	old := prober.MaxClientSeries
+	prober.MaxClientSeries = 1
+	defer func() { prober.MaxClientSeries = old }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	// Restore MaxClientSeries only after the server has returned: it reads
+	// the var from its own goroutine (race detector).
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	const secret = "resolve-after-auth"
+	pc := listenUDP(t, ctx)
+	allowed := mustAllow("127.0.0.0/8") // CIDR entry -> the dynamic resolve path
+	go func() {
+		prober.ServePacketConn(ctx, pc, testSource, allowed, secret)
+		close(done)
+	}()
+	addr := pc.LocalAddr().String()
+
+	// Correct size, magic and fresh timestamp — only the tag is wrong, so the
+	// frame reaches the authentication step and nothing else.
+	bad := dialFrom(t, addr, net.IPv4(127, 0, 0, 9))
+	defer bad.Close()
+	frame := buildHMACFrame(secret, 1, uint64(time.Now().UnixNano()))
+	frame[31] ^= 0xFF
+	bad.Write(frame)
+
+	// Wait for proof the server processed it: the hmac drop counter only
+	// moves once the frame reached authentication.
+	before := getCounterValue(prober.ServerProbesDropped, "hmac")
+	deadline := time.Now().Add(2 * time.Second)
+	for getCounterValue(prober.ServerProbesDropped, "hmac") == before && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if getCounterValue(prober.ServerProbesDropped, "hmac") == before {
+		t.Fatal("the unauthenticated frame was never processed (cpu load?)")
+	}
+	if serverSeriesExists(t, "link_server_probes_received_total", map[string]string{"source": testSource, "client": "127.0.0.9"}) {
+		t.Error("an unauthenticated source must not create a {source,client} series")
+	}
+
+	// The one available slot must still serve a correctly authenticated
+	// client; with resolve-before-auth this frame is client_overflow and the
+	// read below times out.
+	good := dialFrom(t, addr, net.IPv4(127, 0, 0, 8))
+	defer good.Close()
+	good.Write(buildHMACFrame(secret, 2, uint64(time.Now().UnixNano())))
+	good.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if n, _ := good.Read(make([]byte, 1500)); n != prober.PayloadSizeWithHMAC {
+		t.Errorf("an authenticated client must get the free slot, got %d bytes back (client_overflow?)", n)
+	}
+}
+
 // TestAllowlist_IPv4Mapped: allowlist entries written in 4-in-6 form
 // (::ffff:127.0.0.1, ::ffff:127.0.0.0/104) must match the dotted-quad
 // source a UDP datagram actually reports. netip does not unmap addresses
