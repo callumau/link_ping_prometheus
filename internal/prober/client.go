@@ -132,6 +132,14 @@ func LoadTargets(path string) ([]Target, error) {
 	return targets, nil
 }
 
+// stragglerStopTimeout bounds how long RunClient waits for a removed or
+// changed target's probe loop to join before leaving it stopped. A variable
+// (not a constant) so tests can lower it — the 5s value is chosen for real
+// sockets, and the straggler path also has to be exercised. A loop that
+// misses this bound is recorded as a straggler and restarted (when the target
+// is still in the file) once it does exit.
+var stragglerStopTimeout = 5 * time.Second
+
 // RunClient starts probe loops for every target in cfg.Targets. Each
 // target is probed in its own goroutine. Blocks until ctx is cancelled.
 func RunClient(ctx context.Context, cfg Config) error {
@@ -218,7 +226,7 @@ func RunClient(ctx context.Context, cfg Config) error {
 	live := make(map[string]running)
 
 	// stragglers holds names whose old probe loop did NOT join within
-	// stop's 5s bound. Such a loop may still be alive and still writing
+	// stragglerStopTimeout. Such a loop may still be alive and still writing
 	// that target's series, so a later reload must NOT start a second loop
 	// for the name — two loops on one target double-count
 	// link_probes_sent_total and break the loss ratio. The set lives at
@@ -227,14 +235,22 @@ func RunClient(ctx context.Context, cfg Config) error {
 	// mutex.
 	stragglers := make(map[string]bool)
 	var stragglersMu sync.Mutex
+	// desired mirrors the target set currently in force, and freed wakes the
+	// supervisor once a timed-out loop has finally exited. Only the
+	// supervisor goroutine mutates `live`, so the cleanup goroutine signals
+	// instead of starting the replacement loop itself.
+	var desired []Target
+	freed := make(chan struct{}, 1)
 
 	// markStraggler records name until its timed-out loop exits, then
 	// finishes what stop's timeout path could not: withdraws the series
-	// (when this was a removal or an address change — purgeSeries) and
-	// drops the name so a later reload may start it again. The wait on
-	// r.done is bounded: the loop was already cancelled and its own retry
-	// waits are at most 1s.
-	markStraggler := func(name string, r running, purgeSeries bool) {
+	// (when this was a removal or an address change — purgeSeries), drops the
+	// /status entry only when the target is gone from the file, and wakes the
+	// supervisor so that a name which is STILL WANTED gets its replacement
+	// loop started. Skipping that restart used to leave a merely-changed
+	// target unprobed (and, before the status fix, invisible at /status)
+	// until an operator edited the file again.
+	markStraggler := func(name string, r running, purgeSeries, stillWanted bool) {
 		stragglersMu.Lock()
 		stragglers[name] = true
 		stragglersMu.Unlock()
@@ -243,10 +259,16 @@ func RunClient(ctx context.Context, cfg Config) error {
 			if purgeSeries {
 				deleteTargetSeries(cfg.Source, r.tg)
 			}
-			cfg.Status.Remove(name)
+			if !stillWanted {
+				cfg.Status.Remove(name)
+			}
 			stragglersMu.Lock()
 			delete(stragglers, name)
 			stragglersMu.Unlock()
+			select {
+			case freed <- struct{}{}:
+			default:
+			}
 		}()
 	}
 	isStraggler := func(name string) bool {
@@ -284,8 +306,8 @@ func RunClient(ctx context.Context, cfg Config) error {
 				cfg.Status.Remove(name)
 			}
 			return true
-		case <-time.After(5 * time.Second):
-			slog.Warn("Removed target probe loop did not stop within 5s", "target", name)
+		case <-time.After(stragglerStopTimeout):
+			slog.Warn("Removed target probe loop did not stop in time", "target", name, "timeout", stragglerStopTimeout)
 			return false
 		}
 	}
@@ -296,6 +318,7 @@ func RunClient(ctx context.Context, cfg Config) error {
 	// them, still the same endpoint), new targets start fresh. targets must
 	// already be validated (LoadTargets and Config.Validate both do).
 	apply := func(targets []Target) {
+		desired = targets
 		want := make(map[string]Target, len(targets))
 		for _, tg := range targets {
 			want[tg.Name] = tg
@@ -318,7 +341,7 @@ func RunClient(ctx context.Context, cfg Config) error {
 				// (still one endpoint, counters must stay continuous).
 				slog.Error("Probe loop did not stop in time; leaving target stopped", "target", name)
 				ProberInternalErrors.WithLabelValues(cfg.Source, r.tg.Name, r.tg.Address, "stop_timeout").Inc()
-				markStraggler(name, r, !ok || r.tg.Address != w.Address)
+				markStraggler(name, r, !ok || r.tg.Address != w.Address, ok)
 				continue
 			}
 			if ok {
@@ -397,6 +420,11 @@ func RunClient(ctx context.Context, cfg Config) error {
 			reload()
 		case <-reloadTick:
 			reload()
+		case <-freed:
+			// A timed-out loop finally exited. Re-apply the desired set so a
+			// target that is still in the file (a change, not a removal) gets
+			// its replacement loop now that the straggler flag is cleared.
+			apply(desired)
 		}
 	}
 }
