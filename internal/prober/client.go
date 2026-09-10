@@ -383,6 +383,13 @@ func RunClient(ctx context.Context, cfg Config) error {
 			slog.Error("Targets reload failed; keeping previous targets", "path", cfg.TargetsPath, "err", err)
 			return
 		}
+		// The effective-window check needs the GLOBAL interval/timeout, so it
+		// cannot live in LoadTargets: reject a reload that would build an
+		// unbounded in-flight window rather than accept it and peg a core.
+		if err := validatePendingWindow(cfg.BaseInterval, cfg.BaseTimeout, targets); err != nil {
+			slog.Error("Targets reload rejected (in-flight window too large); keeping previous targets", "path", cfg.TargetsPath, "err", err)
+			return
+		}
 		if len(targets) == 0 {
 			// Respect the operator's intent (an empty array means "probe
 			// nothing"), but name the consequence: this stops ALL probing and

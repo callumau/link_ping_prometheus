@@ -89,3 +89,46 @@ func TestLoadTargets_MinProbeInterval(t *testing.T) {
 		})
 	}
 }
+
+// TestConfigValidate_PendingWindow: the pending set holds ~timeout/interval
+// probes and every tick scans all of them, so an extreme ratio must be
+// rejected at load time. minProbeInterval bounds the denominator; this pins
+// the complementary bound on the numerator (and on per-target overrides,
+// which used to be checked by nothing at all).
+func TestConfigValidate_PendingWindow(t *testing.T) {
+	tg := Target{Name: "t", Address: "127.0.0.1:4000"}
+	cases := []struct {
+		name    string
+		cfg     Config
+		wantErr bool
+		errHas  string
+	}{
+		{"default window", Config{Targets: []Target{tg}, BaseInterval: 500 * time.Millisecond, BaseTimeout: time.Second}, false, ""},
+		{"exactly at the cap", Config{Targets: []Target{tg}, BaseInterval: time.Millisecond, BaseTimeout: time.Second}, false, ""},
+		{"one interval past the cap", Config{Targets: []Target{tg}, BaseInterval: time.Millisecond, BaseTimeout: time.Second + time.Millisecond}, true, "in-flight window"},
+		{"a minute of timeout at 1ms interval", Config{Targets: []Target{tg}, BaseInterval: time.Millisecond, BaseTimeout: time.Minute}, true, "-timeout"},
+		{"per-target override cannot open the hole", Config{
+			Targets:      []Target{{Name: "t", Address: "127.0.0.1:4000", Interval: time.Millisecond, Timeout: time.Minute}},
+			BaseInterval: time.Second, BaseTimeout: time.Second}, true, `target "t"`},
+		{"per-target overrides inside the cap are fine", Config{
+			Targets:      []Target{{Name: "t", Address: "127.0.0.1:4000", Interval: time.Millisecond, Timeout: 500 * time.Millisecond}},
+			BaseInterval: time.Second, BaseTimeout: time.Second}, false, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.cfg.Validate()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected the config to be rejected")
+				}
+				if tc.errHas != "" && !strings.Contains(err.Error(), tc.errHas) {
+					t.Errorf("error %q must name the offending knob (%q)", err, tc.errHas)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected rejection: %v", err)
+			}
+		})
+	}
+}

@@ -121,6 +121,49 @@ type Config struct {
 // meaningless. Rejected at config load with an error naming the flag.
 const minProbeInterval = time.Millisecond
 
+// maxPendingWindow caps the effective timeout/interval ratio, i.e. how many
+// probes may be in flight per target at once. minProbeInterval bounds the
+// denominator; this bounds the numerator, which was unlimited: a 1ms interval
+// with a 1m timeout built a ~60k-entry pending map per target and swept all of
+// it on every tick (a pegged core, and hundreds of MB with a full targets
+// file). The cap matches the reader channel's own 1000-response ceiling, so a
+// config inside the limit cannot outrun the drain either.
+const maxPendingWindow = 1000
+
+// checkPendingWindow rejects an effective interval/timeout pair whose in-flight
+// window would be unbounded (see maxPendingWindow). The error names the flags
+// so the operator knows what to change: the timeout is what must come down.
+func checkPendingWindow(interval, timeout time.Duration) error {
+	if interval <= 0 || timeout <= maxPendingWindow*interval {
+		return nil
+	}
+	return fmt.Errorf("probe timeout %v is more than %d probe intervals (%v): the in-flight window would hold ~%d probes per target, and every probe tick scans all of them; lower -timeout or raise -interval",
+		timeout, maxPendingWindow, interval, int(timeout/interval))
+}
+
+// validatePendingWindow applies the effective-window check to the global pair
+// and to every per-target override (a target's own interval/timeout wins over
+// the global one). Called at startup and again on every reload, so a hand-edited
+// targets file cannot introduce an unbounded window either.
+func validatePendingWindow(baseInterval, baseTimeout time.Duration, targets []Target) error {
+	if err := checkPendingWindow(baseInterval, baseTimeout); err != nil {
+		return err
+	}
+	for _, t := range targets {
+		interval, timeout := baseInterval, baseTimeout
+		if t.Interval != 0 {
+			interval = t.Interval
+		}
+		if t.Timeout != 0 {
+			timeout = t.Timeout
+		}
+		if err := checkPendingWindow(interval, timeout); err != nil {
+			return fmt.Errorf("target %q: %w", t.Name, err)
+		}
+	}
+	return nil
+}
+
 // Validate checks that at least one target is present and that all
 // target addresses are well-formed.
 func (c Config) Validate() error {
@@ -151,7 +194,10 @@ func (c Config) Validate() error {
 	if c.ReconnectInterval != 0 && c.ReconnectInterval < c.BaseInterval {
 		return fmt.Errorf("reconnect interval %v must be >= probe interval %v", c.ReconnectInterval, c.BaseInterval)
 	}
-	return validateTargets(c.Targets)
+	if err := validateTargets(c.Targets); err != nil {
+		return err
+	}
+	return validatePendingWindow(c.BaseInterval, c.BaseTimeout, c.Targets)
 }
 
 // validateTargets checks each target's address and name and rejects
