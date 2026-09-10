@@ -69,6 +69,13 @@ func TestRunClient_ReloadAddsRemovesTargets(t *testing.T) {
 
 	waitFor(func() bool { return getCounterValue(prober.ProbesSent, "reload_a", addrA) >= 3 }, "initial target probed")
 
+	// Positive control for the /status ghost check below: without this, a
+	// regression that stops Status.Update entirely would make the "absent"
+	// assertion pass vacuously.
+	if !snapshotHasTarget(reg, "reload_a") {
+		t.Fatal("precondition: reload_a must be present in the /status snapshot while it is running")
+	}
+
 	// Reload: A out, B in.
 	writeTargets("reload_b")
 	hup <- os.Interrupt
@@ -109,15 +116,31 @@ func TestRunClient_ReloadAddsRemovesTargets(t *testing.T) {
 		t.Errorf("a CHANGED target (same name, new interval) must keep its metric series, but it was deleted")
 	}
 
+	// An ADDRESS change (same name) is a DIFFERENT endpoint: the old address's
+	// series must be withdrawn too, or a retired IP keeps exporting its last
+	// link_up=1 for the life of the process — the same frozen-green bug via
+	// the common "edit the target's IP in targets.json" path. The new address
+	// gets its own series.
+	addrB2 := udpEcho(t, ctx, func(buf []byte, w func([]byte)) { w(buf) })
+	writeTargetsFile(t, targetsFile, "reload_b", addrB2)
+	hup <- os.Interrupt
+	waitFor(func() bool { return getCounterValue(prober.ProbesSent, "reload_b", addrB2) >= 2 }, "target probed at its new address")
+	if metricSeriesExists(t, "link_probes_sent_total", testSource, "reload_b", addrB) {
+		t.Errorf("an address change must withdraw the OLD address's series, but it is still registered")
+	}
+	if !metricSeriesExists(t, "link_probes_sent_total", testSource, "reload_b", addrB2) {
+		t.Errorf("the new address must have its own series")
+	}
+
 	// A broken file mid-edit keeps the previous set running.
 	if err := os.WriteFile(targetsFile, []byte("{not json"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	hup <- os.Interrupt
 	time.Sleep(300 * time.Millisecond)
-	b1 := getCounterValue(prober.ProbesSent, "reload_b", addrB)
+	b1 := getCounterValue(prober.ProbesSent, "reload_b", addrB2)
 	time.Sleep(400 * time.Millisecond)
-	b2 := getCounterValue(prober.ProbesSent, "reload_b", addrB)
+	b2 := getCounterValue(prober.ProbesSent, "reload_b", addrB2)
 	if b2 <= b1 {
 		t.Errorf("broken targets file must not stop the running set: sent %v -> %v", b1, b2)
 	}
@@ -135,6 +158,18 @@ func writeTargetsFile(t *testing.T, path, name, addr string) {
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// snapshotHasTarget reports whether a target name is currently present in
+// the /status registry, so "absent" assertions can have a live positive
+// control instead of passing against an empty registry.
+func snapshotHasTarget(reg *prober.StatusRegistry, name string) bool {
+	for _, s := range reg.Snapshot() {
+		if s.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // writeTargetsInterval writes a single-target file with an explicit

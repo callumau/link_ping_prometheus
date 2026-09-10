@@ -505,8 +505,21 @@ func TestRobustness_SpuriousValidFrames(t *testing.T) {
 	recvDelta := getHistogramCount(prober.RTTSeconds, targetName, addr) - startRecv
 	sentDelta := getCounterValue(prober.ProbesSent, targetName, addr) - startSent
 
-	if math.Abs(recvDelta-sentDelta) > 1 {
-		t.Errorf("Spurious frames must be ignored: sent %v, received %v", sentDelta, recvDelta)
+	// The property this test exists for: a spurious frame must never be
+	// counted as a received probe, so received can only ever be <= sent.
+	// (The old symmetric tolerance of 1 mixed that with liveness: probes still
+	// in flight when the client is cancelled are abandoned by design and never
+	// counted, which made the check load-dependent rather than stronger.)
+	if recvDelta > sentDelta {
+		t.Errorf("spurious frames inflated the received counter: sent %v, received %v", sentDelta, recvDelta)
+	}
+	// Liveness floor so the assertion above cannot pass vacuously (no probes
+	// sent at all), with a small allowance for the probes abandoned at cancel.
+	if sentDelta < 5 {
+		t.Errorf("only %v probes sent — test setup broken (cpu load?)", sentDelta)
+	}
+	if recvDelta < sentDelta-3 {
+		t.Errorf("too few real echoes matched (%v of %v sent) — test setup broken (cpu load?)", recvDelta, sentDelta)
 	}
 }
 
