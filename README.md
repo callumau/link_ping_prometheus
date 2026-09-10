@@ -33,6 +33,7 @@ degrading?" — it is not a proxy for what TCP applications experience.
 - [Test](#test)
 - [Usage](#usage)
   - [Flags](#flags)
+  - [Memory & Runtime Tuning](#memory--runtime-tuning)
   - [Targets File](#targets-file)
   - [Examples](#examples)
 - [Installation](#installation)
@@ -476,6 +477,7 @@ link_ping_prometheus -mode=<mode> [flags]
 | `-metrics-tls-cert` | `""` | TLS certificate file for /metrics (requires `-metrics-tls-key`) |
 | `-metrics-tls-key` | `""` | TLS private key file for /metrics (requires `-metrics-tls-cert`) |
 | `-metrics-allow-insecure` | `false` | Allow Basic Auth without TLS (otherwise auth over plaintext HTTP is rejected) |
+| `-mem-scavenge` | `5m` | Runtime: force a heap scavenge at this interval so the unused heap high-water mark is returned to the OS (0 disables; skipped when less than 4MB is unreleased). See [Memory & Runtime Tuning](#memory--runtime-tuning). |
 | `-json-logs` | `false` | Output logs in JSON format |
 | `-log-file` | `""` | Append logs to this file in addition to stdout (required for Windows service logging, where stdout is discarded) |
 | `-log-file-max-mb` | `10` | Max log file size in MB before rotation (0 disables rotation) |
@@ -489,9 +491,24 @@ link_ping_prometheus -mode=<mode> [flags]
 
 Liveness endpoints `GET /healthz` and `GET /readyz` on the same metrics listener return `200 ok` (`text/plain`) for Kubernetes/container probes. They are deliberately unauthenticated — only `/metrics` and `/status` are gated — and are available over both HTTP and HTTPS.
 
-`GET /status` on the same listener serves a JSON snapshot of live per-target probe state — `link_up`, in-flight probes, consecutive misses, the current consecutive send-failure streak (`send_failures`, reset on any successful write; not a cumulative count), RTO/SRTT, last sequence number, socket age, `path_mtu_bytes` (largest DF frame proven to round-trip; 0 = no successful sweep yet) and `last_echo_age_seconds` (-1 until the first echo) — for debugging a flapping target without log access. Unlike the health endpoints it is auth-gated exactly like `/metrics` (open only when no metrics auth is configured).
+`GET /status` on the same listener serves a JSON snapshot of live per-target probe state — `link_up`, in-flight probes, consecutive misses, the current consecutive send-failure streak (`send_failures`, reset on any successful write; not a cumulative count), RTO/SRTT, last sequence number, socket age, `path_mtu_bytes` (largest DF frame proven to round-trip; 0 = no successful sweep yet) and `last_echo_age_seconds` (-1 until the first echo) — for debugging a flapping target without log access. It also returns a `process` object with Go runtime memory and GC stats — `heap_alloc_bytes`, `heap_sys_bytes`, `heap_idle_bytes`, `heap_released_bytes`, `stack_inuse_bytes`, `gc_sys_bytes`, `sys_bytes`, `gc_count` and `goroutines` — so heap growth is observable remotely without a debugger. Unlike the health endpoints it is auth-gated exactly like `/metrics` (open only when no metrics auth is configured).
 
 Resource footprint: metric handles are resolved once per target at startup (no per-probe label lookups), and the Go heap is soft-capped at 128MB (`GOMEMLIMIT` env overrides) so RSS stays flat on long runs. For >100 targets set `GOMEMLIMIT=256MiB` (or higher) as a system environment variable and restart the service.
+
+### Memory & Runtime Tuning
+
+`GOMEMLIMIT` keeps its 128MiB default when the env var is unset; `GOGC` is left at Go's own default (100). Both remain env-overridable. A binding `GOMEMLIMIT` does not reduce the footprint of an idle agent — the runtime only reacts as the heap approaches the limit — so treat it as a safety valve for large target counts, not a footprint knob.
+
+Every `/metrics` scrape allocates (gather trees, text encoding, optional gzip) and ratchets Go's heap high-water mark upward; the runtime does not return it while the agent is otherwise idle because scavenging is allocation-rate driven. On Windows the visible number is commit/working set, so this ratchet shows up there as steady growth.
+
+`-mem-scavenge` (default `5m`, `0` disables) forces a scavenge on that interval so the high-water mark goes back to the OS; it is skipped when less than 4MB is unreleased, and `/status` exposes the same picture as its `process` object for observing it remotely.
+
+`GOGC` is the other lever, and the right value depends on the scrape load (both measured on one target):
+
+- A bursty load (800 scrapes back to back) ended at `heap_sys` 14.7MB / total 22.5MB by default, versus 6.8MB / 14.4MB with `GOGC=50`, for ~0.8ms extra CPU per scrape.
+- A quiet agent (sparse scrapes) measured *worse* at `GOGC=50`: RSS 19.8MB vs 16.7MB, `gc_sys` 2.77MB vs 1.47MB, and ~5x the allocation churn, because it GCs a small heap more often.
+
+So set `GOGC=50` for scrape-heavy deployments and leave it unset (or raise it) for a quiet one. `GOMAXPROCS=1` was the lowest-footprint configuration measured (RSS 14.6MB vs 16.7MB) at the cost of GC parallelism.
 
 ### Targets File
 

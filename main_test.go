@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"log/slog"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -32,6 +34,120 @@ func TestServiceConfigHardening(t *testing.T) {
 	// in link_ping_build_info.
 	if strings.Contains(cfg.Description, version) && version != "dev" {
 		t.Errorf("Description must not embed the build version: %q", cfg.Description)
+	}
+}
+
+// pi-lens-ignore: go-test-functions
+func TestUnreleasedHeap(t *testing.T) {
+	tests := []struct {
+		name string
+		m    runtime.MemStats
+		want uint64
+	}{
+		{
+			// Fully released heap: nothing left to give back.
+			"all released",
+			runtime.MemStats{Sys: 10 << 20, HeapReleased: 10 << 20},
+			0,
+		},
+		{
+			// Sys can transiently dip below HeapReleased; an unsigned
+			// subtraction would wrap and force a scavenge every tick.
+			"released exceeds sys underflows to zero",
+			runtime.MemStats{Sys: 4 << 20, HeapReleased: 8 << 20},
+			0,
+		},
+		{
+			"unreleased is sys minus released",
+			runtime.MemStats{Sys: 20 << 20, HeapReleased: 6 << 20},
+			14 << 20,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := unreleasedHeap(tc.m); got != tc.want {
+				t.Errorf("unreleasedHeap(%+v) = %d, want %d", tc.m, got, tc.want)
+			}
+		})
+	}
+}
+
+// pi-lens-ignore: go-test-functions
+func TestShouldScavenge(t *testing.T) {
+	tests := []struct {
+		name          string
+		m             runtime.MemStats
+		minUnreleased uint64
+		want          bool
+	}{
+		{"below threshold is skipped", runtime.MemStats{Sys: 6 << 20, HeapReleased: 3 << 20}, 4 << 20, false},
+		{"exactly at threshold scavenges", runtime.MemStats{Sys: 8 << 20, HeapReleased: 4 << 20}, 4 << 20, true},
+		{"above threshold scavenges", runtime.MemStats{Sys: 12 << 20, HeapReleased: 2 << 20}, 4 << 20, true},
+		{"lean heap is skipped", runtime.MemStats{Sys: 8 << 20, HeapReleased: 8 << 20}, minScavengeUnreleased, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := shouldScavenge(tc.m, tc.minUnreleased); got != tc.want {
+				t.Errorf("shouldScavenge(%+v, %d) = %v, want %v", tc.m, tc.minUnreleased, got, tc.want)
+			}
+		})
+	}
+}
+
+// chanHandler forwards log records to a channel so the scavenger test can
+// observe a tick without sleeping for a real interval.
+type chanHandler struct{ ch chan string }
+
+func (h chanHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h chanHandler) Handle(_ context.Context, r slog.Record) error {
+	select {
+	case h.ch <- r.Message:
+	default:
+	}
+	return nil
+}
+func (h chanHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h chanHandler) WithGroup(string) slog.Handler      { return h }
+
+// pi-lens-ignore: go-test-functions
+func TestStartHeapScavengerDisabled(t *testing.T) {
+	before := runtime.NumGoroutine()
+	// every <= 0 must not spawn anything at all.
+	// pi-lens-ignore: go-context-background-handler
+	startHeapScavenger(context.Background(), 0, minScavengeUnreleased, slog.Default())
+	if after := runtime.NumGoroutine(); after > before {
+		t.Errorf("every=0 must not spawn a goroutine, count went %d -> %d", before, after)
+	}
+}
+
+// pi-lens-ignore: go-test-functions
+func TestStartHeapScavengerTicksThenStopsOnCancel(t *testing.T) {
+	// pi-lens-ignore: go-context-background-handler
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch := make(chan string, 1)
+	before := runtime.NumGoroutine()
+	// minUnreleased=0 makes every tick take the scavenge path, so the log
+	// line proves the ticker actually fired before we cancel it.
+	startHeapScavenger(ctx, 5*time.Millisecond, 0, slog.New(chanHandler{ch: ch}))
+
+	select {
+	case msg := <-ch:
+		if !strings.Contains(msg, "scavenge") {
+			t.Errorf("unexpected scavenger log message %q", msg)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("scavenger never ticked")
+	}
+
+	cancel()
+	deadline := time.Now().Add(5 * time.Second)
+	for runtime.NumGoroutine() > before && time.Now().Before(deadline) {
+		// pi-lens-ignore: go-time-sleep-test
+		time.Sleep(2 * time.Millisecond)
+	}
+	if n := runtime.NumGoroutine(); n > before {
+		t.Errorf("scavenger goroutine still running after ctx cancel: %d > %d", n, before)
 	}
 }
 

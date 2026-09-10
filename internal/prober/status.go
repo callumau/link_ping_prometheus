@@ -3,6 +3,7 @@ package prober
 import (
 	"encoding/json"
 	"net/http"
+	"runtime"
 	"sort"
 	"sync"
 )
@@ -85,10 +86,49 @@ func (r *StatusRegistry) Snapshot() []TargetStatus {
 	return out
 }
 
-// Handler serves the registry snapshot as JSON.
+// ProcessStatus is a snapshot of the agent's own runtime memory and
+// goroutine counts, served as the /status "process" object. It exists to
+// make the scrape-driven heap high-water mark observable remotely: a
+// heap_sys_bytes that climbs with a flat heap_alloc_bytes and near-zero
+// heap_released_bytes is the signature of a heap the runtime has stopped
+// returning to the OS (Windows reports it as RSS/commit growth).
+type ProcessStatus struct {
+	HeapAllocBytes    uint64 `json:"heap_alloc_bytes"`
+	HeapSysBytes      uint64 `json:"heap_sys_bytes"`
+	HeapIdleBytes     uint64 `json:"heap_idle_bytes"`
+	HeapReleasedBytes uint64 `json:"heap_released_bytes"`
+	StackInuseBytes   uint64 `json:"stack_inuse_bytes"`
+	GCSysBytes        uint64 `json:"gc_sys_bytes"`
+	SysBytes          uint64 `json:"sys_bytes"`
+	GCCount           uint32 `json:"gc_count"`
+	Goroutines        int    `json:"goroutines"`
+}
+
+// ReadProcessStatus snapshots the current process runtime state.
+func ReadProcessStatus() ProcessStatus {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return ProcessStatus{
+		HeapAllocBytes:    m.HeapAlloc,
+		HeapSysBytes:      m.HeapSys,
+		HeapIdleBytes:     m.HeapIdle,
+		HeapReleasedBytes: m.HeapReleased,
+		StackInuseBytes:   m.StackInuse,
+		GCSysBytes:        m.GCSys,
+		SysBytes:          m.Sys,
+		GCCount:           m.NumGC,
+		Goroutines:        runtime.NumGoroutine(),
+	}
+}
+
+// Handler serves the registry snapshot plus the process runtime state as
+// JSON. A nil receiver still answers with an empty target list.
 func (r *StatusRegistry) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string][]TargetStatus{"targets": r.Snapshot()})
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"targets": r.Snapshot(),
+			"process": ReadProcessStatus(),
+		})
 	})
 }

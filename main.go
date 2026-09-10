@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -44,6 +45,60 @@ import (
 // dev_build.sh sets it to a UTC timestamp to the minute. A plain
 // `go build` (and CI test builds) leaves it as "dev".
 var version = "dev"
+
+// minScavengeUnreleased is the amount of heap the runtime must be holding
+// beyond what it already returned to the OS before a scavenge is worth its
+// stop-the-world-adjacent cost. An already-lean process must pay nothing.
+const minScavengeUnreleased = 4 << 20
+
+// unreleasedHeap returns heap bytes the process still holds outside what
+// runtime/debug has already given back to the OS. Clamped at 0: Sys can
+// dip below HeapReleased transiently, and an unsigned subtraction would
+// otherwise wrap to an enormous "unreleased" value and force a scavenge
+// on every tick.
+func unreleasedHeap(m runtime.MemStats) uint64 {
+	if m.Sys <= m.HeapReleased {
+		return 0
+	}
+	return m.Sys - m.HeapReleased
+}
+
+func shouldScavenge(m runtime.MemStats, minUnreleased uint64) bool {
+	return unreleasedHeap(m) >= minUnreleased
+}
+
+// startHeapScavenger returns the unused heap high-water mark to the OS on a
+// fixed interval. The runtime scavenges in proportion to the allocation rate,
+// so a scrape-driven high-water mark survives indefinitely while the agent is
+// idle — visible on Windows as steady commit/RSS growth. every <= 0 disables
+// it. The goroutine exits with ctx so it stops on shutdown in every mode.
+func startHeapScavenger(ctx context.Context, every, minUnreleased time.Duration, logger *slog.Logger) {
+	if every <= 0 {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(every)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+			var before runtime.MemStats
+			runtime.ReadMemStats(&before)
+			if !shouldScavenge(before, uint64(minUnreleased)) {
+				continue
+			}
+			debug.FreeOSMemory()
+			var after runtime.MemStats
+			runtime.ReadMemStats(&after)
+			logger.Debug("heap scavenge",
+				"sys_before_mb", before.Sys>>20, "released_before_mb", before.HeapReleased>>20,
+				"sys_after_mb", after.Sys>>20, "released_after_mb", after.HeapReleased>>20)
+		}
+	}()
+}
 
 // CLI flags.
 var (
@@ -71,6 +126,7 @@ var (
 	flPayload       = flag.Int("payload", 0, "Client: probe payload bytes beyond the 24/32-byte header (up to 1400), filled with a deterministic pattern and validated on echo; corruption is counted in link_probes_corrupted_total, distinct from loss")
 	flTargetsReload = flag.Duration("targets-reload-interval", 0, "Client: poll the -targets file at this interval and apply changes without a restart (0 disables; SIGHUP also reloads on Unix; Windows services need this flag to reload)")
 	flMTUSweep      = flag.Duration("mtu-sweep", time.Minute, "Client: periodically sweep DF-set probe sizes per target to find the largest frame the path carries (0 disables; Linux and Windows 10+; results in link_path_mtu_bytes and /status; separate counters, never in the loss ratio)")
+	flMemScavenge   = flag.Duration("mem-scavenge", 5*time.Minute, "Process: force a heap scavenge at this interval so the unused heap high-water mark is returned to the OS (0 disables). Scrapes ratchet the heap high-water up and the runtime does not return it while the agent is otherwise idle; on Windows that reads as RSS/commit growth.")
 
 	flMetricsBasicAuthUser = flag.String("metrics-user", "", "Metrics: Basic auth username (empty disables auth; env LINK_PING_METRICS_USER)")
 	flMetricsBasicAuthPass = flag.String("metrics-pass", "", "Metrics: Basic auth password (env LINK_PING_METRICS_PASS; prefer env over CLI to avoid ps exposure)")
@@ -102,6 +158,11 @@ func main() {
 	// (with units) overrides this default. 128MB leaves headroom for the
 	// largest supported config (1000 targets: ~2000 goroutine stacks plus
 	// native-histogram buckets) while keeping the agent lightweight.
+	//
+	// GOGC is deliberately NOT overridden here: measured on one target, a
+	// lower GOGC shrinks the heap high-water mark under a bursty scrape load
+	// but costs more GC metadata and allocation churn at the sparse scrape
+	// rate a quiet agent actually sees. Operators can set GOGC themselves.
 	if os.Getenv("GOMEMLIMIT") == "" {
 		debug.SetMemoryLimit(128 << 20)
 	}
@@ -598,6 +659,9 @@ func (p *program) run() error {
 			return err
 		}
 	}
+	// Periodic scavenger: shares p.ctx so it stops with the mode loops.
+	startHeapScavenger(p.ctx, *flMemScavenge, minScavengeUnreleased, slog.Default())
+
 	// Live per-target state for the /status debug endpoint. Always
 	// registered so server-only mode still serves an empty list.
 	statusReg := prober.NewStatusRegistry()

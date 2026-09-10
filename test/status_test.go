@@ -2,6 +2,7 @@ package prober_test
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -70,5 +71,33 @@ func TestStatusRegistryReflectsProbeLoop(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), `"name":"statust"`) {
 		t.Errorf("status JSON missing target entry: %s", rec.Body.String())
+	}
+
+	// Decode rather than substring-match: the process block is the memory
+	// observability path for the scrape-driven heap high-water mark, and a
+	// silent key/label rename would otherwise go unnoticed.
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("status JSON is not an object: %v (%s)", err, rec.Body.String())
+	}
+	if _, ok := body["targets"]; !ok {
+		t.Error(`status JSON lost its "targets" key (existing consumers depend on it)`)
+	}
+	rawProcess, ok := body["process"]
+	if !ok {
+		t.Fatalf(`status JSON missing "process" object: %s`, rec.Body.String())
+	}
+	var proc struct {
+		HeapAllocBytes uint64 `json:"heap_alloc_bytes"`
+		Goroutines     int    `json:"goroutines"`
+	}
+	if err := json.Unmarshal(rawProcess, &proc); err != nil {
+		t.Fatalf("process object is malformed: %v (%s)", err, rawProcess)
+	}
+	if proc.HeapAllocBytes == 0 {
+		t.Error("process.heap_alloc_bytes must be > 0 (a zero here means MemStats was never read)")
+	}
+	if proc.Goroutines < 1 {
+		t.Errorf("process.goroutines must be >= 1, got %d", proc.Goroutines)
 	}
 }
