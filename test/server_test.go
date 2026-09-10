@@ -1067,8 +1067,8 @@ func TestAllowlist_IPv4Mapped(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			al := mustAllow(tc.entry)
 			ip := netip.MustParseAddr(tc.norm)
-			if got := al.Allows(tc.norm, ip); got != tc.wantAllow {
-				t.Errorf("Allows(%q, %s) with entry %q = %v, want %v", tc.norm, ip, tc.entry, got, tc.wantAllow)
+			if got := al.Contains(ip); got != tc.wantAllow {
+				t.Errorf("Contains(%s) with entry %q = %v, want %v", ip, tc.entry, got, tc.wantAllow)
 			}
 		})
 	}

@@ -78,8 +78,13 @@ var MaxClientSeries = 1024
 // IPs keep O(1) matching and pre-resolved metric handles; prefix
 // matches resolve metric handles on demand under MaxClientSeries so
 // metric cardinality stays bounded.
+//
+// Entries are keyed by netip.Addr (a comparable value), not by string: the
+// datagram hot path then needs no per-packet IP.String() allocation and no
+// re-parse of the canonical form, and the label string is produced once, when
+// a series is actually created.
 type Allowlist struct {
-	exact  map[string]struct{}
+	exact  map[netip.Addr]struct{}
 	prefix []netip.Prefix
 }
 
@@ -89,7 +94,7 @@ type Allowlist struct {
 // (admit-nothing) allowlist: server mode will not run without at least
 // one allowed prober.
 func ParseAllowlist(s string) (*Allowlist, error) {
-	a := &Allowlist{exact: make(map[string]struct{})}
+	a := &Allowlist{exact: make(map[netip.Addr]struct{})}
 	for part := range strings.SplitSeq(s, ",") {
 		part = strings.TrimSpace(part)
 		if part == "" {
@@ -131,7 +136,7 @@ func ParseAllowlist(s string) (*Allowlist, error) {
 			// closed, but silently — reject it loudly instead.
 			return nil, fmt.Errorf("invalid allowlist IP %q: a scope zone can never match a datagram source", part)
 		}
-		a.exact[addr.Unmap().String()] = struct{}{}
+		a.exact[addr.Unmap()] = struct{}{}
 	}
 	if n := len(a.exact) + len(a.prefix); n > 256 {
 		return nil, fmt.Errorf("allowlist too large: %d (max 256)", n)
@@ -148,20 +153,20 @@ func (a *Allowlist) Len() int {
 	return len(a.exact) + len(a.prefix)
 }
 
-// Allows reports whether a source is permitted. norm is the incoming
-// datagram's canonical source IP string (net.IP.String()), ip its
-// parsed address. A nil or empty allowlist admits nothing.
-// The entries are stored unmapped by ParseAllowlist; net.IP.String()
-// already renders a 4-in-6 source as dotted quad, but ip is unmapped
-// here anyway so a caller passing a mapped address still matches.
-func (a *Allowlist) Allows(norm string, ip netip.Addr) bool {
-	if a.Len() == 0 {
+// Contains reports whether a source is permitted. A nil, empty or invalid
+// address (or an empty allowlist) admits nothing.
+// Entries are stored unmapped and ip is unmapped here too, so a 4-in-6
+// datagram source matches a plain IPv4 entry and vice versa. Taking the
+// netip.Addr directly (rather than its string form) keeps the per-datagram
+// path free of an allocation and a re-parse.
+func (a *Allowlist) Contains(ip netip.Addr) bool {
+	if a.Len() == 0 || !ip.IsValid() {
 		return false
 	}
-	if _, ok := a.exact[norm]; ok {
+	ip = ip.Unmap()
+	if _, ok := a.exact[ip]; ok {
 		return true
 	}
-	ip = ip.Unmap()
 	for _, p := range a.prefix {
 		if p.Contains(ip) {
 			return true
@@ -171,18 +176,19 @@ func (a *Allowlist) Allows(norm string, ip netip.Addr) bool {
 }
 
 // rateLimiter is a fixed-window per-IP + global packet rate limiter for
-// the UDP echo loop.
+// the UDP echo loop. The per-IP budget is keyed by netip.Addr so the hot
+// path never builds a string for it.
 type rateLimiter struct {
 	mu        sync.Mutex
 	window    time.Time
-	perIP     map[string]int
+	perIP     map[netip.Addr]int
 	global    int
 	perIPCap  int
 	globalCap int
 }
 
 func newRateLimiter(perIPCap, globalCap int) *rateLimiter {
-	return &rateLimiter{perIP: make(map[string]int), perIPCap: perIPCap, globalCap: globalCap}
+	return &rateLimiter{perIP: make(map[netip.Addr]int), perIPCap: perIPCap, globalCap: globalCap}
 }
 
 // resetLocked rolls the fixed window forward when a second has elapsed.
@@ -219,7 +225,7 @@ func (r *rateLimiter) chargeGlobal() string {
 // (or, with no secret, passed the size/magic checks): junk from a
 // spoofed source inside an allowed CIDR must not spend a real client's
 // budget and read as 100% loss for that client.
-func (r *rateLimiter) chargeIP(ip string) string {
+func (r *rateLimiter) chargeIP(ip netip.Addr) string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.resetLocked(time.Now())
@@ -347,22 +353,30 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 	// hash+lookup on the hot path — the same resolve-once convention the
 	// client probe loop uses. Prefix-matched clients resolve their handles
 	// on demand under MaxClientSeries (see resolve below).
+	//
+	// keyed by netip.Addr: the datagram path looks up the unmapped source
+	// address directly, with no string allocation. key is the label value,
+	// materialised once per client (when its series is created).
 	type clientHandles struct {
 		recv prometheus.Counter
 		skew prometheus.Gauge
+		// key is the {client} label value (the canonical address string).
+		key string
 		// lastSeen ages dynamic entries out (DynClientTTL); unused for
 		// pre-resolved exact-IP handles, which are never evicted.
 		lastSeen time.Time
 	}
-	handles := make(map[string]clientHandles, allowed.Len())
+	handles := make(map[netip.Addr]clientHandles, allowed.Len())
 	for ip := range allowed.exact {
+		key := ip.String()
 		handles[ip] = clientHandles{
-			recv: ServerProbesReceived.WithLabelValues(source, ip),
-			skew: ServerClockSkew.WithLabelValues(source, ip),
+			recv: ServerProbesReceived.WithLabelValues(source, key),
+			skew: ServerClockSkew.WithLabelValues(source, key),
+			key:  key,
 		}
 	}
 	var dynMu sync.Mutex
-	dyn := make(map[string]clientHandles)
+	dyn := make(map[netip.Addr]clientHandles)
 	var lastSweep time.Time
 	// sweepExpired drops clients idle for DynClientTTL. Caller must hold
 	// dynMu. Both the map entry AND the Prometheus series are removed —
@@ -371,13 +385,13 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 	sweepExpired := func(now time.Time) {
 		for ip, eh := range dyn {
 			if now.Sub(eh.lastSeen) >= DynClientTTL {
-				ServerProbesReceived.DeleteLabelValues(source, ip)
-				ServerClockSkew.DeleteLabelValues(source, ip)
+				ServerProbesReceived.DeleteLabelValues(source, eh.key)
+				ServerClockSkew.DeleteLabelValues(source, eh.key)
 				delete(dyn, ip)
 			}
 		}
 	}
-	resolve := func(norm string) (clientHandles, bool) {
+	resolve := func(ip netip.Addr) (clientHandles, bool) {
 		dynMu.Lock()
 		defer dynMu.Unlock()
 		now := time.Now()
@@ -391,28 +405,29 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 			lastSweep = now
 			sweepExpired(now)
 		}
-		if h, ok := dyn[norm]; ok {
+		if h, ok := dyn[ip]; ok {
 			h.lastSeen = now
-			dyn[norm] = h
+			dyn[ip] = h
 			return h, true
 		}
 		if len(dyn) >= MaxClientSeries {
 			// Under pressure, sweep idle clients regardless of the gate
-			// above: a source may reach resolve before HMAC validation, so
-			// spoofed sources inside an allowed CIDR could otherwise pin
-			// every slot and black out all other CIDR-matched clients
-			// (client_overflow) permanently.
+			// above: spoofed sources inside an allowed CIDR could otherwise
+			// pin every slot and black out all other CIDR-matched clients
+			// (client_overflow) for as long as the flood lasts.
 			sweepExpired(now)
 		}
 		if len(dyn) >= MaxClientSeries {
 			return clientHandles{}, false
 		}
+		key := ip.String()
 		h := clientHandles{
-			recv:     ServerProbesReceived.WithLabelValues(source, norm),
-			skew:     ServerClockSkew.WithLabelValues(source, norm),
+			recv:     ServerProbesReceived.WithLabelValues(source, key),
+			skew:     ServerClockSkew.WithLabelValues(source, key),
+			key:      key,
 			lastSeen: now,
 		}
-		dyn[norm] = h
+		dyn[ip] = h
 		return h, true
 	}
 
@@ -491,17 +506,21 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 		// work: any internet host must not be able to buy HMAC-SHA256
 		// CPU per flood packet on a latency-measuring box. The echo
 		// responder is UDP-only, so ReadFrom yields a *net.UDPAddr whose
-		// IP is already canonical for the allowlist lookup (no string
-		// round-trip or double parsing).
+		// IP converts to a netip.Addr with no allocation and no string
+		// round-trip: the string form is materialised only when a log line
+		// or a new metric series actually needs it.
 		ua, ok := raddr.(*net.UDPAddr)
 		if !ok {
 			drops.invalidAddr.Inc()
 			continue
 		}
-		norm := ua.IP.String()
-		// ua.IP.String() of a socket-reported IP is always parseable.
-		na, _ := netip.ParseAddr(norm)
-		if !allowed.Allows(norm, na) {
+		na, ok := netip.AddrFromSlice(ua.IP)
+		if !ok {
+			drops.invalidAddr.Inc()
+			continue
+		}
+		na = na.Unmap()
+		if !allowed.Contains(na) {
 			drops.allowlist.Inc()
 			continue
 		}
@@ -565,7 +584,7 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 				// skew — must not be able to flood the log. The counter still
 				// records every rejection, so nothing is lost for alerting.
 				if lastReplayLog.IsZero() || time.Since(lastReplayLog) >= time.Minute {
-					slog.Warn("replayed or stale probe timestamp rejected (check NTP/clock sync)", "addr", norm, "skew", skew, "window", maxReplayWindow)
+					slog.Warn("replayed or stale probe timestamp rejected (check NTP/clock sync)", "addr", na.String(), "skew", skew, "window", maxReplayWindow)
 					lastReplayLog = time.Now()
 				}
 				continue
@@ -574,7 +593,7 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 		// Per-IP budget is charged here, after authentication (or, with no
 		// secret, after size/magic), so only frames that authenticate can
 		// consume the source's allowance.
-		if reason := rl.chargeIP(norm); reason != "" {
+		if reason := rl.chargeIP(na); reason != "" {
 			drops.rateIP.Inc()
 			continue
 		}
@@ -582,9 +601,9 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 		// the pre-resolved map with no lock, while prefix matches go through
 		// the capped dynamic map (H1 cardinality guard), and a frame dropped
 		// above for rate/HMAC/replay never allocates a series at all.
-		h, pre := handles[norm]
+		h, pre := handles[na]
 		if !pre {
-			res, resOK := resolve(norm)
+			res, resOK := resolve(na)
 			if !resOK {
 				drops.clientOverflow.Inc()
 				continue
