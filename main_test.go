@@ -592,10 +592,31 @@ func TestMetricsHandler_ConcurrencyCapReturns503(t *testing.T) {
 	}
 
 	// The next scrape arrives while both slots are held: 503, no gather.
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Errorf("a scrape beyond the %d-scrape cap must get 503, got %d", maxConcurrentScrapes, rec.Code)
+	// Served from a goroutine with a bound so a regression that removes the cap
+	// fails fast instead of hanging until the package timeout: if the cap is
+	// gone, the third request parks inside Gather and announces itself on
+	// g.entered (whose buffer this test drained above).
+	type result struct {
+		code int
+	}
+	third := make(chan result, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+		third <- result{code: rec.Code}
+	}()
+	select {
+	case got := <-third:
+		if got.code != http.StatusServiceUnavailable {
+			t.Errorf("a scrape beyond the %d-scrape cap must get 503, got %d", maxConcurrentScrapes, got.code)
+		}
+	case <-g.entered:
+		t.Error("the concurrency cap is not applied: a third scrape reached the gatherer")
+		close(g.release)
+		<-third // let it finish so the test can report cleanly
+		return
+	case <-time.After(5 * time.Second):
+		t.Fatal("the third scrape neither returned nor reached the gatherer")
 	}
 
 	close(g.release)
@@ -611,7 +632,7 @@ func TestMetricsHandler_ConcurrencyCapReturns503(t *testing.T) {
 	}
 
 	// And the cap must not leak: a scrape after the burst is served normally.
-	rec = httptest.NewRecorder()
+	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	if rec.Code != http.StatusOK {
 		t.Errorf("cap must release after the burst, got %d", rec.Code)
