@@ -127,8 +127,10 @@ func main() {
 	logW := io.Writer(os.Stdout)
 	if *flLogFile != "" {
 		if *flLogMaxSize == 0 {
+			// 0600 matches lumberjack's default: logs carry peer IPs and
+			// internal topology, so they are not world-readable.
 			// pi-lens-ignore: go-path-traversal
-			f, err := os.OpenFile(*flLogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+			f, err := os.OpenFile(*flLogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "open log file %q: %v\n", *flLogFile, err)
 				os.Exit(1)
@@ -426,7 +428,10 @@ func handleService(action string) {
 			os.Exit(1)
 		}
 	default:
+		// A typo like -svc=instal must not exit 0: the operator would
+		// read that as "installed" and get no service and no error.
 		slog.Error("Unknown action", "action", action)
+		os.Exit(1)
 	}
 }
 
@@ -491,6 +496,64 @@ func (p *program) Stop(s service.Service) error {
 		slog.Error("Service stop deadline exceeded")
 		return errors.New("service stop timed out after 20s")
 	}
+}
+
+// startMetricsServer binds addr, wires the metrics/status/probe handlers
+// and starts serving in a goroutine. It returns the server plus a channel
+// closed when serving stops; the listener is bound here rather than
+// lazily so a bind failure reaches the caller as an error and aborts
+// startup. String arguments are captured values, not flag reads: the
+// serve goroutine may outlive flag mutation by tests or shutdown code.
+func (p *program) startMetricsServer(addr, user, pass, cert, key string, statusReg *prober.StatusRegistry) (*http.Server, <-chan struct{}, error) {
+	metricsLn, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("metrics server: %w", err)
+	}
+	mx := http.NewServeMux()
+	mx.Handle("/metrics", prober.MetricsAuth(user, pass, promhttp.Handler()))
+	healthzHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		// pi-lens-ignore: go-ignored-call-result
+		_, _ = w.Write([]byte("ok\n"))
+	})
+	// /healthz and /readyz are deliberately unauthenticated: they are
+	// liveness/readiness probes that an orchestrator must reach without
+	// credentials, and they expose no data. Do not gate them.
+	mx.Handle("/healthz", healthzHandler)
+	mx.Handle("/readyz", healthzHandler)
+	// /status exposes live per-target probe state (link_up, inflight,
+	// misses, RTO, socket age). Gated like /metrics: open only when no
+	// metrics auth is configured.
+	mx.Handle("/status", prober.MetricsAuth(user, pass, statusReg.Handler()))
+	metricsSrv := &http.Server{
+		Handler:      mx,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  60 * time.Second,
+		// Bounded header read: ReadTimeout alone starts only after the
+		// headers land, so a slowloris client could otherwise hold a
+		// connection open indefinitely.
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	if cert != "" {
+		metricsSrv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	}
+	metricsDone := make(chan struct{})
+	go func() {
+		defer close(metricsDone)
+		slog.Info("Starting metrics server", "addr", addr, "tls", cert != "", "auth", user != "")
+		var serveErr error
+		if cert != "" {
+			serveErr = metricsSrv.ServeTLS(metricsLn, cert, key)
+		} else {
+			serveErr = metricsSrv.Serve(metricsLn)
+		}
+		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			slog.Error("Metrics server error", "err", serveErr)
+		}
+	}()
+	return metricsSrv, metricsDone, nil
 }
 
 // run initialises metrics, starts the Prometheus HTTP server, and
@@ -584,50 +647,11 @@ func (p *program) run() error {
 	// Bind the metrics listener before any probing starts so a bind
 	// failure (port taken, permission denied) aborts startup instead of
 	// leaving the agent running with no /metrics endpoint — a silent
-	// partial failure for a monitoring agent. Capture flag values before
-	// spawning the goroutine: it may outlive flag mutation by tests or
-	// shutdown code.
-	metricsAddr := *flMetrics
-	metricsLn, err := net.Listen("tcp", metricsAddr)
+	// partial failure for a monitoring agent.
+	metricsSrv, metricsDone, err := p.startMetricsServer(*flMetrics, user, pass, cert, key, statusReg)
 	if err != nil {
-		return fmt.Errorf("metrics server: %w", err)
+		return err
 	}
-	mx := http.NewServeMux()
-	mx.Handle("/metrics", prober.MetricsAuth(user, pass, promhttp.Handler()))
-	healthzHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok\n"))
-	})
-	mx.Handle("/healthz", healthzHandler)
-	mx.Handle("/readyz", healthzHandler)
-	// /status exposes live per-target probe state (link_up, inflight,
-	// misses, RTO, socket age). Gated like /metrics: open only when no
-	// metrics auth is configured.
-	mx.Handle("/status", prober.MetricsAuth(user, pass, statusReg.Handler()))
-	metricsSrv := &http.Server{
-		Handler:      mx,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		IdleTimeout:  60 * time.Second,
-	}
-	if cert != "" {
-		metricsSrv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
-	}
-	metricsDone := make(chan struct{})
-	go func() {
-		defer close(metricsDone)
-		slog.Info("Starting metrics server", "addr", metricsAddr, "tls", cert != "", "auth", user != "")
-		var serveErr error
-		if cert != "" {
-			serveErr = metricsSrv.ServeTLS(metricsLn, cert, key)
-		} else {
-			serveErr = metricsSrv.Serve(metricsLn)
-		}
-		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
-			slog.Error("Metrics server error", "err", serveErr)
-		}
-	}()
 
 	echoSecret := resolveEchoSecret()
 	echoSecretOld := resolveEchoSecretOld()
