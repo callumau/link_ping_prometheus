@@ -225,11 +225,16 @@ icacls "%LOG_DIR%" /inheritance:r /grant "SYSTEM:(OI)(CI)F" "Administrators:(OI)
 )
 
 :: Install (arguments are snapshotted at install time) --------------------------
+:: Every value is quoted: the wizard invites values with spaces (an allowlist
+:: written as "10.0.0.1, 10.0.0.2", a targets file under Program Files), and an
+:: unquoted space splits the argument list -- Go's flag parser then stops at the
+:: stray token, -svc=install is never seen and this script waits forever on a
+:: foreground agent instead of installing the service.
 set "INSTALL_ARGS=-mode=%RUN_MODE% -metrics=%METRICS_ADDR%"
-if not "%TARGETS_FILE%"==""  set "INSTALL_ARGS=%INSTALL_ARGS% -targets=%TARGETS_FILE%"
-if not "%SINGLE_TARGET%"=="" set "INSTALL_ARGS=%INSTALL_ARGS% -target=%SINGLE_TARGET%"
-if not "%ALLOW_LIST%"==""    set "INSTALL_ARGS=%INSTALL_ARGS% -allow=%ALLOW_LIST%"
-set "INSTALL_ARGS=%INSTALL_ARGS% -log-file=%LOG_DIR%\service.log"
+if not "%TARGETS_FILE%"==""  set "INSTALL_ARGS=%INSTALL_ARGS% -targets="%TARGETS_FILE%""
+if not "%SINGLE_TARGET%"=="" set "INSTALL_ARGS=%INSTALL_ARGS% -target="%SINGLE_TARGET%""
+if not "%ALLOW_LIST%"==""    set "INSTALL_ARGS=%INSTALL_ARGS% -allow="%ALLOW_LIST%""
+set "INSTALL_ARGS=%INSTALL_ARGS% -log-file="%LOG_DIR%\service.log""
 
 "%EXE_PATH%" %INSTALL_ARGS% -svc=install
 if errorlevel 1 (
