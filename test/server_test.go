@@ -5,10 +5,12 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"math"
 	"net"
 	"net/netip"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -801,6 +803,55 @@ func TestServer_MalformedFramesKeepServing(t *testing.T) {
 	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	if n, err := conn.Read(reply); err != nil || n != prober.PayloadSize {
 		t.Errorf("valid probe must be echoed after malformed frames: n=%d err=%v", n, err)
+	}
+}
+
+// erroringConn embeds a real PacketConn but fails every ReadFrom with a
+// non-ICMP error: the "this socket is genuinely broken" case, as opposed to
+// the ICMP-derived unreachability the loop classifies out. counts the calls
+// so the test can prove the loop backs off instead of spinning.
+type erroringConn struct {
+	net.PacketConn
+	reads atomic.Int64
+}
+
+func (c *erroringConn) ReadFrom([]byte) (int, net.Addr, error) {
+	c.reads.Add(1)
+	return 0, nil, errors.New("injected read failure")
+}
+
+// TestServer_ReadErrorsAreBoundedNotFatal: an unexpected read error must not
+// spin the echo loop at Debug level (invisible at default verbosity, and a
+// pegged core on a latency-measuring box), and must NOT kill the responder
+// either — a spoofed source inside the allowlist, or a peer that vanishes,
+// must never be able to take the echo server down. The loop therefore retries
+// on an Error-logged backoff.
+func TestServer_ReadErrorsAreBoundedNotFatal(t *testing.T) {
+	prober.InitMetrics()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	pc := &erroringConn{PacketConn: listenUDP(t, ctx)}
+	done := make(chan error, 1)
+	go func() { done <- prober.ServePacketConn(ctx, pc, testSource, testAllow, "") }()
+
+	// Without a backoff this would be millions of iterations; with one it is
+	// ~10 fast failures followed by ~3 per 100ms window.
+	time.Sleep(350 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("read errors must not kill the responder, got: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ServePacketConn did not return after cancel")
+	}
+
+	if n := pc.reads.Load(); n > 100 {
+		t.Errorf("the read-error path must back off, not spin: %d ReadFrom calls in 350ms", n)
+	} else if n < 10 {
+		t.Errorf("the loop must keep retrying after read errors, got only %d calls", n)
 	}
 }
 

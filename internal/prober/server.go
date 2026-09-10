@@ -29,6 +29,16 @@ const (
 	// the whole dynamic client map under dynMu, so running it on every
 	// resolve would be O(len(dyn)) at packet rate.
 	dynSweepInterval = time.Second
+	// maxConsecutiveServerReadFails bounds successive UNEXPECTED read
+	// errors. ICMP-derived errors are classified out (a vanished client, or
+	// a spoofed source inside the allowlist, is a normal condition — on
+	// Windows it even arrives as a read error), so what remains is a
+	// genuinely misbehaving socket. A bare `continue` there would spin at
+	// Debug level forever; the loop instead logs once at Error, sleeps
+	// serverReadErrorBackoff between attempts, and keeps serving, because a
+	// responder that an unreachable peer can kill is worse than a slow one.
+	maxConsecutiveServerReadFails = 10
+	serverReadErrorBackoff        = 100 * time.Millisecond
 )
 
 var (
@@ -307,6 +317,9 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 	rl := newRateLimiter(MaxPktsPerIP, MaxPktsGlobal)
 	var lastWriteLog time.Time
 	var lastReplayLog time.Time
+	// concurrent-read-failure state (see the read-error branch below).
+	consecutiveReadFails := 0
+	warnedReadErrors := false
 	// Pre-resolve the echo-failure counter once: a label lookup per write
 	// error would be pointless work on the hot path.
 	echoErrors := ServerEchoErrors.WithLabelValues(source)
@@ -443,11 +456,37 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				return nil
 			}
-			// Other read errors on an unconnected UDP socket are
-			// transient; the loop survives them.
+			if isPeerUnreachable(err) {
+				// A client (or a spoofed source inside an allowlisted CIDR)
+				// is unreachable: normal, and no reason to count toward the
+				// failure bound. Same classification as the client's reader.
+				consecutiveReadFails = 0
+				slog.Debug("UDP read error (peer unreachable)", "err", err)
+				continue
+			}
+			// Unexpected read errors on an unconnected UDP socket are
+			// transient; the loop survives them, but bounded so a socket that
+			// fails persistently cannot peg a core at Debug level.
+			consecutiveReadFails++
+			if consecutiveReadFails >= maxConsecutiveServerReadFails {
+				if !warnedReadErrors {
+					warnedReadErrors = true
+					slog.Error("Persistent UDP read errors; backing off (echo service degraded)",
+						"consecutive_failures", consecutiveReadFails, "err", err)
+				}
+				select {
+				// pi-lens-ignore: waitgroup-done-scope
+				case <-ctx.Done():
+					return nil
+				case <-time.After(serverReadErrorBackoff):
+				}
+				continue
+			}
 			slog.Debug("UDP read error", "err", err)
 			continue
 		}
+		consecutiveReadFails = 0
+		warnedReadErrors = false
 		// Cheap untrusted-source rejection MUST stay ahead of crypto
 		// work: any internet host must not be able to buy HMAC-SHA256
 		// CPU per flood packet on a latency-measuring box. The echo
