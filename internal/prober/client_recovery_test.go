@@ -628,33 +628,69 @@ func TestProbeTarget_ReaderDeathRedials(t *testing.T) {
 	defer cancel()
 
 	var dials atomic.Int64
+	// Two-phase seam: a REAL socket to a real echo responder first (so the
+	// link is genuinely up and link_up=1 before the failure), then a conn whose
+	// SetReadDeadline always fails, which kills the reader.
+	var dead atomic.Bool
 	old := dialUDP
-	dialUDP = func(context.Context, string, string) (net.Conn, error) {
+	dialUDP = func(ctx context.Context, network, address string) (net.Conn, error) {
 		dials.Add(1)
-		return newDeadlineFailConn(), nil
+		if dead.Load() {
+			return newDeadlineFailConn(), nil
+		}
+		return old(ctx, network, address)
 	}
 	defer func() { dialUDP = old }()
 
-	const src, name, addr = "test", "reader_dead", "127.0.0.1:4000"
-	// 10ms interval: the short-lived reader (3×15ms) still sees several
-	// probes in flight before it dies, so the flush is genuinely exercised.
-	cfg := Config{Source: src, BaseInterval: 10 * time.Millisecond, BaseTimeout: 300 * time.Millisecond}
+	addr := wbRealEchoServer(t, ctx, "")
+	const src, name = "test", "reader_dead"
+	// 10ms interval so the short-lived reader (3×15ms) still sees several
+	// probes in flight before it dies, and a short reconnect cycle so the
+	// re-dial happens inside the test window.
+	cfg := Config{Source: src, BaseInterval: 10 * time.Millisecond, BaseTimeout: 300 * time.Millisecond, ReconnectInterval: 150 * time.Millisecond}
 	done := make(chan struct{})
 	go func() {
 		probeTarget(ctx, Target{Name: name, Address: addr}, cfg)
 		close(done)
 	}()
 
-	// A second dial proves the loop re-dialed after the bounded pause
-	// instead of exiting on reader death.
-	dialDeadline := time.Now().Add(1800 * time.Millisecond)
-	for time.Now().Before(dialDeadline) && dials.Load() < 2 {
+	// Phase 1: prove the link UP through the real echo server. Without this
+	// the link_up==0 assertion below would hold trivially from the initial 0
+	// and could not fail (the regression it must catch is a FROZEN 1).
+	upDeadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(upDeadline) && wbGauge(LinkUp, src, name, addr) != 1 {
 		time.Sleep(10 * time.Millisecond)
+	}
+	if wbGauge(LinkUp, src, name, addr) != 1 || wbHistCount(src, name, addr) == 0 {
+		cancel()
+		<-done
+		t.Fatalf("link never came up on the real echo server (rtt_samples=%v link_up=%v) — test setup broken",
+			wbHistCount(src, name, addr), wbGauge(LinkUp, src, name, addr))
+	}
+
+	// Phase 2: kill the reader on every re-dial. A second dial proves the loop
+	// re-dialed after the bounded pause instead of exiting on reader death.
+	dead.Store(true)
+	dialDeadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(dialDeadline) && dials.Load() < 2 {
+		time.Sleep(5 * time.Millisecond)
 	}
 	if dials.Load() < 2 {
 		cancel()
 		<-done
 		t.Fatalf("reader death must trigger a re-dial, got %d dials", dials.Load())
+	}
+	// The abandoned probes count toward the link-up miss threshold, so a
+	// PERSISTENT reader failure must drop link_up rather than leave a frozen
+	// green while nothing is being echoed.
+	deathDeadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deathDeadline) && wbGauge(LinkUp, src, name, addr) != 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if up := wbGauge(LinkUp, src, name, addr); up != 0 {
+		cancel()
+		<-done
+		t.Fatalf("link_up stayed %v across persistent reader deaths — a frozen green is the worst failure mode", up)
 	}
 	if got := wbCounterLabels(ProberInternalErrors, src, name, addr, "reader_dead"); got < 1 {
 		t.Errorf("reader death must be counted in link_prober_internal_errors_total{reason=reader_dead}, got %v", got)
