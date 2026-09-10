@@ -7,9 +7,12 @@ import (
 	"encoding/binary"
 	"math"
 	"net"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 
 	"link_ping_prometheus/internal/prober"
 )
@@ -916,6 +919,335 @@ func TestServer_ClientSeriesOverflow(t *testing.T) {
 	}
 	if n := getCounterValue(prober.ServerProbesDropped, "client_overflow"); n < 1 {
 		t.Errorf("expected at least 1 client_overflow drop, got %v", n)
+	}
+}
+
+// TestAllowlist_IPv4Mapped: allowlist entries written in 4-in-6 form
+// (::ffff:127.0.0.1, ::ffff:127.0.0.0/104) must match the dotted-quad
+// source a UDP datagram actually reports. netip does not unmap addresses
+// or prefixes on its own, so without the ParseAllowlist normalisation a
+// 4-in-6 entry silently admitted nothing. Table-driven per AGENTS.md's
+// rule that security controls get good/bad-frame coverage.
+func TestAllowlist_IPv4Mapped(t *testing.T) {
+	cases := []struct {
+		name      string
+		entry     string
+		norm      string
+		wantAllow bool
+	}{
+		{"mapped exact admits canonical v4 source", "::ffff:127.0.0.1", "127.0.0.1", true},
+		{"mapped exact rejects a different v4 source", "::ffff:127.0.0.1", "127.0.0.2", false},
+		{"mapped /104 prefix admits an inside source", "::ffff:127.0.0.0/104", "127.0.0.1", true},
+		{"mapped /104 prefix rejects an outside source", "::ffff:127.0.0.0/104", "10.0.0.1", false},
+		{"plain v4 exact still admits its source", "127.0.0.1", "127.0.0.1", true},
+		{"plain v4 exact still rejects other sources", "127.0.0.1", "127.0.0.2", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			al := mustAllow(tc.entry)
+			ip := netip.MustParseAddr(tc.norm)
+			if got := al.Allows(tc.norm, ip); got != tc.wantAllow {
+				t.Errorf("Allows(%q, %s) with entry %q = %v, want %v", tc.norm, ip, tc.entry, got, tc.wantAllow)
+			}
+		})
+	}
+
+	// End-to-end: a server armed with a 4-in-6 exact entry must echo a real
+	// client whose datagram source canonicalises to 127.0.0.1 — the case
+	// that silently admitted nothing before the Unmap fix.
+	prober.InitMetrics()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	defer func() {
+		cancel()
+		<-done
+	}()
+	pc := listenUDP(t, ctx)
+	allowed := mustAllow("::ffff:127.0.0.1")
+	go func() {
+		prober.ServePacketConn(ctx, pc, testSource, allowed, "")
+		close(done)
+	}()
+
+	conn, probe := dialProbe(t, pc.LocalAddr().String())
+	defer conn.Close()
+	conn.Write(probe)
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if n, err := conn.Read(make([]byte, prober.PayloadSize)); err != nil || n != prober.PayloadSize {
+		t.Fatalf("client on 127.0.0.1 must be echoed by a ::ffff:127.0.0.1 allowlist: n=%d err=%v", n, err)
+	}
+}
+
+// TestServer_RateLimit_JunkDoesNotSpendPerIPBudget (R3 case A): with HMAC
+// enabled, forged frames that fail authentication must NOT consume the
+// source's per-IP budget. The per-IP charge runs only after a frame
+// authenticates, so a flood of spoofed junk (correct size+magic, bad tag)
+// cannot push a real client's valid probe over MaxPktsPerIP and fake 100%
+// loss for that client. Before the fix the forged frames spent the cap and
+// the valid probe was dropped as rate_ip.
+func TestServer_RateLimit_JunkDoesNotSpendPerIPBudget(t *testing.T) {
+	prober.InitMetrics()
+	oldIP, oldGlobal := prober.MaxPktsPerIP, prober.MaxPktsGlobal
+	prober.MaxPktsPerIP = 1 // a single authenticated frame exhausts the budget
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	defer func() {
+		cancel()
+		<-done // join before restoring the shared cap vars
+		prober.MaxPktsPerIP, prober.MaxPktsGlobal = oldIP, oldGlobal
+	}()
+
+	const secret = "rate-order-secret"
+	pc := listenUDP(t, ctx)
+	allowed := mustAllow("127.0.0.1")
+	go func() {
+		prober.ServePacketConn(ctx, pc, testSource, allowed, secret)
+		close(done)
+	}()
+	addr := pc.LocalAddr().String()
+
+	conn, err := net.Dial("udp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	beforeHMAC := getCounterValue(prober.ServerProbesDropped, "hmac")
+	beforeIP := getCounterValue(prober.ServerProbesDropped, "rate_ip")
+
+	now := uint64(time.Now().UnixNano())
+	// Five correctly-sized, correctly-magicked frames with a wrong tag: all
+	// reach the HMAC gate and are rejected there, never authenticating.
+	for i := range 5 {
+		conn.Write(buildHMACFrame("wrong-secret", uint64(i+1), now))
+	}
+
+	// The one legitimately authenticated probe must still be echoed: it is
+	// the first frame to spend this source's per-IP budget. Reading its echo
+	// is also the sync point proving the server processed the forged frames.
+	conn.Write(buildHMACFrame(secret, 100, uint64(time.Now().UnixNano())))
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, _ := conn.Read(make([]byte, 1500))
+	if n != prober.PayloadSizeWithHMAC {
+		t.Fatalf("valid probe must be echoed after forged frames, got %d bytes", n)
+	}
+
+	if got := getCounterValue(prober.ServerProbesDropped, "hmac") - beforeHMAC; got != 5 {
+		t.Errorf("all 5 forged frames must be dropped as hmac, got +%v", got)
+	}
+	if got := getCounterValue(prober.ServerProbesDropped, "rate_ip") - beforeIP; got != 0 {
+		t.Errorf("forged junk must not spend the per-IP budget (rate_ip must stay flat), got +%v", got)
+	}
+}
+
+// TestServer_RateLimit_GlobalChargeBoundsCrypto (R3 case B): the global
+// budget is charged BEFORE validation, so a forged-frame flood is bounded
+// before any HMAC-SHA256 work and a following authenticated probe is also
+// dropped once the global cap is exhausted — an untrusted source cannot buy
+// crypto CPU per packet. Before the fix the global charge ran after
+// validation, so forged frames were only counted after they had already
+// cost the server a hash (and the valid probe would sail through).
+func TestServer_RateLimit_GlobalChargeBoundsCrypto(t *testing.T) {
+	prober.InitMetrics()
+	oldIP, oldGlobal := prober.MaxPktsPerIP, prober.MaxPktsGlobal
+	prober.MaxPktsGlobal = 3
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	defer func() {
+		cancel()
+		<-done // join before restoring the shared cap vars
+		prober.MaxPktsPerIP, prober.MaxPktsGlobal = oldIP, oldGlobal
+	}()
+
+	const secret = "rate-order-secret"
+	pc := listenUDP(t, ctx)
+	allowed := mustAllow("127.0.0.1")
+	go func() {
+		prober.ServePacketConn(ctx, pc, testSource, allowed, secret)
+		close(done)
+	}()
+	addr := pc.LocalAddr().String()
+
+	conn, err := net.Dial("udp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	beforeGlobal := getCounterValue(prober.ServerProbesDropped, "rate_global")
+
+	now := uint64(time.Now().UnixNano())
+	// More forged frames than the global cap, all written back-to-back. The
+	// limiter's 1s window is anchored at the first frame, so the whole test
+	// fits inside one window.
+	for i := range 5 {
+		conn.Write(buildHMACFrame("wrong-secret", uint64(i+1), now))
+	}
+	// Authenticated, freshly timestamped, allowlisted — dropped solely
+	// because the global budget was spent before validation ran.
+	conn.Write(buildHMACFrame(secret, 100, uint64(time.Now().UnixNano())))
+
+	conn.SetReadDeadline(time.Now().Add(400 * time.Millisecond))
+	if n, _ := conn.Read(make([]byte, 1500)); n != 0 {
+		t.Fatalf("probe beyond the global cap must be dropped, got %d bytes", n)
+	}
+	if got := getCounterValue(prober.ServerProbesDropped, "rate_global") - beforeGlobal; got < 1 {
+		t.Errorf("frames beyond MaxPktsGlobal must be charged as rate_global before validation, got +%v", got)
+	}
+}
+
+// TestServer_PerTargetIntervalOverride: a target's per-target Interval must
+// drive its own probe schedule instead of the global BaseInterval (the
+// override plumbing; 0 means inherit). Two targets share one echo server
+// with a global BaseInterval of 1s, so only the 50ms/200ms overrides can
+// produce a large sent-count gap. The ratio is 4 in a quiet run; asserting
+// >= 1.5 leaves room for scheduler jitter under load while still failing if
+// the override were ignored (ratio would be 1.0).
+// pi-lens-ignore: go-test-functions
+func TestServer_PerTargetIntervalOverride(t *testing.T) {
+	prober.InitMetrics()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	addr := startEchoServer(ctx, t)
+	cfg := cfgWith(false, time.Second, time.Second,
+		prober.Target{Name: "fast", Address: addr, Interval: 50 * time.Millisecond},
+		prober.Target{Name: "slow", Address: addr, Interval: 200 * time.Millisecond},
+	)
+
+	runClientFor(ctx, cfg, 2*time.Second)
+	cancel()
+	time.Sleep(100 * time.Millisecond)
+
+	fast := getCounterValue(prober.ProbesSent, "fast", addr)
+	slow := getCounterValue(prober.ProbesSent, "slow", addr)
+	// Vacuous-pass guard: both loops must actually have probed.
+	if fast <= 3 || slow <= 3 {
+		t.Fatalf("both targets must have probed: fast=%v slow=%v (cpu load?)", fast, slow)
+	}
+	if fast < 1.5*slow {
+		t.Errorf("per-target interval override not applied: fast sent %v, slow sent %v (want fast >= 1.5*slow)", fast, slow)
+	}
+}
+
+// serverSeriesExists reports whether a metric family currently has a series
+// whose label set EQUALS labels. reload_test.go's metricSeriesExists matches
+// only the 3-label client shape {source,target,address} and compares label
+// cardinality, so it can never match a 2-label server family like
+// link_server_probes_received_total{source,client} — it would return false
+// vacuously. This helper takes an explicit label map instead. Like that
+// helper it uses Gather(), not WithLabelValues, which would re-create a
+// deleted series at zero and make a "was it deleted?" assertion impossible
+// to fail.
+func serverSeriesExists(t *testing.T, family string, labels map[string]string) bool {
+	t.Helper()
+	fams, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("gather metrics: %v", err)
+	}
+	for _, f := range fams {
+		if f.GetName() != family {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			if len(m.GetLabel()) != len(labels) {
+				continue
+			}
+			match := true
+			for _, lp := range m.GetLabel() {
+				if labels[lp.GetName()] != lp.GetValue() {
+					match = false
+					break
+				}
+			}
+			if match {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// TestServer_DynamicClientEviction (R2): under MaxClientSeries pressure the
+// server sweeps clients idle for DynClientTTL, freeing a slot AND deleting
+// the evicted client's metric series. This pins both halves of the fix:
+//   - blackout lift: a source dropped with client_overflow while all slots
+//     were held by fresh clients is admitted again once those clients age out;
+//   - lifetime cardinality: the evicted client's series is DELETED, not left
+//     registered forever at its last value (a vec keeps a series per label set
+//     for the life of the process).
+func TestServer_DynamicClientEviction(t *testing.T) {
+	prober.InitMetrics()
+	oldCap, oldTTL := prober.MaxClientSeries, prober.DynClientTTL
+	// 500ms rather than a tight 100ms: the blackout phase only needs the three
+	// probes to land within the TTL (microseconds on loopback), while a long TTL
+	// keeps the post-sleep eviction assertion robust against scheduler stalls.
+	prober.MaxClientSeries, prober.DynClientTTL = 2, 500*time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	defer func() {
+		cancel()
+		<-done // join before restoring the shared vars
+		prober.MaxClientSeries, prober.DynClientTTL = oldCap, oldTTL
+	}()
+
+	pc := listenUDP(t, ctx)
+	allowed := mustAllow("127.0.0.0/8") // CIDR entry -> clients take the dynamic path
+	go func() {
+		prober.ServePacketConn(ctx, pc, testSource, allowed, "")
+		close(done)
+	}()
+	addr := pc.LocalAddr().String()
+
+	// Dial all three first so the window between the last admitted probe and
+	// the overflow probe stays far below DynClientTTL.
+	c2 := dialFrom(t, addr, net.IPv4(127, 0, 0, 2))
+	defer c2.Close()
+	c3 := dialFrom(t, addr, net.IPv4(127, 0, 0, 3))
+	defer c3.Close()
+	c4 := dialFrom(t, addr, net.IPv4(127, 0, 0, 4))
+	defer c4.Close()
+
+	// Two clients fill the MaxClientSeries=2 dynamic slots.
+	if !echoOnce(t, c2) {
+		t.Fatal("first CIDR client (127.0.0.2) must be echoed")
+	}
+	if !echoOnce(t, c3) {
+		t.Fatal("second CIDR client (127.0.0.3) must be echoed")
+	}
+	if !serverSeriesExists(t, "link_server_probes_received_total", map[string]string{"source": testSource, "client": "127.0.0.2"}) {
+		t.Fatal("admitted dynamic client 127.0.0.2 must have a metric series")
+	}
+
+	// A third distinct source with all slots held by fresh clients: blacked
+	// out with client_overflow rather than admitted.
+	beforeOverflow := getCounterValue(prober.ServerProbesDropped, "client_overflow")
+	if echoOnce(t, c4) {
+		t.Fatal("source beyond MaxClientSeries with no idle slot must be dropped")
+	}
+	if got := getCounterValue(prober.ServerProbesDropped, "client_overflow") - beforeOverflow; got < 1 {
+		t.Errorf("expected a client_overflow drop, got +%v", got)
+	}
+
+	// Past DynClientTTL the sweep frees the stale slot, so the source that
+	// was just blacked out is admitted again (the R2 blackout-lift fix).
+	time.Sleep(800 * time.Millisecond)
+	if !echoOnce(t, c4) {
+		t.Fatal("source must be echoed once DynClientTTL frees a slot")
+	}
+	if got := getCounterValue(prober.ServerProbesReceived, "127.0.0.4"); got < 1 {
+		t.Errorf("evicted-then-admitted client must be counted, got %v", got)
+	}
+
+	// The sweep must also DELETE the evicted client's series: the vec keeps a
+	// series per label set for the process lifetime, so dropping only the map
+	// entry would leave lifetime cardinality growing unbounded. The control
+	// assertion above (series present while admitted) proves this is not vacuous.
+	if serverSeriesExists(t, "link_server_probes_received_total", map[string]string{"source": testSource, "client": "127.0.0.2"}) {
+		t.Error("evicted client's link_server_probes_received_total series is still registered — series deletion is broken")
 	}
 }
 

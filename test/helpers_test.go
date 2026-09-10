@@ -197,7 +197,11 @@ func runClientAsync(t *testing.T, ctx context.Context, cancel context.CancelFunc
 
 // dialFrom opens a UDP connection to addr bound to the given source IP,
 // for tests that exercise per-source server behavior (rate limits,
-// allowlist prefixes).
+// allowlist prefixes). Not every host can bind a loopback alias
+// (127.0.0.2, 127.0.0.3, ...) — Windows local runs notably cannot — so a
+// bind failure SKIPS the calling test instead of failing it: whether a
+// loopback alias is addressable is an environment property, not the
+// property under test.
 func dialFrom(t *testing.T, addr string, ip net.IP) net.Conn {
 	t.Helper()
 	dst, err := net.ResolveUDPAddr("udp", addr)
@@ -206,7 +210,7 @@ func dialFrom(t *testing.T, addr string, ip net.IP) net.Conn {
 	}
 	conn, err := net.DialUDP("udp", &net.UDPAddr{IP: ip, Port: 0}, dst)
 	if err != nil {
-		t.Fatal(err)
+		t.Skipf("source address %s is not bindable on this host (loopback aliases are Linux-only): %v", ip, err)
 	}
 	return conn
 }

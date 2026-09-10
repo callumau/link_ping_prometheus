@@ -171,6 +171,67 @@ func TestConfigValidate_RejectsBadNames(t *testing.T) {
 	}
 }
 
+// TestConfigValidate_PerTargetIntervalTimeout pins the per-target
+// Interval/Timeout rules through Config.Validate: 0 means "inherit the
+// global value" and is accepted; a positive override is accepted; a
+// negative duration is rejected (it would flow into the probe schedule as
+// an unusable period).
+func TestConfigValidate_PerTargetIntervalTimeout(t *testing.T) {
+	base := func(tg prober.Target) prober.Config {
+		return prober.Config{Targets: []prober.Target{tg}, BaseInterval: time.Second, BaseTimeout: 2 * time.Second}
+	}
+	cases := []struct {
+		name    string
+		target  prober.Target
+		wantErr bool
+	}{
+		{"zero interval and timeout inherit global", prober.Target{Name: "a", Address: "127.0.0.1:4000"}, false},
+		{"positive overrides accepted", prober.Target{Name: "a", Address: "127.0.0.1:4000", Interval: 50 * time.Millisecond, Timeout: 200 * time.Millisecond}, false},
+		{"negative interval rejected", prober.Target{Name: "a", Address: "127.0.0.1:4000", Interval: -time.Millisecond}, true},
+		{"negative timeout rejected", prober.Target{Name: "a", Address: "127.0.0.1:4000", Timeout: -time.Millisecond}, true},
+	}
+	for _, tc := range cases {
+		assertValidate(t, tc.name, base(tc.target), tc.wantErr)
+	}
+}
+
+// TestLoadTargets_PerTargetIntervalTimeout pins the same rules on the
+// targets.json path: LoadTargets re-validates through validateTargets, so a
+// negative duration written in the file must be rejected at load time (a
+// hot-reload keeps the previous set running) rather than slipping into a
+// probe loop.
+func TestLoadTargets_PerTargetIntervalTimeout(t *testing.T) {
+	cases := []struct {
+		name    string
+		body    string
+		wantErr bool
+	}{
+		{"omitted inherits global", `[{"name":"a","address":"127.0.0.1:4000"}]`, false},
+		{"explicit zero inherits global", `[{"name":"a","address":"127.0.0.1:4000","interval":"0s","timeout":"0s"}]`, false},
+		{"positive overrides accepted", `[{"name":"a","address":"127.0.0.1:4000","interval":"50ms","timeout":"200ms"}]`, false},
+		{"negative interval rejected", `[{"name":"a","address":"127.0.0.1:4000","interval":"-50ms"}]`, true},
+		{"negative timeout rejected", `[{"name":"a","address":"127.0.0.1:4000","timeout":"-200ms"}]`, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f, err := os.CreateTemp("", "targets-per-target-*.json")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.Remove(f.Name())
+			if _, err := f.WriteString(tc.body); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := prober.LoadTargets(f.Name()); (err != nil) != tc.wantErr {
+				t.Errorf("LoadTargets error = %v, wantErr %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestLoadTargets_DuplicateNames(t *testing.T) {
 	tmpfile, err := os.CreateTemp("", "targets-dup-*.json")
 	if err != nil {
