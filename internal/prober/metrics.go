@@ -18,9 +18,11 @@ import (
 // The 3s edge keeps samples from degraded-but-alive links (RTT between
 // 2.5s and the 3s RTO cap) out of +Inf so histogram_quantile stays exact.
 // Buckets above the RTO cap would be dead weight: any probe unresolved
-// past the RTO is counted as loss and its late response discarded, so RTT
-// samples can never approach 5s/10s. +Inf is always appended by the
-// Prometheus client.
+// past the RTO is counted as loss and its late response discarded. One
+// exception, deliberately left to +Inf: a link whose SRTT exceeds 1.5s
+// applies a timeout ABOVE the 3s cap (CurrentRTO floors at 2*SRTT so such
+// links are not falsely timed out), and its late-but-real samples land in
+// +Inf — see the RTOEstimate Help text.
 var RTTBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 3.0}
 
 // Prometheus metric descriptors. All use the label set {source, target, address}.
@@ -31,7 +33,7 @@ var (
 	}, []string{"source", "target", "address"})
 	ProbesTimedOut = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "link_probes_timed_out_total",
-		Help: "Total probes with no echo within the RTO. Loss = rate(timed_out) / rate(sent). No TCP retransmission: this is true network loss.",
+		Help: "Total probes whose echo did not arrive within their RTO (a probe is retired at the first probe tick after its deadline, so an echo up to one -interval late still counts as latency). Loss = rate(timed_out) / rate(sent). No TCP retransmission: this is true network loss.",
 	}, []string{"source", "target", "address"})
 	SendErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "link_probes_send_errors_total",
@@ -68,7 +70,7 @@ var (
 	// window can be queried.
 	RTTSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:                        "link_rtt_seconds",
-		Help:                        "Round-trip time in seconds.",
+		Help:                        "Round-trip time in seconds. Samples beyond the largest finite bucket (3s) can only come from a link whose applied RTO exceeded the 3s cap (SRTT above 1.5s) — see link_rto_seconds.",
 		Buckets:                     RTTBuckets,
 		NativeHistogramBucketFactor: 1.1,
 	}, []string{"source", "target", "address"})
@@ -88,7 +90,7 @@ var (
 	}, []string{"source", "target", "address"})
 	RTOEstimate = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "link_rto_seconds",
-		Help: "Current adaptive RTO (RFC 6298: SRTT + 4*RTTVAR, doubled on consecutive timeouts). Floor is max(200ms, 2*SRTT) so a link's timeout always has headroom over its measured RTT.",
+		Help: "Current adaptive RTO (RFC 6298: SRTT + 4*RTTVAR, doubled on consecutive timeouts). Floor is max(200ms, 2*SRTT), so a link whose SRTT exceeds 1.5s applies a timeout above the 3s cap — the cap bounds the backoff value, not the floor, or those links would be falsely read as loss.",
 	}, []string{"source", "target", "address"})
 	SRTTSeconds = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "link_rtt_srtt_seconds",

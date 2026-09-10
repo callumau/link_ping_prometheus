@@ -112,18 +112,18 @@ The exporter exposes the following metrics at `/metrics` (default port 2112).
 | --- | --- | --- | --- |
 | `link_up` | Gauge | `source`, `target`, `address` | 1 while probes are getting echoes, 0 after 3 consecutive probes time out or probing becomes structurally impossible (persistent local send failures, dial/DNS retry). A single lost probe or brief stall does not flap the state. |
 | `link_probes_sent_total` | Counter | `source`, `target`, `address` | Total UDP probes sent. Probes into a down link still count as sent and time out naturally, so loss reads ~100% during an outage. |
-| `link_probes_timed_out_total` | Counter | `source`, `target`, `address` | Total probes with no echo within the RTO — true network loss. |
+| `link_probes_timed_out_total` | Counter | `source`, `target`, `address` | Total probes whose echo did not arrive within their RTO — true network loss. A probe is retired at the first probe tick *after* its deadline, so with `-interval` ≤ `-timeout` an echo up to one interval late still counts as latency, never loss (the effective deadline is RTO + up to one interval). |
 | `link_probes_corrupted_total` | Counter | `source`, `target`, `address` | Probes whose echo came back with corrupted payload bytes (`-payload` mode only): magic, sequence and timestamp intact, data altered in flight. Data-path corruption, not loss — the round trip completed. |
 | `link_mtu_probes_sent_total` | Counter | `source`, `target`, `address` | DF-set probes sent by the periodic MTU sweep (`-mtu-sweep`), counted per ATTEMPT: a size that gets no echo is retried once before the search steps down, so this is a probe rate, not a distinct-size rate (up to ~2x the probes for the same path; a healthy full-size path still costs one). Deliberately separate from the main counters: never in the loss ratio or the sent/rtt/timed_out balance. |
 | `link_mtu_probes_lost_total` | Counter | `source`, `target`, `address` | DF-set MTU probes with no echo, per attempt like `sent` (a size that fails twice counts twice), so lost/sent stays a per-probe ratio: sizes the path does not survive. Rising lost with healthy main probes = PMTUD blackhole (works-small-fails-big). |
-| `link_path_mtu_bytes` | Gauge | `source`, `target`, `address` | Largest probe frame (header + payload, excluding IP/UDP overhead) that round-trips with DF set; 0 until the first successful sweep. A full-size Ethernet path reads 1424. |
+| `link_path_mtu_bytes` | Gauge | `source`, `target`, `address` | Largest probe frame (header + payload, excluding IP/UDP overhead) that round-trips with DF set; 0 until the first successful sweep. A full-size Ethernet path reads 1424, or 1432 with `-echo-secret` (the header grows from 24 to 32 bytes there). |
 | `link_probes_send_errors_total` | Counter | `source`, `target`, `address` | Probes that failed to send locally (UDP write errors). Never on the wire, so never in `link_probes_sent_total`; sustained rate means a local NIC/socket problem, not network loss. |
 | `link_prober_internal_errors_total` | Counter | `source`, `target`, `address`, `reason` | Prober-internal failures (`reason`: `panic`, `reader_dead`, `dial_retry`, `stop_timeout`) — not link conditions. A rising rate means this target's probe numbers are unreliable; check the agent's own logs and socket state. |
 | `link_probes_inflight` | Gauge | `source`, `target`, `address` | Current number of probes sent but waiting for a response or timeout. Grows during stalls. |
-| `link_rtt_seconds` | Histogram | `source`, `target`, `address` | RTT histogram with explicit buckets `{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 3.0}` s plus native histogram support (`NativeHistogramBucketFactor` 1.1). Buckets stop at 3s (the RTO cap): anything slower counts as loss, so higher buckets would never fill. |
+| `link_rtt_seconds` | Histogram | `source`, `target`, `address` | RTT histogram with explicit buckets `{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 3.0}` s plus native histogram support (`NativeHistogramBucketFactor` 1.1). Buckets stop at 3s, the RTO cap: an echo that misses its RTO is counted as loss and discarded, so higher edges would stay empty — except on a link whose SRTT exceeds 1.5s, where the applied timeout floors at 2×SRTT and is therefore *above* 3s, and its samples land in `+Inf`. |
 | `link_rtt_seconds_bucket/sum/count` | Histogram | `source`, `target`, `address` | Classic-bucket series; quantiles and means are derived in PromQL over any window. |
-| `link_rtt_jitter_seconds` | Gauge | `source`, `target`, `address` | Smoothed RTT jitter in seconds (RFC 3550 §6.4.1). Resets after a sequence gap (a timed-out probe), so link recovery never spikes the gauge. |
-| `link_rto_seconds` | Gauge | `source`, `target`, `address` | Current adaptive RTO in use (RFC 6298, doubled on consecutive timeouts; floor `max(200ms, 2×SRTT)`). |
+| `link_rtt_jitter_seconds` | Gauge | `source`, `target`, `address` | Smoothed RTT jitter in seconds (RFC 3550 §6.4.1). Resets to 0 on the first echo after a sequence gap (a timed-out probe), so link recovery never spikes the gauge; during a total outage it holds its last value until that echo. |
+| `link_rto_seconds` | Gauge | `source`, `target`, `address` | Current adaptive RTO in use (RFC 6298, doubled on consecutive timeouts; floor `max(200ms, 2×SRTT)`). The 3s cap bounds the backoff value, **not** the floor: a link whose SRTT exceeds 1.5s applies a timeout above 3s, deliberately, or it would be read as loss. |
 | `link_rtt_srtt_seconds` | Gauge | `source`, `target`, `address` | Smoothed RTT estimate (RFC 6298 SRTT), a window-independent latency signal for dashboards and baseline-shift alerts. Stays 0 with adaptive mode disabled. |
 | `link_server_probes_received_total` | Counter | `source`, `client` | Valid probes received by the server, per remote client IP (server mode only). Cross-check against the client's sent counter — mismatches may also be echo write failures, see `link_server_echo_errors_total`. Includes MTU-sweep probes (they carry the same header frame), so subtract `rate(link_mtu_probes_sent_total)` before reading a mismatch as wire loss. A CIDR-matched client idle past the server's TTL loses this series and restarts it at 0 on return — see Security. |
 | `link_server_echo_errors_total` | Counter | `source` | Validated probes the server failed to echo back (local UDP write error). The client counts these as loss, so subtract this rate before attributing a received/sent mismatch to the network. |
@@ -183,8 +183,11 @@ Two rules that trip people up:
 ```
 
 True network loss: each probe is a UDP datagram and UDP never
-retransmits, so a probe without an echo within the RTO was genuinely lost
-on the wire. With a link loss simulator (e.g. clumsy) at X%, expect the
+retransmits, so a probe without an echo was genuinely lost on the wire.
+The deadline is the RTO, applied at the first probe tick after it expires
+(so with `-interval` ≤ `-timeout` a very late echo can still be recorded as
+latency instead of loss; see the `link_probes_timed_out_total` row above).
+With a link loss simulator (e.g. clumsy) at X%, expect the
 ratio to read X%. During a full outage probes are sent into the void and
 time out naturally, so the ratio reads **~100%** — no fabricated counters
 and no PromQL `OR` workaround. Pair with `link_up == 0` for reachability
@@ -251,11 +254,14 @@ fully down, so latency is a gap (not 0) during an outage — combine with
 `link_up`.
 
 Explicit buckets cover sub-100ms LAN RTTs (5ms lower bound) up to the
-adaptive RTO cap at 3s; values beyond 3s land in `+Inf`. Buckets stop at
-3s because the RTO cap bounds measurable RTT: probes slower than that
-are counted as loss, not latency. The native histogram (bucket factor
-1.1) carries fine-grained data; Prometheus scrapes and aggregates it
-transparently when native-histogram support is enabled.
+adaptive RTO cap at 3s; values beyond 3s land in `+Inf`, which on an
+ordinary link means the sample outran its own RTO and is therefore rare.
+The one regular source of `+Inf` samples is a link whose SRTT exceeds
+1.5s: its applied timeout floors at 2×SRTT (above the 3s cap, on purpose)
+and its late-but-real echoes land beyond the largest edge. The native
+histogram (bucket factor 1.1) carries fine-grained data; Prometheus
+scrapes and aggregates it transparently when native-histogram support is
+enabled.
 
 RTT samples are conservative by construction: a probe is timed when the
 reader goroutine drains the echo, so reader-side buffering can only
@@ -272,7 +278,9 @@ link_rtt_jitter_seconds * 1000
 
 Smoothed RFC 3550 jitter computed in the probe binary from consecutive
 RTT deltas — instantaneous value, no window needed. The estimate resets
-after any timed-out probe, so recovery does not show an artificial spike.
+to 0 on the first echo after a sequence gap, so recovery does not show an
+artificial spike; during a full outage the gauge holds its last value
+until that echo arrives.
 For jitter over a specific time range, use the p90−p50 spread as a
 window-based approximation:
 
@@ -357,12 +365,14 @@ threshold, since the condition persists through the `for` duration.
 
 The alerts above ship ready-to-load in `rules/link-monitor.yml`: recording
 rules (`link:loss_ratio`, `link:rtt_seconds_p50/p90/p99`,
-`link:mean_rtt_seconds` — all with matching `rate()` windows) and alerting
+`link:mean_rtt_seconds`, `link:rtt_seconds_p50_24h_min` — all with matching
+`rate()` windows) and alerting
 rules (`LinkDown`, `LinkMonitorAbsent`, `HighPacketLoss` 5%/10m,
 `SeverePacketLoss` 20%/5m, `LinkProbesStalled`, `LinkProbeStall`,
 `ProbeCorruption`, `ClientSendErrors`, `ProberInternalErrors`,
 `MetricsAuthFailures`, `ServerDropsObserved`, `ServerEchoErrors`,
-`ClockSkewApproaching`, `PathMtuDropped`, `MtuSweepUnresolved`). Wire
+`ClockSkewApproaching`, `LinkLatencyDegraded`, `PathMtuDropped`,
+`MtuSweepUnresolved`). Wire
 them into Prometheus so alerting works out of the box instead of every
 operator copying expressions from these docs:
 
@@ -474,9 +484,9 @@ link_ping_prometheus -mode=<mode> [flags]
 | `-target` | `""` | Client: single target `host:port` |
 | `-targets` | `""` | Client: path to JSON targets file |
 | `-metrics` | `127.0.0.1:2112` | Prometheus metrics HTTP listen address (localhost-only by default; use `:2112` to expose for remote scrape — firewall-restrict) |
-| `-interval` | `500ms` | Client: probe interval (warns if `>= -timeout`; probes will queue). Values below `1ms` are rejected: the pending window grows as `RTO/interval`, so sub-millisecond intervals allocate without bound. |
-| `-timeout` | `1s` | Client: Base/initial probe timeout (with `-adaptive=false` warns if `<200ms`; spurious loss on moderate-RTT links) |
-| `-reconnect-interval` | `5m` | Client: How long to keep a UDP socket before re-dialing for DNS re-resolution (0 means use default 5m via global; must be `>= -interval` or an error; set e.g. `24h` to effectively disable) |
+| `-interval` | `500ms` | Client: probe interval (warns if `>= -timeout`; probes will queue). Values below `1ms` are rejected: the pending window grows as `RTO/interval`, so sub-millisecond intervals allocate without bound. The ratio is capped too — an effective `-timeout` more than 1000× the interval (e.g. `1ms`/`1m`) is rejected rather than accepted and swept every tick. |
+| `-timeout` | `1s` | Client: Base/initial probe timeout (with `-adaptive=false` warns if `<200ms`; spurious loss on moderate-RTT links). An effective timeout more than 1000× `-interval` (global or per-target) is rejected: that ratio is the in-flight window size. |
+| `-reconnect-interval` | `5m` | Client: How long to keep a UDP socket before re-dialing for DNS re-resolution (a non-zero value below `-interval` is rejected as an error; `0` falls back to the built-in 5m and only warns if that is below `-interval`; set e.g. `24h` to effectively disable) |
 | `-dscp` | `0` | Client: DSCP value 0-63 marked on probe packets (e.g. 46 = EF) so QoS-managed networks class them accordingly. 0 = unmarked (default). Best effort, requires OS support (Linux). |
 | `-payload` | `0` | Client: probe payload bytes beyond the 24/32-byte header (up to 1400), filled with a deterministic pattern and validated byte-for-byte on echo. Corruption counts in `link_probes_corrupted_total` — distinct from loss. Detects MTU/data-path corruption a small probe cannot see. |
 | `-targets-reload-interval` | `0` | Client: poll the `-targets` file at this interval and apply changes without a restart (0 disables; SIGHUP also reloads on Unix; Windows services need this flag to reload) |
@@ -493,7 +503,7 @@ link_ping_prometheus -mode=<mode> [flags]
 | `-json-logs` | `false` | Output logs in JSON format |
 | `-log-file` | `""` | Append logs to this file in addition to stdout (required for Windows service logging, where stdout is discarded) |
 | `-log-file-max-mb` | `10` | Max log file size in MB before rotation (0 disables rotation) |
-| `-log-file-max-backups` | `5` | Max rotated log files to keep |
+| `-log-file-max-backups` | `5` | Max rotated log files to keep (`0` keeps all of them — pair with `-log-file-max-age` so the directory cannot grow forever) |
 | `-log-file-max-age` | `28` | Max days to keep rotated log files |
 | `-svc` | `""` | Windows service action: `install`, `uninstall`, `start`, `stop`, `run` |
 | `-echo-secret` | `""` | HMAC secret authenticating UDP probes (env `LINK_PING_ECHO_SECRET`; must be set on **both** client and server — a server without it accepts the client's HMAC frame as a plain payload probe, see [Wire Protocol](#wire-protocol); expands the wire frame to 32 bytes) |
@@ -503,7 +513,7 @@ link_ping_prometheus -mode=<mode> [flags]
 
 Liveness endpoints `GET /healthz` and `GET /readyz` on the same metrics listener return `200 ok` (`text/plain`) for Kubernetes/container probes. They are deliberately unauthenticated — only `/metrics` and `/status` are gated — and are available over both HTTP and HTTPS. `/healthz` is always 200; `/readyz` returns `503` while a client-mode agent has no target with a working socket (server-only mode is always 200), so a rollout waits for a real link. `/metrics` itself serves at most 2 concurrent scrapes — a third concurrent request gets `503`, and responses are bounded by a 30s write timeout — so a scrape storm cannot multiply gather trees against `GOMEMLIMIT`.
 
-`GET /status` on the same listener serves a JSON snapshot of live per-target probe state — `link_up`, in-flight probes, consecutive misses, the current consecutive send-failure streak (`send_failures`, reset on any successful write; not a cumulative count), RTO/SRTT, last sequence number, socket age, `path_mtu_bytes` (largest DF frame proven to round-trip; 0 = no successful sweep yet) and `last_echo_age_seconds` (-1 until the first echo) — for debugging a flapping target without log access. It also returns a `process` object with Go runtime memory and GC stats — `heap_alloc_bytes`, `heap_sys_bytes`, `heap_idle_bytes`, `heap_released_bytes`, `stack_inuse_bytes`, `gc_sys_bytes`, `sys_bytes`, `gc_count` and `goroutines` — so heap growth is observable remotely without a debugger. Unlike the health endpoints it is auth-gated exactly like `/metrics` (open only when no metrics auth is configured).
+`GET /status` on the same listener serves a JSON snapshot of live per-target probe state — `link_up`, in-flight probes, consecutive misses, the current consecutive send-failure streak (`send_failures`, reset on any successful write; not a cumulative count), RTO/SRTT, last sequence number, socket age, `path_mtu_bytes` (largest DF frame proven to round-trip; 0 = no successful sweep yet) and `last_echo_age_seconds` (-1 until the first echo) — for debugging a flapping target without log access. It also returns a `process` object with Go runtime memory and GC stats — `heap_alloc_bytes`, `heap_sys_bytes`, `heap_idle_bytes`, `heap_released_bytes`, `stack_inuse_bytes`, `gc_sys_bytes`, `sys_bytes`, `gc_count` and `goroutines` — so heap growth is observable remotely without a debugger. Unlike the health endpoints it is auth-gated exactly like `/metrics` (open only when no metrics auth is configured). The `process` snapshot is re-read at most once per second (`runtime.ReadMemStats` stops the world and `/status` is uncapped), so a burst of requests cannot inject pauses into the probe loop that inflate its own RTT samples.
 
 Resource footprint: metric handles are resolved once per target at startup (no per-probe label lookups), and the Go heap is soft-capped at 128MB (`GOMEMLIMIT` env overrides) so RSS stays flat on long runs. For >100 targets set `GOMEMLIMIT=256MiB` (or higher) as a system environment variable and restart the service.
 
@@ -576,7 +586,7 @@ Both:
 Use `-svc` to install/uninstall/start/stop/run. The tool records runtime flags at install time (excluding `-svc`, `-metrics-user`, `-metrics-pass`, `-echo-secret`, and `-echo-secret-old`). Metrics auth credentials and HMAC secrets are **not** persisted into the service configuration; set `LINK_PING_METRICS_USER` / `LINK_PING_METRICS_PASS` and `LINK_PING_ECHO_SECRET` / `LINK_PING_ECHO_SECRET_OLD` in the service environment instead (a warning is printed at install time).
 
 ```sh
-link_ping_prometheus.exe -mode=both -targets=targets.json -metrics=":2112" -log-file="C:\ProgramData\link_ping\link_ping.log" -svc=install
+link_ping_prometheus.exe -mode=both -targets=targets.json -metrics=":2112" -log-file="C:\ProgramData\link_ping_prometheus\logs\service.log" -svc=install
 ```
 
 **Built-in service hardening (configured automatically at install):**
@@ -644,11 +654,14 @@ sudo systemctl enable --now link_ping_prometheus
 ## Deployment (Ansible)
 
 For fleets, `deploy/ansible/playbook.yml` deploys the pre-built binary
-and service definition to remote Linux (systemd, using the shipped
-hardened unit above) and Windows (SCM via `sc.exe`, with the same
-failure-recovery ladder as `main.go`) hosts. Secrets are delivered via
-the service environment on both platforms — never service arguments.
-See `deploy/ansible/README.md` for prerequisites and usage.
+and service definition to remote Linux (systemd, using
+`installer/linux/link_ping_prometheus.service` — the hardened unit, driven
+by `/etc/link_ping_prometheus.env`) and Windows (SCM via `sc.exe`, with the
+same failure-recovery ladder as `main.go`) hosts. Secrets are delivered via
+the service environment on both platforms — never service arguments, and
+the secret-bearing tasks are marked `no_log` so they cannot leak into
+`-v`/`--diff` output. See `deploy/ansible/README.md` for prerequisites and
+usage.
 
 ## Grafana Dashboard
 
@@ -657,7 +670,7 @@ It uses the Grafana v2 dashboard resource format
 (`dashboard.grafana.app/v2`) and needs a Grafana version that supports it;
 it also has a `source` variable for filtering panels per site.
 
-Panels: link status, packet loss, RTT percentiles / average / current, adaptive RTO, jitter, probe throughput, plus the newer signals — smoothed RTT (SRTT), path MTU (DF-probed), DF probe loss, corruption % (with `-payload`) and send errors (local fault vs network loss). A **Server & prober health** section covers probes in flight, server probes received / dropped by reason / echo errors, clock skew, prober internal errors and metrics auth failures. `link_up` transitions are annotated on every panel and itemized with timestamps in the Link State Changes table. The `source` variable filters every panel per site, so one dashboard serves the whole fleet.
+Panels: link status, packet loss, RTT percentiles / average / current, adaptive RTO, jitter, probe throughput, plus the newer signals — smoothed RTT (SRTT), path MTU (DF-probed), DF probe loss, corruption % (with `-payload`) and send errors (local fault vs network loss). A **Server & prober health** section covers probes in flight, server probes received / dropped by reason / echo errors, clock skew, prober internal errors and metrics auth failures. `link_up` transitions are annotated on every panel and itemized with timestamps in the Link State Changes table. The `source` variable filters the per-site panels, so one dashboard serves the whole fleet (the global metrics-auth-failure panel is deliberately unfiltered).
 
 [![Grafana dashboard screenshot](.docs/screenshot01.png)](.docs/screenshot01.png)
 
