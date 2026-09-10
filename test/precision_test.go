@@ -143,10 +143,16 @@ func TestPrecision_HealthyLink_NoFabricatedLoss_ServerCrossCheck(t *testing.T) {
 
 	// Cross-check against the REAL prober echo server: only
 	// ServePacketConn increments link_server_probes_received_total — a
-	// hand-rolled test responder never would.
-	pc := listenUDP(t, ctx)
+	// hand-rolled test responder never would. The server gets its OWN
+	// context so cancelling the client (runClientSettle) cannot close the
+	// server socket at the same instant the client writes its last probe —
+	// that teardown race discarded one datagram and made the exact
+	// serverRecv == sent assertion flaky.
+	srvCtx, srvCancel := context.WithCancel(context.Background())
+	defer srvCancel()
+	pc := listenUDP(t, srvCtx)
 	allowed := mustAllow("127.0.0.1")
-	go prober.ServePacketConn(ctx, pc, testSource, allowed, "")
+	go prober.ServePacketConn(srvCtx, pc, testSource, allowed, "")
 	addr := pc.LocalAddr().String()
 	clientIP := "127.0.0.1" // server metric labels the bare IP, not IP:port
 
@@ -156,6 +162,8 @@ func TestPrecision_HealthyLink_NoFabricatedLoss_ServerCrossCheck(t *testing.T) {
 	startServerRecv := getCounterValue(prober.ServerProbesReceived, clientIP)
 
 	runClientSettle(ctx, cancel, cfg, 2*time.Second)
+	// The server is still listening here (its own context), so the last
+	// datagram is drained rather than discarded at socket close.
 	time.Sleep(300 * time.Millisecond)
 
 	sent := getCounterValue(prober.ProbesSent, targetName, addr) - startSent
