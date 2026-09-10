@@ -1251,6 +1251,68 @@ func TestServer_DynamicClientEviction(t *testing.T) {
 	}
 }
 
+// TestServer_DynamicClientSeriesExpiresBelowCap (B1): the idle sweep must
+// also run below MaxClientSeries pressure. It used to run only when the
+// dynamic map was full, so a prefix-matched client that probed once and
+// went away kept exporting its series forever — link_server_clock_skew
+// stayed frozen at its last value and its alert could never resolve.
+// The sweep is time-gated to once per second, so the second client's probe
+// (after both DynClientTTL and the gate have elapsed) is what triggers it.
+func TestServer_DynamicClientSeriesExpiresBelowCap(t *testing.T) {
+	prober.InitMetrics()
+	oldTTL := prober.DynClientTTL
+	// 200ms: far below the 1s sweep gate, so the eviction assertion can only
+	// pass if a resolve below the cap actually sweeps.
+	prober.DynClientTTL = 200 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	defer func() {
+		cancel()
+		<-done // join before restoring the shared var
+		prober.DynClientTTL = oldTTL
+	}()
+
+	pc := listenUDP(t, ctx)
+	allowed := mustAllow("127.0.0.0/8") // CIDR entry -> clients take the dynamic path
+	go func() {
+		prober.ServePacketConn(ctx, pc, testSource, allowed, "")
+		close(done)
+	}()
+	addr := pc.LocalAddr().String()
+
+	c2 := dialFrom(t, addr, net.IPv4(127, 0, 0, 2))
+	defer c2.Close()
+	if !echoOnce(t, c2) {
+		t.Fatal("first CIDR client must be echoed")
+	}
+	// Both per-client families must exist while admitted — the control that
+	// makes the deletion assertion below non-vacuous.
+	for _, family := range []string{"link_server_probes_received_total", "link_server_clock_skew_seconds"} {
+		if !serverSeriesExists(t, family, map[string]string{"source": testSource, "client": "127.0.0.2"}) {
+			t.Fatalf("%s series must exist for the admitted dynamic client", family)
+		}
+	}
+
+	// Wait past BOTH DynClientTTL and the once-per-second sweep gate, with
+	// no MaxClientSeries pressure (cap is the default 1024): exactly the
+	// state the cap-only sweep missed.
+	time.Sleep(1200 * time.Millisecond)
+
+	c3 := dialFrom(t, addr, net.IPv4(127, 0, 0, 3))
+	defer c3.Close()
+	if !echoOnce(t, c3) {
+		t.Fatal("a second CIDR client must be echoed below the cap")
+	}
+
+	// c3's echo proves its resolve() ran, so the sweep had its chance.
+	for _, family := range []string{"link_server_probes_received_total", "link_server_clock_skew_seconds"} {
+		if serverSeriesExists(t, family, map[string]string{"source": testSource, "client": "127.0.0.2"}) {
+			t.Errorf("%s series must be deleted once the client is idle past DynClientTTL, even below MaxClientSeries", family)
+		}
+	}
+}
+
 // TestServer_BoundedPayloadRange: the server echoes the header frame
 // plus any bounded payload extension (clients can probe with a payload
 // without coordinating server config) but still rejects oversized

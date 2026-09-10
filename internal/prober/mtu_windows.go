@@ -4,6 +4,7 @@ package prober
 
 import (
 	"errors"
+	"fmt"
 	"net"
 
 	"golang.org/x/sys/windows"
@@ -38,7 +39,14 @@ const (
 // IP_PMTUDISC_DO is 1 (Linux uses 2), so always use the x/sys/windows
 // constants, never hardcoded Linux values.
 func setDontFragment(conn net.Conn) error {
-	rc, err := conn.(syscallConn).SyscallConn()
+	sc, ok := conn.(syscallConn)
+	if !ok {
+		// Comma-ok, not a bare assertion: a caller handing us a non-*net.UDPConn
+		// must get a bounded error (the sweep disables itself with a warning),
+		// never a panic in the probe loop.
+		return fmt.Errorf("setDontFragment: %T does not implement SyscallConn", conn)
+	}
+	rc, err := sc.SyscallConn()
 	if err != nil {
 		return err
 	}

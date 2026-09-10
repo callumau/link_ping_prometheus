@@ -10,12 +10,12 @@ import (
 
 // runMTUSweep periodically discovers the largest probe frame the path
 // carries with the DF bit set ("largest survives", no ICMP involved):
-// a no-echo at size N means the path does not survive N. Results feed
-// link_path_mtu_bytes and /status. DF probes that vanish are counted in
-// link_mtu_probes_lost_total — deliberately OUTSIDE the main
-// sent/rtt/timed_out/corrupted balance so MTU probing never pollutes
-// the loss ratio. Each sweep opens its own DF socket so the main probe
-// socket's fragmentation behavior is untouched.
+// a no-echo at size N (after the one retry sweepOnce applies) means the
+// path does not survive N. Results feed link_path_mtu_bytes and /status.
+// DF probes that vanish are counted in link_mtu_probes_lost_total —
+// deliberately OUTSIDE the main sent/rtt/timed_out/corrupted balance so
+// MTU probing never pollutes the loss ratio. Each sweep opens its own DF
+// socket so the main probe socket's fragmentation behavior is untouched.
 func runMTUSweep(ctx context.Context, t Target, cfg Config, m targetMetrics, state *probeLoopState, logger *slog.Logger) {
 	// NewTimer(0): the first sweep fires immediately so path_mtu_bytes
 	// is populated on startup instead of after the first full interval.
@@ -74,11 +74,16 @@ func runMTUSweep(ctx context.Context, t Target, cfg Config, m targetMetrics, sta
 }
 
 // sweepOnce binary-searches [0, MaxPayloadBytes] for the largest payload
-// that echoes back on the DF socket. One probe on healthy paths (the
-// full size survives); ~2 + log2(n) when the path is smaller; exactly 2
-// when the link is down (header-only probe fails → abort, leaving the
-// gauge at its last known value). Each failed probe costs one base
-// timeout of wait, so a sweep is milliseconds on healthy links.
+// that echoes back on the DF socket. A failed size is retried once
+// before it counts as "does not survive": a single dropped probe on a
+// lossy path would otherwise converge far below the real MTU and make
+// path_mtu_bytes flap (e.g. 1424 → 1248 at 1% loss). A success
+// short-circuits its retry, so a healthy path still costs one probe per
+// size. ~2*log2(MaxPayloadBytes) probes when the path is smaller; 3 when
+// the link is down (the full-size probe and its retry fail, then the
+// header-only probe aborts, leaving the gauge at its last known value).
+// Each failed probe costs one base timeout of wait, so a sweep is
+// milliseconds on healthy links.
 func sweepOnce(conn net.Conn, cfg Config, m targetMetrics, headerSize int) (int, bool) {
 	deadline := cfg.BaseTimeout
 	buf := make([]byte, headerSize+MaxPayloadBytes)
@@ -114,21 +119,31 @@ func sweepOnce(conn net.Conn, cfg Config, m targetMetrics, headerSize int) (int,
 		}
 		return true
 	}
+	// probeSurvives retries one loss before believing it: on a lossy path
+	// (1% is enough) a single dropped probe would otherwise step the search
+	// down from a size that actually fits, and path_mtu_bytes would flap
+	// between sweeps.
+	probeSurvives := func(payload int) bool {
+		return probe(payload) || probe(payload)
+	}
 
-	// Fast path: healthy full-size path answers on the first probe.
-	if probe(MaxPayloadBytes) {
+	// Fast path: a healthy full-size path answers on the first probe — the
+	// retry only fires after a loss, so the healthy case still costs one.
+	if probeSurvives(MaxPayloadBytes) {
 		return MaxPayloadBytes, true
 	}
 	if !probe(0) {
 		// Even the header-only DF probe dies: link down or DF-blocked
-		// path. Leave the last known gauge value untouched.
+		// path. Leave the last known gauge value untouched. No retry here:
+		// this is the abort path, and a dead link must not pay the loser's
+		// timeout twice.
 		return -1, false
 	}
 	lo, hi := 1, MaxPayloadBytes-1
 	best := 0
 	for lo <= hi {
 		mid := int(uint(lo+hi) >> 1)
-		if probe(mid) {
+		if probeSurvives(mid) {
 			best = mid
 			lo = mid + 1
 		} else {

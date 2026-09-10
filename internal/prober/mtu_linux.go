@@ -4,6 +4,7 @@ package prober
 
 import (
 	"errors"
+	"fmt"
 	"net"
 
 	"golang.org/x/sys/unix"
@@ -16,7 +17,14 @@ import (
 // IPV6_MTU_DISCOVER=PMTUDISC_DO. No ICMP involved: survival is inferred
 // purely from echo/no-echo.
 func setDontFragment(conn net.Conn) error {
-	rc, err := conn.(syscallConn).SyscallConn()
+	sc, ok := conn.(syscallConn)
+	if !ok {
+		// Comma-ok, not a bare assertion: a caller handing us a non-*net.UDPConn
+		// must get a bounded error (the sweep disables itself with a warning),
+		// never a panic in the probe loop.
+		return fmt.Errorf("setDontFragment: %T does not implement SyscallConn", conn)
+	}
+	rc, err := sc.SyscallConn()
 	if err != nil {
 		return err
 	}
