@@ -25,6 +25,10 @@ const (
 	// approximately synchronized clocks between nodes (e.g. NTP); 30s
 	// tolerates typical WAN skew.
 	maxReplayWindow = 30 * time.Second
+	// dynSweepInterval rate-limits the DynClientTTL sweep below: it walks
+	// the whole dynamic client map under dynMu, so running it on every
+	// resolve would be O(len(dyn)) at packet rate.
+	dynSweepInterval = time.Second
 )
 
 var (
@@ -225,6 +229,13 @@ func RunServer(ctx context.Context, addr string, source string, allowed *Allowli
 		return errors.New("server requires a non-empty client allowlist (-allow); fail-closed")
 	}
 	if echoSecret == "" {
+		// A client configured with -echo-secret emits a 32-byte HMAC frame;
+		// without a secret here that frame is indistinguishable from a
+		// legitimate 24+8 payload probe (header ≤ size ≤ header+payload) and
+		// is echoed. A half-configured fleet (secret on clients, not on the
+		// server) therefore looks perfectly healthy while reflector
+		// protection is silently absent: set -echo-secret on BOTH ends.
+		slog.Warn("-echo-secret is unset: HMAC-authenticated frames are indistinguishable from payload probes and will be echoed; set -echo-secret on BOTH ends, otherwise the allowlist is the only reflector protection")
 		// Without HMAC, any host that can spoof a source inside an
 		// allowlisted prefix can use the server as a 1:1 reflector towards
 		// that source (magic is a public constant). Exact IPs are
@@ -331,30 +342,46 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 	}
 	var dynMu sync.Mutex
 	dyn := make(map[string]clientHandles)
+	var lastSweep time.Time
+	// sweepExpired drops clients idle for DynClientTTL. Caller must hold
+	// dynMu. Both the map entry AND the Prometheus series are removed —
+	// the vecs retain a series per label set forever otherwise, so
+	// lifetime cardinality would still grow without bound.
+	sweepExpired := func(now time.Time) {
+		for ip, eh := range dyn {
+			if now.Sub(eh.lastSeen) >= DynClientTTL {
+				ServerProbesReceived.DeleteLabelValues(source, ip)
+				ServerClockSkew.DeleteLabelValues(source, ip)
+				delete(dyn, ip)
+			}
+		}
+	}
 	resolve := func(norm string) (clientHandles, bool) {
 		dynMu.Lock()
 		defer dynMu.Unlock()
 		now := time.Now()
+		// Sweep on every resolve, not only under MaxClientSeries pressure:
+		// below the cap an expired client's series would otherwise be
+		// exported forever at its last value (a frozen link_server_clock_skew
+		// alert that can never resolve). Time-gated because the walk is
+		// O(len(dyn)) under the lock; a live client refreshes lastSeen on
+		// each resolve, so it is never evicted.
+		if now.Sub(lastSweep) >= dynSweepInterval {
+			lastSweep = now
+			sweepExpired(now)
+		}
 		if h, ok := dyn[norm]; ok {
 			h.lastSeen = now
 			dyn[norm] = h
 			return h, true
 		}
 		if len(dyn) >= MaxClientSeries {
-			// Under pressure, sweep idle clients first: a source may reach
-			// resolve before HMAC validation, so spoofed sources inside an
-			// allowed CIDR could otherwise pin every slot and black out all
-			// other CIDR-matched clients (client_overflow) permanently.
-			// Both the map entry AND the Prometheus series are removed —
-			// the vecs retain a series per label set forever otherwise, so
-			// lifetime cardinality would still grow without bound.
-			for ip, eh := range dyn {
-				if now.Sub(eh.lastSeen) >= DynClientTTL {
-					ServerProbesReceived.DeleteLabelValues(source, ip)
-					ServerClockSkew.DeleteLabelValues(source, ip)
-					delete(dyn, ip)
-				}
-			}
+			// Under pressure, sweep idle clients regardless of the gate
+			// above: a source may reach resolve before HMAC validation, so
+			// spoofed sources inside an allowed CIDR could otherwise pin
+			// every slot and black out all other CIDR-matched clients
+			// (client_overflow) permanently.
+			sweepExpired(now)
 		}
 		if len(dyn) >= MaxClientSeries {
 			return clientHandles{}, false

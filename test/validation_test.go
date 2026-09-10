@@ -60,6 +60,8 @@ func TestValidateTarget_PortAndHostRules(t *testing.T) {
 		"127.0.0.1:4000",
 		"[::1]:4000",
 		"good-host.example.com:80",
+		"good-host.example.com.:80", // FQDN root dot is dialable
+		"[fe80::1%eth0]:5000",       // IPv6 zone literal is dialable
 		"a:1",
 		"host:65535",
 	}
@@ -70,15 +72,23 @@ func TestValidateTarget_PortAndHostRules(t *testing.T) {
 	}
 
 	invalid := []string{
-		"",                // empty
-		":80",             // no host
-		"host:0",          // port too low
-		"host:65536",      // port too high
-		"host:abc",        // non-numeric port
-		"host:",           // empty port
-		"-bad.com:80",     // leading hyphen
-		"bad-.com:80",     // trailing hyphen
-		"bad_host.com:80", // underscore not valid in DNS
+		"",                     // empty
+		":80",                  // no host
+		"host:0",               // port too low
+		"host:65536",           // port too high
+		"host:abc",             // non-numeric port
+		"host:",                // empty port
+		"host:+80",             // signed port: strconv.Atoi would accept it, net.Dial would not
+		"host: 80",             // whitespace in the port
+		"host:80 ",             // trailing whitespace in the port
+		"-bad.com:80",          // leading hyphen
+		"bad-.com:80",          // trailing hyphen
+		"bad_host.com:80",      // underscore not valid in DNS
+		"[fe80::1%]:5000",      // empty zone is not dialable
+		"[fe80::1%eth 0]:5000", // junk in the zone
+		"example.com%eth0:80",  // zone suffix on a DNS name
+		"1.2.3.4%eth0:80",      // zone suffix on IPv4 (zones are IPv6-only)
+		"host..example.com:80", // two dots is not an FQDN
 		string([]byte{'h', 0xC3, 's', 't'}) + ":80", // non-ASCII byte must not pass as a "letter"
 	}
 	for _, addr := range invalid {

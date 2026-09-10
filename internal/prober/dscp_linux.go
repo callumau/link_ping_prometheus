@@ -4,6 +4,7 @@ package prober
 
 import (
 	"errors"
+	"fmt"
 	"net"
 
 	"golang.org/x/sys/unix"
@@ -18,7 +19,13 @@ func setDSCP(conn net.Conn, dscp int, remote net.Addr) error {
 	if dscp <= 0 || dscp > 63 {
 		return errors.New("dscp out of range 0-63")
 	}
-	rc, err := conn.(syscallConn).SyscallConn()
+	sc, ok := conn.(syscallConn)
+	if !ok {
+		// Comma-ok, not a bare assertion: setDSCP is best effort, so a
+		// non-*net.UDPConn must yield a logged warning, never a panic.
+		return fmt.Errorf("setDSCP: %T does not implement SyscallConn", conn)
+	}
+	rc, err := sc.SyscallConn()
 	if err != nil {
 		return err
 	}
