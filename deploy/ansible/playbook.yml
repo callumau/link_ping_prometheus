@@ -205,6 +205,9 @@
       when: item.data | length > 0
       loop_control:
         label: "{{ item.name }}"
+      # The SCM reads the environment at process start: a rotated secret must
+      # restart the service to take effect. Fires only when a value changed.
+      notify: Restart link ping service (windows)
 
     - name: Open UDP echo port (server/both mode)
       ansible.windows.win_shell: >-
@@ -229,3 +232,12 @@
         - svc_info_after.services | length > 0
         - svc_info_after.services[0].state != "Running"
       changed_when: false
+
+  handlers:
+    - name: Restart link ping service (windows)
+      # Credential values are read from the environment at process start, so a
+      # rotation only takes effect on restart. Notified only when a value
+      # actually changed, so an unchanged re-run does not bounce the service.
+      ansible.windows.win_service:
+        name: "{{ link_ping_service_name }}"
+        state: restarted

@@ -62,12 +62,24 @@ section. Encrypt the vars file with ansible-vault.
 **Windows caveat:**
 `HKLM\SYSTEM\CurrentControlSet\Services\<service>\Environment` is
 readable by all local users, so values placed there are only as private
-as interactive logon on the host. Where a secret has to be protected
-rather than merely kept off the command line, use the batch installer's
-ACL'd delivery (`installer/windows/install-service.bat`, which prompts
-for the values and documents the same caveat) or a dedicated service
-account instead of this play.
+as interactive logon on the host. The batch installer
+(`installer/windows/install-service.bat`) uses the SAME registry key and
+prompts for the values so they stay off the command line — it does not
+ACL them either (only its log directory is ACL'd). Where a secret has to
+be protected rather than merely kept off the command line, use a
+dedicated service account and restrict logon instead of this play.
 
 **Linux caveat:** `/etc/link_ping_prometheus.env` holds both `OPTIONS`
 and the credential env vars under mode 0600, and is rewritten (with a
 service restart) whenever its content changes.
+
+**Changing flags on an existing host:** the service command line
+(`binPath`, which snapshots the flags at install time) is not rewritten
+on a re-run — that needs a reinstall (uninstall + install). Credential
+changes ARE applied on a re-run: the environment key is rewritten and
+the play restarts the service when it changed.
+
+**Install path:** the Linux play installs to `link_ping_install_dir`,
+but the shipped systemd unit hardcodes
+`/usr/local/bin/link_ping_prometheus`. Changing that variable also
+requires editing `ExecStart` in the unit (or dropping a unit override).

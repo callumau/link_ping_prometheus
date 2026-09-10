@@ -254,8 +254,8 @@ if not "%SERVICE_ACCOUNT%"=="" (
 )
 
 :: Credential environment variables (optional) ----------------------------------
-:: The service reads LINK_PING_METRICS_USER/PASS and LINK_PING_ECHO_SECRET
-:: from its process environment. The per-service Environment registry key is
+:: The service reads LINK_PING_METRICS_USER/PASS, LINK_PING_ECHO_SECRET and
+:: LINK_PING_ECHO_SECRET_OLD (rotation window) from its process environment. The per-service Environment registry key is
 :: the delivery mechanism. NOTE: that key is readable by all local users -
 :: treat these values as non-secret-grade or restrict interactive logon on
 :: this host. Press Enter to skip any value you do not need.
@@ -271,6 +271,9 @@ if not "%MPass%"=="" reg add "%ENV_KEY%" /v LINK_PING_METRICS_PASS /t REG_SZ /d 
 
 set /p "ESecret=Echo HMAC secret: "
 if not "%ESecret%"=="" reg add "%ENV_KEY%" /v LINK_PING_ECHO_SECRET /t REG_SZ /d "%ESecret%" /f >nul
+
+set /p "ESecretOld=Echo HMAC secret (previous, for rotation; Enter to skip): "
+if not "%ESecretOld%"=="" reg add "%ENV_KEY%" /v LINK_PING_ECHO_SECRET_OLD /t REG_SZ /d "%ESecretOld%" /f >nul
 
 :: Start and verify -------------------------------------------------------------
 echo.
