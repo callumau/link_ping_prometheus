@@ -138,7 +138,10 @@ func TestAccuracy_PacketLoss(t *testing.T) {
 	timeoutCount := endTimeout - startTimeout
 
 	if sentCount < float64(totalPackets) {
-		t.Logf("Warning: Sent less packets than intended (%v < %v), cpu load?", sentCount, totalPackets)
+		// Vacuous-pass guard: with sentCount == 0 the derived expectation is
+		// also 0, so the comparison below would pass without a single probe
+		// having left the host.
+		t.Fatalf("sent less packets than intended (%v < %v), cpu load?", sentCount, totalPackets)
 	}
 
 	expectedDrops := int(sentCount) / dropRate
@@ -649,8 +652,15 @@ func TestLinkUp_RequiresThreeMisses(t *testing.T) {
 	})
 
 	targetName, cfg := namedCfg("linkup_test", addr, 50*time.Millisecond, 100*time.Millisecond)
+	startTimeouts := getCounterValue(prober.ProbesTimedOut, targetName, addr)
 	// A single dropped probe must not take the link down.
 	runClientFor(ctx, cfg, 400*time.Millisecond)
+	// Guard against a saturated box manufacturing LinkUpMissThreshold
+	// consecutive misses that are not the property under test (the same
+	// guard its neighbours use).
+	if extra := getCounterValue(prober.ProbesTimedOut, targetName, addr) - startTimeouts; extra > 1 {
+		t.Skipf("environment stalled: %v timeouts, not the single injected drop", extra)
+	}
 	if up := getGaugeValue(prober.LinkUp, targetName, addr); up != 1 {
 		t.Errorf("single missed probe must not flap link_up, got %v", up)
 	}

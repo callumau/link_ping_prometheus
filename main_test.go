@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	dto "github.com/prometheus/client_model/go"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -99,6 +100,19 @@ func TestServiceConfigHardening(t *testing.T) {
 	}
 	if got := cfg.Option["OnFailure"]; got != "restart" {
 		t.Errorf("OnFailure must be restart so crashes self-heal, got %v", got)
+	}
+	// The 5s delay is the recovery ladder the README and the installer
+	// scripts document; a default (1s) would change restart behaviour
+	// silently. OnFailureResetPeriod keeps repeated restarts inside one
+	// SCM failure-accounting window.
+	if got := cfg.Option["OnFailureDelayDuration"]; got != "5s" {
+		t.Errorf("OnFailureDelayDuration must stay 5s (documented recovery ladder), got %v", got)
+	}
+	if got := cfg.Option["OnFailureResetPeriod"]; got == nil {
+		t.Error("OnFailureResetPeriod must be set so the restart counter resets on a healthy day")
+	}
+	if got := cfg.Option["StartType"]; got != "automatic" {
+		t.Errorf("StartType must be automatic, got %v", got)
 	}
 	if cfg.Option["DelayedAutoStart"] != true {
 		t.Error("DelayedAutoStart must be true to avoid boot-race bind failures")
@@ -525,5 +539,78 @@ func TestProgramStartStopBothMode(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("Stop did not return within 5s — lifecycle/WaitGroup bug")
+	}
+}
+
+// blockingGatherer parks every Gather until release is closed, making the
+// MaxRequestsInFlight cap deterministic: without the park, the cap could only
+// be tested by racing real gathers against each other.
+type blockingGatherer struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (g *blockingGatherer) Gather() ([]*dto.MetricFamily, error) {
+	select {
+	case g.entered <- struct{}{}:
+	default:
+	}
+	<-g.release
+	return nil, nil
+}
+
+// TestMetricsHandler_ConcurrencyCapReturns503: /metrics must serve at most
+// maxConcurrentScrapes gathers at once (a large fleet's response is ~10-15MB
+// of text and every concurrent scrape builds its own copy against
+// GOMEMLIMIT). Excess scrapes get a 503, which Prometheus retries; without
+// this an unbounded scrape storm multiplies the agent's own heap and can make
+// the monitor report ITSELF down. The rejected request must not reach Gather.
+func TestMetricsHandler_ConcurrencyCapReturns503(t *testing.T) {
+	prober.InitMetrics()
+	g := &blockingGatherer{entered: make(chan struct{}, 8), release: make(chan struct{})}
+	h := metricsHandlerFor(g, false)
+
+	recs := make([]*httptest.ResponseRecorder, maxConcurrentScrapes)
+	done := make([]chan struct{}, len(recs))
+	for i := range recs {
+		recs[i] = httptest.NewRecorder()
+		done[i] = make(chan struct{})
+		go func(i int) {
+			defer close(done[i])
+			h.ServeHTTP(recs[i], httptest.NewRequest(http.MethodGet, "/metrics", nil))
+		}(i)
+	}
+	for range maxConcurrentScrapes {
+		select {
+		case <-g.entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("scrapes never reached the gatherer (cap not applied?)")
+		}
+	}
+
+	// The next scrape arrives while both slots are held: 503, no gather.
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("a scrape beyond the %d-scrape cap must get 503, got %d", maxConcurrentScrapes, rec.Code)
+	}
+
+	close(g.release)
+	for i := range recs {
+		select {
+		case <-done[i]:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("scrape %d did not finish after release", i)
+		}
+		if recs[i].Code != http.StatusOK {
+			t.Errorf("in-flight scrape %d must complete with 200, got %d", i, recs[i].Code)
+		}
+	}
+
+	// And the cap must not leak: a scrape after the burst is served normally.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if rec.Code != http.StatusOK {
+		t.Errorf("cap must release after the burst, got %d", rec.Code)
 	}
 }

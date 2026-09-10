@@ -1472,3 +1472,123 @@ func TestServer_BoundedPayloadSizeRange(t *testing.T) {
 		t.Errorf("oversized frame must be dropped, got %d bytes", n)
 	}
 }
+
+// writeFailConn reads real datagrams but fails every WriteTo: the "server
+// received a valid probe but could not echo it" case. It must be counted in
+// link_server_echo_errors_total, because the client counts the missing echo as
+// LOSS — without this counter an operator subtracts nothing and blames the
+// network for a local socket fault.
+type writeFailConn struct {
+	net.PacketConn
+	writes atomic.Int64
+}
+
+func (c *writeFailConn) WriteTo([]byte, net.Addr) (int, error) {
+	c.writes.Add(1)
+	return 0, errors.New("injected write failure")
+}
+
+// TestServer_EchoWriteErrorsCounted pins both halves of that contract: the
+// probe is still counted as RECEIVED (it did arrive) and the failed echo is
+// counted separately, with nothing delivered back.
+func TestServer_EchoWriteErrorsCounted(t *testing.T) {
+	prober.InitMetrics()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	pc := &writeFailConn{PacketConn: listenUDP(t, ctx)}
+	done := make(chan error, 1)
+	go func() { done <- prober.ServePacketConn(ctx, pc, testSource, testAllow, "") }()
+
+	conn, probe := dialProbe(t, pc.LocalAddr().String())
+	defer conn.Close()
+
+	before := getCounterValue(prober.ServerEchoErrors)
+	conn.Write(probe)
+	conn.SetReadDeadline(time.Now().Add(400 * time.Millisecond))
+	if n, _ := conn.Read(make([]byte, 1500)); n != 0 {
+		t.Errorf("a failed echo must not deliver bytes back, got %d", n)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for getCounterValue(prober.ServerEchoErrors) == before && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := getCounterValue(prober.ServerEchoErrors) - before; got < 1 {
+		t.Errorf("a probe the server could not echo must be counted in link_server_echo_errors_total, got %v", got)
+	}
+	if pc.writes.Load() < 1 {
+		t.Error("the server never attempted the echo write")
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("ServePacketConn returned %v, want nil on cancel", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ServePacketConn did not return after cancel")
+	}
+}
+
+// TestServer_ExactClientSeriesNeverEvicted: exact-allowlist handles are
+// pre-resolved and must never be swept. Deleting a live client's series resets
+// its counters, which a Prometheus rate() reads as a restart, so the TTL
+// sweeper must only ever touch the dynamic (CIDR) map. Uses a lowered
+// DynClientTTL and waits past a whole dynSweepInterval (1s) so a regression
+// that walked the exact map would have evicted the series by then.
+func TestServer_ExactClientSeriesNeverEvicted(t *testing.T) {
+	prober.InitMetrics()
+	oldTTL := prober.DynClientTTL
+	prober.DynClientTTL = 50 * time.Millisecond
+	defer func() { prober.DynClientTTL = oldTTL }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	// Join the server BEFORE restoring the var above (defer order).
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	pc := listenUDP(t, ctx)
+	allowed := mustAllow("127.0.0.1") // exact entry -> pre-resolved handle
+	go func() {
+		prober.ServePacketConn(ctx, pc, testSource, allowed, "")
+		close(done)
+	}()
+
+	conn, probe := dialProbe(t, pc.LocalAddr().String())
+	defer conn.Close()
+
+	conn.Write(probe)
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if n, _ := conn.Read(make([]byte, 1500)); n != prober.PayloadSize {
+		t.Fatal("exact-allowlist client must be echoed")
+	}
+	before := getCounterValue(prober.ServerProbesReceived, "127.0.0.1")
+
+	// Past the lowered TTL and past a full sweeper tick.
+	time.Sleep(1300 * time.Millisecond)
+
+	// Non-mutating check FIRST: reading through WithLabelValues would re-create
+	// a series the sweeper had evicted, making the regression invisible.
+	if !serverSeriesExists(t, "link_server_probes_received_total",
+		map[string]string{"source": testSource, "client": "127.0.0.1"}) {
+		t.Error("an exact-IP client's series must never be evicted by the TTL sweeper")
+	}
+
+	// The counter must CONTINUE from where it was, not restart: a reset would
+	// show up as 1 (or as the series having been re-created at 0 by the read
+	// above). Metrics are process-global, so `before` counts every earlier test
+	// that probed 127.0.0.1 too.
+	conn.Write(probe)
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if n, _ := conn.Read(make([]byte, 1500)); n != prober.PayloadSize {
+		t.Fatal("exact-allowlist client must still be echoed after the TTL")
+	}
+	if got := getCounterValue(prober.ServerProbesReceived, "127.0.0.1"); got < before+1 {
+		t.Errorf("exact-IP counters must not reset: got %v, want >= %v (evicted and re-created?)", got, before+1)
+	}
+}
