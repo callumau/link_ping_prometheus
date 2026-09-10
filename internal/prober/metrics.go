@@ -57,7 +57,7 @@ var (
 	}, []string{"source", "target", "address"})
 	PathMTUBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "link_path_mtu_bytes",
-		Help: "Largest probe frame (LNKPING header + payload, excluding IP/UDP overhead) that round-trips with DF set; 0 until the first successful sweep. Stays 0 on paths that block DF-set packets. A full-size Ethernet path reads 1424 (the MaxPayloadBytes cap).",
+		Help: "Largest probe frame (LNKPING header + payload, excluding IP/UDP overhead) that round-trips with DF set; 0 until the first successful sweep. A full-size Ethernet path reads 1424, or 1432 with -echo-secret (the header grows from 24 to 32 bytes). Stays 0 on paths that block DF-set packets.",
 	}, []string{"source", "target", "address"})
 	ProbesInflight = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "link_probes_inflight",
@@ -70,7 +70,7 @@ var (
 	// window can be queried.
 	RTTSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:                        "link_rtt_seconds",
-		Help:                        "Round-trip time in seconds. Samples beyond the largest finite bucket (3s) can only come from a link whose applied RTO exceeded the 3s cap (SRTT above 1.5s) — see link_rto_seconds.",
+		Help:                        "Round-trip time in seconds. Samples beyond the largest finite bucket (3s) are those that outlived the 3s RTO cap: a link whose applied RTO exceeds 3s (SRTT above 1.5s), a fixed -timeout above 3s, or simply an echo that missed its RTO by up to one probe interval (the deadline is the first tick after it expires).",
 		Buckets:                     RTTBuckets,
 		NativeHistogramBucketFactor: 1.1,
 	}, []string{"source", "target", "address"})
@@ -80,7 +80,7 @@ var (
 	// (a timed-out probe), so link recovery never spikes the gauge.
 	JitterSeconds = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "link_rtt_jitter_seconds",
-		Help: "Smoothed RTT jitter in seconds (RFC 3550, consecutive RTT deltas). Resets after a probe timeout; a single lost probe does not feed an artificial spike into the estimate.",
+		Help: "Smoothed RTT jitter in seconds (RFC 3550, consecutive RTT deltas). Resets to 0 on the first echo after a sequence gap (a timed-out probe), so recovery never feeds an artificial spike into the estimate; during a full outage the gauge holds its last value until that echo arrives.",
 	}, []string{"source", "target", "address"})
 	LinkUp = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "link_up",
