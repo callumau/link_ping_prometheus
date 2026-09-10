@@ -36,6 +36,7 @@ import (
 	"link_ping_prometheus/internal/prober"
 
 	"github.com/kardianos/service"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"gopkg.in/natefinch/lumberjack.v2"
 )
@@ -133,6 +134,7 @@ var (
 	flMetricsTLSCert       = flag.String("metrics-tls-cert", "", "Metrics: TLS certificate file (requires -metrics-tls-key)")
 	flMetricsTLSKey        = flag.String("metrics-tls-key", "", "Metrics: TLS private key file (requires -metrics-tls-cert)")
 	flMetricsAllowInsecure = flag.Bool("metrics-allow-insecure", false, "Metrics: allow Basic Auth over plaintext HTTP (otherwise requires TLS when auth is set)")
+	flMetricsGzip          = flag.Bool("metrics-gzip", false, "Metrics: gzip-compress /metrics responses when the scraper offers it. Off by default: promhttp pools a gzip writer per CPU, and each holds ~0.7MB of flate state, so compression costs up to ~0.7MB x GOMAXPROCS of live heap - more than a small fleet's whole response. Enable it for many targets, where the response size matters.")
 	flEchoSecret           = flag.String("echo-secret", "", "Wire: HMAC secret for UDP echo authentication (env LINK_PING_ECHO_SECRET; mitigates reflector spoof when set on both client and server)")
 	flEchoSecretOld        = flag.String("echo-secret-old", "", "Wire: previous HMAC secret, still accepted by the SERVER during a zero-downtime rotation alongside -echo-secret (env LINK_PING_ECHO_SECRET_OLD; server side only)")
 )
@@ -565,13 +567,24 @@ func (p *program) Stop(s service.Service) error {
 // lazily so a bind failure reaches the caller as an error and aborts
 // startup. String arguments are captured values, not flag reads: the
 // serve goroutine may outlive flag mutation by tests or shutdown code.
-func (p *program) startMetricsServer(addr, user, pass, cert, key string, statusReg *prober.StatusRegistry) (*http.Server, <-chan struct{}, error) {
+// metricsHandler builds the /metrics handler. gzip=false disables response
+// compression on purpose: promhttp pools a gzip.Writer per P and each writer
+// holds a flate compressor of roughly 0.7MB (hashHead 1<<17 + hashPrev 1<<15
+// plus a 32KB window), so compression costs up to ~0.7MB x GOMAXPROCS of live
+// heap that only a GC reclaims - measured as the dominant scrape-driven heap
+// growth. For a small fleet the whole response is smaller than one compressor,
+// so plain is the lighter default; large fleets should enable it.
+func metricsHandler(gzip bool) http.Handler {
+	return promhttp.HandlerFor(prometheus.DefaultGatherer, promhttp.HandlerOpts{DisableCompression: !gzip})
+}
+
+func (p *program) startMetricsServer(addr, user, pass, cert, key string, statusReg *prober.StatusRegistry, gzip bool) (*http.Server, <-chan struct{}, error) {
 	metricsLn, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, nil, fmt.Errorf("metrics server: %w", err)
 	}
 	mx := http.NewServeMux()
-	mx.Handle("/metrics", prober.MetricsAuth(user, pass, promhttp.Handler()))
+	mx.Handle("/metrics", prober.MetricsAuth(user, pass, metricsHandler(gzip)))
 	healthzHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
@@ -712,7 +725,7 @@ func (p *program) run() error {
 	// failure (port taken, permission denied) aborts startup instead of
 	// leaving the agent running with no /metrics endpoint — a silent
 	// partial failure for a monitoring agent.
-	metricsSrv, metricsDone, err := p.startMetricsServer(*flMetrics, user, pass, cert, key, statusReg)
+	metricsSrv, metricsDone, err := p.startMetricsServer(*flMetrics, user, pass, cert, key, statusReg, *flMetricsGzip)
 	if err != nil {
 		return err
 	}
