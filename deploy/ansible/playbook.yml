@@ -112,6 +112,8 @@
     # 80-column budget while producing single unbroken strings.
     link_ping_dir: "{{ link_ping_windows_install_dir }}"
     link_ping_win_exe: "{{ link_ping_dir }}\\link_ping_prometheus.exe"
+    link_ping_win_targets_path: >-
+      {{ link_ping_windows_install_dir }}\targets.json
     # stdout is discarded under the SCM, so -log-file is the only sink
     # that survives; the batch installer uses this same location.
     link_ping_win_log_dir: 'C:\ProgramData\link_ping_prometheus\logs'
@@ -135,6 +137,24 @@
       ansible.windows.win_copy:
         src: link_ping_prometheus-windows-amd64.exe
         dest: "{{ link_ping_win_exe }}"
+
+    - name: Write targets file
+      # Mirrors the Linux play. A client/both service started without
+      # -targets exits 1 ("no targets specified") and the OnFailure
+      # restart ladder crash-loops it every 5s forever.
+      ansible.windows.win_copy:
+        content: "{{ link_ping_targets_json }}"
+        dest: "{{ link_ping_win_targets_path }}"
+      when: link_ping_targets_json | length > 0
+
+    - name: Append -targets to options
+      # Order matters: -svc=install snapshots the options into the service
+      # binPath, so this must run before the install task below.
+      ansible.builtin.set_fact:
+        link_ping_win_options: >-
+          {{ link_ping_win_options }}
+          -targets={{ link_ping_win_targets_path }}
+      when: link_ping_targets_json | length > 0
 
     - name: Create log directory
       ansible.windows.win_file:

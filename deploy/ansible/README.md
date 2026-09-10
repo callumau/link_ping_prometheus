@@ -7,11 +7,41 @@ definition to remote Linux (systemd) and Windows (SCM) hosts.
 
 - Ansible on the control node (2.15+); `pip install pywinrm` for the
   Windows play.
-- Built binaries copied here (release tags from GHCR work too, but the
-  playbooks copy plain files):
+- Built binaries copied here under these exact names (release tags
+  from GHCR work too, but the playbooks copy plain files):
   - `files/link_ping_prometheus-linux-amd64`
   - `files/link_ping_prometheus-windows-amd64.exe`
-  Build with `./dev_build.sh` or goreleaser, then copy from `build/`.
+  From `./dev_build.sh` the names differ — the build writes
+  `build/link_ping_prometheus` and `build/link_ping_prometheus.exe`,
+  so copy them across:
+
+  ```sh
+  cp build/link_ping_prometheus \
+     deploy/ansible/files/link_ping_prometheus-linux-amd64
+  cp build/link_ping_prometheus.exe \
+     deploy/ansible/files/link_ping_prometheus-windows-amd64.exe
+  ```
+
+  Goreleaser emits archives instead
+  (`dist/link_ping_prometheus_Linux_x86_64.tar.gz`,
+  `dist/link_ping_prometheus_Windows_x86_64.zip`, see
+  `.goreleaser.yaml`), so unpack and rename the binary inside:
+
+  ```sh
+  tar -xzf dist/link_ping_prometheus_Linux_x86_64.tar.gz \
+    -C /tmp link_ping_prometheus
+  mv /tmp/link_ping_prometheus \
+     deploy/ansible/files/link_ping_prometheus-linux-amd64
+  unzip -o dist/link_ping_prometheus_Windows_x86_64.zip \
+    link_ping_prometheus.exe -d /tmp/win
+  mv /tmp/win/link_ping_prometheus.exe \
+     deploy/ansible/files/link_ping_prometheus-windows-amd64.exe
+  ```
+
+  (`goreleaser release` / `--snapshot` write those archives into
+  `dist/`, and the GitHub release assets carry the same names — unpack
+  and rename them the same way. `dev_build.sh` tags the binary with a
+  build timestamp; goreleaser sets `main.version` from the git tag.)
 
 ## Usage
 
@@ -32,7 +62,12 @@ ansible-playbook -i inventory.yml playbook.yml --ask-vault-pass
   starts the service. The file is always written — the unit expands
   `$OPTIONS`, so an absent file would start the binary on fail-closed
   defaults and crash-loop it.
-- **Windows:** copies the binary, creates the service by running
+- **Windows:** writes `targets.json` to the install directory and
+  appends `-targets=<install dir>\targets.json` to the options when
+  `link_ping_targets_json` is set — a client/both service installed
+  without `-targets` exits 1 (`no targets specified`) and the SCM
+  restart ladder crash-loops it every 5s. It then copies the binary,
+  creates the service by running
   `link_ping_prometheus.exe <options> -svc=install` — the only path that
   applies the hardened SCM config from `main.go` (`DelayedAutoStart`
   plus the load-bearing Tcpip/W32Time dependencies and the OnFailure
@@ -48,7 +83,12 @@ ansible-playbook -i inventory.yml playbook.yml --ask-vault-pass
   created by an older play is hardened too. Note that `-svc=install`
   snapshots the flags into the service `binPath`: changing options on an
   existing service requires a reinstall (uninstall + install) — the play
-  does not rewrite `binPath` for an existing service.
+  does not rewrite `binPath` for an existing service. That applies to
+  `-targets` as well: setting `link_ping_targets_json` on a host whose
+  service already exists rewrites `targets.json` but needs a reinstall
+  before the service picks the path up. The file's *content* is rewritten
+  on every run, so editing targets on an already-installed host takes
+  effect on the next restart (or SIGHUP/reload on Linux).
 
 ## Secrets
 
