@@ -238,16 +238,17 @@ func (r *rateLimiter) chargeIP(ip netip.Addr) string {
 
 // RunServer starts a UDP echo responder on addr. served is the
 // fail-closed allowlist of prober client IPs; it must be non-empty, or
-// the server refuses to start. Each accepted 24-byte datagram with a
-// valid magic header from an allowed source is echoed back to its
+// the server refuses to start. Each accepted datagram — the header
+// (24 bytes, or 32 with HMAC) plus any bounded payload extension, with a
+// valid magic header — from an allowed source is echoed back to its
 // sender and counted in ServerProbesReceived under the remote IP. There
 // is no connection lifecycle: loss is measured exactly because UDP does
 // not retransmit. Blocks until ctx is cancelled, then closes the socket.
-// When echoSecret is non-empty, probes must be 32 bytes with HMAC; this
-// mitigates reflector spoofing where static magic alone allows off-path
-// 1:1 reflect to a victim allowlisted IP. During a rotation,
-// echoSecretOld (when non-empty) is also accepted so clients can switch
-// secrets one endpoint at a time.
+// When echoSecret is non-empty, probes must start with the 32-byte HMAC
+// frame; this mitigates reflector spoofing where static magic alone
+// allows off-path 1:1 reflect to a victim allowlisted IP. During a
+// rotation, echoSecretOld (when non-empty) is also accepted so clients
+// can switch secrets one endpoint at a time.
 func RunServer(ctx context.Context, addr string, source string, allowed *Allowlist, echoSecret string, echoSecretOld ...string) error {
 	if allowed.Len() == 0 {
 		return errors.New("server requires a non-empty client allowlist (-allow); fail-closed")
@@ -293,9 +294,11 @@ func RunServer(ctx context.Context, addr string, source string, allowed *Allowli
 	return nil
 }
 
-// ServePacketConn runs the UDP echo loop on pc. Datagrams of exactly
-// PayloadSize bytes with a valid magic header from an allowlisted source
-// are echoed and counted; everything else is dropped. The allowlist is
+// ServePacketConn runs the UDP echo loop on pc. Datagrams whose size is
+// the expected header (PayloadSize, or PayloadSizeWithHMAC when a secret
+// is set) plus a bounded payload extension, with a valid magic header
+// from an allowlisted source, are echoed and counted; everything else is
+// dropped. The allowlist is
 // fail-closed: an empty or nil map admits no clients, so only permitted
 // prober IPs can drive the echo responder or contribute metric labels.
 // Per-IP and global rate limits bound echo processing. Datagram
@@ -307,9 +310,10 @@ func RunServer(ctx context.Context, addr string, source string, allowed *Allowli
 // client's per-IP budget. Blocks until ctx is cancelled or pc is closed.
 // A recovered panic is returned as an error so callers treat it as a
 // fatal failure, never a clean exit.
-// When echoSecret is non-empty, only 32-byte HMAC-authenticated datagrams
-// with a fresh timestamp are accepted; this mitigates reflector spoofing
-// (SEC22). When empty, 24-byte backward-compatible datagrams are accepted.
+// When echoSecret is non-empty, only HMAC-authenticated datagrams with a
+// fresh timestamp are accepted; this mitigates reflector spoofing
+// (SEC22). When empty, backward-compatible 24-byte-header datagrams (plus
+// any bounded payload) are accepted.
 // During a rotation, echoSecretOld (when set) is also accepted so clients
 // can switch to the new secret one endpoint at a time.
 func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allowed *Allowlist, echoSecret string, echoSecretOld ...string) (retErr error) {
