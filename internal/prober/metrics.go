@@ -49,11 +49,11 @@ var (
 	}, []string{"source", "target", "address", "reason"})
 	MTUProbesSent = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "link_mtu_probes_sent_total",
-		Help: "DF-set probes sent by the periodic MTU sweep (-mtu-sweep). Deliberately separate from the main probe counters: they never enter the loss ratio or the sent/rtt/timed_out balance.",
+		Help: "DF-set probes sent by the periodic MTU sweep (-mtu-sweep), counted per ATTEMPT: a size with no echo is retried once before the search steps down, so this is a probe rate, not a rate of distinct sizes tested. Deliberately separate from the main probe counters: they never enter the loss ratio or the sent/rtt/timed_out balance.",
 	}, []string{"source", "target", "address"})
 	MTUProbesLost = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "link_mtu_probes_lost_total",
-		Help: "DF-set MTU probes with no echo: sizes the path does not survive. Rising lost with healthy main probes means fragmentation-requiring traffic is being blackholed (PMTUD failure) — the classic works-small-fails-big signature.",
+		Help: "DF-set MTU probes with no echo, per attempt like link_mtu_probes_sent_total (a size that fails twice counts twice), so lost/sent stays a per-probe ratio. Rising lost with healthy main probes means fragmentation-requiring traffic is being blackholed (PMTUD failure) — the classic works-small-fails-big signature. Alert on the ratio, not on > 0: a single retried loss on a 1%-loss path moves this counter.",
 	}, []string{"source", "target", "address"})
 	PathMTUBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "link_path_mtu_bytes",

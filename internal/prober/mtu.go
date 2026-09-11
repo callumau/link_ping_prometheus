@@ -106,6 +106,34 @@ func mtuDeadline(cfg Config, state *probeLoopState) time.Duration {
 	return deadline
 }
 
+// readEcho waits for an echo of exactly size bytes whose sequence is one of
+// seqs. Foreign datagrams and echoes of another size are SKIPPED rather than
+// taken as this probe's answer: one socket serves the whole sweep, so a late
+// echo of a larger size would otherwise be consumed as a failure of a smaller
+// size that may well survive, stepping the binary search below the real MTU.
+// The deadline is absolute, so skipping cannot extend the wait (and a stream
+// of foreign datagrams cannot spin the loop past it).
+func readEcho(conn net.Conn, buf []byte, size int, seqs []uint64, deadline time.Time) error {
+	if err := conn.SetReadDeadline(deadline); err != nil {
+		return err
+	}
+	for {
+		n, err := conn.Read(buf)
+		if err != nil {
+			return err
+		}
+		if n != size || string(buf[0:8]) != MagicBytes {
+			continue // a foreign or other-size datagram: keep waiting for ours
+		}
+		got := binary.LittleEndian.Uint64(buf[8:16])
+		for _, s := range seqs {
+			if got == s {
+				return nil
+			}
+		}
+	}
+}
+
 // sweepOnce binary-searches [0, MaxPayloadBytes] for the largest payload
 // that echoes back on the DF socket. A failed size is retried once
 // before it counts as "does not survive": a single dropped probe on a
@@ -151,34 +179,15 @@ func sweepOnce(ctx context.Context, conn net.Conn, cfg Config, m targetMetrics, 
 	}
 
 	// waitEcho waits for an echo of THIS payload size whose sequence is one we
-	// actually sent for it. Checking the sequence matters because one socket
-	// serves the whole sweep: a late echo of a larger size would otherwise be
-	// consumed as this probe's read (failing its length check) and be read as
-	// "this smaller size does not survive", stepping the search down below the
-	// real MTU. Accepting every sequence sent for this payload keeps the retry
-	// semantics: an echo of the first attempt arriving during the retry still
-	// proves survival.
+	// actually sent for it (see readEcho). Accepting every sequence sent for
+	// this payload keeps the retry semantics: an echo of the first attempt
+	// arriving during the retry still proves survival.
 	waitEcho := func(payload int, seqs ...uint64) bool {
-		if err := conn.SetReadDeadline(time.Now().Add(deadline)); err != nil {
+		if err := readEcho(conn, buf, headerSize+payload, seqs, time.Now().Add(deadline)); err != nil {
 			m.mtuLost.Inc()
 			return false
 		}
-		for {
-			n, err := conn.Read(buf)
-			if err != nil {
-				m.mtuLost.Inc()
-				return false
-			}
-			if n != headerSize+payload || string(buf[0:8]) != MagicBytes {
-				continue // a foreign or other-size datagram: keep waiting for ours
-			}
-			got := binary.LittleEndian.Uint64(buf[8:16])
-			for _, s := range seqs {
-				if got == s {
-					return true
-				}
-			}
-		}
+		return true
 	}
 	// probeOnce is a single attempt with no retry: used for the header-only
 	// abort probe, where paying the loser's timeout twice would be pointless.

@@ -142,6 +142,11 @@ if "%TARGETS_FILE%"=="" (
     echo   REQUIRED: without a targets file nothing would be probed.
     goto :wiz_targets_file
 )
+:: A trailing backslash would escape the closing quote when the value is
+:: quoted into INSTALL_ARGS ("C:\data\" swallows everything after it,
+:: including -svc=install), and it is a directory-like path either way, so
+:: strip it instead of installing an agent that never returns.
+if "%TARGETS_FILE:~-1%"=="\" set "TARGETS_FILE=%TARGETS_FILE:~0,-1%"
 if not exist "%TARGETS_FILE%" (
     echo   File not found: "%TARGETS_FILE%"
     goto :wiz_targets_file
@@ -225,11 +230,13 @@ icacls "%LOG_DIR%" /inheritance:r /grant "SYSTEM:(OI)(CI)F" "Administrators:(OI)
 )
 
 :: Install (arguments are snapshotted at install time) --------------------------
-:: Every value is quoted: the wizard invites values with spaces (an allowlist
-:: written as "10.0.0.1, 10.0.0.2", a targets file under Program Files), and an
-:: unquoted space splits the argument list -- Go's flag parser then stops at the
-:: stray token, -svc=install is never seen and this script waits forever on a
-:: foreground agent instead of installing the service.
+:: Every value that can contain a space is quoted: the wizard invites an
+:: allowlist written as "10.0.0.1, 10.0.0.2" and paths under Program Files,
+:: and an unquoted space splits the argument list -- Go's flag parser then
+:: stops at the stray token, -svc=install is never seen and this script waits
+:: forever on a foreground agent instead of installing the service. (-mode and
+:: -metrics are left bare: their values are validated literals with no sane
+:: space in them.)
 set "INSTALL_ARGS=-mode=%RUN_MODE% -metrics=%METRICS_ADDR%"
 if not "%TARGETS_FILE%"==""  set "INSTALL_ARGS=%INSTALL_ARGS% -targets="%TARGETS_FILE%""
 if not "%SINGLE_TARGET%"=="" set "INSTALL_ARGS=%INSTALL_ARGS% -target="%SINGLE_TARGET%""
