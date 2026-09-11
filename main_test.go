@@ -740,3 +740,62 @@ func TestStatusEndpointIsGatedLikeMetrics(t *testing.T) {
 		t.Error("/readyz must stay unauthenticated (orchestrators cannot send credentials)")
 	}
 }
+
+// TestRulesAndDashboardReferenceOnlyDefinedMetrics pins a coupling that has
+// drifted before: a renamed metric silently turns a shipped alert or dashboard
+// panel into "no data". Every link_* identifier in rules/link-monitor.yml and
+// grafana-dashboard.json must be a metric defined in internal/prober/metrics.go
+// (or one of the histogram suffixes the client library appends). promtool in CI
+// would validate PromQL syntax, but not this, and the repo's suite needs nothing
+// beyond go test.
+// pi-lens-ignore: go-test-functions
+func TestRulesAndDashboardReferenceOnlyDefinedMetrics(t *testing.T) {
+	src, err := os.ReadFile("internal/prober/metrics.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defined := make(map[string]bool)
+	for _, m := range regexp.MustCompile(`Name:\s*"([a-z][a-z0-9_]*)"`).FindAllStringSubmatch(string(src), -1) {
+		defined[m[1]] = true
+	}
+	if len(defined) < 15 {
+		t.Fatalf("only %d metric names parsed from metrics.go — the extraction broke, so this test would pass vacuously", len(defined))
+	}
+	// Histogram series are exported with suffixes the code never spells out.
+	isDefined := func(name string) bool {
+		if defined[name] {
+			return true
+		}
+		for _, suffix := range []string{"_bucket", "_sum", "_count"} {
+			if strings.HasSuffix(name, suffix) && defined[strings.TrimSuffix(name, suffix)] {
+				return true
+			}
+		}
+		return false
+	}
+	// Prose, not series: the binary/project name appears in comments and titles.
+	notMetrics := map[string]bool{"link_ping": true, "link_ping_prometheus": true}
+
+	for _, path := range []string{"rules/link-monitor.yml", "grafana-dashboard.json"} {
+		// Fixed literals, not user input.
+		// pi-lens-ignore: go-path-traversal
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		refs := regexp.MustCompile(`\blink_[a-z0-9_]+`).FindAllString(string(body), -1)
+		if len(refs) < 15 {
+			t.Fatalf("%s references only %d link_* names — the extraction broke", path, len(refs))
+		}
+		seen := make(map[string]bool, len(refs))
+		for _, ref := range refs {
+			if seen[ref] || notMetrics[ref] {
+				continue
+			}
+			seen[ref] = true
+			if !isDefined(ref) {
+				t.Errorf("%s references %q, which internal/prober/metrics.go does not define (renamed metric? the alert/panel would read 'no data')", path, ref)
+			}
+		}
+	}
+}

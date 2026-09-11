@@ -115,7 +115,7 @@ The exporter exposes the following metrics at `/metrics` (default port 2112).
 | `link_probes_timed_out_total` | Counter | `source`, `target`, `address` | Total probes whose echo did not arrive within their RTO — true network loss. A probe is retired at the first probe tick *after* its deadline, so with `-interval` ≤ `-timeout` an echo up to one interval late still counts as latency, never loss (the effective deadline is RTO + up to one interval). |
 | `link_probes_corrupted_total` | Counter | `source`, `target`, `address` | Probes whose echo came back with corrupted payload bytes (`-payload` mode only): magic, sequence and timestamp intact, data altered in flight. Data-path corruption, not loss — the round trip completed. |
 | `link_mtu_probes_sent_total` | Counter | `source`, `target`, `address` | DF-set probes sent by the periodic MTU sweep (`-mtu-sweep`), counted per ATTEMPT: a size that gets no echo is retried once before the search steps down, so this is a probe rate, not a distinct-size rate (up to ~2x the probes for the same path; a healthy full-size path still costs one). Deliberately separate from the main counters: never in the loss ratio or the sent/rtt/timed_out balance. |
-| `link_mtu_probes_lost_total` | Counter | `source`, `target`, `address` | DF-set MTU probes with no echo, per attempt like `sent` (a size that fails twice counts twice), so lost/sent stays a per-probe ratio: sizes the path does not survive. Rising lost with healthy main probes = PMTUD blackhole (works-small-fails-big). |
+| `link_mtu_probes_lost_total` | Counter | `source`, `target`, `address` | DF-set MTU probes with no echo, per attempt like `sent` (a size that fails twice counts twice), so lost/sent stays a per-probe ratio: sizes the path does not survive. Rising lost with healthy main probes = PMTUD blackhole (works-small-fails-big). Alert on the ratio (e.g. `> 0.2`), not on `> 0` — one retried probe on a 1%-loss path moves it. |
 | `link_path_mtu_bytes` | Gauge | `source`, `target`, `address` | Largest probe frame (header + payload, excluding IP/UDP overhead) that round-trips with DF set; 0 until the first successful sweep. A full-size Ethernet path reads 1424, or 1432 with `-echo-secret` (the header grows from 24 to 32 bytes there). |
 | `link_probes_send_errors_total` | Counter | `source`, `target`, `address` | Probes that failed to send locally (UDP write errors). Never on the wire, so never in `link_probes_sent_total`; sustained rate means a local NIC/socket problem, not network loss. |
 | `link_prober_internal_errors_total` | Counter | `source`, `target`, `address`, `reason` | Prober-internal failures (`reason`: `panic`, `reader_dead`, `dial_retry`, `stop_timeout`) — not link conditions. A rising rate means this target's probe numbers are unreliable; check the agent's own logs and socket state. |
@@ -214,10 +214,12 @@ before reading a mismatch as loss:
 ```promql
 # Labels differ between the two families (the server side carries
 # {source,client}, the client side {source,target,address}), so a bare
-# subtraction matches nothing; aggregate both sides instead. Narrow the
-# selectors per site in a multi-site deployment.
+# subtraction matches nothing; aggregate both sides instead. Narrow both
+# client-side selectors to the target being cross-checked (and to one server
+# client) — leaving the MTU term unfiltered over-subtracts on a client that
+# probes more than one target.
 100 * (1 - (sum(rate(link_server_probes_received_total{client="203.0.113.5"}[$__rate_interval]))
-            - sum(rate(link_mtu_probes_sent_total[$__rate_interval])))
+            - sum(rate(link_mtu_probes_sent_total{target="site-b"}[$__rate_interval])))
            / sum(rate(link_probes_sent_total{target="site-b"}[$__rate_interval])))
 ```
 
@@ -514,7 +516,12 @@ link_ping_prometheus -mode=<mode> [flags]
 | `-echo-secret` | `""` | HMAC secret authenticating UDP probes (env `LINK_PING_ECHO_SECRET`; must be set on **both** client and server — a server without it accepts the client's HMAC frame as a plain payload probe, see [Wire Protocol](#wire-protocol); expands the wire frame to 32 bytes) |
 | `-echo-secret-old` | `""` | Server: previous HMAC secret still accepted during a zero-downtime rotation, alongside `-echo-secret` (env `LINK_PING_ECHO_SECRET_OLD`; server side only) |
 
-**Why MTU discovery (`-mtu-sweep`) matters:** 24-byte probes prove a path *exists* — they cannot prove it *carries full-size traffic*. VPN tunnels, PPPoE/GRE/VXLAN overlays and broken PMTUD routinely pass small packets while black-holing full-size ones — the classic "monitor says healthy, users say broken" failure. The sweep DF-marks probes on a dedicated socket, binary-searches the largest frame that round-trips, and publishes it as `link_path_mtu_bytes`; a shrinking gauge (or rising `link_mtu_probes_lost_total` while `link_up` stays 1) is that failure's signature. A size with no echo is retried once before the search shrinks — a single dropped probe on a lossy path would otherwise converge far below the real MTU and make the gauge flap between sweeps — so both MTU counters advance per attempt and read as a probe rate, not one probe per distinct size tested. It needs no ICMP and no extra firewall rules, uses separate counters that never enter the loss ratio, and is on by default (1m; `0` disables). Alert on `link_path_mtu_bytes < max_over_time(link_path_mtu_bytes[24h])` or `rate(link_mtu_probes_lost_total[10m]) > 0`; `link_up` deliberately stays 1 through an MTU shrink (24-byte probes keep flowing), so the gauge — not `link_up` — is the MTU-specific alarm.
+**Why MTU discovery (`-mtu-sweep`) matters:** 24-byte probes prove a path *exists* — they cannot prove it *carries full-size traffic*. VPN tunnels, PPPoE/GRE/VXLAN overlays and broken PMTUD routinely pass small packets while black-holing full-size ones — the classic "monitor says healthy, users say broken" failure. The sweep DF-marks probes on a dedicated socket, binary-searches the largest frame that round-trips, and publishes it as `link_path_mtu_bytes`; a shrinking gauge (or rising `link_mtu_probes_lost_total` while `link_up` stays 1) is that failure's signature. A size with no echo is retried once before the search shrinks — a single dropped probe on a lossy path would otherwise converge far below the real MTU and make the gauge flap between sweeps — so both MTU counters advance per attempt and read as a probe rate, not one probe per distinct size tested. It needs no ICMP and no extra firewall rules, uses separate counters that never enter the loss ratio, and is on by default (1m; `0` disables). Alert on `link_path_mtu_bytes < max_over_time(link_path_mtu_bytes[24h])`, or
+on MTU probe loss as a RATIO (`rate(link_mtu_probes_lost_total[10m]) /
+rate(link_mtu_probes_sent_total[10m]) > 0.2`) — a bare `> 0` fires on a
+single retried probe, which a normal 1%-loss path produces routinely. `link_up`
+deliberately stays 1 through an MTU shrink (24-byte probes keep flowing), so
+the gauge — not `link_up` — is the MTU-specific alarm.
 
 Liveness endpoints `GET /healthz` and `GET /readyz` on the same metrics listener return `200 ok` (`text/plain`) for Kubernetes/container probes. They are deliberately unauthenticated — only `/metrics` and `/status` are gated — and are available over both HTTP and HTTPS. `/healthz` is always 200; `/readyz` returns `503` while a client-mode agent has no target with a working socket (server-only mode is always 200), so a rollout waits for a real link. `/metrics` itself serves at most 2 concurrent scrapes — a third concurrent request gets `503`, and responses are bounded by a 30s write timeout — so a scrape storm cannot multiply gather trees against `GOMEMLIMIT`.
 
