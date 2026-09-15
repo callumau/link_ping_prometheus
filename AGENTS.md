@@ -11,7 +11,7 @@ UDP is deliberate: no retransmission, so the loss ratio is true network loss (TC
 - Verify before commit: `go build ./... && go vet ./... && go test -count=1 -race ./...`
 - Focused: `go test -count=1 -run TestName ./test/`
 - Verify before commit: `go build ./... && go vet ./... && go test -count=1 ./...`
-- No linter configured; CI runs `go vet ./...` + `GOOS=windows go vet ./...`/`go build ./...` (the Windows-only files are never compiled on the ubuntu runner otherwise) + `govulncheck ./...` + `go test -race -v ./...` + `go build -v ./...`
+- No linter configured; CI runs `go vet ./...` + `GOOS=windows go vet ./...`/`go build ./...` (the Windows-only files are never compiled on the ubuntu runner otherwise) + `promtool check rules rules/link-monitor.yml` + `dashboard-linter lint --strict grafana-dashboard.json` (style rules excluded with reasons in `.github/dashboard-linter.yaml`) + `govulncheck ./...` + `go test -race -v ./...` + `go build -v ./...`
 
 ## Architecture
 
