@@ -62,7 +62,7 @@
         "spec": {
           "id": 1,
           "title": "Current RTT",
-          "description": "Median (p50) round-trip time over the last 5 minutes, in ms. No RTT samples during an outage -> gap; check Link Status.",
+          "description": "Median (p50) round-trip time over the last 5 minutes, in ms. No RTT samples during an outage -> gap; check Link Status. Blank (—) also means the source stopped exporting: staleness clears the series instead of freezing the last value.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -78,9 +78,9 @@
                       "spec": {
                         "editorMode": "code",
                         "expr": "histogram_quantile(0.5, rate(link_rtt_seconds_bucket{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"}[$__rate_interval])) * 1000",
-                        "instant": false,
+                        "instant": true,
                         "legendFormat": "{{target}}",
-                        "range": true
+                        "range": false
                       },
                       "labels": {
                         "grafana.app/export-label": "prometheus-1"
@@ -141,7 +141,8 @@
                   "color": {
                     "mode": "thresholds",
                     "fixedColor": "#ad46ff"
-                  }
+                  },
+                  "noValue": "—"
                 },
                 "overrides": []
               }
@@ -400,7 +401,7 @@
         "spec": {
           "id": 2,
           "title": "Link Status",
-          "description": "1 = up, 0 = down (after 3 consecutive missed probes). Latency panels show a gap while 0 (no RTT samples).",
+          "description": "1 = up, 0 = down (after 3 consecutive missed probes). NO DATA = the source stopped exporting entirely (stale series gone) — a dead monitor, not an up link.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -415,7 +416,7 @@
                       "version": "v0",
                       "spec": {
                         "editorMode": "code",
-                        "expr": "link_up{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"}",
+                        "expr": "link_up{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"} or (absent_over_time(link_up{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"}[10m]) * 3)",
                         "instant": true,
                         "legendFormat": "{{target}}",
                         "range": false
@@ -473,6 +474,11 @@
                           "text": "UP",
                           "color": "green",
                           "index": 0
+                        },
+                        "3": {
+                          "text": "NO DATA",
+                          "color": "dark-red",
+                          "index": 2
                         }
                       }
                     }
@@ -487,6 +493,10 @@
                       {
                         "value": 1,
                         "color": "green"
+                      },
+                      {
+                        "value": 3,
+                        "color": "dark-red"
                       }
                     ]
                   },
@@ -1183,7 +1193,7 @@
         "spec": {
           "id": 8,
           "title": "Link Status (history)",
-          "description": "Connection state over time: 1 = up, 0 = down after 3 consecutive missed probes. Cross-reference with Packet Loss (100% while down).",
+          "description": "Connection state over time: 1 = up, 0 = down after 3 consecutive missed probes. Cross-reference with Packet Loss (100% while down). NO DATA (3) = the source stopped exporting; the line ends where the series went stale.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -1198,7 +1208,7 @@
                       "version": "v0",
                       "spec": {
                         "editorMode": "code",
-                        "expr": "link_up{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"}",
+                        "expr": "link_up{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"} or (absent_over_time(link_up{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"}[10m]) * 3)",
                         "legendFormat": "Status",
                         "range": true
                       },
@@ -1251,6 +1261,11 @@
                           "text": "UP",
                           "color": "green",
                           "index": 0
+                        },
+                        "3": {
+                          "text": "NO DATA",
+                          "color": "dark-red",
+                          "index": 2
                         }
                       }
                     }
@@ -1265,6 +1280,10 @@
                       {
                         "value": 1,
                         "color": "green"
+                      },
+                      {
+                        "value": 3,
+                        "color": "dark-red"
                       }
                     ]
                   },
@@ -2105,7 +2124,7 @@
         "spec": {
           "id": 18,
           "title": "Links Down (now)",
-          "description": "Count of monitored links currently showing link_up = 0 after the 3-miss threshold. 0 = all healthy.",
+          "description": "Count of monitored links currently showing link_up = 0 after the 3-miss threshold. 1 = everything absent (monitor itself is gone). Per-source absences show in 'Monitors missing (now)'.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -2120,7 +2139,7 @@
                       "version": "v0",
                       "spec": {
                         "editorMode": "code",
-                        "expr": "count(link_up{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"} == 0) or vector(0)",
+                        "expr": "count(link_up{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"} == 0) or count(absent_over_time(link_up{instance=~\"$instance\", target=~\"$target\", source=~\"$source\"}[10m])) or vector(0)",
                         "instant": true,
                         "legendFormat": "{{instance}}",
                         "range": false
@@ -2897,6 +2916,96 @@
             }
           }
         }
+      },
+      "panel-27": {
+        "kind": "Panel",
+        "spec": {
+          "id": 27,
+          "title": "Monitors missing (now)",
+          "description": "Sources with a firing LinkMonitorAbsent / LinkMonitorSourceAbsent / LinkScrapeTargetDown alert: the prober stopped exporting (dead agent, unreachable /metrics, broken scrape). This is the down signal a stale link_up series cannot show.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "spec": {
+                        "editorMode": "code",
+                        "expr": "count(ALERTS{alertname=~\"LinkMonitorAbsent|LinkMonitorSourceAbsent|LinkScrapeTargetDown\", alertstate=\"firing\"}) or vector(0)",
+                        "instant": true,
+                        "legendFormat": "missing",
+                        "range": false
+                      },
+                      "labels": {
+                        "grafana.app/export-label": "prometheus-1"
+                      }
+                    },
+                    "refId": "A",
+                    "hidden": false
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "stat",
+            "version": "13.2.0-30616302309",
+            "spec": {
+              "options": {
+                "colorMode": "background",
+                "graphMode": "none",
+                "justifyMode": "auto",
+                "orientation": "auto",
+                "percentChangeColorMode": "standard",
+                "reduceOptions": {
+                  "calcs": [
+                    "lastNotNull"
+                  ],
+                  "fields": "",
+                  "values": false
+                },
+                "showPercentChange": false,
+                "textMode": "auto",
+                "wideLayout": true
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "none",
+                  "decimals": 0,
+                  "min": 0,
+                  "noValue": "—",
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "value": 0,
+                        "color": "green"
+                      },
+                      {
+                        "value": 1,
+                        "color": "dark-red"
+                      }
+                    ]
+                  },
+                  "color": {
+                    "mode": "thresholds",
+                    "fixedColor": "#5794F2"
+                  }
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
       }
     },
     "layout": {
@@ -3129,7 +3238,7 @@
             "spec": {
               "x": 6,
               "y": 45,
-              "width": 18,
+              "width": 12,
               "height": 8,
               "element": {
                 "kind": "ElementReference",
@@ -3238,6 +3347,19 @@
               "element": {
                 "kind": "ElementReference",
                 "name": "panel-26"
+              }
+            }
+          },
+          {
+            "kind": "GridLayoutItem",
+            "spec": {
+              "x": 18,
+              "y": 45,
+              "width": 6,
+              "height": 8,
+              "element": {
+                "kind": "ElementReference",
+                "name": "panel-27"
               }
             }
           }
