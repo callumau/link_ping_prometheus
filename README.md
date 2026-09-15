@@ -572,7 +572,7 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o build/link_ping_prometheus.e
 ```sh
 go test -count=1 ./...          # full suite (~2 min; CI also runs it under -race)
 go vet ./...
-SOAK_SECONDS=600 go test -count=1 -run TestSoakMemory -v ./test/   # opt-in memory soak (heap must stay flat, +8MB ceiling)
+SOAK_SECONDS=600 go test -count=1 -timeout 15m -run TestSoakMemory -v ./test/   # opt-in memory soak (heap must stay flat, +8MB ceiling; -timeout required, the default 10m expires mid-soak)
 ```
 
 Release binaries for Linux, macOS, Windows at [Latest Release](https://github.com/callumau/link_ping_prometheus/releases/latest).
