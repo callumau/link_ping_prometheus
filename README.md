@@ -346,6 +346,13 @@ alert: LinkMonitorAbsent
   expr: absent(link_up)
   for:  10m
 
+alert: LinkScrapeTargetDown
+  expr: up{job="link_ping"} == 0
+  for:  3m
+
+alert: LinkMonitorSourceAbsent   # one rule per source, see below
+  expr: absent_over_time(link_up{source="<site>"}[10m])
+
 alert: LinkProbesStalled
   expr: rate(link_probes_sent_total[$__rate_interval]) == 0
   for:  5m
@@ -374,12 +381,13 @@ The alerts above ship ready-to-load in `rules/link-monitor.yml`: recording
 rules (`link:loss_ratio`, `link:rtt_seconds_p50/p90/p99`,
 `link:mean_rtt_seconds`, `link:rtt_seconds_p50_24h_min` — all with matching
 `rate()` windows) and alerting
-rules (`LinkDown`, `LinkMonitorAbsent`, `HighPacketLoss` 5%/10m,
+rules (`LinkDown`, `LinkMonitorAbsent`, `LinkScrapeTargetDown`,
+`LinkMonitorSourceAbsent` (per-source template), `HighPacketLoss` 5%/10m,
 `SeverePacketLoss` 20%/5m, `LinkProbesStalled`, `LinkProbeStall`,
 `ProbeCorruption`, `ClientSendErrors`, `ProberInternalErrors`,
 `MetricsAuthFailures`, `ServerDropsObserved`, `ServerEchoErrors`,
 `ClockSkewApproaching`, `LinkLatencyDegraded`, `PathMtuDropped`,
-`MtuSweepUnresolved`). Wire
+`MtuProbeLossHigh` (lost/sent ratio > 0.2), `MtuSweepUnresolved`). Wire
 them into Prometheus so alerting works out of the box instead of every
 operator copying expressions from these docs:
 
@@ -402,6 +410,42 @@ target is gone entirely, so missing data can never fire the other alerts).
 `link_prober_internal_errors_total` or `link_server_echo_errors_total` is
 rising, the affected target's numbers are unreliable — fix the cause
 before trusting its loss ratio.
+
+### Dead-Source Coverage
+
+`LinkMonitorAbsent` is a global catch-all: `absent(link_up)` fires only
+when *every* `link_up` series is gone. In a fleet with more than one
+source, one dead prober leaves the others exporting, the expression stays
+non-empty, and **nothing fires** — every `link_up`-keyed alert silently
+resolves ~2 scrapes after the dead source stops exporting (Prometheus
+marks the vanished series stale). Three shipped mechanisms close that gap:
+
+1. **`LinkScrapeTargetDown`** (direct scraping): `up{job="link_ping"} == 0`
+   for 3m fires ~3 scrapes after the exporter dies — the fastest signal,
+   and it carries `job`/`instance` labels. The job name must match your
+   scrape config (the README examples use `link_ping`); a wrong name makes
+   the rule inert, so verify it once with an instant query. Not available
+   for remote-write (Alloy) setups — the receiving Prometheus has no `up`
+   for them.
+2. **`LinkMonitorSourceAbsent`** (template in `rules/link-monitor.yml`, one
+   rule per monitored source): `absent_over_time(link_up{source="site-a"}[10m])`.
+   The [10m] window already encodes the duration — do not add a `for:` on
+   top. The equality matcher is required: it is what makes
+   `{{ $labels.source }}` resolve in the notification, and regex matchers
+   (`source=~"site-.*"`) cannot tell which source died or catch one dead
+   source among several. Generate one block per source from your targets
+   inventory — this is the only dead-source signal for remote-write
+   deployments.
+3. **`LinkMonitorAbsent`** stays as the global fallback for
+   single-source deployments and Prometheus-config-wide breakage. Do not
+   load the file for scrape jobs that run `-mode=server` — `link_up` does
+   not exist there and the alert would fire forever.
+
+The handoff: a live-but-degraded link fires `LinkDown`/loss alerts while
+data still flows; a dead source fires `LinkScrapeTargetDown`
+(direct-scrape, fast) and/or `LinkMonitorSourceAbsent` (any transport,
+~10–12m); the whole export path dying fires `LinkMonitorAbsent`. No state
+leaves a silent gap.
 
 ## Grafana Alloy Scraping
 
