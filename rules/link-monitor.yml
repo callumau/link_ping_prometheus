@@ -66,6 +66,11 @@ groups:
             echo server and the path between them.
 
       - alert: LinkMonitorAbsent
+        # Global catch-all: fires only when EVERY link_up series is gone
+        # (single-source deployments, or a Prometheus-config-wide breakage).
+        # In a multi-source fleet one dead source leaves the others
+        # exporting, so absent() stays non-empty and never fires — that is
+        # what LinkMonitorSourceAbsent (template below) is for.
         expr: absent(link_up)
         for: 10m
         labels:
@@ -76,16 +81,57 @@ groups:
           description: >-
             Nothing is exporting link_up — the agent is down, /metrics
             is unreachable, or scraping is broken. Missing data cannot
-            fire the loss alerts, so this is the only signal that the
-            monitor itself stopped reporting.
-            CAVEAT: link_up exists only in client/both mode, so a
-            scrape job that runs -mode=server would fire this forever.
-            Scope it per site (absent(link_up{source="<site>"})) or use
-            the job-based up{job="<job>"} == 0 variant below, and load
-            this file only for scrape jobs that run the client.
-          # Per-site variant: absent(link_up{source="<site>"})
-          # Job-based alternative (deployment-specific job name):
-          # up{job="<job>"} == 0
+            fire the loss alerts, so this is a signal that the monitor
+            itself stopped reporting. For per-source coverage in a
+            multi-source fleet use the LinkMonitorSourceAbsent template
+            below; for fast direct-scrape detection use
+            LinkScrapeTargetDown.
+            CAVEAT: link_up exists only in client/both mode, so do NOT
+            load this file for scrape jobs that run -mode=server — it
+            would fire this forever.
+
+      # LinkScrapeTargetDown is the FAST dead-exporter signal for direct
+      # scraping: it fires ~3 scrapes after the /metrics endpoint stops
+      # answering, versus ~10m+ for the absent() rules. It requires that
+      # your scrape job is actually named link_ping (the README examples
+      # do) — a wrong job name makes the rule inert (never fires), so
+      # verify once with an instant query in the Prometheus console.
+      # Remote-write deployments (the Alloy example) have no receiving-side
+      # up metric: rely on LinkMonitorSourceAbsent instead.
+      - alert: LinkScrapeTargetDown
+        expr: up{job="link_ping"} == 0
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: >-
+            Scrape of {{ $labels.job }} / {{ $labels.instance }} is failing
+          description: >-
+            Prometheus cannot scrape the link monitor's /metrics endpoint:
+            the agent process is down or unreachable. Every link_up-based
+            alert resolves while this condition holds, so this is the
+            dead-source signal for direct-scrape setups.
+
+      # LinkMonitorSourceAbsent is a TEMPLATE, not a ready rule: per-source
+      # dead-source detection needs one rule per monitored source, and only
+      # an EQUALITY matcher makes {{ $labels.source }} resolve (a regex
+      # matcher such as source=~"site-.*" returns an unlabeled series and
+      # cannot tell you which source died, and it still misses one dead
+      # source among several). Duplicate the block below once per source:
+      #
+      # - alert: LinkMonitorSourceAbsent
+      #   expr: absent_over_time(link_up{source="site-a"}[10m])
+      #   labels:
+      #     severity: critical
+      #   annotations:
+      #     summary: >-
+      #       Source {{ $labels.source }} stopped exporting link_up —
+      #       agent dead, /metrics unreachable, or the scrape path broken
+      #     description: >-
+      #       No link_up sample for {{ $labels.source }} for 10m. Stale
+      #       series resolve every link_up-based alert, so this is the
+      #       per-source dead-source signal. The [10m] window already
+      #       encodes the duration — do not add a for: on top of it.
 
       - alert: HighPacketLoss
         expr: link:loss_ratio > 5
@@ -181,6 +227,7 @@ groups:
 
       - alert: ProbeCorruption
         expr: increase(link_probes_corrupted_total[10m]) > 0
+        for: 5m
         labels:
           severity: warning
         annotations:
@@ -307,6 +354,30 @@ groups:
             24h baseline: the path stopped carrying full-size packets
             (VPN/tunnel MTU shrink or PMTUD breakage) while link_up
             remains 1 — the works-small-fails-big failure mode.
+
+      - alert: MtuProbeLossHigh
+        # The documented lost/sent ratio check ("alert on the ratio, not
+        # on > 0"): one retried probe on a 1%-loss path moves the raw
+        # count, so a ratio is the only usable signal. Matched 15m windows
+        # on both sides per the ratio convention. A denominator of 0
+        # (sweep disabled) yields an empty vector, so this cannot fire
+        # when -mtu-sweep=0.
+        expr: >-
+          rate(link_mtu_probes_lost_total[15m])
+          / rate(link_mtu_probes_sent_total[15m]) > 0.2
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            DF-probe loss ratio above 20% on {{ $labels.target }} from
+            {{ $labels.source }} ({{ $value | humanizePercentage }})
+          description: >-
+            Most DF-set probes are not surviving while small probes do:
+            a PMTUD blackhole or a path that fragments/drops full-size
+            frames. Unlike PathMtuDropped this does not need a 24h
+            baseline, so it also catches a blackhole that persists from
+            before the gauge had history.
 
       - alert: MtuSweepUnresolved
         expr: >-
