@@ -67,7 +67,7 @@ UDP is deliberate: no retransmission, so the loss ratio is true network loss (TC
 ## Tests
 
 - Sleep-timed with tight tolerances; can be flaky under CI load (tests tolerate "cpu load?").
-- `soak_test.go` is an opt-in long-run memory diagnostic — it skips unless `SOAK_SECONDS` or `SOAK_TARGETS` is set, so the default suite stays fast. Run `SOAK_SECONDS=600 go test -count=1 -run TestSoakMemory -v ./test/` for a soak. Heap must stay flat (+8MB ceiling over the run).
+- `soak_test.go` is an opt-in long-run memory diagnostic — it skips unless `SOAK_SECONDS` or `SOAK_TARGETS` is set, so the default suite stays fast. Run `SOAK_SECONDS=600 go test -count=1 -timeout 15m -run TestSoakMemory -v ./test/` for a soak (the `-timeout` is mandatory: go test's default 10m deadline expires while the soak is still sampling). Heap must stay flat (+8MB ceiling over the run).
 - Always pass `-count=1` to bypass the Go test cache.
 - Helpers: `cfgWith(adaptive, interval, timeout, targets...)`; metric getters keyed by `testSource="test"`.
 - Server rate-limit caps (`MaxPktsPerIP`, `MaxPktsGlobal`) are vars so tests can lower them — restore them in a defer after `ServePacketConn` returns. `DynClientTTL` and `MaxClientSeries` are exported vars for the same reason; the TTL sweeper runs on its own timer, so an eviction test no longer needs a second client's probe to trigger it.
