@@ -2,6 +2,7 @@ package prober_test
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -152,6 +153,74 @@ func TestMTUSweep_FindsLimit(t *testing.T) {
 	}
 	if up := getGaugeValue(prober.LinkUp, "mtu_target", addr); up != 1 {
 		t.Errorf("MTU sweeps must not disturb link_up, got %v", up)
+	}
+}
+
+// TestMTUSweep_SingleLossDoesNotFlapGauge pins the retry-once flap
+// protection at a LIVE link: a size with no echo is retried once before the
+// search steps down, so one dropped DF probe cannot converge path_mtu_bytes
+// below the real MTU and make it flap between sweeps (e.g. 1424 → 1248 at
+// 1% loss). The server drops exactly one full-size probe (the first
+// attempt) and echoes the retry and everything else, so the gauge must
+// converge to and stay at the real MTU, lost must be exactly 1 (the single
+// dropped ATTEMPT — a probe rate, not a distinct-size rate), and the
+// retry's extra attempt must appear in sent.
+// pi-lens-ignore: go-test-functions
+func TestMTUSweep_SingleLossDoesNotFlapGauge(t *testing.T) {
+	prober.InitMetrics()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var fullSeen atomic.Int64
+	addr := udpEcho(t, ctx, func(buf []byte, w func([]byte)) {
+		if len(buf) == prober.PayloadSize+prober.MaxPayloadBytes && fullSeen.Add(1) == 1 {
+			return // drop exactly the first full-size DF probe
+		}
+		w(buf)
+	})
+	reg := prober.NewStatusRegistry()
+	cfg := mtuCfg(addr, reg)
+
+	runClientAsync(t, ctx, cancel, cfg)
+	want := float64(prober.PayloadSize + prober.MaxPayloadBytes)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if getGaugeValue(prober.PathMTUBytes, "mtu_target", addr) == want {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := getGaugeValue(prober.PathMTUBytes, "mtu_target", addr); got != want {
+		t.Fatalf("gauge must converge to the real MTU despite one dropped probe: want %v, got %v (retry-once broken?)", want, got)
+	}
+	if n := getCounterValue(prober.MTUProbesSent, "mtu_target", addr); n < 2 {
+		t.Fatalf("the dropped size must be retried: sent %v probes, want >= 2", n)
+	}
+	if n := getCounterValue(prober.MTUProbesLost, "mtu_target", addr); n != 1 {
+		t.Errorf("exactly one attempt must count lost (the dropped first attempt; later sweeps all succeed), got %v", n)
+	}
+	// The flap this guards against happens between sweeps, so keep sampling
+	// across several more sweeps: the gauge must stay at the real MTU.
+	for range 20 {
+		if got := getGaugeValue(prober.PathMTUBytes, "mtu_target", addr); got != want {
+			t.Fatalf("gauge flapped after the transient loss: want %v, got %v", want, got)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if n := getCounterValue(prober.MTUProbesLost, "mtu_target", addr); n != 1 {
+		t.Errorf("succeeding sweeps must not add lost attempts, got %v (want 1)", n)
+	}
+	// MTU probes stay outside the main loss balance even with a retry.
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if mainBalanceGap("mtu_target", addr) == 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if gap := mainBalanceGap("mtu_target", addr); gap != 0 {
+		t.Errorf("main balance broken while MTU sweeps run: gap %v", gap)
 	}
 }
 

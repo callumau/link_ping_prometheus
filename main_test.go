@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	dto "github.com/prometheus/client_model/go"
 	"log/slog"
@@ -797,5 +798,80 @@ func TestRulesAndDashboardReferenceOnlyDefinedMetrics(t *testing.T) {
 				t.Errorf("%s references %q, which internal/prober/metrics.go does not define (renamed metric? the alert/panel would read 'no data')", path, ref)
 			}
 		}
+	}
+}
+
+// TestDashboardAndRules_RateWindowsMatch pins the AGENTS.md convention that
+// a ratio expression must use the SAME rate() window in numerator and
+// denominator: mismatched windows read wrong across restarts and scrape
+// gaps (after a restart one side's rate is 0 while the other still sees
+// pre-restart traffic, silently corrupting loss %/mean RTT). Every
+// expression in grafana-dashboard.json (all "expr" values) and
+// rules/link-monitor.yml (all rule exprs) that contains a division and a
+// rate()/irate() must use one single rate window. Subquery brackets
+// ([24h:5m]) are skipped — they are not rate windows.
+func TestDashboardAndRules_RateWindowsMatch(t *testing.T) {
+	windowRe := regexp.MustCompile(`\[(\$?[0-9]+(?:\.[0-9]+)?[smhd]|\$?__rate_interval)\]`)
+	// [X:Y] is a subquery selector, not a rate window.
+	subqueryRe := regexp.MustCompile(`\[[^]\[]*:[^]\[]*\]`)
+
+	check := func(path, expr string) {
+		t.Helper()
+		if !strings.Contains(expr, "rate(") || !strings.Contains(expr, "/") {
+			return
+		}
+		clean := subqueryRe.ReplaceAllString(expr, "")
+		windows := windowRe.FindAllString(clean, -1)
+		uniq := make(map[string]bool, len(windows))
+		for _, w := range windows {
+			// $__rate_interval and __rate_interval are the same window.
+			uniq[strings.TrimPrefix(strings.TrimPrefix(w, "["), "$")] = true
+		}
+		if len(windows) == 0 {
+			t.Errorf("%s: ratio expression has no extractable rate window (the extraction broke): %q", path, expr)
+			return
+		}
+		if len(uniq) > 1 {
+			t.Errorf("%s: ratio expression mixes rate() windows %v — numerator and denominator MUST match or the ratio reads wrong across restarts and scrape gaps: %q", path, windows, expr)
+		}
+	}
+
+	// Dashboard: every query expression in the v2 schema (spec.elements).
+	dashBody, err := os.ReadFile("grafana-dashboard.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dash any
+	if err := json.Unmarshal(dashBody, &dash); err != nil {
+		t.Fatal(err)
+	}
+	var walk func(node any)
+	walk = func(node any) {
+		switch v := node.(type) {
+		case map[string]any:
+			if expr, ok := v["expr"].(string); ok {
+				check("grafana-dashboard.json", expr)
+			}
+			for _, child := range v {
+				walk(child)
+			}
+		case []any:
+			for _, child := range v {
+				walk(child)
+			}
+		}
+	}
+	walk(dash)
+
+	// Rules file: every rule's expr, split on the rule markers so each
+	// expression (and its numerator/denominator) is checked in isolation.
+	rulesBody, err := os.ReadFile("rules/link-monitor.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	exprRe := regexp.MustCompile(`(?m)^\s+(?:expr|recording)\s*:\s*(?:\|>?)?\s*\n((?:\s{10,}.*\n?)+)|^\s+expr:\s*(.+)$`)
+	for _, m := range exprRe.FindAllStringSubmatch(string(rulesBody), -1) {
+		expr := m[1] + m[2]
+		check("rules/link-monitor.yml", strings.TrimSpace(expr))
 	}
 }
