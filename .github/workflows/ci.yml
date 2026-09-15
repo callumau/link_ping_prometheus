@@ -46,6 +46,31 @@ jobs:
           GOOS=windows go vet ./...
           GOOS=windows go build ./...
 
+      # PromQL syntax + lint for the shipped rules. The Go suite only checks
+      # metric-NAME coupling (TestRulesAndDashboardReferenceOnlyDefinedMetrics)
+      # and ratio-window equality (TestDashboardAndRules_RateWindowsMatch) —
+      # it cannot catch a PromQL syntax error that still parses in an
+      # eyeballed YAML block. Version pinned like govulncheck below; bump in
+      # its own commit.
+      - name: Validate Prometheus rules
+        run: |
+          PROM_URL=https://github.com/prometheus/prometheus/releases/download/v3.14.0
+          curl -sL "$PROM_URL/prometheus-3.14.0.linux-amd64.tar.gz" \
+            | tar xz --strip-components=1 prometheus-3.14.0.linux-amd64/promtool
+          ./promtool check rules rules/link-monitor.yml
+
+      # Grafana dashboard lint: JSON validity, v2 required fields, panel
+      # title/description/units, counter aggregation, PromQL parse. Style
+      # rules assuming a templated datasource or job/instance keying are
+      # excluded in .github/dashboard-linter.yaml (with reasons).
+      - name: Lint Grafana dashboard
+        run: |
+          LINT_URL=https://github.com/grafana/dashboard-linter/releases/download/v0.3.0
+          curl -sL "$LINT_URL/dashboard-linter_0.3.0_linux_amd64.tar.gz" \
+            | tar xz
+          ./dashboard-linter lint -c .github/dashboard-linter.yaml \
+            --strict grafana-dashboard.json
+
       # Fail the build on reachable stdlib/dependency vulnerabilities
       # (the /metrics HTTP server keeps net/http reachable in every mode).
       # Pinned deliberately: this job also runs untrusted PR code, so a
