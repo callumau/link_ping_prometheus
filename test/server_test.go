@@ -9,6 +9,7 @@ import (
 	"math"
 	"net"
 	"net/netip"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1218,6 +1219,130 @@ func TestServer_RateLimit_GlobalChargeBoundsCrypto(t *testing.T) {
 	}
 	if got := getCounterValue(prober.ServerProbesDropped, "rate_global") - beforeGlobal; got < 1 {
 		t.Errorf("frames beyond MaxPktsGlobal must be charged as rate_global before validation, got +%v", got)
+	}
+}
+
+// TestServer_RateLimit_ReplayDoesNotSpendPerIPBudget completes the
+// datagram-order pinning: the per-IP charge runs only AFTER the replay
+// window check (allowlist → global → size → magic → HMAC → replay →
+// per-IP → series resolution). The HMAC-fail branch is pinned by
+// TestServer_RateLimit_JunkDoesNotSpendPerIPBudget; this covers the
+// replay branch: a frame with a VALID tag but a stale timestamp must be
+// dropped as replay WITHOUT spending the source's per-IP budget, so a
+// client with drifting clock skew cannot have its fresh probes pushed
+// over MaxPktsPerIP and read as manufactured loss.
+func TestServer_RateLimit_ReplayDoesNotSpendPerIPBudget(t *testing.T) {
+	prober.InitMetrics()
+	oldIP, oldGlobal := prober.MaxPktsPerIP, prober.MaxPktsGlobal
+	prober.MaxPktsPerIP = 1 // one authenticated frame exhausts the budget
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	defer func() {
+		cancel()
+		<-done // join before restoring the shared cap vars
+		prober.MaxPktsPerIP, prober.MaxPktsGlobal = oldIP, oldGlobal
+	}()
+
+	const secret = "replay-order-secret"
+	pc := listenUDP(t, ctx)
+	allowed := mustAllow("127.0.0.1")
+	go func() {
+		prober.ServePacketConn(ctx, pc, testSource, allowed, secret)
+		close(done)
+	}()
+	addr := pc.LocalAddr().String()
+
+	conn, err := net.Dial("udp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	beforeReplay := getCounterValue(prober.ServerProbesDropped, "replay")
+	beforeIP := getCounterValue(prober.ServerProbesDropped, "rate_ip")
+
+	// A perfectly authenticated frame whose timestamp skews well past the
+	// replay window: it passes the HMAC gate and must be rejected at the
+	// replay guard, BEFORE the per-IP charge that follows it.
+	stale := uint64(time.Now().Add(-2 * time.Minute).UnixNano())
+	conn.Write(buildHMACFrame(secret, 1, stale))
+
+	// The one legitimately fresh probe must still be echoed: it is the
+	// first frame to spend this source's per-IP budget. Reading its echo is
+	// also the sync point proving the stale frame was processed.
+	conn.Write(buildHMACFrame(secret, 2, uint64(time.Now().UnixNano())))
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, _ := conn.Read(make([]byte, 1500))
+	if n != prober.PayloadSizeWithHMAC {
+		t.Fatalf("fresh probe must be echoed after a stale one, got %d bytes (replay spent the per-IP budget?)", n)
+	}
+
+	if got := getCounterValue(prober.ServerProbesDropped, "replay") - beforeReplay; got != 1 {
+		t.Errorf("the stale frame must be dropped exactly once as replay, got +%v", got)
+	}
+	if got := getCounterValue(prober.ServerProbesDropped, "rate_ip") - beforeIP; got != 0 {
+		t.Errorf("a replayed frame must not spend the per-IP budget (rate_ip must stay flat), got +%v", got)
+	}
+}
+
+// TestServer_WarnsWhenEchoSecretUnset pins the startup warning that is the
+// only install-time signal of a half-configured fleet: with -echo-secret on
+// the client but not the server, the 32-byte HMAC frames are echoed as
+// ordinary bounded-payload probes and the whole fleet reads healthy while
+// reflector protection (SEC22) is silently absent. Also pins that the
+// warning fires once at startup, not per datagram — a per-datagram warn on
+// a public reflector would flood the log it is meant to be read from.
+func TestServer_WarnsWhenEchoSecretUnset(t *testing.T) {
+	prober.InitMetrics()
+
+	capture := &logCapture{}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	withLogCapture(capture, func() {
+		go func() {
+			// Exact-IP allowlist: no wide-prefix warning noise; RunServer
+			// binds its own socket ("127.0.0.1:0").
+			_ = prober.RunServer(ctx, "127.0.0.1:0", testSource, mustAllow("127.0.0.1"), "")
+			close(done)
+		}()
+		// The listening Info record is the sync point: the startup warning
+		// is emitted before it, so by the time the server accepts probes
+		// the warning has fired (or is lost).
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) && capture.find("Echo server listening") == "" {
+			// pi-lens-ignore: go-time-sleep-test
+			time.Sleep(10 * time.Millisecond)
+		}
+	})
+	if got := capture.count("set -echo-secret on BOTH ends"); got != 1 {
+		t.Errorf("server must warn exactly once at startup when -echo-secret is unset, got %d warnings", got)
+	}
+
+	// Datagrams must not re-trigger the warning (a public reflector under
+	// load would otherwise flood the log through the warning path).
+	listening := capture.find("Echo server listening")
+	m := regexp.MustCompile(`addr=(\S+)`).FindStringSubmatch(listening)
+	if len(m) != 2 {
+		t.Fatalf("could not extract the listening address from %q", listening)
+	}
+	conn, err := net.Dial("udp", m[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	for range 3 {
+		conn.Write(buildHMACFrame("any", 1, uint64(time.Now().UnixNano())))
+	}
+	// pi-lens-ignore: go-time-sleep-test
+	time.Sleep(200 * time.Millisecond)
+	if got := capture.count("set -echo-secret on BOTH ends"); got != 1 {
+		t.Errorf("the unset-secret warning must fire once at startup, not per datagram, got %d", got)
 	}
 }
 

@@ -2,7 +2,10 @@ package prober_test
 
 import (
 	"context"
+	"log/slog"
 	"net"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -225,4 +228,71 @@ func echoOnce(t *testing.T, conn net.Conn) bool {
 	conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
 	n, _ := conn.Read(make([]byte, prober.PayloadSize))
 	return n == prober.PayloadSize
+}
+
+// logCapture is a slog.Handler recording every record (message + attrs) that
+// passes through it, so tests can assert a specific warning was emitted — and
+// how often. slog's default logger is process-global, so a capture is only
+// valid while the test under it owns the default: install with
+// withLogCapture (or SetDefault + defer restore) and never combine with
+// tests that rely on another handler concurrently (the suite runs
+// sequentially within a package).
+type logCapture struct {
+	mu      sync.Mutex
+	records []string
+}
+
+func (c *logCapture) Enabled(context.Context, slog.Level) bool { return true }
+
+func (c *logCapture) Handle(_ context.Context, r slog.Record) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var b strings.Builder
+	b.WriteString(r.Message)
+	r.Attrs(func(a slog.Attr) bool {
+		b.WriteString(" ")
+		b.WriteString(a.Key)
+		b.WriteString("=")
+		b.WriteString(a.Value.String())
+		return true
+	})
+	c.records = append(c.records, b.String())
+	return nil
+}
+
+func (c *logCapture) WithAttrs([]slog.Attr) slog.Handler { return c }
+func (c *logCapture) WithGroup(string) slog.Handler      { return c }
+
+// count returns how many captured records contain substr.
+func (c *logCapture) count(substr string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for _, r := range c.records {
+		if strings.Contains(r, substr) {
+			n++
+		}
+	}
+	return n
+}
+
+// find returns the first captured record containing substr, or "".
+func (c *logCapture) find(substr string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, r := range c.records {
+		if strings.Contains(r, substr) {
+			return r
+		}
+	}
+	return ""
+}
+
+// withLogCapture installs c as the default slog handler for the duration of
+// fn and restores the previous default afterwards.
+func withLogCapture(c *logCapture, fn func()) {
+	old := slog.Default()
+	slog.SetDefault(slog.New(c))
+	defer slog.SetDefault(old)
+	fn()
 }

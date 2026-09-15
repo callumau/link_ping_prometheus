@@ -2,6 +2,7 @@ package prober_test
 
 import (
 	"context"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -236,6 +237,17 @@ func TestReload_EmptyArrayStopsProbingAndPurges(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// AGENTS.md: "a reload whose file parses to an empty array logs a
+	// warning that all probing has stopped" — the warning is the operator's
+	// only signal that a save-as-[] mistake silenced every link at once, so
+	// it is asserted here alongside the behavioral consequences. The
+	// capture must be installed before RunClient launches (the reload
+	// happens in the client goroutine).
+	capture := &logCapture{}
+	old := slog.Default()
+	slog.SetDefault(slog.New(capture))
+	defer slog.SetDefault(old)
+
 	var received atomic.Int64
 	addr := udpEcho(t, ctx, func(buf []byte, w func([]byte)) {
 		received.Add(1)
@@ -293,5 +305,8 @@ func TestReload_EmptyArrayStopsProbingAndPurges(t *testing.T) {
 		if s.Name == "empty_reload" {
 			t.Errorf("empty-array reload must drop the target from /status, still present: %+v", s)
 		}
+	}
+	if got := capture.count("ALL probing stopped"); got != 1 {
+		t.Errorf("empty-array reload must warn exactly once that all probing stopped, got %d", got)
 	}
 }
