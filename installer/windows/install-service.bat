@@ -291,6 +291,13 @@ if not "%ESecret%"=="" reg add "%ENV_KEY%" /v LINK_PING_ECHO_SECRET /t REG_SZ /d
 set /p "ESecretOld=Echo HMAC secret (previous, for rotation; Enter to skip): "
 if not "%ESecretOld%"=="" reg add "%ENV_KEY%" /v LINK_PING_ECHO_SECRET_OLD /t REG_SZ /d "%ESecretOld%" /f >nul
 
+:: The binary refuses plaintext metrics basic auth without TLS certificates or
+:: -metrics-allow-insecure, and the service arguments this wizard renders cannot
+:: carry either flag - so wizard-delivered credentials would make the service
+:: exit at startup and the SCM restart ladder would loop forever. Warn the
+:: operator at install time instead of letting the install fail silently later.
+if not "%MUser%"=="" if not "%MPass%"=="" echo WARNING: metrics basic-auth credentials were set, but the rendered service arguments include no -metrics-tls-cert/-metrics-tls-key and no -metrics-allow-insecure - the service will exit at startup with "metrics basic auth requires TLS ... or -metrics-allow-insecure" until the service configuration gains one of them.
+
 :: Start and verify -------------------------------------------------------------
 echo.
 echo === Starting service ===
