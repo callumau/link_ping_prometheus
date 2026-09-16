@@ -61,7 +61,10 @@ jobs:
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # yamllint disable-line rule:line-length
         with:
           distribution: goreleaser
-          version: "~> v2"
+          # Pinned deliberately: this workflow holds write tokens, so a floating
+          # constraint would let an upstream release decide what executes here.
+          # Bump the version in its own commit.
+          version: v2.18.1
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
