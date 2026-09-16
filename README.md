@@ -610,7 +610,7 @@ link_ping_prometheus -mode=<mode> [flags]
 | `-metrics-gzip` | `false` | Gzip-compress `/metrics` responses when the scraper offers it. Off by default because promhttp pools a gzip writer per CPU and each holds ~0.7MB of flate state, so compression costs up to ~0.7MB x `GOMAXPROCS` of live heap — more than a small fleet's whole response. Enable it for many targets. |
 | `-mem-scavenge` | `5m` | Runtime: force a heap scavenge at this interval so the unused heap high-water mark is returned to the OS (0 disables; skipped unless at least 4MB of releasable heap is held, see [Memory & Runtime Tuning](#memory--runtime-tuning)). |
 | `-json-logs` | `false` | Output logs in JSON format |
-| `-log-file` | `""` | Append logs to this file in addition to stdout (required for Windows service logging, where stdout is discarded) |
+| `-log-file` | `""` | Append logs to this file in addition to stdout (required for Windows service logging, where stdout is discarded). The agent enforces mode `0600` on this file at startup (repairing wider modes) and refuses symlinked log paths — logs carry peer IPs and topology |
 | `-log-file-max-mb` | `10` | Max log file size in MB before rotation (0 disables rotation) |
 | `-log-file-max-backups` | `5` | Max rotated log files to keep (`0` keeps all of them — pair with `-log-file-max-age` so the directory cannot grow forever) |
 | `-log-file-max-age` | `28` | Max days to keep rotated log files |
@@ -716,7 +716,7 @@ link_ping_prometheus.exe -mode=both -targets=targets.json -metrics=":2112" -log-
 
 > `installer/windows/install-service.bat` / `uninstall-service.bat` in this repo automate steps 1–4 below (admin check, ACL'd log dir, escalating restart ladder, per-service SID, credential prompts). Run from an elevated prompt: an interactive wizard asks for mode (server/client/both), metrics address, targets — a JSON file or a single host:port — the **required** client IP allow-list for server/both modes, log directory, and optional service account, then shows a summary before installing.
 
-1. **Always pass `-log-file` at install.** Under the service, stdout is discarded; without a log file, verbose logs go nowhere (lifecycle/fatal events still reach the event log). Log rotation is built in (`-log-file-max-mb/-backups/-age`). A warning is printed if you skip it.
+1. **Always pass `-log-file` at install.** Under the service, stdout is discarded; without a log file, verbose logs go nowhere (lifecycle/fatal events still reach the event log). Log rotation is built in (`-log-file-max-mb/-backups/-age`). A warning is printed if you skip it. The agent enforces `0600` on the log file at startup (repairing wider modes) and refuses symlinked log paths — place the log in a directory not writable by other local users (the installer's ACL'd log dir satisfies this).
 2. **Service account.** By default the service installs as `LocalSystem`, which is more privilege than this prober needs (outbound UDP + a metrics port + its log directory). For least privilege, switch to a passwordless built-in or gMSA account after install:
 
    ```sh
