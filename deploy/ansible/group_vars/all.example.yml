@@ -11,7 +11,11 @@ link_ping_service_name: link_ping_prometheus
 # Runtime configuration (CLI flags built by the playbook).
 link_ping_mode: both            # server, client, both
 link_ping_listen: ":4000"       # UDP echo listener (server/both modes)
-link_ping_metrics_listen: ":2112"
+# Default matches the binary's localhost default (metrics/status are
+# unauthenticated unless LINK_PING_METRICS_USER/PASS are set); set an
+# explicit all-interfaces value only with auth+TLS or a firewall rule
+# for TCP 2112.
+link_ping_metrics_listen: "127.0.0.1:2112"
 # REQUIRED for server/both: comma-separated client IPs or CIDR
 # prefixes, e.g. "203.0.113.5,10.0.0.0/24".
 link_ping_allow: ""
