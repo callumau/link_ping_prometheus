@@ -166,6 +166,57 @@ func flagDefaultInt(name string) (int, error) {
 	return v, nil
 }
 
+// hardenLogSink enforces the 0600 log invariant regardless of file
+// provenance. Logs carry peer IPs and internal topology, so they are never
+// world-readable, but os.OpenFile applies its mode only at creation: a file
+// placed at the configured path by someone else keeps its wider mode while
+// the agent appends topology into it, and the lumberjack writer opens the
+// existing file with no mode check and copies the live file's mode onto
+// every rotated artifact — so repairing the live file at startup also
+// protects future rotations. A symlinked path is refused outright: it can
+// redirect topology-bearing log lines into a file owned by another local
+// user. Fail-closed: the caller exits on error, like the allowlist refusal.
+func hardenLogSink(path string) (repaired bool, err error) {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return false, err
+		}
+		// Not there yet: create it at the enforced mode so the lumberjack
+		// path finds an existing 0600 file (its rotation copies the current
+		// file's mode onto artifacts).
+		// pi-lens-ignore: go-path-traversal (operator-supplied -log-file path)
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			return false, err
+		}
+		return false, f.Close()
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return false, fmt.Errorf("refusing symlinked log path %q: a symlink can redirect topology-bearing log lines into another local user's file; create the log path directly", path)
+	}
+	// Open the file we Lstat'ed (no O_CREATE: it exists) and repair its mode
+	// on the open descriptor, not by path, so the chmod lands on what we
+	// verified.
+	// pi-lens-ignore: go-path-traversal (operator-supplied -log-file path)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	got, err := f.Stat()
+	if err != nil {
+		return false, err
+	}
+	if got.Mode().Perm() != 0o600 {
+		if err := f.Chmod(0o600); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
 func main() {
 	flag.Parse()
 	// Bound the Go heap so long-running RSS stays flat even during
@@ -201,7 +252,19 @@ func main() {
 		}
 	}
 	logW := io.Writer(os.Stdout)
+	var logRepaired bool
 	if *flLogFile != "" {
+		// Enforce the 0600 invariant at the sink BEFORE either writer opens
+		// the file: O_CREATE applies the mode only at creation, lumberjack
+		// re-opens pre-existing files with no mode check and copies the live
+		// file's mode onto every rotated artifact, and a symlink would
+		// redirect topology-bearing lines into another local user's file.
+		repaired, err := hardenLogSink(*flLogFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "harden log file %q: %v\n", *flLogFile, err)
+			os.Exit(1)
+		}
+		logRepaired = repaired
 		if *flLogMaxSize == 0 {
 			// 0600 matches lumberjack's default: logs carry peer IPs and
 			// internal topology, so they are not world-readable.
@@ -231,6 +294,12 @@ func main() {
 		slog.SetDefault(slog.New(slog.NewJSONHandler(logW, opts)))
 	} else {
 		slog.SetDefault(slog.New(slog.NewTextHandler(logW, opts)))
+	}
+	if logRepaired {
+		// Land the repair notice in the log itself, so an operator whose
+		// pre-created file was wide finds the evidence next to the logs it
+		// would have leaked.
+		slog.Warn("Log file had wider permissions; repaired to 0600", "path", *flLogFile)
 	}
 
 	if *flSvc != "" {

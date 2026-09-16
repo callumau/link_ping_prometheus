@@ -355,6 +355,92 @@ func TestFlagDefaultInt(t *testing.T) {
 	}
 }
 
+// TestHardenLogSink pins the log-sink invariant: the agent enforces 0600 on
+// the configured log file regardless of provenance (a file placed at the
+// configured path by someone else keeps its wider mode while the agent
+// appends topology into it) and refuses symlinked log paths (a symlink can
+// redirect topology-bearing lines into a file another local user controls).
+func TestHardenLogSink(t *testing.T) {
+	t.Run("creates missing file at 0600", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "agent.log")
+		if _, err := hardenLogSink(path); err != nil {
+			t.Fatalf("hardenLogSink: %v", err)
+		}
+		fi, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat created file: %v", err)
+		}
+		if fi.Mode().Perm() != 0o600 {
+			t.Errorf("created file mode = %04o, want 0600", fi.Mode().Perm())
+		}
+	})
+
+	t.Run("repairs pre-existing wide mode", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "agent.log")
+		if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+			t.Fatalf("seed file: %v", err)
+		}
+		repaired, err := hardenLogSink(path)
+		if err != nil {
+			t.Fatalf("hardenLogSink: %v", err)
+		}
+		if !repaired {
+			t.Error("repaired = false, want true")
+		}
+		fi, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat repaired file: %v", err)
+		}
+		if fi.Mode().Perm() != 0o600 {
+			t.Errorf("repaired file mode = %04o, want 0600", fi.Mode().Perm())
+		}
+		if data, err := os.ReadFile(path); err != nil || string(data) != "x" {
+			t.Errorf("file content changed: %q, err %v", data, err)
+		}
+	})
+
+	t.Run("keeps a compliant file untouched", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "agent.log")
+		if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+			t.Fatalf("seed file: %v", err)
+		}
+		repaired, err := hardenLogSink(path)
+		if err != nil {
+			t.Fatalf("hardenLogSink: %v", err)
+		}
+		if repaired {
+			t.Error("repaired = true for an already-0600 file")
+		}
+	})
+
+	t.Run("refuses symlink", func(t *testing.T) {
+		dir := t.TempDir()
+		target := filepath.Join(dir, "outside.log")
+		if err := os.WriteFile(target, []byte("keep"), 0o644); err != nil {
+			t.Fatalf("seed target: %v", err)
+		}
+		path := filepath.Join(dir, "agent.log")
+		if err := os.Symlink(target, path); err != nil {
+			t.Skipf("symlink not supported here: %v", err)
+		}
+		_, err := hardenLogSink(path)
+		if err == nil {
+			t.Fatal("hardenLogSink accepted a symlinked log path")
+		}
+		if !strings.Contains(err.Error(), "symlink") {
+			t.Errorf("error does not mention symlink: %v", err)
+		}
+		// The linked target must be untouched and the symlink itself must
+		// survive (no replace-with-regular-file fallback).
+		if data, err := os.ReadFile(target); err != nil || string(data) != "keep" {
+			t.Errorf("linked target changed: %q, err %v", data, err)
+		}
+		if fi, err := os.Lstat(path); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+			t.Errorf("symlink replaced or missing: %v, %v", fi, err)
+		}
+	})
+}
+
 // TestAbsolutizeFlagValue pins the service-install argument rewriting: path
 // flags must be persisted absolute (the SCM's working directory is unrelated
 // to the install directory), while every other flag - notably the integer
