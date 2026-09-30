@@ -386,7 +386,9 @@ rules (`LinkDown`, `LinkMonitorAbsent`, `LinkScrapeTargetDown`,
 `SeverePacketLoss` 20%/5m, `LinkProbesStalled`, `LinkProbeStall`,
 `ProbeCorruption`, `ClientSendErrors`, `ProberInternalErrors`,
 `MetricsAuthFailures`, `ServerDropsObserved`, `ServerEchoErrors`,
-`ClockSkewApproaching`, `LinkLatencyDegraded`, `PathMtuDropped`,
+`LinkClockSkewHigh` (>20s skew), `LinkClockSkewCritical` (>25s skew,
+replacing the former `ClockSkewApproaching`), `ServerReplayDrops` (replay
+drops while `link_up` is still 1), `LinkLatencyDegraded`, `PathMtuDropped`,
 `MtuProbeLossHigh` (lost/sent ratio > 0.2), `MtuSweepUnresolved`). Wire
 them into Prometheus so alerting works out of the box instead of every
 operator copying expressions from these docs:
@@ -732,9 +734,13 @@ link_ping_prometheus.exe -mode=both -targets=targets.json -metrics=":2112" -log-
    reg add HKLM\SYSTEM\CurrentControlSet\Services\link_ping_prometheus\Environment /v LINK_PING_ECHO_SECRET /t REG_SZ /d <secret> /f
    ```
 
-   Be aware: that registry key is readable by all local users by default — treat these values as non-secret-grade, restrict who can log on to the host, and prefer an ACL-hardened secrets file sourced by your config management for higher assurance. Restart the service after changing them.
+   Be aware: that registry key is readable by all local users by default — treat these values as non-secret-grade, restrict who can log on to the host, and prefer an ACL-hardened secrets file sourced by your config management for higher assurance. Restart the service after changing them. Tighten the ACL on that `Environment` key so only SYSTEM, Administrators and the service account can read it, and rotate the values on a schedule — they sit in the registry in plaintext for the life of the install.
 4. **Further hardening (optional, post-install):** restart escalation ladder via `sc.exe failure link_ping_prometheus reset= 86400 actions= restart/5000/restart/30000/restart/60000`; restrict who can reconfigure the service via `sc.exe sdset`; give the service a per-service SID (`sc.exe sidtype link_ping_prometheus unrestricted`) and ACL the log/data directories to it; keep the binary under `%ProgramFiles%` with Admins-only write ACLs; Authenticode-sign the binary and allowlist via AppLocker/WDAC.
-5. **Upgrades:** re-run `installer/windows/install-service.bat` with the new binary — it detects the existing service, swaps the binary only when its SHA256 differs, and restarts (runtime truth updates via `link_ping_build_info`). Parameters are preserved. If any runtime flags changed, uninstall and reinstall instead — arguments are snapshotted at install time.
+5. **Upgrades:** re-run `installer/windows/install-service.bat` with the new binary — it detects the existing service, swaps the binary only when its SHA256 differs, and restarts (runtime truth updates via `link_ping_build_info`). Parameters are preserved. If any runtime flags changed, uninstall and reinstall instead — arguments are snapshotted at install time. Verify the release checksum (and the signature, once releases are signed) before running the installer: this step is elevated and writes a service, so a tampered binary lands with SYSTEM rights.
+6. **Supply chain and fleet-wide auth, before scaling out:**
+   - Restrict who can create `v*` tags with a GitHub Ruleset — the release build reads the tag for `link_ping_build_info`, so tag creation is a release-authoring permission, not a general contributor one.
+   - Pin the WinRM CA per host in the Ansible inventory (`deploy/ansible/inventory.example.yml`); an unpinned `winrm` connection trusts whatever CA answers first, which is the deploy host's supply chain.
+   - Clock sync is load-bearing, not hygiene: `-echo-secret` rejects any probe more than 30s from the reflector's clock, so a drifted node drops its own legitimate probes as replay and its peers read `link_up=0`. `LinkClockSkewHigh`, `LinkClockSkewCritical` and `ServerReplayDrops` in `rules/link-monitor.yml` alert on it — load them everywhere the service runs.
 
 #### Linux (systemd)
 
