@@ -17,6 +17,7 @@ setlocal EnableExtensions
 ::   - Binary placed in %ProgramFiles%\link_ping_prometheus (Admins-only write)
 ::   - ACL-hardened log dir; per-service SID granted write access to it only
 ::   - Credentials NEVER persisted into the service config (env vars instead)
+::   - The credential Environment key is ACL-restricted to SYSTEM/Admins
 ::   - Lifecycle/fatal events go to the Windows Event Log
 ::
 :: Re-running on an existing installation performs an in-place UPGRADE:
@@ -271,10 +272,10 @@ if not "%SERVICE_ACCOUNT%"=="" (
 
 :: Credential environment variables (optional) ----------------------------------
 :: The service reads LINK_PING_METRICS_USER/PASS, LINK_PING_ECHO_SECRET and
-:: LINK_PING_ECHO_SECRET_OLD (rotation window) from its process environment. The per-service Environment registry key is
-:: the delivery mechanism. NOTE: that key is readable by all local users -
-:: treat these values as non-secret-grade or restrict interactive logon on
-:: this host. Press Enter to skip any value you do not need.
+:: LINK_PING_ECHO_SECRET_OLD (rotation window) from its process environment. The
+:: per-service Environment registry key is the delivery mechanism, and it is
+:: world-readable until the ACL step below runs. Press Enter to skip any value
+:: you do not need.
 echo.
 echo === Optional credential environment variables (Enter to skip) ===
 set "ENV_KEY=HKLM\SYSTEM\CurrentControlSet\Services\%SERVICE_NAME%\Environment"
@@ -290,6 +291,36 @@ if not "%ESecret%"=="" reg add "%ENV_KEY%" /v LINK_PING_ECHO_SECRET /t REG_SZ /d
 
 set /p "ESecretOld=Echo HMAC secret (previous, for rotation; Enter to skip): "
 if not "%ESecretOld%"=="" reg add "%ENV_KEY%" /v LINK_PING_ECHO_SECRET_OLD /t REG_SZ /d "%ESecretOld%" /f >nul
+
+:: Restrict the credential key ------------------------------------------------
+:: The per-service Environment key inherits its ACL from ...\Services, so
+:: before this step every local user could read the plaintext metrics password
+:: and echo HMAC secret just written above. The binary cannot take them as
+:: flags - credential flags are deliberately stripped from the persisted
+:: service config - so this key ACL is the ONLY control on the secret.
+:: Inheritance is dropped (the inherited Everyone/BUILTIN\Users read goes with
+:: it) and full control is re-granted explicitly to SYSTEM and to
+:: BUILTIN\Administrators. No per-service SID grant is needed: the service
+:: process never reads this key itself - the SCM reads it as LocalSystem and
+:: injects the values into the service environment - so a custom service
+:: account is unaffected either way.
+::
+:: The step runs unconditionally and no-ops inside PowerShell when the key
+:: does not exist (no credential was entered, so nothing to protect; only the
+:: reg adds above ever create the key). That keeps the whole step a flat line
+:: with no parenthesized block, which matters here: a ")" inside a user-typed
+:: password would close a block at parse time. The PowerShell invocation is
+:: one physical line on purpose - a ^ inside the quoted -Command is a literal
+:: caret, not a line join. An operator can paste the identical snippet to
+:: re-apply or audit the ACL by hand.
+powershell -NoProfile -Command "$k='HKLM:\SYSTEM\CurrentControlSet\Services\%SERVICE_NAME%\Environment'; if (-not (Test-Path $k)) { exit 0 }; $a=Get-Acl $k; $a.SetAccessRuleProtection($true,$false); foreach($n in 'SYSTEM','BUILTIN\Administrators'){ $a.AddAccessRule((New-Object System.Security.AccessControl.RegistrySystemAccessRule($n,'FullControl','ContainerInherit,ObjectInherit','None','Allow'))) }; Set-Acl -Path $k -AclObject $a; Write-Host 'Environment key ACL restricted to SYSTEM + BUILTIN\Administrators.'"
+:: Fail loud: a credential-bearing key left world-readable is exactly the
+:: exposure this step removes, so never continue past a failed ACL.
+if errorlevel 1 (
+    echo ERROR: could not restrict the ACL on "%ENV_KEY%" - it may still be readable by every local user.
+    echo        Audit it with: powershell -NoProfile -Command "Get-Acl HKLM:\SYSTEM\CurrentControlSet\Services\%SERVICE_NAME%\Environment"
+    exit /b 1
+)
 
 :: The binary refuses plaintext metrics basic auth without TLS certificates or
 :: -metrics-allow-insecure, and the service arguments this wizard renders cannot
