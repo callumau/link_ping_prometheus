@@ -52,6 +52,38 @@ dockers_v2:
 checksum:
   name_template: "checksums.txt"
 
+# Keyless signing of the published checksums file via sigstore (Fulcio
+# cert + Rekor transparency log). The identity is the workflow run itself
+# -- cosign mints the short-lived cert from the runner's OIDC token, which
+# release.yml requests with id-token:write -- so there is no key material
+# in the repo and nothing to rotate or leak.
+#
+# Signing checksums.txt rather than each archive: the checksum file is
+# already the entry point every consumer verifies against, and one
+# signature over it transitively covers every artifact it lists.
+signs:
+  - artifacts: checksum
+    cmd: cosign
+    output: true
+    # sigstore's bundle form: certificate + signature in ONE file, so a
+    # consumer verifies with a single --bundle argument.
+    signature: '${artifact}.sigstore.json'
+    args:
+      # --yes: non-interactive runner, no TTY to confirm the Rekor upload.
+      - "sign-blob"
+      - "--bundle=${signature}"
+      - "${artifact}"
+      - "--yes"
+#
+# Consumers verify the signature FIRST, then the artifacts:
+#   cosign verify-blob --bundle checksums.txt.sigstore.json \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+#     --certificate-identity "$RELEASE_IDENTITY" checksums.txt
+#   sha256sum --check --ignore-missing checksums.txt
+# $RELEASE_IDENTITY is this release workflow's URL identity at the release
+# tag (the release.yml path prefixed with the repo, suffixed @refs/tags/
+# <tag>). See https://goreleaser.com/customization/sign/ .
+
 snapshot:
   version_template: "{{ .Tag }}-next"
 

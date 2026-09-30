@@ -736,9 +736,19 @@ link_ping_prometheus.exe -mode=both -targets=targets.json -metrics=":2112" -log-
 
    The installer and the Ansible play both restrict this key's ACL to SYSTEM and Administrators once a value has been stored (inheritance off, so the inherited world-readable entry is dropped); run the same PowerShell snippet by hand if you add values with `reg add` yourself, and confirm a non-admin `reg query` of the key now fails. Values that sat in the key before that hardening should be treated as disclosed: rotate the echo secret (and metrics password) with the outage-free rotation runbook in the Security section, then restart the service. For higher assurance still, prefer an ACL-hardened secrets file sourced by your configuration management over the registry.
 4. **Further hardening (optional, post-install):** restart escalation ladder via `sc.exe failure link_ping_prometheus reset= 86400 actions= restart/5000/restart/30000/restart/60000`; restrict who can reconfigure the service via `sc.exe sdset`; give the service a per-service SID (`sc.exe sidtype link_ping_prometheus unrestricted`) and ACL the log/data directories to it; keep the binary under `%ProgramFiles%` with Admins-only write ACLs; Authenticode-sign the binary and allowlist via AppLocker/WDAC.
-5. **Upgrades:** re-run `installer/windows/install-service.bat` with the new binary — it detects the existing service, swaps the binary only when its SHA256 differs, and restarts (runtime truth updates via `link_ping_build_info`). Parameters are preserved. If any runtime flags changed, uninstall and reinstall instead — arguments are snapshotted at install time. Verify the release checksum (and the signature, once releases are signed) before running the installer: this step is elevated and writes a service, so a tampered binary lands with SYSTEM rights.
+5. **Upgrades:** re-run `installer/windows/install-service.bat` with the new binary — it detects the existing service, swaps the binary only when its SHA256 differs, and restarts (runtime truth updates via `link_ping_build_info`). Parameters are preserved. If any runtime flags changed, uninstall and reinstall instead — arguments are snapshotted at install time. Before running the installer (it is elevated and writes a service, so a tampered binary lands with SYSTEM rights), verify the release in this order:
+
+   ```sh
+   # 1. the signature: who published this checksums file (keyless sigstore)
+   cosign verify-blob --bundle checksums.txt.sigstore.json \
+     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+     --certificate-identity "https://github.com/<owner>/<repo>/.github/workflows/release.yml@refs/tags/<tag>" \
+     checksums.txt
+   # 2. the artifacts: against the now-trusted checksums file
+   sha256sum --check --ignore-missing checksums.txt
+   ```
 6. **Supply chain and fleet-wide auth, before scaling out:**
-   - Restrict who can create `v*` tags with a GitHub Ruleset — the release build reads the tag for `link_ping_build_info`, so tag creation is a release-authoring permission, not a general contributor one.
+   - Restrict who can create `v*` tags with a GitHub Ruleset — the release build reads the tag for `link_ping_build_info` and now also mints a sigstore signing identity from the run, so tag creation is release-authoring permission, not a general contributor one. `.github/CODEOWNERS` lists the release paths (replace its placeholder team first — an unresolved handle matches nobody, so a required-review ruleset on it would never be satisfiable).
    - Pin the WinRM CA per host in the Ansible inventory (`deploy/ansible/inventory.example.yml`); an unpinned `winrm` connection trusts whatever CA answers first, which is the deploy host's supply chain.
    - Clock sync is load-bearing, not hygiene: `-echo-secret` rejects any probe more than 30s from the reflector's clock, so a drifted node drops its own legitimate probes as replay and its peers read `link_up=0`. `LinkClockSkewHigh`, `LinkClockSkewCritical` and `ServerReplayDrops` in `rules/link-monitor.yml` alert on it — load them everywhere the service runs.
 
