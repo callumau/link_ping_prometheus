@@ -183,12 +183,15 @@ func flagDefaultInt(name string) (int, error) {
 // protects future rotations. A symlinked path is refused outright: it can
 // redirect topology-bearing log lines into a file owned by another local
 // user. Fail-closed: the caller exits on error, like the allowlist refusal.
-// Windows: chmod is a no-op there (os.Stat reports 0666 regardless of ACL),
-// so the POSIX mode-bit enforcement below cannot restrict a DACL; the
-// Windows control for log confidentiality is the ACL'd log DIRECTORY the
-// installer creates (install-service.bat). Enforcing a DACL from here would
-// need SetNamedSecurityInfo work — filed as a round-2 audit finding
-// (deferred).
+// Windows: os.OpenFile's 0600 mode, os.Stat (always 0666) and f.Chmod (an
+// attribute toggle) are all meaningless for a DACL, so the POSIX enforcement
+// below cannot restrict one there — Windows delegates to restrictLogDACL
+// (logacl_windows.go), which replaces the file's DACL with a protected set
+// granting full access only to SYSTEM, Administrators and the account this
+// process runs as. The installer's ACL'd log DIRECTORY remains
+// defense-in-depth: log rotation creates fresh files that inherit the
+// directory's DACL, and restricting those on the fly would add a rotation
+// path to hardenLogSink.
 func hardenLogSink(path string) (repaired bool, err error) {
 	fi, err := os.Lstat(path)
 	if err != nil {
@@ -202,6 +205,14 @@ func hardenLogSink(path string) (repaired bool, err error) {
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 		if err != nil {
 			return false, err
+		}
+		if runtime.GOOS == "windows" {
+			// A fresh file inherits its parent directory's DACL, which may be
+			// wide (a manual install pointing -log-file into a Users-writable
+			// directory); restrict it now so the repair path does not have to
+			// wait for the next start.
+			defer f.Close()
+			return restrictLogDACL(f)
 		}
 		return false, f.Close()
 	}
@@ -220,6 +231,14 @@ func hardenLogSink(path string) (repaired bool, err error) {
 	got, err := f.Stat()
 	if err != nil {
 		return false, err
+	}
+	if runtime.GOOS == "windows" {
+		// os.Stat always reports 0666 on Windows, so the perm-bit comparison
+		// is meaningless there: restrictLogDACL reads the actual DACL of the
+		// open descriptor, compares it against the restricted set it pins,
+		// and only rewrites it when it differs (repaired=false for an
+		// already-compliant file).
+		return restrictLogDACL(f)
 	}
 	if got.Mode().Perm() != 0o600 {
 		if err := f.Chmod(0o600); err != nil {
