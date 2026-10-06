@@ -90,6 +90,14 @@ type Config struct {
 	// link_probes_corrupted_total (distinct from loss). Must be ≤
 	// MaxPayloadBytes so probes are never fragmented.
 	Payload int
+	// HmacCoverage selects which frame bytes the HMAC tag covers when
+	// EchoSecret is set: the 24-byte header only (default, byte-identical
+	// to the v0.7 wire format) or the header plus the pattern payload
+	// (HMACFullFrameCoverage), so a tampered payload — or a payload riding
+	// a captured tag — no longer authenticates. Only meaningful with
+	// EchoSecret AND Payload > 0: the two coverages produce byte-identical
+	// tags for zero-payload frames.
+	HmacCoverage HmacCoverage
 	// MTUSweep, when > 0, runs a periodic DF-bit sweep per target to
 	// discover the largest frame the path carries (link_path_mtu_bytes,
 	// /status path_mtu_bytes). 0 disables. Linux and Windows (IPv4 from
@@ -284,4 +292,70 @@ func validHMACAny(secret, secretOld string, seq, ts uint64, tag []byte) bool {
 		return true
 	}
 	return secretOld != "" && validHMAC(secretOld, seq, ts, tag)
+}
+
+// HmacCoverage selects which frame bytes the client's HMAC tag covers.
+type HmacCoverage int
+
+const (
+	// HMACHeaderCoverage tags only the 24-byte header (magic+seq+ts): the
+	// v0.7 behavior and the default, so the wire bytes are unchanged.
+	HMACHeaderCoverage HmacCoverage = iota
+	// HMACFullFrameCoverage tags the header AND the pattern payload while
+	// skipping the 8-byte tag slot itself, closing the substitution gap
+	// where a payload tampered in flight — or a different payload riding a
+	// captured header tag — still authenticated.
+	HMACFullFrameCoverage
+)
+
+// ParseHMACCoverage maps the -hmac-coverage flag value onto the enum.
+func ParseHMACCoverage(s string) (HmacCoverage, error) {
+	switch s {
+	case "header":
+		return HMACHeaderCoverage, nil
+	case "full-frame":
+		return HMACFullFrameCoverage, nil
+	default:
+		return 0, fmt.Errorf("invalid -hmac-coverage %q: must be \"header\" or \"full-frame\"", s)
+	}
+}
+
+// computeHMACFullFrame returns the truncated HMAC-SHA256 (first 8 bytes)
+// over the header (frame[0:24]) followed by the payload (frame[32:]) —
+// the whole frame EXCEPT the 8-byte tag slot frame[24:32] that the tag
+// itself occupies. For a zero-payload frame (len == PayloadSizeWithHMAC)
+// the result is byte-identical to computeHMAC over the header, which is
+// what makes the coverage additive and forwards-compatible: an old
+// 32-byte frame IS a valid full-frame tag, and a server's header check
+// keeps accepting it. frame must be at least 24 bytes; every caller is
+// size-gated to at least PayloadSizeWithHMAC.
+func computeHMACFullFrame(key string, frame []byte) [8]byte {
+	mac := hmac.New(sha256.New, []byte(key))
+	mac.Write(frame[0:PayloadSize])
+	if len(frame) > PayloadSizeWithHMAC {
+		mac.Write(frame[PayloadSizeWithHMAC:])
+	}
+	sum := mac.Sum(nil)
+	var out [8]byte
+	copy(out[:], sum[:8])
+	return out
+}
+
+// validHMACFullFrame reports whether the frame's 8-byte tag slot matches
+// the expected full-frame HMAC under key. Constant-time via hmac.Equal.
+// frame must be at least PayloadSizeWithHMAC bytes; the server's size
+// gate and the client reader's expectedSize gate both guarantee it.
+func validHMACFullFrame(key string, frame []byte) bool {
+	expected := computeHMACFullFrame(key, frame)
+	return hmac.Equal(expected[:], frame[24:32])
+}
+
+// validHMACFullFrameAny mirrors validHMACAny for the full-frame
+// coverage: the tag must match the primary secret or, during a
+// zero-downtime rotation, the previous one. Constant-time per attempt.
+func validHMACFullFrameAny(secret, secretOld string, frame []byte) bool {
+	if validHMACFullFrame(secret, frame) {
+		return true
+	}
+	return secretOld != "" && validHMACFullFrame(secretOld, frame)
 }

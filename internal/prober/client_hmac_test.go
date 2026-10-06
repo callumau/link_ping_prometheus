@@ -187,3 +187,41 @@ func TestClientHMAC_WithPayload(t *testing.T) {
 		t.Errorf("a valid HMAC+payload echo must not be flagged corrupted (plOff=PayloadSizeWithHMAC), got %v", corrupted)
 	}
 }
+
+// TestClientHMAC_FullFrameCoverage: a client running HmacCoverage ==
+// HMACFullFrameCoverage must round-trip through a production dual-accept
+// server with a payload: the tag covers header+payload, the server accepts
+// it and echoes unmodified, and the reader verifies under the coverage the
+// client sent with — RTT samples appear, nothing times out, and the echo
+// is not flagged corrupted.
+// pi-lens-ignore: go-test-functions
+func TestClientHMAC_FullFrameCoverage(t *testing.T) {
+	InitMetrics()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const src, secret = "test", "hmac-full-frame-secret"
+	addr := hmacEchoServer(t, ctx, src, secret)
+
+	const name = "hmac_full_frame"
+	cfg := Config{
+		Source:       src,
+		BaseInterval: 30 * time.Millisecond,
+		BaseTimeout:  300 * time.Millisecond,
+		EchoSecret:   secret,
+		Payload:      64,
+		HmacCoverage: HMACFullFrameCoverage,
+	}
+	runProbeTargetFor(t, Target{Name: name, Address: addr}, cfg, 600*time.Millisecond)
+
+	if rtt := wbHistCount(src, name, addr); rtt <= 0 {
+		t.Fatalf("a full-frame tagged probe must round-trip through a dual-accept server, got %v RTT samples", rtt)
+	}
+	if tout := wbCounter(ProbesTimedOut, src, name, addr); tout != 0 {
+		t.Errorf("full-frame probes must all be echoed, got timed_out=%v", tout)
+	}
+	if corrupted := wbCounter(CorruptedProbes, src, name, addr); corrupted != 0 {
+		t.Errorf("an intact full-frame echo must not be flagged corrupted, got %v", corrupted)
+	}
+}

@@ -114,11 +114,15 @@ func mtuDeadline(cfg Config, state *probeLoopState) time.Duration {
 // readEcho waits for an echo of exactly size bytes whose sequence is one of
 // seqs, whose timestamp byte-equals the ts this sweep sent for that sequence
 // (sent maps seq -> ts), and — when the sweep runs with -echo-secret — whose
-// trailing 8-byte tag matches computeHMAC(secret, seq, ts), compared
-// constant-time (validHMAC). The main reader applies the same identity
-// checks to its responses; without them a peer able to inject into the
-// connected DF socket could fabricate an echo for the currently probed size
-// (sequence numbers are deterministic) and steer the binary search.
+// tag authenticates under the coverage the sweep sent with: coverage selects
+// between the header tag (v0.7 layout) and the full-frame tag over
+// header+payload with the tag slot skipped (computeHMACFullFrame; for the
+// header-only probe the two coverages coincide byte-for-byte, so the header
+// check is the same check), compared constant-time (validHMAC /
+// validHMACFullFrame). The main reader applies the same identity checks to
+// its responses; without them a peer able to inject into the connected DF
+// socket could fabricate an echo for the currently probed size (sequence
+// numbers are deterministic) and steer the binary search.
 // Foreign datagrams and echoes of another size are SKIPPED rather than
 // taken as this probe's answer: one socket serves the whole sweep, so a late
 // echo of a larger size would otherwise be consumed as a failure of a smaller
@@ -126,7 +130,7 @@ func mtuDeadline(cfg Config, state *probeLoopState) time.Duration {
 // Forged or stale frames are skipped the same way, and the deadline is
 // absolute, so skipping cannot extend the wait (and a stream of foreign
 // datagrams cannot spin the loop past it).
-func readEcho(conn net.Conn, buf []byte, size int, seqs []uint64, sent map[uint64]uint64, secret string, deadline time.Time) error {
+func readEcho(conn net.Conn, buf []byte, size int, seqs []uint64, sent map[uint64]uint64, secret string, coverage HmacCoverage, deadline time.Time) error {
 	if err := conn.SetReadDeadline(deadline); err != nil {
 		return err
 	}
@@ -163,11 +167,23 @@ func readEcho(conn net.Conn, buf []byte, size int, seqs []uint64, sent map[uint6
 			// the probe stays lost at the absolute deadline.
 			continue
 		}
-		if secret != "" && !validHMAC(secret, got, wantSent, buf[24:32]) {
-			// buf[24:32] is in bounds here: secret set means size is at
-			// least PayloadSizeWithHMAC, and the size gate above already
-			// matched n == size.
-			continue // wrong tag: not an echo the prober sent
+		if secret != "" {
+			// Verify under the coverage the sweep sent with; no fallback: the
+			// server echoes buf[:n] unmodified, so an echo can only carry the
+			// tag we wrote. buf[24:32] is in bounds here: secret set means
+			// size is at least PayloadSizeWithHMAC, and the size gate above
+			// already matched n == size.
+			ok := validHMAC(secret, got, wantSent, buf[24:32])
+			if !ok && coverage == HMACFullFrameCoverage {
+				// Full-frame coverage: the header check fails for a
+				// payload-bearing frame's full-frame tag, so verify the whole
+				// frame instead (tag slot skipped). Header-only probes
+				// already passed above — the coverages coincide there.
+				ok = validHMACFullFrame(secret, buf[:n])
+			}
+			if !ok {
+				continue // wrong tag: not an echo the prober sent
+			}
 		}
 		return nil
 	}
@@ -206,14 +222,24 @@ func sweepOnce(ctx context.Context, conn net.Conn, cfg Config, m targetMetrics, 
 		copy(buf[0:8], MagicBytes)
 		binary.LittleEndian.PutUint64(buf[8:16], seq)
 		binary.LittleEndian.PutUint64(buf[16:24], ts)
-		if cfg.EchoSecret != "" {
-			h := computeHMAC(cfg.EchoSecret, seq, ts)
-			copy(buf[24:32], h[:])
-		}
-		if payload > 0 {
-			// Pattern fill: keep the probe indistinguishable from real
-			// opaque traffic for middleboxes (dedup/compression).
+		if cfg.EchoSecret != "" && cfg.HmacCoverage == HMACFullFrameCoverage && payload > 0 {
+			// Full-frame coverage: the tag covers header+payload, so the
+			// payload must be in buf BEFORE the tag is computed. Same
+			// deterministic (seq, ts) pattern as before; only the tag's
+			// INPUT changes.
 			fillPayload(buf[headerSize:headerSize+payload], seq, ts)
+			h := computeHMACFullFrame(cfg.EchoSecret, buf[:headerSize+payload])
+			copy(buf[24:32], h[:])
+		} else {
+			if cfg.EchoSecret != "" {
+				h := computeHMAC(cfg.EchoSecret, seq, ts)
+				copy(buf[24:32], h[:])
+			}
+			if payload > 0 {
+				// Pattern fill: keep the probe indistinguishable from real
+				// opaque traffic for middleboxes (dedup/compression).
+				fillPayload(buf[headerSize:headerSize+payload], seq, ts)
+			}
 		}
 		m.mtuSent.Inc()
 		if _, err := conn.Write(buf[:headerSize+payload]); err != nil {
@@ -230,7 +256,7 @@ func sweepOnce(ctx context.Context, conn net.Conn, cfg Config, m targetMetrics, 
 	// sent for this payload keeps the retry semantics: an echo of the first
 	// attempt arriving during the retry still proves survival.
 	waitEcho := func(payload int, seqs ...uint64) bool {
-		if err := readEcho(conn, buf, headerSize+payload, seqs, sent, cfg.EchoSecret, time.Now().Add(deadline)); err != nil {
+		if err := readEcho(conn, buf, headerSize+payload, seqs, sent, cfg.EchoSecret, cfg.HmacCoverage, time.Now().Add(deadline)); err != nil {
 			m.mtuLost.Inc()
 			return false
 		}
