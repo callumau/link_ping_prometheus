@@ -270,6 +270,7 @@ func saveFlags(t *testing.T) {
 	oldLogFile, oldJSONLogs := *flLogFile, *flJSONLogs
 	oldLogMaxSize, oldLogMaxBackups, oldLogMaxAge := *flLogMaxSize, *flLogMaxBackups, *flLogMaxAge
 	oldAllowInsecure := *flMetricsAllowInsecure
+	oldEchoSecret, oldEchoSecretOld := *flEchoSecret, *flEchoSecretOld
 	t.Cleanup(func() {
 		*flMode, *flListen, *flMetrics = oldMode, oldListen, oldMetrics
 		*flTarget, *flTargets = oldTarget, oldTargets
@@ -281,6 +282,7 @@ func saveFlags(t *testing.T) {
 		*flLogFile, *flJSONLogs = oldLogFile, oldJSONLogs
 		*flLogMaxSize, *flLogMaxBackups, *flLogMaxAge = oldLogMaxSize, oldLogMaxBackups, oldLogMaxAge
 		*flMetricsAllowInsecure = oldAllowInsecure
+		*flEchoSecret, *flEchoSecretOld = oldEchoSecret, oldEchoSecretOld
 	})
 }
 
@@ -333,6 +335,74 @@ func TestResolveMetricsAuth(t *testing.T) {
 	if u, p, err := resolveMetricsAuth(); err != nil || u != "flagu" || p != "flagp" {
 		t.Errorf("full flag pair should win over env: got %q/%q, err %v", u, p, err)
 	}
+}
+
+// TestRunRejectsEchoSecretOldWithoutPrimary pins the rotation guard (F4):
+// -echo-secret-old without a primary -echo-secret silently disables ALL wire
+// auth — internal/prober/server.go consults the old secret only inside its
+// `if echoSecret != ""` branch, so an operator mid-rotation whose new secret
+// deploy failed would run unauthenticated believing rotation protection is
+// active. The guard must fail the run BEFORE any bind.
+func TestRunRejectsEchoSecretOldWithoutPrimary(t *testing.T) {
+	saveFlags(t)
+	t.Setenv("LINK_PING_METRICS_USER", "")
+	t.Setenv("LINK_PING_METRICS_PASS", "")
+	t.Setenv("LINK_PING_ECHO_SECRET", "")
+	t.Setenv("LINK_PING_ECHO_SECRET_OLD", "")
+
+	for _, tc := range []struct {
+		name    string
+		secret  string
+		old     string
+		wantErr bool
+	}{
+		{"old secret without primary", "", "x", true},
+		{"old secret with primary", "s", "x", false},
+		{"no secrets", "", "", false},
+		{"primary only", "s", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			saveFlags(t)
+			*flEchoSecret = tc.secret
+			*flEchoSecretOld = tc.old
+			// Deterministic late failure PAST the guard: an invalid target
+			// fails buildConfig, which runs after the rotation guard, so an
+			// error that does not mention the old secret proves the guard
+			// let the run proceed without binding anything.
+			*flMode = "client"
+			*flTarget = "not a target"
+
+			// pi-lens-ignore: go-context-background-handler
+			prg := &program{ctx: context.Background()}
+			err := prg.run()
+			if err == nil {
+				t.Fatal("expected run() to fail (rotation guard or invalid target sentinel)")
+			}
+			if tc.wantErr && !strings.Contains(err.Error(), "old secret alone provides no authentication") {
+				t.Errorf("error should name the old-secret-only problem, got: %v", err)
+			}
+			if !tc.wantErr && strings.Contains(err.Error(), "echo-secret-old") {
+				t.Errorf("valid secret pair must pass the rotation guard, got: %v", err)
+			}
+		})
+	}
+
+	// Env-only variant: LINK_PING_ECHO_SECRET_OLD set while the primary is
+	// absent. resolveEchoSecret cannot distinguish a present-but-empty env
+	// var from unset (both read "") — acceptable for the primary; the guard
+	// must still catch the dangerous combination regardless of provenance.
+	t.Run("old secret via env only", func(t *testing.T) {
+		saveFlags(t)
+		*flEchoSecret = ""
+		*flEchoSecretOld = ""
+		t.Setenv("LINK_PING_ECHO_SECRET_OLD", "x")
+		// pi-lens-ignore: go-context-background-handler
+		prg := &program{ctx: context.Background()}
+		err := prg.run()
+		if err == nil || !strings.Contains(err.Error(), "old secret alone provides no authentication") {
+			t.Errorf("env-sourced old secret without primary must fail the guard, got: %v", err)
+		}
+	})
 }
 
 // pi-lens-ignore: go-test-functions

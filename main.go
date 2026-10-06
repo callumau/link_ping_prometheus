@@ -811,6 +811,16 @@ func (p *program) run() error {
 		return fmt.Errorf("unknown mode: %s", mode)
 	}
 
+	// Rotation guard. ServePacketConn consults echoSecretOld only inside
+	// its `if echoSecret != ""` branch (internal/prober/server.go), so an
+	// old secret on its own authenticates NOTHING: with the primary secret
+	// empty the agent runs unauthenticated while an operator mid-rotation
+	// believes the rotation protection is active. Fail fast instead.
+	echoSecret, echoSecretOld := resolveEchoSecret(), resolveEchoSecretOld()
+	if echoSecret == "" && echoSecretOld != "" {
+		return errors.New("-echo-secret-old is set without -echo-secret: the old secret alone provides no authentication (it is only accepted alongside a primary secret), so the agent would run unauthenticated; set -echo-secret or clear -echo-secret-old")
+	}
+
 	user, pass, err := resolveMetricsAuth()
 	if err != nil {
 		return err
@@ -902,8 +912,8 @@ func (p *program) run() error {
 		return err
 	}
 
-	echoSecret := resolveEchoSecret()
-	echoSecretOld := resolveEchoSecretOld()
+	// echoSecret/echoSecretOld resolved at the top of run(): the rotation
+	// guard must fire before any bind, not after the metrics server is up.
 	mode := *flMode
 	// runCtx: a mid-run metrics-serve failure must cancel the mode loops.
 	// A monitor without a live /metrics endpoint is dead weight that looks
