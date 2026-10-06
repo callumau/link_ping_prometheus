@@ -337,6 +337,31 @@ func resolveEchoSecretOld() string {
 	return os.Getenv("LINK_PING_ECHO_SECRET_OLD")
 }
 
+// warnIgnoredFlags emits one-line slog.Warn diagnostics for flags that are
+// set but silently unused in the selected mode. Warnings, not errors: every
+// case is backward compatible (the previous behavior ignored the flag too),
+// but silent ingestion gaps are how a half-configured fleet ships.
+// - echo-secret-old is consumed ONLY by the server (rotation acceptance in
+//   internal/prober/server.go), so it is ignored in client mode.
+// - allow and listen gate the echo responder, so they are ignored in client mode.
+// - with both -targets and -target set, buildConfig's else-if means -targets wins.
+func warnIgnoredFlags(mode string) {
+	if *flEchoSecretOld != "" && mode == "client" {
+		slog.Warn("-echo-secret-old set but ignored: the old secret is only accepted by the echo server (server/both mode), not by the client")
+	}
+	// -listen's default (":4000") is non-empty, so compare against the
+	// registered default: a client run with the default must not warn.
+	if *flAllow != "" && mode == "client" {
+		slog.Warn("-allow set but ignored: the client allowlist only applies to the echo server (server/both mode)")
+	}
+	if *flListen != "" && *flListen != flag.Lookup("listen").DefValue && mode == "client" {
+		slog.Warn("-listen set but ignored: the listen address only applies to the echo server (server/both mode)")
+	}
+	if *flTargets != "" && *flTarget != "" && mode != "server" {
+		slog.Warn("-targets and -target are both set: -targets wins, -target is ignored")
+	}
+}
+
 func sanitizeHostname(s string) string {
 	s = strings.ToLower(s)
 	var b strings.Builder
@@ -827,6 +852,7 @@ func (p *program) run() error {
 	if echoSecret == "" && echoSecretOld != "" {
 		return errors.New("-echo-secret-old is set without -echo-secret: the old secret alone provides no authentication (it is only accepted alongside a primary secret), so the agent would run unauthenticated; set -echo-secret or clear -echo-secret-old")
 	}
+	warnIgnoredFlags(*flMode)
 
 	user, pass, err := resolveMetricsAuth()
 	if err != nil {
