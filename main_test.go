@@ -495,8 +495,8 @@ func TestWarnIgnoredFlags(t *testing.T) {
 			wantWarns: []string{"-allow", "-listen", "-echo-secret-old"},
 		},
 		{
-			name: "clean client mode",
-			mode: "client",
+			name:  "clean client mode",
+			mode:  "client",
 			setup: func() {},
 		},
 		{
@@ -526,13 +526,13 @@ func TestWarnIgnoredFlags(t *testing.T) {
 			wantWarns: []string{"-targets wins"},
 		},
 		{
-			name: "only target set",
-			mode: "client",
+			name:  "only target set",
+			mode:  "client",
 			setup: func() { *flTarget = "127.0.0.1:4000" },
 		},
 		{
-			name: "only targets set",
-			mode: "client",
+			name:  "only targets set",
+			mode:  "client",
 			setup: func() { *flTargets = "targets.json" },
 		},
 	} {
@@ -580,12 +580,12 @@ func TestFlagDefaultInt(t *testing.T) {
 // configured path by someone else keeps its wider mode while the agent
 // appends topology into it) and refuses symlinked log paths (a symlink can
 // redirect topology-bearing lines into a file another local user controls).
-// Windows note: os.Stat reports 0666 for every file regardless of ACL and
+// Windows: os.Stat reports 0666 for every file regardless of ACL and
 // f.Chmod only toggles the read-only attribute, so the POSIX perm-bit
-// assertions below are unix-only. The Windows control for log confidentiality
-// is the ACL'd log DIRECTORY the installer creates (install-service.bat), not
-// the mode bit — enforcing a DACL from hardenLogSink itself is filed as a
-// round-2 finding (deferred, needs SetNamedSecurityInfo work).
+// assertions are unimplementable there — hardenLogSink instead restricts
+// the file's DACL (logacl_windows.go) and the Windows branches below assert
+// that DACL directly: protected from inheritance, full access only for
+// SYSTEM, Administrators and the process token user.
 func TestHardenLogSink(t *testing.T) {
 	t.Run("creates missing file at 0600", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "agent.log")
@@ -593,7 +593,11 @@ func TestHardenLogSink(t *testing.T) {
 			t.Fatalf("hardenLogSink: %v", err)
 		}
 		if runtime.GOOS == "windows" {
-			// Stat reports 0666 on Windows regardless of the create mode.
+			// Stat reports 0666 on Windows regardless of the create mode, so
+			// pin the Windows equivalent: the created file's DACL is the
+			// restricted protected set, not the parent directory's inherited
+			// grant.
+			verifyLogDACLRestricted(t, path)
 			return
 		}
 		fi, err := os.Stat(path)
@@ -617,8 +621,15 @@ func TestHardenLogSink(t *testing.T) {
 		if !repaired {
 			t.Error("repaired = false, want true")
 		}
+		// The content assertion is platform-independent: a repair, perm-bit
+		// or DACL alike, must not touch what is already in the file.
+		if data, err := os.ReadFile(path); err != nil || string(data) != "x" {
+			t.Errorf("file content changed: %q, err %v", data, err)
+		}
 		if runtime.GOOS == "windows" {
-			// Stat reports 0666 on Windows regardless of the actual ACL.
+			// The repair on Windows is a DACL restriction, not perm bits —
+			// pin exactly that.
+			verifyLogDACLRestricted(t, path)
 			return
 		}
 		fi, err := os.Stat(path)
@@ -628,22 +639,30 @@ func TestHardenLogSink(t *testing.T) {
 		if fi.Mode().Perm() != 0o600 {
 			t.Errorf("repaired file mode = %04o, want 0600", fi.Mode().Perm())
 		}
-		if data, err := os.ReadFile(path); err != nil || string(data) != "x" {
-			t.Errorf("file content changed: %q, err %v", data, err)
-		}
 	})
 
 	t.Run("keeps a compliant file untouched", func(t *testing.T) {
-		if runtime.GOOS == "windows" {
-			// "compliant" is a POSIX perm-bit concept: Windows reports 0666 for
-			// every file, so hardenLogSink would always report repaired=true and
-			// the untouched assertion is unimplementable there (see the Windows
-			// note on this test function).
-			t.Skip("perm-bit semantics are unix-only; Windows control is the installer's log-dir ACL")
-		}
 		path := filepath.Join(t.TempDir(), "agent.log")
 		if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
 			t.Fatalf("seed file: %v", err)
+		}
+		if runtime.GOOS == "windows" {
+			// "compliant" is not observable through os.Stat (always 0666), so
+			// pre-apply the log DACL by running hardenLogSink once; the DACL
+			// comparison in restrictLogDACL must then report the second run as
+			// compliant — pins the idempotence of that comparison.
+			if _, err := hardenLogSink(path); err != nil {
+				t.Fatalf("pre-limit hardenLogSink: %v", err)
+			}
+			repaired, err := hardenLogSink(path)
+			if err != nil {
+				t.Fatalf("hardenLogSink: %v", err)
+			}
+			if repaired {
+				t.Error("repaired = true for an already-restricted DACL")
+			}
+			verifyLogDACLRestricted(t, path)
+			return
 		}
 		repaired, err := hardenLogSink(path)
 		if err != nil {

@@ -13,7 +13,7 @@ folder (or edit `EXE_PATH` at the top of the script).
 
 1. Verifies admin rights and binary presence
 2. Copies the binary into `%ProgramFiles%\link_ping_prometheus` (Admins-only-write location; weak binary-path ACLs are the classic Windows service-persistence attack)
-3. Creates an ACL-hardened log directory (`C:\ProgramData\link_ping_prometheus\logs`)
+3. Creates an ACL-hardened log directory (`C:\ProgramData\link_ping_prometheus\logs`). The agent hardens the log **file** itself as well: at startup, `hardenLogSink` replaces the file's DACL with a protected set granting full access only to `SYSTEM`, `Administrators` and the account the agent runs as. The directory ACL remains defense-in-depth: log rotation creates fresh files that inherit the directory ACL, not the hardened one
 4. Installs via `-svc=install`, which bakes in:
    - SCM recovery: restart on failure after 5s
    - Delayed auto-start; dependencies on `Tcpip` and `W32Time`
