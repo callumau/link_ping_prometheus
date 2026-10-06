@@ -386,7 +386,9 @@ rules (`LinkDown`, `LinkMonitorAbsent`, `LinkScrapeTargetDown`,
 `SeverePacketLoss` 20%/5m, `LinkProbesStalled`, `LinkProbeStall`,
 `ProbeCorruption`, `ClientSendErrors`, `ProberInternalErrors`,
 `MetricsAuthFailures`, `ServerDropsObserved`, `ServerEchoErrors`,
-`ClockSkewApproaching`, `LinkLatencyDegraded`, `PathMtuDropped`,
+`LinkClockSkewHigh` (>20s skew), `LinkClockSkewCritical` (>25s skew,
+replacing the former `ClockSkewApproaching`), `ServerReplayDrops` (replay
+drops while `link_up` is still 1), `LinkLatencyDegraded`, `PathMtuDropped`,
 `MtuProbeLossHigh` (lost/sent ratio > 0.2), `MtuSweepUnresolved`). Wire
 them into Prometheus so alerting works out of the box instead of every
 operator copying expressions from these docs:
@@ -610,7 +612,7 @@ link_ping_prometheus -mode=<mode> [flags]
 | `-metrics-gzip` | `false` | Gzip-compress `/metrics` responses when the scraper offers it. Off by default because promhttp pools a gzip writer per CPU and each holds ~0.7MB of flate state, so compression costs up to ~0.7MB x `GOMAXPROCS` of live heap — more than a small fleet's whole response. Enable it for many targets. |
 | `-mem-scavenge` | `5m` | Runtime: force a heap scavenge at this interval so the unused heap high-water mark is returned to the OS (0 disables; skipped unless at least 4MB of releasable heap is held, see [Memory & Runtime Tuning](#memory--runtime-tuning)). |
 | `-json-logs` | `false` | Output logs in JSON format |
-| `-log-file` | `""` | Append logs to this file in addition to stdout (required for Windows service logging, where stdout is discarded) |
+| `-log-file` | `""` | Append logs to this file in addition to stdout (required for Windows service logging, where stdout is discarded). The agent enforces mode `0600` on this file at startup (repairing wider modes) and refuses symlinked log paths — logs carry peer IPs and topology |
 | `-log-file-max-mb` | `10` | Max log file size in MB before rotation (0 disables rotation) |
 | `-log-file-max-backups` | `5` | Max rotated log files to keep (`0` keeps all of them — pair with `-log-file-max-age` so the directory cannot grow forever) |
 | `-log-file-max-age` | `28` | Max days to keep rotated log files |
@@ -716,7 +718,7 @@ link_ping_prometheus.exe -mode=both -targets=targets.json -metrics=":2112" -log-
 
 > `installer/windows/install-service.bat` / `uninstall-service.bat` in this repo automate steps 1–4 below (admin check, ACL'd log dir, escalating restart ladder, per-service SID, credential prompts). Run from an elevated prompt: an interactive wizard asks for mode (server/client/both), metrics address, targets — a JSON file or a single host:port — the **required** client IP allow-list for server/both modes, log directory, and optional service account, then shows a summary before installing.
 
-1. **Always pass `-log-file` at install.** Under the service, stdout is discarded; without a log file, verbose logs go nowhere (lifecycle/fatal events still reach the event log). Log rotation is built in (`-log-file-max-mb/-backups/-age`). A warning is printed if you skip it.
+1. **Always pass `-log-file` at install.** Under the service, stdout is discarded; without a log file, verbose logs go nowhere (lifecycle/fatal events still reach the event log). Log rotation is built in (`-log-file-max-mb/-backups/-age`). A warning is printed if you skip it. The agent enforces `0600` on the log file at startup (repairing wider modes) and refuses symlinked log paths — place the log in a directory not writable by other local users (the installer's ACL'd log dir satisfies this).
 2. **Service account.** By default the service installs as `LocalSystem`, which is more privilege than this prober needs (outbound UDP + a metrics port + its log directory). For least privilege, switch to a passwordless built-in or gMSA account after install:
 
    ```sh
@@ -732,9 +734,23 @@ link_ping_prometheus.exe -mode=both -targets=targets.json -metrics=":2112" -log-
    reg add HKLM\SYSTEM\CurrentControlSet\Services\link_ping_prometheus\Environment /v LINK_PING_ECHO_SECRET /t REG_SZ /d <secret> /f
    ```
 
-   Be aware: that registry key is readable by all local users by default — treat these values as non-secret-grade, restrict who can log on to the host, and prefer an ACL-hardened secrets file sourced by your config management for higher assurance. Restart the service after changing them.
+   The installer and the Ansible play both restrict this key's ACL to SYSTEM and Administrators once a value has been stored (inheritance off, so the inherited world-readable entry is dropped); run the same PowerShell snippet by hand if you add values with `reg add` yourself, and confirm a non-admin `reg query` of the key now fails. Values that sat in the key before that hardening should be treated as disclosed: rotate the echo secret (and metrics password) with the outage-free rotation runbook in the Security section, then restart the service. For higher assurance still, prefer an ACL-hardened secrets file sourced by your configuration management over the registry.
 4. **Further hardening (optional, post-install):** restart escalation ladder via `sc.exe failure link_ping_prometheus reset= 86400 actions= restart/5000/restart/30000/restart/60000`; restrict who can reconfigure the service via `sc.exe sdset`; give the service a per-service SID (`sc.exe sidtype link_ping_prometheus unrestricted`) and ACL the log/data directories to it; keep the binary under `%ProgramFiles%` with Admins-only write ACLs; Authenticode-sign the binary and allowlist via AppLocker/WDAC.
-5. **Upgrades:** re-run `installer/windows/install-service.bat` with the new binary — it detects the existing service, swaps the binary only when its SHA256 differs, and restarts (runtime truth updates via `link_ping_build_info`). Parameters are preserved. If any runtime flags changed, uninstall and reinstall instead — arguments are snapshotted at install time.
+5. **Upgrades:** re-run `installer/windows/install-service.bat` with the new binary — it detects the existing service, swaps the binary only when its SHA256 differs, and restarts (runtime truth updates via `link_ping_build_info`). Parameters are preserved. If any runtime flags changed, uninstall and reinstall instead — arguments are snapshotted at install time. Before running the installer (it is elevated and writes a service, so a tampered binary lands with SYSTEM rights), verify the release in this order:
+
+   ```sh
+   # 1. the signature: who published this checksums file (keyless sigstore)
+   cosign verify-blob --bundle checksums.txt.sigstore.json \
+     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+     --certificate-identity "https://github.com/<owner>/<repo>/.github/workflows/release.yml@refs/tags/<tag>" \
+     checksums.txt
+   # 2. the artifacts: against the now-trusted checksums file
+   sha256sum --check --ignore-missing checksums.txt
+   ```
+6. **Supply chain and fleet-wide auth, before scaling out:**
+   - Restrict who can create `v*` tags with a GitHub Ruleset — the release build reads the tag for `link_ping_build_info` and now also mints a sigstore signing identity from the run, so tag creation is release-authoring permission, not a general contributor one. `.github/CODEOWNERS` lists the release paths (replace its placeholder team first — an unresolved handle matches nobody, so a required-review ruleset on it would never be satisfiable).
+   - Pin the WinRM CA per host in the Ansible inventory (`deploy/ansible/inventory.example.yml`); an unpinned `winrm` connection trusts whatever CA answers first, which is the deploy host's supply chain.
+   - Clock sync is load-bearing, not hygiene: `-echo-secret` rejects any probe more than 30s from the reflector's clock, so a drifted node drops its own legitimate probes as replay and its peers read `link_up=0`. `LinkClockSkewHigh`, `LinkClockSkewCritical` and `ServerReplayDrops` in `rules/link-monitor.yml` alert on it — load them everywhere the service runs.
 
 #### Linux (systemd)
 

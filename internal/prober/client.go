@@ -26,6 +26,29 @@ type Target struct {
 	Timeout  time.Duration `json:"timeout,omitempty"`
 }
 
+// runClientDoneKey carries the RunClient root context's Done channel into
+// every probe-loop context, so an exiting loop can distinguish "the process
+// is shutting down" (every series stops being exported) from "this loop was
+// cancelled for a restart" (kept-series restarts keep exporting while the
+// old loop unwinds). The distinction decides the clean-cancel exit
+// accounting — see the runEchoLoop exit defer.
+type runClientDoneKey struct{}
+
+func runClientShuttingDown(ctx context.Context) bool {
+	d, ok := ctx.Value(runClientDoneKey{}).(<-chan struct{})
+	if !ok || d == nil {
+		// Defensive: no marker means no root to consult. Treat as shutdown
+		// (inflight-only accounting) — the conservative choice.
+		return true
+	}
+	select {
+	case <-d:
+		return true
+	default:
+		return false
+	}
+}
+
 // MarshalJSON encodes Interval/Timeout as duration strings (e.g. "500ms")
 // when non-zero, omitting them otherwise so the global config is used.
 func (t Target) MarshalJSON() ([]byte, error) {
@@ -310,8 +333,12 @@ func RunClient(ctx context.Context, cfg Config) error {
 		}
 	}
 
+	// start spawns one probe loop. Every loop context carries the RunClient
+	// root context's Done channel so its exit can distinguish "the process
+	// is shutting down" from "this loop was cancelled for a restart" — the
+	// distinction the runEchoLoop exit defer needs for its accounting.
 	start := func(tg Target) {
-		tctx, cancel := context.WithCancel(ctx)
+		tctx, cancel := context.WithCancel(context.WithValue(ctx, runClientDoneKey{}, ctx.Done()))
 		r := running{tg: tg, cancel: cancel, done: make(chan struct{})}
 		live[tg.Name] = r
 		go func() {
@@ -383,7 +410,9 @@ func RunClient(ctx context.Context, cfg Config) error {
 				// exporting its last link_up=1 for the life of the process (the
 				// same frozen-green bug the removal purge fixes). An
 				// interval/timeout change keeps the series: still one endpoint,
-				// so its counters must stay continuous.
+				// so its counters must stay continuous. Mark only the keep case
+				// as a kept-series restart — a withdrawn series makes the old
+				// exit accounting invisible, so no marker is needed there.
 				if r.tg.Address != w.Address {
 					deleteTargetSeries(cfg.Source, r.tg)
 				}
@@ -396,6 +425,11 @@ func RunClient(ctx context.Context, cfg Config) error {
 				continue
 			}
 			if _, ok := live[tg.Name]; !ok {
+				// A freed straggler whose series were kept (interval/timeout
+				// change) restarts on the same series. No per-restart marker is
+				// needed: the exit defer consults the root Done channel and
+				// counts on every non-shutdown cancellation (the count is
+				// invisible on withdrawn series — detached children).
 				SeedMetrics(cfg.Source, []Target{tg})
 				start(tg)
 			}
@@ -1134,8 +1168,29 @@ func runEchoLoop(
 			drainResponses()
 			m.timedOut.Add(float64(len(pending)))
 		}
-		// Probes still in flight die with the loop on cancellation
-		// without counting as timeouts, but must leave the gauge.
+		// Probes still in flight die with the loop on cancellation. Whether
+		// they must also be counted as timed out depends on whether the
+		// series stays exported after this exit:
+		// - Process shutdown (the RunClient root context is done): every
+		//   series stops being exported, so counting them would fabricate
+		//   loss — inflight-only accounting (pinned by
+		//   TestGracefulShutdown_NoPhantomTimeouts).
+		// - A restart (reload keep-restart, straggler replacement, removal,
+		//   address change): the series either stays attached — the balance
+		//   must hold on the live series, so drain delivered echoes (they
+		//   count as RTT, not loss) and count the remaining abandoned probes
+		//   as timed out (the reconnect-flush convention) — or was just
+		//   withdrawn (detached children make the count invisible).
+		// The straggler case exits on its own with the root still alive and
+		// gets the same treatment; releaseStraggler decides keep-or-purge
+		// afterwards, and a purged series only detaches the (invisible)
+		// children.
+		if !runClientShuttingDown(ctx) {
+			drainResponses()
+			if n := len(pending); n > 0 {
+				m.timedOut.Add(float64(n))
+			}
+		}
 		inflight := m.inflight
 		if n := float64(len(pending)); n > 0 {
 			inflight.Sub(n)

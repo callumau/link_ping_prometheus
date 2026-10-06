@@ -8,14 +8,36 @@ on:
 
 # GoReleaser must create the GitHub release and upload assets (contents
 # write) and push the container image to GHCR (packages write).
+# id-token: write is required by .goreleaser.yaml: keyless signing
+# (sigstore/Fulcio) mints an OIDC token from the runner to prove the
+# signing identity is this workflow run. A named `permissions` block
+# sets every unlisted scope to none, so it must be listed explicitly.
 permissions:
   contents: write
   packages: write
+  id-token: write
+
+# REQUIRED REPOSITORY SETTING (not verifiable from this file): restrict
+# `v*` tag creation in Settings > Rules > Rulesets to a release role.
+# This workflow's contents:write and id-token:write are only as
+# authorized as whatever may push those tags, so a tag push by an
+# untrusted account publishes signed-looking artifacts under this repo.
 
 jobs:
   release:
     name: Release
     runs-on: ubuntu-latest
+    # Two tag pushes (e.g. a re-tagged release) must not publish at the
+    # same time: they race on the same GitHub release and the same image
+    # tags. Queue them instead of cancelling -- a half-finished publish
+    # that gets cancelled leaves the release without its assets.
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    # Bounds a hung goreleaser/docker step; a build that cannot finish in
+    # 30 minutes (including the full race test suite) should fail loudly
+    # rather than hold a runner until the 6h platform limit.
+    timeout-minutes: 30
     steps:
       # v7.0.1 (SHA-pinned for supply-chain safety)
       - name: Checkout code
@@ -54,6 +76,15 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # yamllint disable-line rule:line-length
 
+      # v4.1.2 (SHA-pinned for supply-chain safety). Keyless signing needs
+      # the cosign binary on PATH: goreleaser shells out to `cosign
+      # sign-blob` for the `signs` block in .goreleaser.yaml. Pinned like
+      # every other action here, since this job holds write tokens.
+      - name: Install Cosign
+        # The full action SHA makes this line exceed the raw 80-col cap;
+        # the reference is pinned and literal, so length is waived here.
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # yamllint disable-line rule:line-length
+
       # v7.2.3 (SHA-pinned for supply-chain safety)
       - name: Run GoReleaser
         # The full action SHA makes this line exceed the raw 80-col cap;
@@ -61,7 +92,10 @@ jobs:
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # yamllint disable-line rule:line-length
         with:
           distribution: goreleaser
-          version: "~> v2"
+          # Pinned deliberately: this workflow holds write tokens, so a floating
+          # constraint would let an upstream release decide what executes here.
+          # Bump the version in its own commit.
+          version: v2.18.1
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -50,24 +50,48 @@ jobs:
       # metric-NAME coupling (TestRulesAndDashboardReferenceOnlyDefinedMetrics)
       # and ratio-window equality (TestDashboardAndRules_RateWindowsMatch) —
       # it cannot catch a PromQL syntax error that still parses in an
-      # eyeballed YAML block. Version pinned like govulncheck below; bump in
-      # its own commit.
+      # eyeballed YAML block. Version pinned like govulncheck below, and the
+      # tarball bytes are pinned to the SHA-256 from the release's official
+      # sha256sums.txt: the downloaded binary executes on the runner before
+      # govulncheck/tests/build, so a compromised upstream asset must fail
+      # the checksum before extraction, not after execution. Bump the
+      # version and its digest in the same commit.
       - name: Validate Prometheus rules
         run: |
           PROM_URL=https://github.com/prometheus/prometheus/releases/download/v3.14.0
-          curl -sL "$PROM_URL/prometheus-3.14.0.linux-amd64.tar.gz" \
-            | tar xz --strip-components=1 prometheus-3.14.0.linux-amd64/promtool
+          PROM_TGZ=prometheus-3.14.0.linux-amd64.tar.gz
+          # From the release's official sha256sums.txt; bump with the version.
+          PSHA=f665c6da19eb7ba399c915d30c7d9793c9b417bf8a749b504bc470678631478d
+          curl -sL -o "$PROM_TGZ" "$PROM_URL/$PROM_TGZ"
+          echo "$PSHA  $PROM_TGZ" | sha256sum -c -
+          tar xzf "$PROM_TGZ" --strip-components=1 \
+            prometheus-3.14.0.linux-amd64/promtool
           ./promtool check rules rules/link-monitor.yml
 
       # Grafana dashboard lint: JSON validity, v2 required fields, panel
       # title/description/units, counter aggregation, PromQL parse. Style
       # rules assuming a templated datasource or job/instance keying are
-      # excluded in .github/dashboard-linter.yaml (with reasons).
+      # excluded in .github/dashboard-linter.yaml (with reasons). Version
+      # pinned and SHA-256-verified like the promtool download above;
+      # upstream publishes no sums file, so the digest was derived from the
+      # v0.3.0 release artifact at pin time — re-derive and re-pin it on any
+      # version bump.
       - name: Lint Grafana dashboard
         run: |
           LINT_URL=https://github.com/grafana/dashboard-linter/releases/download/v0.3.0
-          curl -sL "$LINT_URL/dashboard-linter_0.3.0_linux_amd64.tar.gz" \
-            | tar xz
+          LINT_TGZ=dashboard-linter_0.3.0_linux_amd64.tar.gz
+          # Upstream publishes no sums file: digest derived from the v0.3.0
+          # release artifact at pin time; re-derive on any version bump.
+          LSHA=9a0eecb84ff22005dbd21c39ffd91534b407b511c45c21879df62ad0de33d79f
+          curl -sL -o "$LINT_TGZ" "$LINT_URL/$LINT_TGZ"
+          echo "$LSHA  $LINT_TGZ" | sha256sum -c -
+          # Extract ONLY the binary: the tarball also carries README.md and
+          # LICENSE, and a repo-root extraction overwrites the tracked files
+          # before the test step runs — TestREADME_FlagsTableAndBucketsMatchCode
+          # then parses the linter's README (0 flag rows) and the GPL LICENSE
+          # file is silently replaced on CI (matches the member-only pattern
+          # the promtool step above already uses).
+          tar xzf "$LINT_TGZ" dashboard-linter
           ./dashboard-linter lint -c .github/dashboard-linter.yaml \
             --strict grafana-dashboard.json
 
@@ -78,7 +102,7 @@ jobs:
       # the version in its own commit.
       - name: Govulncheck
         run: |
-          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+          go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
           govulncheck ./...
 
       - name: Run Tests (race detector)

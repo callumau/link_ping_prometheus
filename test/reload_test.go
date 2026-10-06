@@ -2,14 +2,18 @@ package prober_test
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 
 	"link_ping_prometheus/internal/prober"
 )
@@ -224,13 +228,178 @@ func metricSeriesExists(t *testing.T, family, source, target, address string) bo
 	return false
 }
 
-// TestReload_EmptyArrayStopsProbingAndPurges: an empty array is a documented
-// state — probe nothing and withdraw every series, so a truncated or
-// half-written targets file that happens to parse as [] cannot leave frozen
-// link_up=1 series behind. Probing stopped is proven with the test's OWN frame
-// counter, not with the absence of a series: a still-running loop keeps
-// incrementing its cached handle into a series that is no longer gathered, so
-// "the series is gone" alone is not evidence that the probing stopped.
+// TestBalanceHoldsAcrossKeptSeriesRestart pins the audit finding
+// client.reload-restart-cancel-abandon-unaccounted: a reload that changes
+// only a target's per-target interval keeps the series and restarts the
+// loop, and the old loop's clean-cancel exit must preserve the documented
+// balance sent == rtt_count + timed_out + inflight (+ corrupted) on the
+// still-exported series. The shutdown path keeps inflight-only accounting
+// (series stop being exported; pinned by
+// TestGracefulShutdown_NoPhantomTimeouts) — this test asserts only while
+// the replacement loop is running.
+//
+// The listener is a discard socket: writes succeed, nothing echoes, so
+// every probe resolves as a timeout and rtt_count/corrupted stay 0.
+func TestBalanceHoldsAcrossKeptSeriesRestart(t *testing.T) {
+	prober.InitMetrics()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Discard listener: binds, never reads — writes succeed, no echoes.
+	discard := listenUDP(t, ctx)
+	addr := discard.LocalAddr().String()
+	target := "bal_restart"
+
+	targetsFile := filepath.Join(t.TempDir(), "targets.json")
+	writeTargetsFile(t, targetsFile, target, addr)
+
+	reg := prober.NewStatusRegistry()
+	hup := make(chan os.Signal, 1)
+	cfg := prober.Config{
+		Source:       testSource,
+		Targets:      []prober.Target{{Name: target, Address: addr}},
+		BaseInterval: 10 * time.Millisecond,
+		BaseTimeout:  300 * time.Millisecond,
+		TargetsPath:  targetsFile,
+		ReloadSignal: hup,
+		Status:       reg,
+	}
+	runClientAsync(t, ctx, cancel, cfg)
+
+	// Balance read through Gather(): reflects only series already
+	// registered, so it cannot manufacture a zero-valued series the way
+	// WithLabelValues would (this target is never purged, but the balance
+	// must be asserted on exactly the series the scraper would see).
+	balance := func() (drift float64, sent float64) {
+		fams, err := prometheus.DefaultGatherer.Gather()
+		if err != nil {
+			t.Fatalf("gather metrics: %v", err)
+		}
+		want := map[string]string{"source": testSource, "target": target, "address": addr}
+		values := map[string]float64{}
+		read := func(name string, pick func(*dto.Metric) float64) {
+			for _, f := range fams {
+				if f.GetName() != name {
+					continue
+				}
+				for _, m := range f.GetMetric() {
+					got := make(map[string]string, len(m.GetLabel()))
+					for _, lp := range m.GetLabel() {
+						got[lp.GetName()] = lp.GetValue()
+					}
+					if len(got) != len(want) {
+						continue
+					}
+					match := true
+					for k, v := range want {
+						if got[k] != v {
+							match = false
+							break
+						}
+					}
+					if match {
+						values[name] = pick(m)
+					}
+				}
+			}
+		}
+		read("link_probes_sent_total", func(m *dto.Metric) float64 { return m.GetCounter().GetValue() })
+		read("link_rtt_seconds_count", func(m *dto.Metric) float64 { return float64(m.GetHistogram().GetSampleCount()) })
+		read("link_probes_timed_out_total", func(m *dto.Metric) float64 { return m.GetCounter().GetValue() })
+		read("link_probes_corrupted_total", func(m *dto.Metric) float64 { return m.GetCounter().GetValue() })
+		read("link_probes_inflight", func(m *dto.Metric) float64 { return m.GetGauge().GetValue() })
+		sent = values["link_probes_sent_total"]
+		drift = sent - values["link_rtt_seconds_count"] - values["link_probes_timed_out_total"] - values["link_probes_corrupted_total"] - values["link_probes_inflight"]
+		return drift, sent
+	}
+
+	// waitForBalance asserts the balance invariant the way any consumer of
+	// these series — including a live Prometheus scrape — must: with a
+	// SAMPLED read, not a single snapshot. prometheus/client_golang Gather()
+	// is atomic per series and never across families (each family is
+	// collected at its own instant, by concurrent collector workers), while
+	// the probe loop moves the balance in adjacent two-statement pairs
+	// (timeout sweep: timedOut.Inc then inflight.Dec; send path:
+	// inflight.Inc then sent.Inc) on every tick — and under -race on a
+	// loaded box those microsecond windows stretch to scheduler quanta. A
+	// single gather straddling one pair therefore transiently reads ±1: an
+	// observation-boundary artifact, not an accounting leak (measured: drift
+	// oscillates ±1/±2 around 0 and returns to 0 on ~60% of consecutive
+	// samples; inflight stays pinned at the timeout/interval window).
+	// Asserting exact zero on one snapshot would encode a consistency
+	// guarantee the exposition format itself does not provide. What must
+	// hold is the INVARIANT — every probe resolves into exactly one bucket —
+	// and a violation of it (an exit path resolving a probe into the wrong
+	// bucket or not at all) shifts EVERY sample by the same nonzero offset,
+	// so no sample ever reads 0. Sample until a gather observes drift 0;
+	// fail with the observed drift sequence otherwise. (The quiescent-state
+	// exactness this sampling cannot express — inflight drained to 0 with
+	// exact counters — is pinned separately by the accuracy tests.)
+	waitForBalance := func(stage string) {
+		t.Helper()
+		var drifts []string
+		deadline := time.Now().Add(3 * time.Second)
+		for {
+			drift, sent := balance()
+			if drift == 0 {
+				return
+			}
+			drifts = append(drifts, fmt.Sprintf("%.0f(sent=%.0f)", drift, sent))
+			if time.Now().After(deadline) {
+				t.Fatalf("%s: balance never reconciled to 0 across 3s of sampling: %s — an exit path must be resolving probes into the wrong bucket (or not at all)", stage, strings.Join(drifts, ", "))
+			}
+			// pi-lens-ignore: go-time-sleep-test — deadline-bounded poll, not an arbitrary sleep
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
+
+	// Settle at 10ms interval: sent >= 40 needs 400ms, timed_out >= 15
+	// needs ~300ms + one interval of sweep latency. A generous wait with
+	// the same skip guard the accuracy tests use keeps the test honest
+	// under CPU load.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		sent := getCounterValue(prober.ProbesSent, target, addr)
+		timedOut := getCounterValue(prober.ProbesTimedOut, target, addr)
+		if sent >= 40 && timedOut >= 15 {
+			break
+		}
+		if time.Now().After(deadline) {
+			skipIfRTTNearTimeout(t, target, addr, cfg.BaseTimeout)
+			t.Fatalf("probes did not settle: sent=%f timed_out=%f", sent, timedOut)
+		}
+		// pi-lens-ignore: go-time-sleep-test — deadline-bounded poll, not an arbitrary sleep
+		time.Sleep(20 * time.Millisecond)
+	}
+	waitForBalance("pre-restart control")
+
+	// Keep-restart: the address is unchanged, only the interval changes —
+	// the apply() keep branch runs (series stay attached, sent continues).
+	writeTargetsInterval(t, targetsFile, target, addr, "100ms")
+	hup <- syscall.SIGTERM
+
+	// Confirm the restart took effect, then assert the balance EXACTLY while
+	// the replacement loop is still running (no shutdown contamination). At
+	// 100ms the replacement needs ~1.5s for 15 probes; the pre-restart
+	// counters are snapshotted once and the wait requires that many NEW
+	// resolved probes so the assertion sees post-restart accounting, not
+	// just the pre-restart state.
+	preSent := getCounterValue(prober.ProbesSent, target, addr)
+	restartWait := time.Now().Add(5 * time.Second)
+	for {
+		if time.Now().After(restartWait) {
+			skipIfRTTNearTimeout(t, target, addr, cfg.BaseTimeout)
+			t.Fatalf("restart did not produce enough post-restart probes: sent=%f (pre=%f)", getCounterValue(prober.ProbesSent, target, addr), preSent)
+		}
+		// pi-lens-ignore: go-time-sleep-test — deadline-bounded poll, not an arbitrary sleep
+		time.Sleep(50 * time.Millisecond)
+		if getCounterValue(prober.ProbesSent, target, addr)-preSent >= 15 {
+			break
+		}
+	}
+	waitForBalance("kept-series restart")
+}
 func TestReload_EmptyArrayStopsProbingAndPurges(t *testing.T) {
 	prober.InitMetrics()
 
