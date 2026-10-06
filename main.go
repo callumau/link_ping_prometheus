@@ -176,6 +176,12 @@ func flagDefaultInt(name string) (int, error) {
 // protects future rotations. A symlinked path is refused outright: it can
 // redirect topology-bearing log lines into a file owned by another local
 // user. Fail-closed: the caller exits on error, like the allowlist refusal.
+// Windows: chmod is a no-op there (os.Stat reports 0666 regardless of ACL),
+// so the POSIX mode-bit enforcement below cannot restrict a DACL; the
+// Windows control for log confidentiality is the ACL'd log DIRECTORY the
+// installer creates (install-service.bat). Enforcing a DACL from here would
+// need SetNamedSecurityInfo work — filed as a round-2 audit finding
+// (deferred).
 func hardenLogSink(path string) (repaired bool, err error) {
 	fi, err := os.Lstat(path)
 	if err != nil {
