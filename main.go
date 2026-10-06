@@ -442,6 +442,13 @@ func resolveMetricsAuth() (string, string, error) {
 	if (user == "") != (pass == "") {
 		return "", "", errors.New("metrics basic auth requires both username and password (-metrics-user/-metrics-pass or LINK_PING_METRICS_USER/LINK_PING_METRICS_PASS)")
 	}
+	// r.BasicAuth() splits the header at the FIRST colon, so a username
+	// containing ':' can never be produced by a client: the part before
+	// the colon is what must match. Accepting such a user here would make
+	// the endpoint permanently unreachable (401 for every attempt).
+	if strings.Contains(user, ":") {
+		return "", "", errors.New("metrics basic auth username must not contain ':' (HTTP Basic Auth splits user:pass at the first colon, so this user is unreachable and every request 401s)")
+	}
 	return user, pass, nil
 }
 
