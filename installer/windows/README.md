@@ -42,9 +42,12 @@ and a summary/confirm step before anything is installed.
 **Input validation:** typed values are rejected when they contain a
 double-quote or an ampersand — those characters cannot be delivered safely
 through the script's quoted expansions (`reg add /d "..."`, the service
-argument list, summary echoes). The echo HMAC secret (and its rotation
-predecessor) must be at least 16 characters: it is the key material for
-HMAC-SHA256 probe authentication, and a short value is brute-forceable.
+argument list, summary echoes). The metrics listen address is quoted into
+the argument list like the other free-text values. A trailing backslash is
+stripped from path values (it would escape the closing quote). The echo
+HMAC secret (and its rotation predecessor) must be at least 16 characters:
+it is the key material for HMAC-SHA256 probe authentication, and a short
+value is brute-forceable.
 
 ## Credential storage and the `Environment` key
 
