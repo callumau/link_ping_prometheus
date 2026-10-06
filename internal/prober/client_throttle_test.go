@@ -2,12 +2,18 @@ package prober
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// invocationCounter differentiates metric label sets across go -count
+// invocations (see the note in TestEchoLoop_PendingWindowThrottleSkipsSends).
+var invocationCounter atomic.Int64
 
 // White-box test for the pending-window send throttle (client.go): the
 // static interval/timeout pair is validated by validatePendingWindow, but
@@ -58,7 +64,15 @@ func (c *blackholeConn) SetWriteDeadline(time.Time) error { return nil }
 // window read without a hook into the local map.
 func TestEchoLoop_PendingWindowThrottleSkipsSends(t *testing.T) {
 	InitMetrics()
-	const src, name, addr = "throttle-src", "throttled_target", "127.0.0.1:9"
+	// Per-invocation series: the loop exits via cancel, whose deferred tail
+	// resolves pending inflight-only (the pinned shutdown convention — a
+	// deliberate imbalance on the shared series). A second -count iteration
+	// reading the SAME series would then start with that residual drift and
+	// never see the balance reconcile to zero. A unique address label gives
+	// every invocation a fresh, self-consistent series.
+	invocation := invocationCounter.Add(1)
+	addr := fmt.Sprintf("127.0.0.1:9%d", invocation)
+	const src, name = "throttle-src", "throttled_target"
 
 	stats := NewAdaptiveStats(2 * time.Second)
 	stats.Update(0.8) // SRTT=0.8s, RTTVAR=0.4s → RTO = 0.8+4*0.4 = 2.4s
