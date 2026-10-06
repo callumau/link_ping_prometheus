@@ -381,6 +381,51 @@ func TestEchoLoop_ReaderDeathDrainsReceivedEcho(t *testing.T) {
 	}
 }
 
+// TestEchoLoop_ReaderDeathStatusNotReady: the reader-death re-emit must
+// report socket_age_seconds=0 (socketStart zeroed), not the dead socket's
+// stale age — AnyReady (and thus /readyz) is built on SocketAgeSeconds > 0,
+// so a stale age would keep the agent "ready" through the 1s re-dial pause
+// while no echo can be read at all.
+// pi-lens-ignore: go-test-functions
+func TestEchoLoop_ReaderDeathStatusNotReady(t *testing.T) {
+	InitMetrics()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	addr := wbEchoServer(t, ctx, nil)
+	realConn, err := dialUDP(ctx, "udp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := &firstDeadlineOKConn{Conn: realConn}
+
+	const src, name = "test", "reader_death_status"
+	reg := NewStatusRegistry()
+	m := newTargetMetrics(src, Target{Name: name, Address: addr})
+	m.status = reg
+	// Pretend a socket was dialed long ago: without the socketStart zeroing,
+	// the re-emit would carry a large socket_age_seconds and AnyReady would
+	// stay true across the re-dial pause.
+	state := &probeLoopState{socketStart: time.Now().Add(-time.Hour)}
+
+	cfg := Config{Source: src, BaseInterval: 40 * time.Millisecond, BaseTimeout: 2 * time.Second}
+	if err := runEchoLoop(ctx, conn, cfg, NewAdaptiveStats(cfg.BaseTimeout), m, state, slog.Default()); !errors.Is(err, errReaderDead) {
+		t.Fatalf("expected errReaderDead from the reader-death exit, got %v", err)
+	}
+
+	snap := reg.Snapshot()
+	if len(snap) != 1 {
+		t.Fatalf("expected exactly one status snapshot, got %d", len(snap))
+	}
+	if got := snap[0].SocketAgeSeconds; got != 0 {
+		t.Errorf("reader-death re-emit must report socket_age_seconds=0 (dead socket is not ready), got %v", got)
+	}
+	if reg.AnyReady() {
+		t.Errorf("a dead reader must not satisfy AnyReady (/readyz must read not-ready during the re-dial pause)")
+	}
+}
+
 // TestEchoLoop_WriteFailureRefreshStatus: when link_up drops to 0 on the
 // Nth consecutive write failure, /status must reflect it immediately, not
 // up to a full interval later — a /status reporting link_up:true while the

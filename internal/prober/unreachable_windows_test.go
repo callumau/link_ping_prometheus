@@ -29,6 +29,7 @@ func TestIsPeerUnreachable_WindowsErrnos(t *testing.T) {
 		{"WSAECONNREFUSED is a peer failure", windows.WSAECONNREFUSED, true},
 		{"WSAEHOSTUNREACH is a peer failure", windows.WSAEHOSTUNREACH, true},
 		{"WSAENETUNREACH is a peer failure", windows.WSAENETUNREACH, true},
+		{"WSAENETRESET (ICMP time exceeded / frag needed) is a peer failure", windows.WSAENETRESET, true},
 		{"wrapped winsock errno still classifies", fmt.Errorf("read: %w", windows.WSAECONNRESET), true},
 		{"the portable ECONNRESET is not what Windows reports", syscall.ECONNRESET, false},
 		{"read deadline is a local failure", os.ErrDeadlineExceeded, false},
