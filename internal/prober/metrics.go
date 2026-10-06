@@ -116,6 +116,10 @@ var (
 		Name: "link_server_clock_skew_seconds",
 		Help: "Last observed clock skew in seconds (server time minus client timestamp) for HMAC-authenticated probes. Positive means client is behind. Used to diagnose NTP drift causing replay drops.",
 	}, []string{"source", "client"})
+	ServerUnauthHMACFrames = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "link_server_unauth_hmac_frames_total",
+		Help: "HMAC-shaped frames (32-byte header, with or without the bounded payload extension) received while this server has NO -echo-secret configured. Such frames are accepted and echoed as ordinary bounded payload probes — acceptance is unchanged — so a half-configured pairing (secret on clients, absent on the server) exports no hmac drop reason and reads healthy; a rising rate means set -echo-secret on BOTH ends. Note: a secret-less probe with a 24-byte header plus exactly 8 bytes of payload has the same shape and is counted too.",
+	}, []string{"source"})
 	MetricsAuthFailures = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "link_metrics_auth_failures_total",
 		Help: "Rejected HTTP Basic auth attempts on /metrics and /status. A rising rate means a misconfigured scraper or credential scanning.",
@@ -137,7 +141,7 @@ func InitMetrics() {
 			ProberInternalErrors,
 			MTUProbesSent, MTUProbesLost, PathMTUBytes,
 			RTTSeconds, JitterSeconds, LinkUp, RTOEstimate, SRTTSeconds,
-			ServerProbesReceived, ServerProbesDropped, ServerEchoErrors, ServerClockSkew,
+			ServerProbesReceived, ServerProbesDropped, ServerEchoErrors, ServerClockSkew, ServerUnauthHMACFrames,
 			MetricsAuthFailures, BuildInfo,
 		)
 	})

@@ -130,6 +130,7 @@ The exporter exposes the following metrics at `/metrics` (default port 2112).
 | `link_server_echo_errors_total` | Counter | `source` | Validated probes the server failed to echo back (local UDP write error). The client counts these as loss, so subtract this rate before attributing a received/sent mismatch to the network. |
 | `link_server_probes_dropped_total` | Counter | `source`, `reason` | Probes dropped by server: `allowlist`, `rate_ip`, `rate_global`, `size`, `magic`, `hmac`, `replay`, `dup`, `invalid_addr`, `client_overflow`. `dup` marks a frame identical to one recently echoed (same source, seq, timestamp) — replay or echo-loop guard, so two mutual-allowlist servers cannot bounce a frame forever; `hmac`/`replay` diagnose secret/NTP misconfig vs true loss; `client_overflow` means more distinct CIDR-allowlisted client IPs than the per-client series cap; that cap is not the only way a per-client series ends — CIDR-matched clients idle past the server's TTL have their series deleted and restart at 0 if they return (see Security). |
 | `link_server_clock_skew_seconds` | Gauge | `source`, `client` | Last observed clock skew (server minus client timestamp) for HMAC probes; positive means client behind. Diagnose replay drops from NTP drift per peer. |
+| `link_server_unauth_hmac_frames_total` | Counter | `source` | HMAC-shaped frames (32-byte header, with or without the bounded payload extension) received by a server running WITHOUT `-echo-secret`. They are still echoed as ordinary bounded payload probes — acceptance is unchanged — so this is the only signal a half-configured pairing (secret on clients, absent on the server) produces; a rising rate means set `-echo-secret` on **both** ends. A secret-less probe with a 24-byte header plus exactly 8 bytes of payload has the same shape and counts too. |
 | `link_metrics_auth_failures_total` | Counter | (none) | Rejected HTTP Basic auth attempts on `/metrics` and `/status`. A rising rate means a misconfigured scraper or credential scanning. |
 | `link_ping_build_info` | Gauge | `version` | Build version; value is always 1. Git tag for release builds, UTC timestamp to the minute for dev builds. |
 
@@ -892,7 +893,12 @@ inside the accepted `header ≤ size ≤ header + 1400` range — so it echoes
 the frame unverified. A half-configured fleet therefore reads healthy with
 no probe authenticated: nothing lands in
 `link_server_probes_dropped_total{reason="hmac"}`, and the allowlist is the
-only thing gating the reflector. The server logs a startup warning when
+only thing gating the reflector. The server makes the pairing
+metric-visible instead: every HMAC-shaped frame it receives without a
+secret is counted in `link_server_unauth_hmac_frames_total`, and
+`LinkMonitorReflectorUnauthenticated` in `rules/link-monitor.yml` alerts on
+it. A secret-less 24-byte header plus exactly 8 bytes of payload has the
+same shape and is counted too. The server logs a startup warning when
 `-echo-secret` is unset.
 
 The server rate-limits echo processing to 2000 packets/s per remote IP

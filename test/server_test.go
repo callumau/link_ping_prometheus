@@ -1919,3 +1919,96 @@ func TestServer_DupGuardBreaksEchoLoop(t *testing.T) {
 		t.Errorf("dup drop must not count the frame as received; want >= 3 received total, got %v", got)
 	}
 }
+
+// TestServer_UnauthHMACFrameCounter pins the half-configured-HMAC
+// observability counter: a server WITHOUT -echo-secret accepts and echoes
+// an HMAC-shaped frame — the bare 32-byte header and the 32B+payload
+// shape alike, exactly as the size gate always did — because acceptance
+// is intentionally unchanged. The frames are counted in
+// link_server_unauth_hmac_frames_total, the only metric signal the
+// half-configured pairing (secret on clients, absent on the server)
+// produces, since the drop path stays silent. A server WITH the secret
+// must leave the counter untouched (its HMAC frames are authenticated,
+// not "unauth HMAC-shaped").
+func TestServer_UnauthHMACFrameCounter(t *testing.T) {
+	prober.InitMetrics()
+	ctx := t.Context()
+
+	// Phase 1: server without a secret. Deltas on the {source}-keyed
+	// series: WithLabelValues re-creates a missing series at 0, so
+	// baseline-first keeps the counting exact.
+	addr := startServer(t, ctx)
+	conn, err := net.Dial("udp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	before := getCounterValue(prober.ServerUnauthHMACFrames)
+
+	// Bare 32-byte HMAC frame: magic + seq + ts + 8 arbitrary bytes
+	// (the tag bytes, unverified by a secret-less server). Echoed whole.
+	bare := make([]byte, prober.PayloadSizeWithHMAC)
+	copy(bare[0:8], prober.MagicBytes)
+	binary.LittleEndian.PutUint64(bare[8:16], 1001)
+	binary.LittleEndian.PutUint64(bare[16:24], uint64(time.Now().UnixNano()))
+	conn.Write(bare)
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, _ := conn.Read(make([]byte, 1500))
+	if n != prober.PayloadSizeWithHMAC {
+		t.Fatalf("bare 32-byte HMAC frame must STILL be echoed by a secret-less server (acceptance unchanged), got %d bytes", n)
+	}
+	if got := getCounterValue(prober.ServerUnauthHMACFrames); got != before+1 {
+		t.Fatalf("bare 32-byte frame must increment link_server_unauth_hmac_frames_total by 1, moved %v", got-before)
+	}
+
+	// 32B + payload shape (32+16 bytes): also echoed whole and counted.
+	withPayload := make([]byte, prober.PayloadSizeWithHMAC+16)
+	copy(withPayload[0:8], prober.MagicBytes)
+	binary.LittleEndian.PutUint64(withPayload[8:16], 1002)
+	binary.LittleEndian.PutUint64(withPayload[16:24], uint64(time.Now().UnixNano()))
+	// fillPayload over the payload region for realism — the server echoes
+	// it verbatim either way.
+	conn.Write(withPayload)
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, _ = conn.Read(make([]byte, 1500))
+	if n != len(withPayload) {
+		t.Fatalf("32B+payload HMAC-shaped frame must still be echoed, got %d bytes", n)
+	}
+	if got := getCounterValue(prober.ServerUnauthHMACFrames); got != before+2 {
+		t.Fatalf("32B+payload frame must increment the counter by 1 (total %v), got %v", before+2, got)
+	}
+
+	// A plain 24-byte probe is not HMAC-shaped: echoed, counter unmoved.
+	plain := make([]byte, prober.PayloadSize)
+	copy(plain[0:8], prober.MagicBytes)
+	binary.LittleEndian.PutUint64(plain[8:16], 1003)
+	binary.LittleEndian.PutUint64(plain[16:24], uint64(time.Now().UnixNano()))
+	conn.Write(plain)
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, _ = conn.Read(make([]byte, 1500))
+	if n != prober.PayloadSize {
+		t.Fatalf("plain 24-byte probe must still be echoed, got %d bytes", n)
+	}
+	if got := getCounterValue(prober.ServerUnauthHMACFrames); got != before+2 {
+		t.Errorf("24-byte frame is not HMAC-shaped and must not count, counter moved to %v from %v", got, before+2)
+	}
+
+	// Phase 2: server WITH a secret — its own HMAC frames authenticate, so
+	// the counter must stay exactly where phase 1 left it. Same process,
+	// same source label: assert by delta, not by absolute value.
+	addr2 := startHMACServer(t, ctx, "test-secret")
+	conn2, err := net.Dial("udp", addr2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn2.Close()
+	conn2.Write(buildHMACFrame("test-secret", 1004, uint64(time.Now().UnixNano())))
+	conn2.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if n, _ := conn2.Read(make([]byte, 1500)); n != prober.PayloadSizeWithHMAC {
+		t.Fatalf("authenticated frame must be echoed at a secret-configured server, got %d bytes", n)
+	}
+	if got := getCounterValue(prober.ServerUnauthHMACFrames); got != before+2 {
+		t.Errorf("authenticated HMAC frames must not increment the counter (want %v, got %v)", before+2, got)
+	}
+}
