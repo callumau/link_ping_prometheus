@@ -49,6 +49,32 @@ them, since those tests are the interop guarantee's enforcement.
 Everything above applies to post-v0.7 releases; v0.6 and earlier made no
 interop promises.
 
+## Cross-major upgrade path (a new MAJOR's .0 vs the last minor)
+
+A MAJOR bump is where the wire or contract may genuinely change, so
+same-major guarantees end at the major boundary. The upgrade EXPECTATION,
+not a hard guarantee: **a new major's `.0` release aims to interoperate
+with the previous major's LAST minor**, so a fleet can roll onto the new
+major one site at a time without a flag day. "Aims to" is deliberate —
+some major changes are exactly the reason for the bump (a retired cipher,
+a reworked authentication), so full bidirectional interop may be
+impossible; the release notes must then state PRECISELY which
+directions work:
+
+- which pairs are fully compatible (e.g. new server ↔ last-minor client);
+- which pairs are degraded and how (e.g. probes flow, but a deprecated
+  feature no longer authenticates);
+- which pairs are broken and what the upgrade ORDER is (e.g. upgrade
+  servers first; clients may then flip; the last release that supports
+  the old wire is X).
+
+Design majors with a transition shape when the change allows one (the
+v0.8 HMAC-tag dual-acceptance is the template: the server learns to
+accept both coverages while the default wire output is unchanged; the
+observable flip rides the next minor; the old acceptance path stays for
+peers that never upgrade). A major that ships with NO transition path
+must justify it in the notes and name the last compatible release.
+
 ## v1.0.0 — the stable, hardened promotion gate
 
 v1.0.0 is a promise of stability, not a birthday. Every item below must hold
