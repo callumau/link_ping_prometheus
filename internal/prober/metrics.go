@@ -39,6 +39,10 @@ var (
 		Name: "link_probes_send_errors_total",
 		Help: "Total probes that failed to send locally (UDP write errors). They never reach the wire, so they are not counted in link_probes_sent_total; a sustained rate means a local NIC/socket problem, not network loss.",
 	}, []string{"source", "target", "address"})
+	ProbesThrottled = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "link_probes_throttled_total",
+		Help: "Probes skipped because the pending window (the timeout/interval ratio) is full: the adaptive RTO floor (2*SRTT) can exceed the configured timeout and grow the in-flight set past its cap, so sends are skipped until probes resolve. A probe-rate reduction, NOT network loss — a throttled probe is never built or sent and is not counted in link_probes_sent_total.",
+	}, []string{"source", "target", "address"})
 	CorruptedProbes = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "link_probes_corrupted_total",
 		Help: "Probes whose echo came back with corrupted payload bytes (-payload mode only): magic, sequence and timestamp intact, data altered in flight. Data-path corruption, not loss — the round trip completed.",
@@ -129,7 +133,7 @@ var registerOnce sync.Once
 func InitMetrics() {
 	registerOnce.Do(func() {
 		prometheus.MustRegister(
-			ProbesSent, ProbesTimedOut, SendErrors, CorruptedProbes, ProbesInflight,
+			ProbesSent, ProbesTimedOut, SendErrors, ProbesThrottled, CorruptedProbes, ProbesInflight,
 			ProberInternalErrors,
 			MTUProbesSent, MTUProbesLost, PathMTUBytes,
 			RTTSeconds, JitterSeconds, LinkUp, RTOEstimate, SRTTSeconds,
@@ -147,6 +151,7 @@ func SeedMetrics(source string, targets []Target) {
 		m := newTargetMetrics(source, t)
 		m.sent.Add(0)
 		m.sendErr.Add(0)
+		m.throttled.Add(0)
 		m.corrupted.Add(0)
 		m.mtuSent.Add(0)
 		m.mtuLost.Add(0)

@@ -118,6 +118,7 @@ The exporter exposes the following metrics at `/metrics` (default port 2112).
 | `link_mtu_probes_lost_total` | Counter | `source`, `target`, `address` | DF-set MTU probes with no echo, per attempt like `sent` (a size that fails twice counts twice), so lost/sent stays a per-probe ratio: sizes the path does not survive. Rising lost with healthy main probes = PMTUD blackhole (works-small-fails-big). Alert on the ratio (e.g. `> 0.2`), not on `> 0` — one retried probe on a 1%-loss path moves it. |
 | `link_path_mtu_bytes` | Gauge | `source`, `target`, `address` | Largest probe frame (header + payload, excluding IP/UDP overhead) that round-trips with DF set; 0 until the first successful sweep. A full-size Ethernet path reads 1424, or 1432 with `-echo-secret` (the header grows from 24 to 32 bytes there). |
 | `link_probes_send_errors_total` | Counter | `source`, `target`, `address` | Probes that failed to send locally (UDP write errors). Never on the wire, so never in `link_probes_sent_total`; sustained rate means a local NIC/socket problem, not network loss. |
+| `link_probes_throttled_total` | Counter | `source`, `target`, `address` | Probes skipped because the pending window (the timeout/interval ratio) is full: the adaptive RTO floor (`2×SRTT`) can exceed the configured timeout and grow the in-flight set past its cap, so sends are skipped until probes resolve. A probe-rate reduction, NOT network loss — a throttled probe is never built or sent and is not counted in `link_probes_sent_total`. |
 | `link_prober_internal_errors_total` | Counter | `source`, `target`, `address`, `reason` | Prober-internal failures (`reason`: `panic`, `reader_dead`, `dial_retry`, `stop_timeout`) — not link conditions. A rising rate means this target's probe numbers are unreliable; check the agent's own logs and socket state. |
 | `link_probes_inflight` | Gauge | `source`, `target`, `address` | Current number of probes sent but waiting for a response or timeout. Grows during stalls. |
 | `link_rtt_seconds` | Histogram | `source`, `target`, `address` | RTT histogram with explicit buckets `{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 3.0}` s plus native histogram support (`NativeHistogramBucketFactor` 1.1). Buckets stop at 3s, the RTO cap: an echo that misses its RTO is normally counted as loss and discarded, so higher edges stay empty — except for the samples above 3s that can still occur: a link whose SRTT exceeds 1.5s applies a timeout above the cap (floor `2×SRTT`), a fixed `-timeout` above 3s does the same, and an echo that misses its RTO by up to one probe interval is still recorded (see the timeout row above). |
@@ -233,7 +234,12 @@ latency jumps above the current value), floored at `max(200ms, 2×SRTT)`
 rather than a fixed 200ms — a fixed floor counts normal jitter on links
 whose RTT approaches it (e.g. ~185ms) as loss and pins the RTO at its 3s
 clamp. Flooring at twice the smoothed RTT guarantees headroom and keeps
-the loss ratio meaningful.
+the loss ratio meaningful. Because the floor is unbounded above (a
+satellite-scale SRTT applies an RTO above the 3s cap), a fast `-interval`
+especially on such a link can grow the in-flight window past its cap; the
+loop then skips sends until probes resolve. Skipped probes are counted in
+`link_probes_throttled_total` — a probe-rate reduction, not loss: they are
+never built or sent, so neither `sent` nor the loss ratio is affected.
 
 One deliberate exception: when probes are in flight across the periodic
 5-minute DNS re-dial (only possible with aggressive `-interval` values below

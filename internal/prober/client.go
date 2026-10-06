@@ -511,6 +511,7 @@ func RunClient(ctx context.Context, cfg Config) error {
 type targetMetrics struct {
 	sent      prometheus.Counter
 	sendErr   prometheus.Counter
+	throttled prometheus.Counter
 	corrupted prometheus.Counter
 	timedOut  prometheus.Counter
 	inflight  prometheus.Gauge
@@ -540,6 +541,7 @@ func newTargetMetrics(source string, t Target) targetMetrics {
 	return targetMetrics{
 		sent:               ProbesSent.WithLabelValues(source, t.Name, t.Address),
 		sendErr:            SendErrors.WithLabelValues(source, t.Name, t.Address),
+		throttled:          ProbesThrottled.WithLabelValues(source, t.Name, t.Address),
 		corrupted:          CorruptedProbes.WithLabelValues(source, t.Name, t.Address),
 		timedOut:           ProbesTimedOut.WithLabelValues(source, t.Name, t.Address),
 		inflight:           ProbesInflight.WithLabelValues(source, t.Name, t.Address),
@@ -607,6 +609,7 @@ func deleteTargetSeries(source string, t Target) {
 	labels := prometheus.Labels{"source": source, "target": t.Name, "address": t.Address}
 	ProbesSent.DeletePartialMatch(labels)
 	SendErrors.DeletePartialMatch(labels)
+	ProbesThrottled.DeletePartialMatch(labels)
 	CorruptedProbes.DeletePartialMatch(labels)
 	ProberInternalErrors.DeletePartialMatch(labels)
 	ProbesTimedOut.DeletePartialMatch(labels)
@@ -1046,6 +1049,9 @@ func runEchoLoop(
 	// warnedWriteDown makes the Error log fire once per failure streak
 	// (the drop itself is re-asserted on every failing tick).
 	warnedWriteDown := false
+	// warnedThrottle makes the pending-window throttle Warn fire once per
+	// sustained-throttle streak; reset on the next successful send.
+	warnedThrottle := false
 	payloadSize := PayloadSize
 	if cfg.EchoSecret != "" {
 		payloadSize = PayloadSizeWithHMAC
@@ -1375,6 +1381,31 @@ func runEchoLoop(
 			return errReconnect
 		}
 
+		// Pending-window send throttle: the static interval/timeout pair is
+		// validated at startup and reload (validatePendingWindow), but with
+		// -adaptive the applied timeout is the RFC 6298 RTO, whose floor
+		// max(200ms, 2*SRTT) is unbounded above — a large-SRTT link with a
+		// fast interval would otherwise grow `pending` past the cap and
+		// sweep all of it on every tick. When the window is at the cap, SKIP
+		// the send for this tick: no frame is built, nothing reaches the
+		// wire, and neither sent nor inflight moves — the balance invariant
+		// is untouched because the probe never existed (this is NOT a
+		// pending exit path). The skip is a measured probe-rate reduction,
+		// not loss; it is counted in link_probes_throttled_total, which
+		// stays outside the balance by design (like send errors).
+		if len(pending) >= maxPendingWindow {
+			m.throttled.Inc()
+			if !warnedThrottle {
+				// Bounded like the write-failure warning: once per
+				// sustained-throttle streak, Warn level (Debug is invisible
+				// at default verbosity). Reset on the next successful send.
+				warnedThrottle = true
+				logger.Warn("Pending window is full; skipping probe sends until probes resolve",
+					"pending", len(pending), "window", maxPendingWindow)
+			}
+			continue
+		}
+
 		// Reserve, but do not yet consume, the sequence number: a failed
 		// write never put the datagram on the wire, so burning its seq
 		// would look like a loss to the RFC 3550 gap check and spuriously
@@ -1435,6 +1466,7 @@ func runEchoLoop(
 		}
 		writeFails = 0
 		warnedWriteDown = false
+		warnedThrottle = false
 		state.seq = seq
 
 		pending[state.seq] = sendTime
