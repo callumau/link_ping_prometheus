@@ -85,7 +85,13 @@ jobs:
           LSHA=9a0eecb84ff22005dbd21c39ffd91534b407b511c45c21879df62ad0de33d79f
           curl -sL -o "$LINT_TGZ" "$LINT_URL/$LINT_TGZ"
           echo "$LSHA  $LINT_TGZ" | sha256sum -c -
-          tar xzf "$LINT_TGZ"
+          # Extract ONLY the binary: the tarball also carries README.md and
+          # LICENSE, and a repo-root extraction overwrites the tracked files
+          # before the test step runs — TestREADME_FlagsTableAndBucketsMatchCode
+          # then parses the linter's README (0 flag rows) and the GPL LICENSE
+          # file is silently replaced on CI (matches the member-only pattern
+          # the promtool step above already uses).
+          tar xzf "$LINT_TGZ" dashboard-linter
           ./dashboard-linter lint -c .github/dashboard-linter.yaml \
             --strict grafana-dashboard.json
 
