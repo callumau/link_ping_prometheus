@@ -60,7 +60,7 @@ jobs:
         run: |
           PROM_URL=https://github.com/prometheus/prometheus/releases/download/v3.14.0
           PROM_TGZ=prometheus-3.14.0.linux-amd64.tar.gz
-          # Digest from the release's official sha256sums.txt; bump with the version.
+          # From the release's official sha256sums.txt; bump with the version.
           PSHA=f665c6da19eb7ba399c915d30c7d9793c9b417bf8a749b504bc470678631478d
           curl -sL -o "$PROM_TGZ" "$PROM_URL/$PROM_TGZ"
           echo "$PSHA  $PROM_TGZ" | sha256sum -c -
@@ -96,7 +96,7 @@ jobs:
       # the version in its own commit.
       - name: Govulncheck
         run: |
-          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+          go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
           govulncheck ./...
 
       - name: Run Tests (race detector)
