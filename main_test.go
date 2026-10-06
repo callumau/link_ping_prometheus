@@ -554,6 +554,84 @@ func TestRunRejectsUnknownModeBeforeBind(t *testing.T) {
 	}
 }
 
+// TestRun_MetricsServerDeathIsFatal pins the round-2 hardening: when the
+// metrics serve goroutine dies MID-RUN (anything that terminates Serve
+// other than our deliberate Shutdown — listener/accept failure, fd
+// exhaustion, container network teardown), run() must cancel the mode
+// loops and return an error, so the agent exits non-zero and the SCM
+// restart action fires. Before the fix a dead endpoint was only
+// slog.Error'd while the agent kept probing — a monitor that looks
+// healthy. The seam (program.testServeMetrics) keeps the production
+// binder's return shape while letting the test hold the *http.Server
+// handle; srv.Close() terminates Serve and closes metricsDone
+// deterministically. Falsification: remove the "case <-metricsDone" arm
+// of the run() select and this test times out at the runErr guard.
+// pi-lens-ignore: go-test-functions
+func TestRun_MetricsServerDeathIsFatal(t *testing.T) {
+	saveFlags(t)
+	t.Setenv("LINK_PING_METRICS_USER", "")
+	t.Setenv("LINK_PING_METRICS_PASS", "")
+
+	// Same deliberate config as TestProgramStartStopBothMode: both mode
+	// runs until cancelled, so the ONLY way run() can return is the
+	// metrics-death arm of the select.
+	*flMode = "both"
+	*flListen = "127.0.0.1:0"
+	*flMetrics = "127.0.0.1:0"
+	*flTargets = ""
+	*flTarget = "127.0.0.1:1" // nothing listening: client just reconnect-loops
+	*flAllow = "127.0.0.1"
+
+	// pi-lens-ignore: go-context-background-handler
+	rootCtx, rootCancel := context.WithCancel(context.Background())
+	defer rootCancel()
+	prg := &program{ctx: rootCtx, cancel: rootCancel}
+
+	var srvHandle *http.Server
+	started := make(chan struct{})
+	prg.testServeMetrics = func() (*http.Server, <-chan struct{}, error) {
+		// The real binder with the same captured-string discipline as
+		// production (startMetricsServer takes values, not flag reads).
+		srv, done, err := prg.startMetricsServer("127.0.0.1:0", "", "", "", "", prober.NewStatusRegistry(), false, "both")
+		srvHandle = srv
+		close(started)
+		return srv, done, err
+	}
+
+	runErr := make(chan error, 1)
+	go func() { runErr <- prg.run() }()
+
+	select {
+	case <-started:
+	case err := <-runErr:
+		t.Fatalf("run() failed before the metrics server was up: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("metrics server did not start within 5s")
+	}
+	// Let run() settle into its select before killing the listener, so
+	// the close cannot be mistaken for a startup-order artifact.
+	// pi-lens-ignore: go-time-sleep-test
+	time.Sleep(200 * time.Millisecond)
+
+	// Kill the serve goroutine mid-run: Close tears down the listener and
+	// active conns, Serve returns, metricsDone closes.
+	if err := srvHandle.Close(); err != nil {
+		t.Fatalf("closing metrics server: %v", err)
+	}
+
+	select {
+	case err := <-runErr:
+		if err == nil {
+			t.Fatal("run() returned nil after mid-run metrics-server death; want fatal error")
+		}
+		if !strings.Contains(err.Error(), "metrics server terminated") {
+			t.Errorf("error should name the metrics-server death, got: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("run() did not observe the dead metrics server within 5s")
+	}
+}
+
 // pi-lens-ignore: go-test-functions
 func TestRunRejectsBadFlagCombos(t *testing.T) {
 	saveFlags(t)
@@ -596,7 +674,6 @@ func TestRunRejectsBadFlagCombos(t *testing.T) {
 // in "both" mode. With the race detector this proves the WaitGroup Add is
 // correctly sequenced before Stop's Wait (previously Add ran concurrently
 // inside run()).
-// pi-lens-ignore: go-test-functions
 func TestProgramStartStopBothMode(t *testing.T) {
 	saveFlags(t)
 	t.Setenv("LINK_PING_METRICS_USER", "")

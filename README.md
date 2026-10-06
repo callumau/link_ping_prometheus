@@ -707,7 +707,7 @@ link_ping_prometheus.exe -mode=both -targets=targets.json -metrics=":2112" -log-
 
 **Built-in service hardening (configured automatically at install):**
 
-- **Crash recovery**: SCM failure action is *restart* after 5s (reset period 24h). A crash or fatal internal error exits non-zero so recovery fires — a dead monitor never stays down silently.
+- **Crash recovery**: SCM failure action is *restart* after 5s (reset period 24h). A crash or fatal internal error exits non-zero so recovery fires — a dead monitor never stays down silently. This includes a mid-run failure of the metrics HTTP server itself: if `/metrics`, `/status`, `/healthz` or `/readyz` die while the agent keeps probing, the agent exits non-zero so the restart ladder brings the whole monitor back (probing without a metrics endpoint is dead weight that looks healthy).
 - **Delayed auto-start** with dependencies on `Tcpip` (sockets) and `W32Time` (time sync — the HMAC replay window requires roughly NTP-synchronized clocks between nodes).
 - **Lifecycle events in the Windows Event Log** (Application source `link_ping_prometheus`): start, stop, and fatal errors are visible even with no access to the log file.
 - **Credentials never persisted** into the service configuration.

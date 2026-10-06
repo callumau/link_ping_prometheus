@@ -603,6 +603,11 @@ type program struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+	// testServeMetrics, when set (tests only), replaces startMetricsServer
+	// in run(): the test owns the *http.Server handle so it can kill the
+	// listener mid-run and observe the fatal path deterministically.
+	// Production leaves it nil; nil selects the real binder.
+	testServeMetrics func() (*http.Server, <-chan struct{}, error)
 }
 
 // Start is called by the service framework to begin execution.
@@ -886,7 +891,13 @@ func (p *program) run() error {
 	// failure (port taken, permission denied) aborts startup instead of
 	// leaving the agent running with no /metrics endpoint — a silent
 	// partial failure for a monitoring agent.
-	metricsSrv, metricsDone, err := p.startMetricsServer(*flMetrics, user, pass, cert, key, statusReg, *flMetricsGzip, *flMode)
+	startMetrics := p.testServeMetrics
+	if startMetrics == nil {
+		startMetrics = func() (*http.Server, <-chan struct{}, error) {
+			return p.startMetricsServer(*flMetrics, user, pass, cert, key, statusReg, *flMetricsGzip, *flMode)
+		}
+	}
+	metricsSrv, metricsDone, err := startMetrics()
 	if err != nil {
 		return err
 	}
@@ -894,16 +905,63 @@ func (p *program) run() error {
 	echoSecret := resolveEchoSecret()
 	echoSecretOld := resolveEchoSecretOld()
 	mode := *flMode
+	// runCtx: a mid-run metrics-serve failure must cancel the mode loops.
+	// A monitor without a live /metrics endpoint is dead weight that looks
+	// healthy — probes continue, the SCM/OS-level process is "running", and
+	// nothing restarts until manual intervention. The serve goroutine runs
+	// until Serve returns; any return other than deliberate Shutdown closes
+	// metricsDone, which is fatal below.
+	runCtx, runCancel := context.WithCancel(p.ctx)
+	defer runCancel()
+	modeDone := make(chan error, 1)
+	go func() { modeDone <- runModes(runCtx, mode, cfg, sourceForServer, allow, echoSecret, echoSecretOld) }()
 	var modeErr error
+	select {
+	case modeErr = <-modeDone:
+	case <-metricsDone:
+		// The serve goroutine returned before Shutdown: the listener or an
+		// accept failed mid-run. Cancel the mode loops and fail the run so
+		// the agent exits non-zero and service recovery can fire, instead of
+		// probing without an endpoint for the remaining uptime.
+		runCancel()
+		<-modeDone
+		modeErr = errors.New("metrics server terminated unexpectedly; monitor cannot serve metrics, status, or health endpoints")
+	}
+	// Drain the metrics server on the way out so an in-flight scrape
+	// finishes instead of being cut off by process exit. On the
+	// metricsDone path the server is already gone and Shutdown is a no-op;
+	// on a normal mode exit it stops the listener and unblocks the select's
+	// second case only if it had not fired yet.
+	// pi-lens-ignore: go-context-background-handler
+	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	// pi-lens-ignore: go-ignored-call-result
+	_ = metricsSrv.Shutdown(shutCtx)
+	<-metricsDone
+	return modeErr
+}
+
+// runModes executes the selected probe/server mode until ctx is cancelled,
+// returning its terminal error. Extracted from run() so the metrics-server
+// death at the select above is comparable to (and can preempt) a mode exit.
+func runModes(
+	ctx context.Context,
+	mode string,
+	cfg prober.Config,
+	sourceForServer string,
+	allow *prober.Allowlist,
+	echoSecret string,
+	echoSecretOld string,
+) error {
 	switch mode {
 	case "server":
-		modeErr = prober.RunServer(p.ctx, *flListen, sourceForServer, allow, echoSecret, echoSecretOld)
+		return prober.RunServer(ctx, *flListen, sourceForServer, allow, echoSecret, echoSecretOld)
 	case "client":
-		modeErr = prober.RunClient(p.ctx, cfg)
+		return prober.RunClient(ctx, cfg)
 	case "both":
 		// Local WaitGroup: Add is sequenced before the goroutine starts
 		// and Wait runs in the same goroutine, so no Add/Wait race.
-		modeCtx, modeCancel := context.WithCancel(p.ctx)
+		modeCtx, modeCancel := context.WithCancel(ctx)
 		var wg sync.WaitGroup
 		var serverErr error
 		wg.Add(1)
@@ -918,24 +976,14 @@ func (p *program) run() error {
 				modeCancel()
 			}
 		}()
-		modeErr = prober.RunClient(modeCtx, cfg)
+		clientErr := prober.RunClient(modeCtx, cfg)
 		modeCancel()
 		wg.Wait()
 		if serverErr != nil {
-			modeErr = serverErr
+			return serverErr
 		}
+		return clientErr
 	default:
-		modeErr = fmt.Errorf("unknown mode: %s", mode)
+		return fmt.Errorf("unknown mode: %s", mode)
 	}
-
-	// Drain the metrics server on the way out so an in-flight scrape
-	// finishes instead of being cut off by process exit. Best-effort:
-	// the agent's own metrics are in-memory and die with it regardless.
-	// pi-lens-ignore: go-context-background-handler
-	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	// pi-lens-ignore: go-ignored-call-result
-	_ = metricsSrv.Shutdown(shutCtx)
-	<-metricsDone
-	return modeErr
 }
