@@ -746,6 +746,14 @@ link_ping_prometheus.exe -mode=both -targets=targets.json -allow=192.168.1.71 -m
      checksums.txt
    # 2. the artifacts: against the now-trusted checksums file
    sha256sum --check --ignore-missing checksums.txt
+   # 3. the provenance: this release workflow built the artifact (GitHub
+   #    attestation store). The cosign signature above only proves who
+   #    published the checksums file; the SLSA provenance attestation
+   #    proves which workflow run built each artifact, on what runner,
+   #    from what source commit — a swapped or out-of-pipeline artifact
+   #    fails this check even if the signature itself verifies.
+   gh attestation verify link_ping_prometheus_Linux_x86_64.tar.gz \
+     -R callumau/link_ping_prometheus
    ```
 6. **Supply chain and fleet-wide auth, before scaling out:**
    - Restrict who can create `v*` tags with a GitHub Ruleset — the release build reads the tag for `link_ping_build_info` and now also mints a sigstore signing identity from the run, so tag creation is release-authoring permission, not a general contributor one. `.github/CODEOWNERS` lists the release paths (replace its placeholder team first — an unresolved handle matches nobody, so a required-review ruleset on it would never be satisfiable).
