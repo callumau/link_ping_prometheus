@@ -1164,9 +1164,21 @@ func runEchoLoop(
 			// fabricate loss. The remaining abandoned probes can never match
 			// on this socket, so they are counted as timed out to keep
 			// sent = rtt_count + timed_out + inflight balancing across the
-			// restart (same treatment as the reconnect flush).
+			// restart (same treatment as the reconnect flush). The flush is
+			// UNCONDITIONAL — a panicking loop is never a process shutdown
+			// (shutdown cancels the context; the loop returns normally), the
+			// supervisor restarts it, and its series stay exported — and it
+			// clears pending: the tail below would otherwise re-run its own
+			// accounting (a RunClient-managed restart exits with the root
+			// context still alive, so runClientShuttingDown is false and the
+			// tail re-adds) and every abandoned probe would be counted
+			// twice, over-reporting loss through the balance invariant.
 			drainResponses()
-			m.timedOut.Add(float64(len(pending)))
+			if n := len(pending); n > 0 {
+				m.timedOut.Add(float64(n))
+				m.inflight.Sub(float64(n))
+				pending = make(map[uint64]time.Time)
+			}
 		}
 		// Probes still in flight die with the loop on cancellation. Whether
 		// they must also be counted as timed out depends on whether the
