@@ -732,7 +732,7 @@ link_ping_prometheus.exe -mode=both -targets=targets.json -allow=192.168.1.71 -m
    sc.exe config link_ping_prometheus obj= "NT AUTHORITY\LocalService"
    ```
 
-   Use `NT AUTHORITY\NetworkService` instead of LocalService if network firewalls expect machine-account identity, or a domain gMSA (`DOMAIN\svc-linkping$`) if policy mandates managed accounts. Grant the chosen account write access to the log directory only.
+   Use `NT AUTHORITY\NetworkService` instead of LocalService if network firewalls expect machine-account identity, or a domain gMSA (`DOMAIN\svc-linkping$`) if policy mandates managed accounts. Grant the chosen account write access to the log directory only. **If a log file already exists, delete it (or re-ACL it) before switching accounts**: the agent restricts the log file's DACL to SYSTEM + Administrators + the account that created it, so the *previous* account's log file denies the new account write access and the service exits at startup (loud, non-zero — the restart ladder will loop until the file is removed).
 3. **Secrets delivery.** Set the credential environment variables machine-wide via System Properties → Environment Variables, or per-service:
 
    ```sh
