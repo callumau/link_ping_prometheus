@@ -121,6 +121,14 @@ goto :wiz_mode
 :wiz_metrics
 set "METRICS_ADDR="
 set /p "METRICS_ADDR=Metrics listen address [%DEF_METRICS%]: "
+REM Validate BEFORE any %VAR% expansion: the emptiness check itself expands
+REM the raw value, and a " in it would abort the batch at parse time.
+call :RejectQuoteAmp METRICS_ADDR
+if errorlevel 1 (
+    echo   ERROR: the address cannot contain a double-quote or ampersand -
+    echo   those characters cannot be delivered safely through quoting below.
+    goto :wiz_metrics
+)
 if "%METRICS_ADDR%"=="" set "METRICS_ADDR=%DEF_METRICS%"
 echo   NOTE: localhost binds are scrape-able only from this machine; use ":2112" to expose remotely (firewall-restrict it).
 
@@ -139,6 +147,13 @@ if /i "%TGT_CHOICE%"=="2" goto :wiz_single
 
 :wiz_targets_file
 set /p "TARGETS_FILE=Path to targets JSON file: "
+REM Validate BEFORE any %VAR% expansion (see the note at :wiz_metrics).
+call :RejectQuoteAmp TARGETS_FILE
+if errorlevel 1 (
+    echo   ERROR: the path cannot contain a double-quote or ampersand -
+    echo   those characters cannot be delivered safely through quoting below.
+    goto :wiz_targets_file
+)
 if "%TARGETS_FILE%"=="" (
     echo   REQUIRED: without a targets file nothing would be probed.
     goto :wiz_targets_file
@@ -156,11 +171,18 @@ goto :wiz_allow_ask
 
 :wiz_single
 set /p "SINGLE_TARGET=Single target address (host:port, e.g. 192.168.1.60:4000): "
+REM Validate BEFORE any %VAR% expansion (see the note at :wiz_metrics).
+call :RejectQuoteAmp SINGLE_TARGET
+if errorlevel 1 (
+    echo   ERROR: the address cannot contain a double-quote or ampersand -
+    echo   those characters cannot be delivered safely through quoting below.
+    goto :wiz_single
+)
 if "%SINGLE_TARGET%"=="" (
     echo   REQUIRED: without a target nothing would be probed.
     goto :wiz_single
 )
-echo %SINGLE_TARGET% | findstr /r /c:":" >nul || (
+echo "%SINGLE_TARGET%" | findstr /r /c:":" >nul || (
     echo   Missing port - use host:port form, e.g. 192.168.1.60:4000.
     goto :wiz_single
 )
@@ -174,6 +196,13 @@ set "ALLOW_LIST="
 echo Client IP allowlist - IPs of probers allowed to send probes TO this node.
 echo Fail-closed: the echo server REFUSES to start without at least one IP.
 set /p "ALLOW_LIST=Comma-separated IPs (REQUIRED): "
+REM Validate BEFORE any %VAR% expansion (see the note at :wiz_metrics).
+call :RejectQuoteAmp ALLOW_LIST
+if errorlevel 1 (
+    echo   ERROR: the allowlist cannot contain a double-quote or ampersand -
+    echo   those characters cannot be delivered safely through quoting below.
+    goto :wiz_allow
+)
 if "%ALLOW_LIST%"=="" (
     echo   REQUIRED: cannot be empty - see error above.
     goto :wiz_allow
@@ -182,22 +211,38 @@ if "%ALLOW_LIST%"=="" (
 :wiz_logdir
 set "LOG_DIR="
 set /p "LOG_DIR=Log directory [%DEF_LOG_DIR%]: "
+REM Validate BEFORE any %VAR% expansion (see the note at :wiz_metrics).
+call :RejectQuoteAmp LOG_DIR
+if errorlevel 1 (
+    echo   ERROR: the path cannot contain a double-quote or ampersand -
+    echo   those characters cannot be delivered safely through quoting below.
+    goto :wiz_logdir
+)
 if "%LOG_DIR%"=="" set "LOG_DIR=%DEF_LOG_DIR%"
 
 :wiz_account
 set "SERVICE_ACCOUNT="
 echo Optional least-privilege service account (Enter = LocalSystem default^).
 set /p "SERVICE_ACCOUNT=e.g. NT AUTHORITY\LocalService or DOMAIN\svc-linkping$ [skip]: "
+REM Validate BEFORE any %VAR% expansion (see the note at :wiz_metrics).
+call :RejectQuoteAmp SERVICE_ACCOUNT
+if errorlevel 1 (
+    echo   ERROR: the account name cannot contain a double-quote or ampersand.
+    goto :wiz_account
+)
 
 echo.
 echo === Summary ================================================================
 echo   Mode           : %RUN_MODE%
-if not "%TARGETS_FILE%"=="" echo   Targets file   : %TARGETS_FILE%
-if not "%SINGLE_TARGET%"=="" echo   Single target  : %SINGLE_TARGET%
-if not "%ALLOW_LIST%"==""   echo   Allow list     : %ALLOW_LIST%
-echo   Metrics address: %METRICS_ADDR%
-echo   Log directory  : %LOG_DIR%
-if "%SERVICE_ACCOUNT%"=="" (echo   Service account: LocalSystem ^(default^)) else (echo   Service account: %SERVICE_ACCOUNT%)
+REM Every user-derived value is quoted in these echoes: an unquoted expansion
+REM of a value containing & or " would execute or corrupt the line (a path
+REM like C:\R&D\targets.json would run "D\targets.json" as a command).
+if not "%TARGETS_FILE%"=="" echo   Targets file   : "%TARGETS_FILE%"
+if not "%SINGLE_TARGET%"=="" echo   Single target  : "%SINGLE_TARGET%"
+if not "%ALLOW_LIST%"==""   echo   Allow list     : "%ALLOW_LIST%"
+echo   Metrics address: "%METRICS_ADDR%"
+echo   Log directory  : "%LOG_DIR%"
+if "%SERVICE_ACCOUNT%"=="" (echo   Service account: LocalSystem ^(default^)) else (echo   Service account: "%SERVICE_ACCOUNT%")
 echo   Binary         : %INSTALLED_EXE%
 echo ============================================================================
 :wiz_confirm
@@ -280,16 +325,66 @@ echo.
 echo === Optional credential environment variables (Enter to skip) ===
 set "ENV_KEY=HKLM\SYSTEM\CurrentControlSet\Services\%SERVICE_NAME%\Environment"
 
+:wiz_muser
+set "MUser="
 set /p "MUser=Metrics basic-auth user: "
-if not "%MUser%"=="" reg add "%ENV_KEY%" /v LINK_PING_METRICS_USER /t REG_SZ /d "%MUser%" /f >nul
-
+call :RejectQuoteAmp MUser
+if errorlevel 1 (
+    echo   ERROR: the value cannot contain a double-quote or ampersand -
+    echo   those characters cannot be delivered safely through quoting below.
+    goto :wiz_muser
+)
+if "%MUser%"=="" goto :wiz_mpass
+:wiz_mpass
+set "MPass="
 set /p "MPass=Metrics basic-auth password: "
-if not "%MPass%"=="" reg add "%ENV_KEY%" /v LINK_PING_METRICS_PASS /t REG_SZ /d "%MPass%" /f >nul
-
+call :RejectQuoteAmp MPass
+if errorlevel 1 (
+    echo   ERROR: the value cannot contain a double-quote or ampersand -
+    echo   those characters cannot be delivered safely through quoting below.
+    goto :wiz_mpass
+)
+if "%MPass%"=="" goto :wiz_esecret
+:wiz_esecret
+set "ESecret="
 set /p "ESecret=Echo HMAC secret: "
-if not "%ESecret%"=="" reg add "%ENV_KEY%" /v LINK_PING_ECHO_SECRET /t REG_SZ /d "%ESecret%" /f >nul
-
+call :RejectQuoteAmp ESecret
+if errorlevel 1 (
+    echo   ERROR: the value cannot contain a double-quote or ampersand -
+    echo   those characters cannot be delivered safely through quoting below.
+    goto :wiz_esecret
+)
+if "%ESecret%"=="" goto :wiz_esecretold
+call :CheckSecretLength ESecret
+if not errorlevel 1 goto :wiz_esecretold
+REM Block-free error handling: the generation hint below contains parentheses,
+REM which must not sit inside a parenthesized if-block (a ")" at parse time
+REM would close the block early - the same class of hazard as a ")" in a
+REM user-typed password, which is why the ACL step below is also block-free).
+echo   ERROR: the echo HMAC secret must be at least 16 characters - it is
+echo   the key material for HMAC-SHA256 probe authentication, and a short
+echo   value is brute-forceable. Generate one with:
+echo     powershell -NoProfile -Command "-join ((48..57)+(97..122) | Get-Random -Count 32 | %% {[char]$_}^)"
+goto :wiz_esecret
+:wiz_esecretold
+set "ESecretOld="
 set /p "ESecretOld=Echo HMAC secret (previous, for rotation; Enter to skip): "
+call :RejectQuoteAmp ESecretOld
+if errorlevel 1 (
+    echo   ERROR: the value cannot contain a double-quote or ampersand -
+    echo   those characters cannot be delivered safely through quoting below.
+    goto :wiz_esecretold
+)
+if "%ESecretOld%"=="" goto :wiz_creds_done
+call :CheckSecretLength ESecretOld
+if errorlevel 1 (
+    echo   ERROR: the previous echo HMAC secret must also be at least 16 characters.
+    goto :wiz_esecretold
+)
+:wiz_creds_done
+if not "%MUser%"=="" reg add "%ENV_KEY%" /v LINK_PING_METRICS_USER /t REG_SZ /d "%MUser%" /f >nul
+if not "%MPass%"=="" reg add "%ENV_KEY%" /v LINK_PING_METRICS_PASS /t REG_SZ /d "%MPass%" /f >nul
+if not "%ESecret%"=="" reg add "%ENV_KEY%" /v LINK_PING_ECHO_SECRET /t REG_SZ /d "%ESecret%" /f >nul
 if not "%ESecretOld%"=="" reg add "%ENV_KEY%" /v LINK_PING_ECHO_SECRET_OLD /t REG_SZ /d "%ESecretOld%" /f >nul
 
 :: Restrict the credential key ------------------------------------------------
@@ -338,5 +433,32 @@ sc.exe query "%SERVICE_NAME%" | findstr /i "STATE"
 
 echo.
 echo Done. Event Log source "%SERVICE_NAME%" (Application) carries lifecycle/fatal events.
-echo Logs: %LOG_DIR%\service.log
+echo Logs: "%LOG_DIR%\service.log"
 endlocal
+exit /b 0
+
+:: ============================================================================
+:: Subroutines
+:: ============================================================================
+
+:: RejectQuoteAmp VALUEVAR
+::   Sets errorlevel 1 when the named variable contains a double-quote or an
+::   ampersand. A " breaks every quoted expansion below (summary echoes,
+::   INSTALL_ARGS, reg add /d "..."), silently corrupting the install or the
+::   credential; a bare & executes as a command separator wherever quoting is
+::   lost (an unquoted echo of a path like C:\R&D\x runs "D\x" as a command).
+::   The check itself runs in PowerShell against the process environment so
+::   the raw value is NEVER expanded into a cmd command line - expanding a
+::   value to search it would itself be the injection this guard exists for.
+:RejectQuoteAmp
+powershell -NoProfile -Command "if ($env:%~1 -match '[\"&]') { exit 1 } else { exit 0 }" >nul 2>&1
+exit /b %errorlevel%
+
+:: CheckSecretLength VALUEVAR
+::   Sets errorlevel 1 when the named variable holds fewer than 16 characters.
+::   The echo HMAC secret is the key material for HMAC-SHA256 probe
+::   authentication; a short value is brute-forceable. PowerShell reads the
+::   value from the environment for the same no-expansion reason as above.
+:CheckSecretLength
+powershell -NoProfile -Command "if ($env:%~1.Length -lt 16) { exit 1 } else { exit 0 }" >nul 2>&1
+exit /b %errorlevel%

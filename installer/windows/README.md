@@ -7,7 +7,7 @@ folder (or edit `EXE_PATH` at the top of the script).
 | Script | Purpose |
 | --- | --- |
 | `install-service.bat` | Fresh install, or in-place upgrade when a newer binary is provided |
-| `uninstall-service.bat` | Stop, remove service + event-log source + credential env vars |
+| `uninstall-service.bat` | Stop, remove service + event-log source + credential env vars; also removes a wizard-custom log directory read back from the persisted service arguments |
 
 ## What install-service.bat does
 
@@ -38,6 +38,13 @@ else is asked interactively: mode (server/client/both), metrics address,
 targets — a JSON file or a single host:port endpoint — the required client
 IP allow-list for server/both, log directory, optional service account,
 and a summary/confirm step before anything is installed.
+
+**Input validation:** typed values are rejected when they contain a
+double-quote or an ampersand — those characters cannot be delivered safely
+through the script's quoted expansions (`reg add /d "..."`, the service
+argument list, summary echoes). The echo HMAC secret (and its rotation
+predecessor) must be at least 16 characters: it is the key material for
+HMAC-SHA256 probe authentication, and a short value is brute-forceable.
 
 ## Credential storage and the `Environment` key
 
