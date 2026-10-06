@@ -580,11 +580,21 @@ func TestFlagDefaultInt(t *testing.T) {
 // configured path by someone else keeps its wider mode while the agent
 // appends topology into it) and refuses symlinked log paths (a symlink can
 // redirect topology-bearing lines into a file another local user controls).
+// Windows note: os.Stat reports 0666 for every file regardless of ACL and
+// f.Chmod only toggles the read-only attribute, so the POSIX perm-bit
+// assertions below are unix-only. The Windows control for log confidentiality
+// is the ACL'd log DIRECTORY the installer creates (install-service.bat), not
+// the mode bit — enforcing a DACL from hardenLogSink itself is filed as a
+// round-2 finding (deferred, needs SetNamedSecurityInfo work).
 func TestHardenLogSink(t *testing.T) {
 	t.Run("creates missing file at 0600", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "agent.log")
 		if _, err := hardenLogSink(path); err != nil {
 			t.Fatalf("hardenLogSink: %v", err)
+		}
+		if runtime.GOOS == "windows" {
+			// Stat reports 0666 on Windows regardless of the create mode.
+			return
 		}
 		fi, err := os.Stat(path)
 		if err != nil {
@@ -607,6 +617,10 @@ func TestHardenLogSink(t *testing.T) {
 		if !repaired {
 			t.Error("repaired = false, want true")
 		}
+		if runtime.GOOS == "windows" {
+			// Stat reports 0666 on Windows regardless of the actual ACL.
+			return
+		}
 		fi, err := os.Stat(path)
 		if err != nil {
 			t.Fatalf("stat repaired file: %v", err)
@@ -620,6 +634,13 @@ func TestHardenLogSink(t *testing.T) {
 	})
 
 	t.Run("keeps a compliant file untouched", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			// "compliant" is a POSIX perm-bit concept: Windows reports 0666 for
+			// every file, so hardenLogSink would always report repaired=true and
+			// the untouched assertion is unimplementable there (see the Windows
+			// note on this test function).
+			t.Skip("perm-bit semantics are unix-only; Windows control is the installer's log-dir ACL")
+		}
 		path := filepath.Join(t.TempDir(), "agent.log")
 		if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
 			t.Fatalf("seed file: %v", err)
