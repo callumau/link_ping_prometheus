@@ -604,7 +604,7 @@ link_ping_prometheus -mode=<mode> [flags]
 | `-mtu-sweep` | `1m` | Client: periodically sweep DF-set probe sizes to find the largest frame the path carries (`link_path_mtu_bytes`, `/status path_mtu_bytes`). 0 disables. Linux, and Windows for IPv4 targets on any Windows Server (2003+ via the DF flag; Server 2019+/Win10 1703+ use full path-MTU discovery); IPv6 targets need Server 2019+/Win10 1703+. Unsupported socket options disable just the sweep with a one-time warning. Separate counters — never in the loss ratio. |
 | `-adaptive` | `true` | Enable adaptive RTO based on link quality. With `false`, the fixed `-timeout` applies: links whose true RTT exceeds it read as 100% loss with no warning — pick a timeout comfortably above expected RTT |
 | `-source` | `""` | Source label applied to every metric series, e.g. the local site or datacenter (`sydney-dc`) (defaults to hostname) |
-| `-metrics-user` | `""` | Basic auth username for /metrics (empty = disabled; env `LINK_PING_METRICS_USER`) |
+| `-metrics-user` | `""` | Basic auth username for /metrics (empty = disabled; env `LINK_PING_METRICS_USER`; must not contain `:` — HTTP Basic Auth splits at the first colon, so such a user is unreachable and startup is refused) |
 | `-metrics-pass` | `""` | Basic auth password for /metrics (env `LINK_PING_METRICS_PASS`; prefer env over CLI to avoid `ps` exposure) |
 | `-metrics-tls-cert` | `""` | TLS certificate file for /metrics (requires `-metrics-tls-key`) |
 | `-metrics-tls-key` | `""` | TLS private key file for /metrics (requires `-metrics-tls-cert`) |
@@ -949,7 +949,7 @@ DNS failure at startup is retried, not fatal.
 - UDP is not amplification-prone (echo is the same size as the request)
   and carries no state, but any internet-facing echo endpoint should be
   firewall-restricted to known monitoring sites.
-- The `/metrics` endpoint supports HTTP Basic Auth (`-metrics-user` / `-metrics-pass`) with constant-time comparison over hashed credentials. Both must be set together; the process refuses to start with only one.
+- The `/metrics` endpoint supports HTTP Basic Auth (`-metrics-user` / `-metrics-pass`) with constant-time comparison over hashed credentials. Both must be set together; the process refuses to start with only one. Usernames must not contain `:` (Basic Auth cannot represent them: the client side is parsed at the first colon, so the user would be unreachable and every request would 401) — the process refuses to start with such a username.
 - Prefer the `LINK_PING_METRICS_USER` / `LINK_PING_METRICS_PASS` environment variables over CLI flags — flag values are visible in `ps` to other local users.
 - Basic Auth without TLS sends credentials as base64 on the wire; a startup warning is logged in that configuration. Use `-metrics-tls-cert` / `-metrics-tls-key` to serve `/metrics` over HTTPS.
 - The wire protocol carries no sensitive data (sequence numbers and wall-clock timestamps only) and has no TLS — intended for internal network monitoring. Restrict access with a firewall on untrusted networks.

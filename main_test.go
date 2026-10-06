@@ -337,6 +337,50 @@ func TestResolveMetricsAuth(t *testing.T) {
 	}
 }
 
+// TestResolveMetricsAuthRejectsColonInUser pins the Basic-auth username
+// constraint (F6): r.BasicAuth() splits the header at the FIRST colon, so a
+// username containing ':' is unreachable — every request 401s and the
+// endpoint is permanently locked out. The validation applies to the flag and
+// the env fallback alike; an empty user keeps meaning "auth disabled".
+func TestResolveMetricsAuthRejectsColonInUser(t *testing.T) {
+	saveFlags(t)
+	t.Setenv("LINK_PING_METRICS_USER", "")
+	t.Setenv("LINK_PING_METRICS_PASS", "")
+
+	for _, tc := range []struct {
+		name    string
+		user    string
+		pass    string
+		wantErr bool
+	}{
+		{"colon in user", "ad:min", "p", true},
+		{"plain user", "admin", "p", false},
+		{"empty user (auth disabled)", "", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			*flMetricsBasicAuthUser = tc.user
+			*flMetricsBasicAuthPass = tc.pass
+			_, _, err := resolveMetricsAuth()
+			if tc.wantErr && err == nil {
+				t.Errorf("user %q must be rejected", tc.user)
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("user %q must be accepted, got %v", tc.user, err)
+			}
+		})
+	}
+
+	// Env-derived username gets the same check (flags win only when set).
+	t.Run("colon in env user", func(t *testing.T) {
+		*flMetricsBasicAuthUser, *flMetricsBasicAuthPass = "", ""
+		t.Setenv("LINK_PING_METRICS_USER", "ad:min")
+		t.Setenv("LINK_PING_METRICS_PASS", "p")
+		if _, _, err := resolveMetricsAuth(); err == nil {
+			t.Error("env user containing ':' must be rejected")
+		}
+	})
+}
+
 // TestRunRejectsEchoSecretOldWithoutPrimary pins the rotation guard (F4):
 // -echo-secret-old without a primary -echo-secret silently disables ALL wire
 // auth — internal/prober/server.go consults the old secret only inside its
