@@ -22,11 +22,20 @@ permissions:
 # This workflow's contents:write and id-token:write are only as
 # authorized as whatever may push those tags, so a tag push by an
 # untrusted account publishes signed-looking artifacts under this repo.
+# The job-level `github.repository ==` guard below is the second,
+# workflow-level layer: it stops a fork's or collaborator's `v*` tag
+# from ever running this job with the real repo's write permissions —
+# the ruleset remains the first line of defense for the primary repo.
 
 jobs:
   release:
     name: Release
     runs-on: ubuntu-latest
+    # Workflow-level guard (second layer on top of the tag-creation
+    # ruleset above): a fork or collaborator re-tag of `v*` in another
+    # repository must not run this job, which signs and publishes under
+    # the real repo's tokens.
+    if: github.repository == 'callumau/link_ping_prometheus'
     # Two tag pushes (e.g. a re-tagged release) must not publish at the
     # same time: they race on the same GitHub release and the same image
     # tags. Queue them instead of cancelling -- a half-finished publish
