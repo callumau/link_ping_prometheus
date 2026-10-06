@@ -60,6 +60,13 @@ const minScavengeUnreleased = 4 << 20
 // down). Excess scrapes get a 503 instead; Prometheus retries.
 const maxConcurrentScrapes = 2
 
+// shutdownJoinGrace bounds the wait for the metrics serve goroutine to exit
+// after Shutdown: an in-flight scrape holds Serve open up to the 30s
+// WriteTimeout, which exceeds the service Stop deadline (20s). The drain is
+// best-effort, so the join is cut short rather than making Stop report a
+// timeout while the process drains a clean shutdown.
+const shutdownJoinGrace = 2 * time.Second
+
 // releasableHeap returns the idle heap bytes a scavenge could actually return
 // to the OS, i.e. HeapIdle minus what has already been released. Deliberately
 // NOT Sys-HeapReleased: Sys covers the whole process and stays far above any
@@ -347,10 +354,10 @@ func resolveEchoSecretOld() string {
 // set but silently unused in the selected mode. Warnings, not errors: every
 // case is backward compatible (the previous behavior ignored the flag too),
 // but silent ingestion gaps are how a half-configured fleet ships.
-// - echo-secret-old is consumed ONLY by the server (rotation acceptance in
-//   internal/prober/server.go), so it is ignored in client mode.
-// - allow and listen gate the echo responder, so they are ignored in client mode.
-// - with both -targets and -target set, buildConfig's else-if means -targets wins.
+//   - echo-secret-old is consumed ONLY by the server (rotation acceptance in
+//     internal/prober/server.go), so it is ignored in client mode.
+//   - allow and listen gate the echo responder, so they are ignored in client mode.
+//   - with both -targets and -target set, buildConfig's else-if means -targets wins.
 func warnIgnoredFlags(mode string) {
 	if *flEchoSecretOld != "" && mode == "client" {
 		slog.Warn("-echo-secret-old set but ignored: the old secret is only accepted by the echo server (server/both mode), not by the client")
@@ -986,7 +993,17 @@ func (p *program) run() error {
 	defer cancel()
 	// pi-lens-ignore: go-ignored-call-result
 	_ = metricsSrv.Shutdown(shutCtx)
-	<-metricsDone
+	// Bounded join: a scrape mid-write holds Serve open up to the 30s
+	// WriteTimeout, which exceeds the service Stop deadline (20s) - waiting
+	// unconditionally would make Stop report "timed out" while the process
+	// was still draining a clean shutdown. The drain is best-effort (the
+	// agent's own metrics die with the process), so after the Shutdown
+	// deadline a short grace is all an in-flight scrape gets.
+	select {
+	case <-metricsDone:
+	case <-time.After(shutdownJoinGrace):
+		slog.Warn("metrics server drain grace exceeded; continuing exit", "grace", shutdownJoinGrace)
+	}
 	return modeErr
 }
 
