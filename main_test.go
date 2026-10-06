@@ -1044,6 +1044,123 @@ func TestMetricsHandler_ConcurrencyCapReturns503(t *testing.T) {
 	}
 }
 
+func TestStatusHandler_ConcurrencyCapReturns503(t *testing.T) {
+	prober.InitMetrics()
+	inner := &blockingStatusHandler{entered: make(chan struct{}, 8), release: make(chan struct{})}
+	h := limitConcurrent(maxConcurrentScrapes, inner)
+
+	recs := make([]*httptest.ResponseRecorder, maxConcurrentScrapes)
+	done := make([]chan struct{}, len(recs))
+	for i := range recs {
+		recs[i] = httptest.NewRecorder()
+		done[i] = make(chan struct{})
+		go func(i int) {
+			defer close(done[i])
+			h.ServeHTTP(recs[i], httptest.NewRequest(http.MethodGet, "/status", nil))
+		}(i)
+	}
+	for range maxConcurrentScrapes {
+		select {
+		case <-inner.entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("status requests never reached the handler (cap not applied?)")
+		}
+	}
+
+	// The third request arrives while both slots are held: 503, and it must
+	// never reach the status handler itself.
+	third := make(chan int, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
+		third <- rec.Code
+	}()
+	select {
+	case got := <-third:
+		if got != http.StatusServiceUnavailable {
+			t.Errorf("a request beyond the %d-request cap must get 503, got %d", maxConcurrentScrapes, got)
+		}
+	case <-inner.entered:
+		t.Error("the concurrency cap is not applied: a third request reached the status handler")
+		close(inner.release)
+		<-third
+		return
+	case <-time.After(5 * time.Second):
+		t.Fatal("the third request neither returned nor reached the handler")
+	}
+
+	close(inner.release)
+	for i := range recs {
+		select {
+		case <-done[i]:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("request %d did not finish after release", i)
+		}
+		if recs[i].Code != http.StatusOK {
+			t.Errorf("in-flight request %d must complete with 200, got %d", i, recs[i].Code)
+		}
+	}
+
+	// Release happens on every path (including a handler panic), and slots
+	// must have returned, so 10 sequential requests after the burst are all
+	// served normally (release is closed above, so they complete at once).
+	for range 10 {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
+		if rec.Code != http.StatusOK {
+			t.Errorf("cap must serve sequential requests after the burst, got %d", rec.Code)
+		}
+	}
+}
+
+// blockingStatusHandler parks every request until release is closed, making
+// the /status concurrency cap deterministic (the same pattern as
+// blockingGatherer for /metrics). After release is closed, later requests
+// complete immediately, so the test can verify slots are reusable afterward.
+type blockingStatusHandler struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (h *blockingStatusHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	select {
+	case h.entered <- struct{}{}:
+	default:
+	}
+	<-h.release
+}
+
+// TestStatusHandler_CapReleasesOnPanic pins that a panicking request still
+// frees its semaphore slot: the cap wraps arbitrary handlers and a leaked
+// slot would eventually 503 every /status request forever. The wrapper lets
+// the panic propagate to net/http's server-side recovery, so the test
+// mirrors that by recovering it itself. The inner handler panics exactly
+// once, so the request after the panic also proves the freed slot serves.
+func TestStatusHandler_CapReleasesOnPanic(t *testing.T) {
+	var panicked bool
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !panicked {
+			panicked = true
+			panic("boom")
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	h := limitConcurrent(1, inner)
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				return
+			}
+		}()
+		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/status", nil))
+	}()
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
+	if rec.Code != http.StatusOK {
+		t.Errorf("slot leaked after a panicking request: recovery request got %d, want 200", rec.Code)
+	}
+}
+
 // TestREADME_FlagsTableAndBucketsMatchCode ties the user-facing documentation
 // to the code. Both have drifted before: -echo-secret was registered but
 // missing from the flags table, and the bucket list lost its 2.5s/3s edges.
