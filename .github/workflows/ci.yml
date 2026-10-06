@@ -110,3 +110,32 @@ jobs:
 
       - name: Build
         run: go build -v ./...
+
+  # Native Windows test job — the ubuntu job above only CROSS-compiles the
+  # windows-only files (GOOS=windows vet/build never executes them), so
+  # winsock errno classification, DF socket options and the service lifecycle
+  # previously shipped with zero execution coverage on their own platform.
+  # The generous -timeout is deliberate: the suite is sleep-timed and windows
+  # runners are slower/noisier than a local box (the suite runs ~90-120s
+  # locally, 2-3x under -race, and can take 10-20 min here); the existing
+  # skipIfRTTNearTimeout flake guards absorb runner noise — do NOT add
+  # continue-on-error, which would hide real failures.
+  test-windows:
+    name: Test (windows)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      # Same SHA pins as the ubuntu job (v7.0.1 checkout, v7.0.0 setup-go).
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: "1.27.1"
+          cache: false
+
+      - name: Run Tests (race detector)
+        run: go test -count=1 -race -timeout 30m -v ./...
