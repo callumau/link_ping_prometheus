@@ -618,7 +618,7 @@ link_ping_prometheus -mode=<mode> [flags]
 | `-log-file-max-age` | `28` | Max days to keep rotated log files |
 | `-svc` | `""` | Windows service action: `install`, `uninstall`, `start`, `stop`, `run` |
 | `-echo-secret` | `""` | HMAC secret authenticating UDP probes (env `LINK_PING_ECHO_SECRET`; must be set on **both** client and server — a server without it accepts the client's HMAC frame as a plain payload probe, see [Wire Protocol](#wire-protocol); expands the wire frame to 32 bytes) |
-| `-echo-secret-old` | `""` | Server: previous HMAC secret still accepted during a zero-downtime rotation, alongside `-echo-secret` (env `LINK_PING_ECHO_SECRET_OLD`; server side only) |
+| `-echo-secret-old` | `""` | Server: previous HMAC secret still accepted during a zero-downtime rotation, alongside `-echo-secret` (env `LINK_PING_ECHO_SECRET_OLD`; server side only; startup error if set without `-echo-secret`) |
 
 **Why MTU discovery (`-mtu-sweep`) matters:** 24-byte probes prove a path *exists* — they cannot prove it *carries full-size traffic*. VPN tunnels, PPPoE/GRE/VXLAN overlays and broken PMTUD routinely pass small packets while black-holing full-size ones — the classic "monitor says healthy, users say broken" failure. The sweep DF-marks probes on a dedicated socket, binary-searches the largest frame that round-trips, and publishes it as `link_path_mtu_bytes`; a shrinking gauge (or rising `link_mtu_probes_lost_total` while `link_up` stays 1) is that failure's signature. A size with no echo is retried once before the search shrinks — a single dropped probe on a lossy path would otherwise converge far below the real MTU and make the gauge flap between sweeps — so both MTU counters advance per attempt and read as a probe rate, not one probe per distinct size tested. It needs no ICMP and no extra firewall rules, uses separate counters that never enter the loss ratio, and is on by default (1m; `0` disables). Alert on `link_path_mtu_bytes < max_over_time(link_path_mtu_bytes[24h])`, or
 on MTU probe loss as a RATIO (`rate(link_mtu_probes_lost_total[10m]) /
@@ -941,7 +941,11 @@ DNS failure at startup is retried, not fatal.
   with `-echo-secret=<new>`. Finally remove `-echo-secret-old` from the
   servers — any frame failing both secrets still counts in
   `link_server_probes_dropped_total{reason="hmac"}` so a half-rotated
-  fleet is visible in metrics.
+  fleet is visible in metrics. The agent refuses to start with
+  `-echo-secret-old` set while `-echo-secret` is empty: the old secret
+  alone provides no authentication (it is only consulted server-side
+  when a primary secret is configured), so a rotation deploy that lost
+  the new secret fails loudly instead of running unauthenticated.
 - UDP is not amplification-prone (echo is the same size as the request)
   and carries no state, but any internet-facing echo endpoint should be
   firewall-restricted to known monitoring sites.
