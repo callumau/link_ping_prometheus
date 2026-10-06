@@ -951,6 +951,7 @@ DNS failure at startup is retried, not fatal.
   firewall-restricted to known monitoring sites.
 - The `/metrics` endpoint supports HTTP Basic Auth (`-metrics-user` / `-metrics-pass`) with constant-time comparison over hashed credentials. Both must be set together; the process refuses to start with only one. Usernames must not contain `:` (Basic Auth cannot represent them: the client side is parsed at the first colon, so the user would be unreachable and every request would 401) — the process refuses to start with such a username.
 - Prefer the `LINK_PING_METRICS_USER` / `LINK_PING_METRICS_PASS` environment variables over CLI flags — flag values are visible in `ps` to other local users.
+- Mode-mismatched flags are not silently ignored: server-only flags (`-allow`, `-listen`, `-echo-secret-old`) set in client mode, and `-targets`/`-target` set together (`-targets` wins), each log a one-line startup warning — backward compatible, but visible.
 - Basic Auth without TLS sends credentials as base64 on the wire; a startup warning is logged in that configuration. Use `-metrics-tls-cert` / `-metrics-tls-key` to serve `/metrics` over HTTPS.
 - The wire protocol carries no sensitive data (sequence numbers and wall-clock timestamps only) and has no TLS — intended for internal network monitoring. Restrict access with a firewall on untrusted networks.
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -337,48 +338,17 @@ func TestResolveMetricsAuth(t *testing.T) {
 	}
 }
 
-// TestResolveMetricsAuthRejectsColonInUser pins the Basic-auth username
-// constraint (F6): r.BasicAuth() splits the header at the FIRST colon, so a
-// username containing ':' is unreachable — every request 401s and the
-// endpoint is permanently locked out. The validation applies to the flag and
-// the env fallback alike; an empty user keeps meaning "auth disabled".
-func TestResolveMetricsAuthRejectsColonInUser(t *testing.T) {
-	saveFlags(t)
-	t.Setenv("LINK_PING_METRICS_USER", "")
-	t.Setenv("LINK_PING_METRICS_PASS", "")
-
-	for _, tc := range []struct {
-		name    string
-		user    string
-		pass    string
-		wantErr bool
-	}{
-		{"colon in user", "ad:min", "p", true},
-		{"plain user", "admin", "p", false},
-		{"empty user (auth disabled)", "", "", false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			*flMetricsBasicAuthUser = tc.user
-			*flMetricsBasicAuthPass = tc.pass
-			_, _, err := resolveMetricsAuth()
-			if tc.wantErr && err == nil {
-				t.Errorf("user %q must be rejected", tc.user)
-			}
-			if !tc.wantErr && err != nil {
-				t.Errorf("user %q must be accepted, got %v", tc.user, err)
-			}
-		})
-	}
-
-	// Env-derived username gets the same check (flags win only when set).
-	t.Run("colon in env user", func(t *testing.T) {
-		*flMetricsBasicAuthUser, *flMetricsBasicAuthPass = "", ""
-		t.Setenv("LINK_PING_METRICS_USER", "ad:min")
-		t.Setenv("LINK_PING_METRICS_PASS", "p")
-		if _, _, err := resolveMetricsAuth(); err == nil {
-			t.Error("env user containing ':' must be rejected")
-		}
-	})
+// captureWarns swaps the default slog logger for a buffered text handler so
+// tests can assert startup warnings fired. Restores the previous default on
+// cleanup (tests are sequential: no parallel test may rely on the default
+// logger while the buffer is installed).
+func captureWarns(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return &buf
 }
 
 // TestRunRejectsEchoSecretOldWithoutPrimary pins the rotation guard (F4):
@@ -447,6 +417,142 @@ func TestRunRejectsEchoSecretOldWithoutPrimary(t *testing.T) {
 			t.Errorf("env-sourced old secret without primary must fail the guard, got: %v", err)
 		}
 	})
+}
+
+// TestResolveMetricsAuthRejectsColonInUser pins the Basic-auth username
+// constraint (F6): r.BasicAuth() splits the header at the FIRST colon, so a
+// username containing ':' is unreachable — every request 401s and the
+// endpoint is permanently locked out. The validation applies to the flag and
+// the env fallback alike; an empty user keeps meaning "auth disabled".
+func TestResolveMetricsAuthRejectsColonInUser(t *testing.T) {
+	saveFlags(t)
+	t.Setenv("LINK_PING_METRICS_USER", "")
+	t.Setenv("LINK_PING_METRICS_PASS", "")
+
+	for _, tc := range []struct {
+		name    string
+		user    string
+		pass    string
+		wantErr bool
+	}{
+		{"colon in user", "ad:min", "p", true},
+		{"plain user", "admin", "p", false},
+		{"empty user (auth disabled)", "", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			*flMetricsBasicAuthUser = tc.user
+			*flMetricsBasicAuthPass = tc.pass
+			_, _, err := resolveMetricsAuth()
+			if tc.wantErr && err == nil {
+				t.Errorf("user %q must be rejected", tc.user)
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("user %q must be accepted, got %v", tc.user, err)
+			}
+		})
+	}
+
+	// Env-derived username gets the same check (flags win only when set).
+	t.Run("colon in env user", func(t *testing.T) {
+		*flMetricsBasicAuthUser, *flMetricsBasicAuthPass = "", ""
+		t.Setenv("LINK_PING_METRICS_USER", "ad:min")
+		t.Setenv("LINK_PING_METRICS_PASS", "p")
+		if _, _, err := resolveMetricsAuth(); err == nil {
+			t.Error("env user containing ':' must be rejected")
+		}
+	})
+}
+
+// TestWarnIgnoredFlags pins the silent-ingestion-gap warnings (F7): flags
+// with no effect in the selected mode (and the -targets/-target precedence)
+// must log a one-line slog.Warn at startup, and must NOT warn in the modes
+// where the flags are actually consumed.
+func TestWarnIgnoredFlags(t *testing.T) {
+	saveFlags(t)
+	t.Setenv("LINK_PING_ECHO_SECRET", "")
+	t.Setenv("LINK_PING_ECHO_SECRET_OLD", "")
+	// Reset to the registered defaults: earlier run()-based tests leak
+	// non-default values through saveFlags' snapshot-at-entry restore.
+	*flAllow = ""
+	*flListen = flag.Lookup("listen").DefValue
+	*flTarget, *flTargets = "", ""
+	*flEchoSecretOld = ""
+
+	for _, tc := range []struct {
+		name      string
+		mode      string
+		setup     func()
+		wantWarns []string // substrings that MUST appear in the log
+	}{
+		{
+			name: "server flags set in client mode",
+			mode: "client",
+			setup: func() {
+				*flAllow = "127.0.0.1"
+				*flListen = "127.0.0.1:4100"
+				*flEchoSecretOld = "old"
+			},
+			wantWarns: []string{"-allow", "-listen", "-echo-secret-old"},
+		},
+		{
+			name: "clean client mode",
+			mode: "client",
+			setup: func() {},
+		},
+		{
+			name: "server mode consumes server flags",
+			mode: "server",
+			setup: func() {
+				*flAllow = "127.0.0.1"
+				*flListen = "127.0.0.1:4100"
+				*flEchoSecretOld = "old"
+			},
+		},
+		{
+			name: "both mode consumes server flags",
+			mode: "both",
+			setup: func() {
+				*flAllow = "127.0.0.1"
+				*flEchoSecretOld = "old"
+			},
+		},
+		{
+			name: "targets and target both set",
+			mode: "client",
+			setup: func() {
+				*flTarget = "127.0.0.1:4000"
+				*flTargets = "targets.json"
+			},
+			wantWarns: []string{"-targets wins"},
+		},
+		{
+			name: "only target set",
+			mode: "client",
+			setup: func() { *flTarget = "127.0.0.1:4000" },
+		},
+		{
+			name: "only targets set",
+			mode: "client",
+			setup: func() { *flTargets = "targets.json" },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			saveFlags(t)
+			*flMode = tc.mode
+			tc.setup()
+			buf := captureWarns(t)
+			warnIgnoredFlags(tc.mode)
+			log := buf.String()
+			for _, w := range tc.wantWarns {
+				if !strings.Contains(log, w) {
+					t.Errorf("expected warning containing %q, log:\n%s", w, log)
+				}
+			}
+			if len(tc.wantWarns) == 0 && log != "" {
+				t.Errorf("expected no warnings, log:\n%s", log)
+			}
+		})
+	}
 }
 
 // pi-lens-ignore: go-test-functions
