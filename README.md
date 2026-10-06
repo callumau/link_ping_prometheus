@@ -162,7 +162,7 @@ Copy-paste these.
 | **Jitter** (window-based) | `(histogram_quantile(0.9, rate(link_rtt_seconds_bucket[$__rate_interval])) - histogram_quantile(0.5, rate(link_rtt_seconds_bucket[$__rate_interval]))) * 1000` | ms |
 | **Link up** | `link_up` | 0/1 |
 | **Baseline shift** (recent p50 vs 24h min) | `link:rtt_seconds_p50 > 1.5 * link:rtt_seconds_p50_24h_min` (shipped recording rules) | bool |
-| **True wire loss** (needs server at remote end) | `100 * (1 - (rate(link_server_probes_received_total{client="<ip>"}[$__rate_interval]) - rate(link_mtu_probes_sent_total[$__rate_interval])) / rate(link_probes_sent_total[$__rate_interval]))` | % |
+| **True wire loss** (needs server at remote end) | `100 * (1 - (sum(rate(link_server_probes_received_total{client="<ip>"}[$__rate_interval])) - sum(rate(link_mtu_probes_sent_total{target="<target>"}[$__rate_interval]))) / sum(rate(link_probes_sent_total{target="<target>"}[$__rate_interval])))` — `sum()` is required (disjoint label sets; see below) | % |
 
 Two rules that trip people up:
 
@@ -690,7 +690,7 @@ Server:
 Both:
 
 ```sh
-./link_ping_prometheus -mode=both -targets=targets.json -metrics=":2112"
+./link_ping_prometheus -mode=both -targets=targets.json -allow=192.168.1.71 -metrics=":2112"
 ```
 
 ## Installation
@@ -702,7 +702,7 @@ Both:
 Use `-svc` to install/uninstall/start/stop/run. The tool records runtime flags at install time (excluding `-svc`, `-metrics-user`, `-metrics-pass`, `-echo-secret`, and `-echo-secret-old`). Metrics auth credentials and HMAC secrets are **not** persisted into the service configuration; set `LINK_PING_METRICS_USER` / `LINK_PING_METRICS_PASS` and `LINK_PING_ECHO_SECRET` / `LINK_PING_ECHO_SECRET_OLD` in the service environment instead (a warning is printed at install time).
 
 ```sh
-link_ping_prometheus.exe -mode=both -targets=targets.json -metrics=":2112" -log-file="C:\ProgramData\link_ping_prometheus\logs\service.log" -svc=install
+link_ping_prometheus.exe -mode=both -targets=targets.json -allow=192.168.1.71 -metrics=":2112" -log-file="C:\ProgramData\link_ping_prometheus\logs\service.log" -svc=install
 ```
 
 **Built-in service hardening (configured automatically at install):**
