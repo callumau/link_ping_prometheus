@@ -799,6 +799,29 @@ func readinessHandler(mode string, statusReg *prober.StatusRegistry) http.Handle
 	})
 }
 
+// limitConcurrent wraps handler in a counting semaphore of limit slots:
+// the first limit concurrent requests are served normally, any further
+// request gets a plain-text 503 (the same status and message shape the
+// /metrics cap produces) and never reaches the handler. Slot release is
+// tied to the ServeHTTP call itself (not to the handler's return), so a
+// panic among the admitted requests unwinds through the deferred release
+// and cannot leak a slot forever. The semaphore is a channel, exactly
+// the promhttp MaxRequestsInFlight pattern, which /status cannot reuse
+// because it is bound to a Gatherer rather than a plain handler.
+func limitConcurrent(limit int, handler http.Handler) http.Handler {
+	sem := make(chan struct{}, limit)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case sem <- struct{}{}:
+			defer func() { <-sem }()
+			handler.ServeHTTP(w, r)
+		default:
+			// Same wording shape as promhttp's MaxRequestsInFlight body.
+			http.Error(w, "Limit of concurrent requests reached (2), try again later.", http.StatusServiceUnavailable)
+		}
+	})
+}
+
 func (p *program) startMetricsServer(addr, user, pass, cert, key string, statusReg *prober.StatusRegistry, gzip bool, mode string) (*http.Server, <-chan struct{}, error) {
 	metricsLn, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -821,8 +844,12 @@ func (p *program) startMetricsServer(addr, user, pass, cert, key string, statusR
 	mx.Handle("/readyz", readinessHandler(mode, statusReg))
 	// /status exposes live per-target probe state (link_up, inflight,
 	// misses, RTO, socket age). Gated like /metrics: open only when no
-	// metrics auth is configured.
-	mx.Handle("/status", prober.MetricsAuth(user, pass, statusReg.Handler()))
+	// metrics auth is configured. Capped like /metrics too: the snapshot
+	// copies and sorts the whole registry and the process snapshot does a
+	// potentially STW ReadMemStats, so a local burst loop must not pile
+	// those on top of each other. /healthz and /readyz stay uncapped —
+	// they are cheap booleans an orchestrator must always reach.
+	mx.Handle("/status", prober.MetricsAuth(user, pass, limitConcurrent(maxConcurrentScrapes, statusReg.Handler())))
 	metricsSrv := &http.Server{
 		Handler: mx,
 		// Addr is informational (Serve uses the already-bound listener) but
