@@ -604,7 +604,7 @@ link_ping_prometheus -mode=<mode> [flags]
 | `-mtu-sweep` | `1m` | Client: periodically sweep DF-set probe sizes to find the largest frame the path carries (`link_path_mtu_bytes`, `/status path_mtu_bytes`). 0 disables. Linux, and Windows for IPv4 targets on any Windows Server (2003+ via the DF flag; Server 2019+/Win10 1703+ use full path-MTU discovery); IPv6 targets need Server 2019+/Win10 1703+. Unsupported socket options disable just the sweep with a one-time warning. Separate counters — never in the loss ratio. |
 | `-adaptive` | `true` | Enable adaptive RTO based on link quality. With `false`, the fixed `-timeout` applies: links whose true RTT exceeds it read as 100% loss with no warning — pick a timeout comfortably above expected RTT |
 | `-source` | `""` | Source label applied to every metric series, e.g. the local site or datacenter (`sydney-dc`) (defaults to hostname) |
-| `-metrics-user` | `""` | Basic auth username for /metrics (empty = disabled; env `LINK_PING_METRICS_USER`) |
+| `-metrics-user` | `""` | Basic auth username for /metrics (empty = disabled; env `LINK_PING_METRICS_USER`; must not contain `:` — HTTP Basic Auth splits at the first colon, so such a user is unreachable and startup is refused) |
 | `-metrics-pass` | `""` | Basic auth password for /metrics (env `LINK_PING_METRICS_PASS`; prefer env over CLI to avoid `ps` exposure) |
 | `-metrics-tls-cert` | `""` | TLS certificate file for /metrics (requires `-metrics-tls-key`) |
 | `-metrics-tls-key` | `""` | TLS private key file for /metrics (requires `-metrics-tls-cert`) |
@@ -618,7 +618,7 @@ link_ping_prometheus -mode=<mode> [flags]
 | `-log-file-max-age` | `28` | Max days to keep rotated log files |
 | `-svc` | `""` | Windows service action: `install`, `uninstall`, `start`, `stop`, `run` |
 | `-echo-secret` | `""` | HMAC secret authenticating UDP probes (env `LINK_PING_ECHO_SECRET`; must be set on **both** client and server — a server without it accepts the client's HMAC frame as a plain payload probe, see [Wire Protocol](#wire-protocol); expands the wire frame to 32 bytes) |
-| `-echo-secret-old` | `""` | Server: previous HMAC secret still accepted during a zero-downtime rotation, alongside `-echo-secret` (env `LINK_PING_ECHO_SECRET_OLD`; server side only) |
+| `-echo-secret-old` | `""` | Server: previous HMAC secret still accepted during a zero-downtime rotation, alongside `-echo-secret` (env `LINK_PING_ECHO_SECRET_OLD`; server side only; startup error if set without `-echo-secret`) |
 
 **Why MTU discovery (`-mtu-sweep`) matters:** 24-byte probes prove a path *exists* — they cannot prove it *carries full-size traffic*. VPN tunnels, PPPoE/GRE/VXLAN overlays and broken PMTUD routinely pass small packets while black-holing full-size ones — the classic "monitor says healthy, users say broken" failure. The sweep DF-marks probes on a dedicated socket, binary-searches the largest frame that round-trips, and publishes it as `link_path_mtu_bytes`; a shrinking gauge (or rising `link_mtu_probes_lost_total` while `link_up` stays 1) is that failure's signature. A size with no echo is retried once before the search shrinks — a single dropped probe on a lossy path would otherwise converge far below the real MTU and make the gauge flap between sweeps — so both MTU counters advance per attempt and read as a probe rate, not one probe per distinct size tested. It needs no ICMP and no extra firewall rules, uses separate counters that never enter the loss ratio, and is on by default (1m; `0` disables). Alert on `link_path_mtu_bytes < max_over_time(link_path_mtu_bytes[24h])`, or
 on MTU probe loss as a RATIO (`rate(link_mtu_probes_lost_total[10m]) /
@@ -941,12 +941,17 @@ DNS failure at startup is retried, not fatal.
   with `-echo-secret=<new>`. Finally remove `-echo-secret-old` from the
   servers — any frame failing both secrets still counts in
   `link_server_probes_dropped_total{reason="hmac"}` so a half-rotated
-  fleet is visible in metrics.
+  fleet is visible in metrics. The agent refuses to start with
+  `-echo-secret-old` set while `-echo-secret` is empty: the old secret
+  alone provides no authentication (it is only consulted server-side
+  when a primary secret is configured), so a rotation deploy that lost
+  the new secret fails loudly instead of running unauthenticated.
 - UDP is not amplification-prone (echo is the same size as the request)
   and carries no state, but any internet-facing echo endpoint should be
   firewall-restricted to known monitoring sites.
-- The `/metrics` endpoint supports HTTP Basic Auth (`-metrics-user` / `-metrics-pass`) with constant-time comparison over hashed credentials. Both must be set together; the process refuses to start with only one.
+- The `/metrics` endpoint supports HTTP Basic Auth (`-metrics-user` / `-metrics-pass`) with constant-time comparison over hashed credentials. Both must be set together; the process refuses to start with only one. Usernames must not contain `:` (Basic Auth cannot represent them: the client side is parsed at the first colon, so the user would be unreachable and every request would 401) — the process refuses to start with such a username.
 - Prefer the `LINK_PING_METRICS_USER` / `LINK_PING_METRICS_PASS` environment variables over CLI flags — flag values are visible in `ps` to other local users.
+- Mode-mismatched flags are not silently ignored: server-only flags (`-allow`, `-listen`, `-echo-secret-old`) set in client mode, and `-targets`/`-target` set together (`-targets` wins), each log a one-line startup warning — backward compatible, but visible.
 - Basic Auth without TLS sends credentials as base64 on the wire; a startup warning is logged in that configuration. Use `-metrics-tls-cert` / `-metrics-tls-key` to serve `/metrics` over HTTPS.
 - The wire protocol carries no sensitive data (sequence numbers and wall-clock timestamps only) and has no TLS — intended for internal network monitoring. Restrict access with a firewall on untrusted networks.
 
