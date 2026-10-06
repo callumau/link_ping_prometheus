@@ -337,6 +337,31 @@ func resolveEchoSecretOld() string {
 	return os.Getenv("LINK_PING_ECHO_SECRET_OLD")
 }
 
+// warnIgnoredFlags emits one-line slog.Warn diagnostics for flags that are
+// set but silently unused in the selected mode. Warnings, not errors: every
+// case is backward compatible (the previous behavior ignored the flag too),
+// but silent ingestion gaps are how a half-configured fleet ships.
+// - echo-secret-old is consumed ONLY by the server (rotation acceptance in
+//   internal/prober/server.go), so it is ignored in client mode.
+// - allow and listen gate the echo responder, so they are ignored in client mode.
+// - with both -targets and -target set, buildConfig's else-if means -targets wins.
+func warnIgnoredFlags(mode string) {
+	if *flEchoSecretOld != "" && mode == "client" {
+		slog.Warn("-echo-secret-old set but ignored: the old secret is only accepted by the echo server (server/both mode), not by the client")
+	}
+	// -listen's default (":4000") is non-empty, so compare against the
+	// registered default: a client run with the default must not warn.
+	if *flAllow != "" && mode == "client" {
+		slog.Warn("-allow set but ignored: the client allowlist only applies to the echo server (server/both mode)")
+	}
+	if *flListen != "" && *flListen != flag.Lookup("listen").DefValue && mode == "client" {
+		slog.Warn("-listen set but ignored: the listen address only applies to the echo server (server/both mode)")
+	}
+	if *flTargets != "" && *flTarget != "" && mode != "server" {
+		slog.Warn("-targets and -target are both set: -targets wins, -target is ignored")
+	}
+}
+
 func sanitizeHostname(s string) string {
 	s = strings.ToLower(s)
 	var b strings.Builder
@@ -441,6 +466,13 @@ func resolveMetricsAuth() (string, string, error) {
 	}
 	if (user == "") != (pass == "") {
 		return "", "", errors.New("metrics basic auth requires both username and password (-metrics-user/-metrics-pass or LINK_PING_METRICS_USER/LINK_PING_METRICS_PASS)")
+	}
+	// r.BasicAuth() splits the header at the FIRST colon, so a username
+	// containing ':' can never be produced by a client: the part before
+	// the colon is what must match. Accepting such a user here would make
+	// the endpoint permanently unreachable (401 for every attempt).
+	if strings.Contains(user, ":") {
+		return "", "", errors.New("metrics basic auth username must not contain ':' (HTTP Basic Auth splits user:pass at the first colon, so this user is unreachable and every request 401s)")
 	}
 	return user, pass, nil
 }
@@ -811,6 +843,17 @@ func (p *program) run() error {
 		return fmt.Errorf("unknown mode: %s", mode)
 	}
 
+	// Rotation guard. ServePacketConn consults echoSecretOld only inside
+	// its `if echoSecret != ""` branch (internal/prober/server.go), so an
+	// old secret on its own authenticates NOTHING: with the primary secret
+	// empty the agent runs unauthenticated while an operator mid-rotation
+	// believes the rotation protection is active. Fail fast instead.
+	echoSecret, echoSecretOld := resolveEchoSecret(), resolveEchoSecretOld()
+	if echoSecret == "" && echoSecretOld != "" {
+		return errors.New("-echo-secret-old is set without -echo-secret: the old secret alone provides no authentication (it is only accepted alongside a primary secret), so the agent would run unauthenticated; set -echo-secret or clear -echo-secret-old")
+	}
+	warnIgnoredFlags(*flMode)
+
 	user, pass, err := resolveMetricsAuth()
 	if err != nil {
 		return err
@@ -902,8 +945,8 @@ func (p *program) run() error {
 		return err
 	}
 
-	echoSecret := resolveEchoSecret()
-	echoSecretOld := resolveEchoSecretOld()
+	// echoSecret/echoSecretOld resolved at the top of run(): the rotation
+	// guard must fire before any bind, not after the metrics server is up.
 	mode := *flMode
 	// runCtx: a mid-run metrics-serve failure must cancel the mode loops.
 	// A monitor without a live /metrics endpoint is dead weight that looks
