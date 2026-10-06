@@ -57,7 +57,11 @@ ansible-playbook -i inventory.yml playbook.yml --ask-vault-pass
 ## What it does
 
 - **Both plays:** refuse to install when the metrics listener is exposed
-  unauthenticated (see Pre-flight guardrail below).
+  unauthenticated (see Pre-flight guardrail below), when `server`/`both`
+  mode has no client allowlist (the binary refuses to start, so the
+  restart ladder would crash-loop it), or when a flag value contains
+  whitespace that would split the rendered command line (see Other
+  pre-flight checks below).
 - **Linux:** installs the binary to `/usr/local/bin`, writes the
   shipped hardened systemd unit (`installer/linux/`), writes
   `/etc/link_ping_prometheus.env` (0600) containing the rendered CLI
@@ -111,7 +115,9 @@ install task and stop with an explicit message when all three hold:
   (the binary refuses a half-configured pair, so one empty var means auth
   is off), and
 - `link_ping_extra_args` carries no `-metrics-tls-cert`/`-metrics-tls-key`
-  and no `-metrics-allow-insecure`.
+  (`-metrics-allow-insecure` is deliberately **not** counted here: it only
+  relaxes auth-over-plaintext *when credentials are set*, so with no
+  user/pass it is a no-op and cannot make a wildcard bind safe).
 
 If any one of them is not true the assert passes **silently**, so the
 localhost default adds no noise to a run.
@@ -132,9 +138,11 @@ adding one of the four controls it names, not silencing the check.
    start unless TLS or `-metrics-allow-insecure` is present too — pair
    this with remedy 3.
 3. **Add TLS.** Pass `-metrics-tls-cert` and `-metrics-tls-key` (both,
-   or neither) in `link_ping_extra_args`. `-metrics-allow-insecure`
-   instead keeps plaintext HTTP with Basic auth — better than no auth,
-   but the credentials are only base64 on the wire.
+   or neither) in `link_ping_extra_args`. `-metrics-allow-insecure` does
+   **not** satisfy this guardrail on its own: without credentials it is
+   a no-op. It only matters together with remedy 2, where it keeps
+   plaintext HTTP with Basic auth — better than no auth, but the
+   credentials are only base64 on the wire.
 4. **Firewall TCP 2112 to the monitoring hosts only.** The play does not
    open or close TCP 2112 (it opens UDP 4000 in the Windows firewall for
    server/both mode), and it cannot verify your firewall, so add the rule
@@ -142,6 +150,25 @@ adding one of the four controls it names, not silencing the check.
    `firewalld`, Windows `netsh advfirewall firewall add rule`. With no
    credentials, the firewall is the only thing between the network and
    `/status`.
+
+### Other pre-flight checks
+
+Both plays also assert before the first install task that:
+
+- `link_ping_mode` is not `server`/`both` with an empty
+  `link_ping_allow`. The binary refuses server/both mode without
+  `-allow` (fail-closed), so `Restart=on-failure` / the SCM restart
+  ladder would crash-loop the service every 5s. Set `link_ping_allow`
+  to the comma-separated client IPs or CIDR prefixes allowed to echo.
+- `link_ping_allow` and `link_ping_metrics_listen` contain no whitespace,
+  and every whitespace-separated token in `link_ping_extra_args` starts
+  with `-`. The rendered command line is split on whitespace (systemd
+  expands the unquoted `$OPTIONS`; the Windows play renders one
+  unquoted command line), so a space *inside* a flag value silently
+  truncates the flag list — the same hazard
+  `installer/windows/install-service.bat` quotes against. Separate
+  multiple allowlist entries with commas, never spaces. Spaces between
+  complete `-flag=value` tokens in `link_ping_extra_args` are fine.
 
 ## WinRM certificate validation
 
