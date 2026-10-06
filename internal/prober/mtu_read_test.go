@@ -128,7 +128,7 @@ func TestReadEcho_SkipsForeignAndOtherSizedDatagrams(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			conn := &scriptedReadConn{frames: tc.frames}
 			buf := make([]byte, MaxDatagramSize)
-			err := readEcho(conn, buf, wantSize, []uint64{wantSeq}, sent, secret, deadline)
+			err := readEcho(conn, buf, wantSize, []uint64{wantSeq}, sent, secret, HMACHeaderCoverage, deadline)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatal("expected the probe to be lost, readEcho accepted a datagram that was not ours")
@@ -144,7 +144,7 @@ func TestReadEcho_SkipsForeignAndOtherSizedDatagrams(t *testing.T) {
 	// Any sequence sent for this size is accepted, so an echo of attempt 1
 	// arriving during attempt 2 still proves survival (the retry contract).
 	conn := &scriptedReadConn{frames: [][]byte{dfFrameFull(41, wantTS, wantSize, nil)}}
-	if err := readEcho(conn, make([]byte, MaxDatagramSize), wantSize, []uint64{41, 42}, sent, secret, deadline); err != nil {
+	if err := readEcho(conn, make([]byte, MaxDatagramSize), wantSize, []uint64{41, 42}, sent, secret, HMACHeaderCoverage, deadline); err != nil {
 		t.Errorf("an echo of either attempt's sequence must be accepted, got %v", err)
 	}
 }
@@ -210,7 +210,7 @@ func TestReadEcho_VerifiesHMACTag(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			conn := &scriptedReadConn{frames: tc.frames}
 			buf := make([]byte, MaxDatagramSize)
-			err := readEcho(conn, buf, wantSize, []uint64{wantSeq}, sent, secret, deadline)
+			err := readEcho(conn, buf, wantSize, []uint64{wantSeq}, sent, secret, HMACHeaderCoverage, deadline)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatal("expected the probe to be lost, readEcho accepted a frame that was not ours")
@@ -229,7 +229,74 @@ func TestReadEcho_VerifiesHMACTag(t *testing.T) {
 	both := map[uint64]uint64{41: s1TS, 42: s2TS}
 	tag1 := computeHMAC(secret, 41, s1TS)
 	conn2 := &scriptedReadConn{frames: [][]byte{dfFrameFull(41, s1TS, wantSize, tag1[:])}}
-	if err := readEcho(conn2, make([]byte, MaxDatagramSize), wantSize, []uint64{41, 42}, both, secret, deadline); err != nil {
+	if err := readEcho(conn2, make([]byte, MaxDatagramSize), wantSize, []uint64{41, 42}, both, secret, HMACHeaderCoverage, deadline); err != nil {
 		t.Errorf("an echo of either attempt's (seq, ts) pair must be accepted, got %v", err)
+	}
+}
+
+// TestReadEcho_VerifiesHMACFullFrameTag pins the sweep-side echo
+// authentication under HmacCoverage == HMACFullFrameCoverage: a
+// payload-bearing echo must verify against the full-frame tag over
+// header+payload (tag slot skipped) that the sweep actually sent, and a
+// frame whose payload was tampered with AFTER tagging must be skipped —
+// that is the substitution the coverage exists to close.
+func TestReadEcho_VerifiesHMACFullFrameTag(t *testing.T) {
+	const secret = "audit-secret"
+	const wantSeq = uint64(9)
+	const payload = 64
+	wantSize := PayloadSizeWithHMAC + payload
+	wantTS := uint64(1727000000987654321)
+	deadline := time.Now().Add(time.Second)
+	sent := map[uint64]uint64{wantSeq: wantTS}
+
+	// build assembles a payload-bearing frame and tags it with the
+	// full-frame HMAC; tamper flips one payload byte after tagging.
+	build := func(tamper bool) []byte {
+		b := dfFrameFull(wantSeq, wantTS, wantSize, nil)
+		fillPayload(b[PayloadSizeWithHMAC:], wantSeq, wantTS)
+		h := computeHMACFullFrame(secret, b)
+		copy(b[24:32], h[:])
+		if tamper {
+			b[PayloadSizeWithHMAC] ^= 0xFF
+		}
+		return b
+	}
+
+	cases := []struct {
+		name    string
+		frames  [][]byte
+		wantErr bool
+	}{
+		{
+			"good echo with a full-frame tag is accepted",
+			[][]byte{build(false)},
+			false,
+		},
+		{
+			"tampered payload is skipped, our intact echo is accepted",
+			[][]byte{build(true), build(false)},
+			false,
+		},
+		{
+			"only tampered payloads: the probe is lost at the deadline",
+			[][]byte{build(true)},
+			true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			conn := &scriptedReadConn{frames: tc.frames}
+			buf := make([]byte, MaxDatagramSize)
+			err := readEcho(conn, buf, wantSize, []uint64{wantSeq}, sent, secret, HMACFullFrameCoverage, deadline)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected the probe to be lost, readEcho accepted a tampered frame")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("readEcho must accept the intact full-frame echo, got %v", err)
+			}
+		})
 	}
 }

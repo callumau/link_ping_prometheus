@@ -157,6 +157,7 @@ var (
 	flMetricsGzip          = flag.Bool("metrics-gzip", false, "Metrics: gzip-compress /metrics responses when the scraper offers it. Off by default: promhttp pools a gzip writer per CPU, and each holds ~0.7MB of flate state, so compression costs up to ~0.7MB x GOMAXPROCS of live heap - more than a small fleet's whole response. Enable it for many targets, where the response size matters.")
 	flEchoSecret           = flag.String("echo-secret", "", "Wire: HMAC secret for UDP echo authentication (env LINK_PING_ECHO_SECRET; mitigates reflector spoof when set on both client and server)")
 	flEchoSecretOld        = flag.String("echo-secret-old", "", "Wire: previous HMAC secret, still accepted by the SERVER during a zero-downtime rotation alongside -echo-secret (env LINK_PING_ECHO_SECRET_OLD; server side only)")
+	flHMACCoverage         = flag.String("hmac-coverage", "header", "Wire: which frame bytes the client's HMAC tag covers when -echo-secret is set: 'header' (the 24-byte header only — the v0.7 layout and the default, byte-identical wire output) or 'full-frame' (header plus the -payload bytes, so a tampered payload or a payload riding a captured tag no longer authenticates; needs -payload > 0 to differ; the server accepts both coverages whenever it has -echo-secret)")
 )
 
 // flagDefaultInt returns the registered default value of an int flag so
@@ -392,6 +393,12 @@ func warnIgnoredFlags(mode string) {
 	if *flTargets != "" && *flTarget != "" && mode != "server" {
 		slog.Warn("-targets and -target are both set: -targets wins, -target is ignored")
 	}
+	// -hmac-coverage shapes the tag the CLIENT writes; the echo server
+	// accepts both coverages whenever -echo-secret is set, so the flag has
+	// no effect in server-only mode.
+	if *flHMACCoverage != flag.Lookup("hmac-coverage").DefValue && mode == "server" {
+		slog.Warn("-hmac-coverage set but ignored: tag coverage is a client-side choice; the echo server accepts both coverages whenever -echo-secret is set")
+	}
 }
 
 func sanitizeHostname(s string) string {
@@ -479,6 +486,11 @@ func buildConfig() (prober.Config, error) {
 		Payload:           *flPayload,
 		MTUSweep:          *flMTUSweep,
 	}
+	coverage, err := prober.ParseHMACCoverage(*flHMACCoverage)
+	if err != nil {
+		return prober.Config{}, err
+	}
+	cfg.HmacCoverage = coverage
 	return cfg, nil
 }
 

@@ -1018,7 +1018,23 @@ func runEchoLoop(
 			seq := binary.LittleEndian.Uint64(buf[8:16])
 			ts := binary.LittleEndian.Uint64(buf[16:24])
 			if cfg.EchoSecret != "" {
-				if !validHMAC(cfg.EchoSecret, seq, ts, buf[24:32]) {
+				// Verify under the coverage this client SENT with; no
+				// fallback is needed or safe: the server echoes buf[:n]
+				// unmodified (server.go WriteTo), so an echo can only carry
+				// the tag we wrote. A full-frame frame is either echoed
+				// intact (the dual-accept server) or never echoes at all —
+				// a v0.7 header-only server rejects it before echoing,
+				// which is exactly why the default stays 'header' for
+				// mixed fleets. Zero-payload frames are excluded from the
+				// full-frame check because the two coverages coincide
+				// byte-for-byte there (pinned by
+				// TestHMACCoverageZeroPayloadEquivalence), so the header
+				// check is the same check.
+				if cfg.HmacCoverage == HMACFullFrameCoverage && cfg.Payload > 0 {
+					if !validHMACFullFrame(cfg.EchoSecret, buf[:n]) {
+						continue
+					}
+				} else if !validHMAC(cfg.EchoSecret, seq, ts, buf[24:32]) {
 					continue
 				}
 			}
@@ -1421,14 +1437,25 @@ func runEchoLoop(
 		binary.LittleEndian.PutUint64(buf[8:16], seq)
 		ts := uint64(sendTime.UnixNano())
 		binary.LittleEndian.PutUint64(buf[16:24], ts)
-		if cfg.EchoSecret != "" {
-			h := computeHMAC(cfg.EchoSecret, seq, ts)
-			copy(buf[24:32], h[:])
-		}
-		if cfg.Payload > 0 {
-			// Header end is payloadSize (24 or 32): fill the rest with the
-			// deterministic corruption-detection pattern.
+		if cfg.EchoSecret != "" && cfg.HmacCoverage == HMACFullFrameCoverage && cfg.Payload > 0 {
+			// Full-frame coverage: the tag covers header+payload, so the
+			// payload must be in buf BEFORE the tag is computed. The pattern
+			// still derives deterministically from (seq, ts) exactly as
+			// before; only the tag's INPUT changes, not the frame layout or
+			// the payload derivation.
 			fillPayload(buf[payloadSize:payloadSize+cfg.Payload], seq, ts)
+			h := computeHMACFullFrame(cfg.EchoSecret, buf)
+			copy(buf[24:32], h[:])
+		} else {
+			if cfg.EchoSecret != "" {
+				h := computeHMAC(cfg.EchoSecret, seq, ts)
+				copy(buf[24:32], h[:])
+			}
+			if cfg.Payload > 0 {
+				// Header end is payloadSize (24 or 32): fill the rest with the
+				// deterministic corruption-detection pattern.
+				fillPayload(buf[payloadSize:payloadSize+cfg.Payload], seq, ts)
+			}
 		}
 
 		// Send first, then register: registering in-flight only after a

@@ -667,9 +667,26 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 			}
 			seq := binary.LittleEndian.Uint64(buf[8:16])
 			ts := binary.LittleEndian.Uint64(buf[16:24])
+			// Payload frames are accepted under EITHER tag coverage: the
+			// header tag (v0.7 clients) or the full-frame tag over
+			// header+payload with the tag slot skipped (clients running
+			// -hmac-coverage=full-frame), so an upgraded client mixes freely
+			// with this server. Header-only is tried first — it matches bare
+			// 32-byte frames and old clients exactly — then full-frame. There
+			// is deliberately NO new drop reason: a drop is a drop, the two
+			// coverages fail together on a wrong secret, and splitting the
+			// reason would fragment the hmac/replay misconfig alerting in
+			// rules/link-monitor.yml for a distinction the operator cannot
+			// act on.
 			if !validHMACAny(echoSecret, oldSecret, seq, ts, buf[24:32]) {
-				drops.hmac.Inc()
-				continue
+				// Bare 32-byte frames (n == expectedSize) skip the second
+				// attempt: the two coverages coincide byte-for-byte there
+				// (pinned by TestHMACCoverageZeroPayloadEquivalence), so the
+				// extra HMAC-SHA256 could never change the outcome.
+				if n == expectedSize || !validHMACFullFrameAny(echoSecret, oldSecret, buf[:n]) {
+					drops.hmac.Inc()
+					continue
+				}
 			}
 			// Replay guard: an authenticated frame older or newer than
 			// the window is a capture-replay, not a live probe. Clocks
