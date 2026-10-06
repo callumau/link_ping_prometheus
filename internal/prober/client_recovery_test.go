@@ -275,6 +275,72 @@ func TestEchoLoop_PanicFlushCountsTimeouts(t *testing.T) {
 	}
 }
 
+// TestEchoLoop_PanicFlushRestartNoDoubleCount pins the PRODUCTION panic
+// restart path: a RunClient-managed loop carries the runClientDoneKey marker
+// (client.go start()), so on a restart the root context is still alive and
+// runClientShuttingDown is false. The panic-recovery flush counts the
+// abandoned probes AND clears the pending map; the exit tail then sees an
+// empty map and must not count them again. Falsification: remove the
+// pending = make(...) clear in the recover block and this test sees
+// timed_out=2 for a single abandoned probe (double count) — the two older
+// panic tests both pass unmarked contexts, which silently take the
+// "no marker = shutdown" defensive branch and never exercise the tail.
+func TestEchoLoop_PanicFlushRestartNoDoubleCount(t *testing.T) {
+	InitMetrics()
+
+	// Marker-carrying context whose root Done channel is NEVER closed:
+	// exactly what a RunClient-managed restart sees.
+	rootDone := make(chan struct{})
+	defer close(rootDone) // test cleanup only; the loop is gone by then
+	// RunClient stores ctx.Done(), a receive-only channel, as the marker
+	// value — the type assertion in runClientShuttingDown requires it.
+	ctx := context.WithValue(context.Background(), runClientDoneKey{}, (<-chan struct{})(rootDone))
+	if runClientShuttingDown(ctx) {
+		t.Fatal("test setup: marker-carrying ctx must not report shutdown")
+	}
+
+	// Delay echoes past the second write so probe #1 is still pending when
+	// the panic fires.
+	addr := wbEchoServer(t, ctx, func(buf []byte) {
+		time.Sleep(150 * time.Millisecond)
+	})
+
+	realConn, err := dialUDP(ctx, "udp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := &scriptedConn{Conn: realConn, hook: func(n int64) (bool, bool) {
+		return false, n == 2 // panic on the second write
+	}}
+
+	const src, name = "test", "panic_restart_balance"
+	m := newTargetMetrics(src, Target{Name: name, Address: addr})
+	cfg := Config{Source: src, BaseInterval: 30 * time.Millisecond, BaseTimeout: time.Second}
+
+	err = runEchoLoop(ctx, conn, cfg, NewAdaptiveStats(cfg.BaseTimeout), m, &probeLoopState{}, slog.Default())
+	if err == nil || !strings.Contains(err.Error(), "panic") {
+		t.Fatalf("expected panic error from runEchoLoop, got %v", err)
+	}
+
+	sent := wbCounter(ProbesSent, src, name, addr)
+	rtt := wbHistCount(src, name, addr)
+	tout := wbCounter(ProbesTimedOut, src, name, addr)
+	infl := wbGauge(ProbesInflight, src, name, addr)
+
+	// Exactly one abandoned probe: counted once by the panic flush, NOT
+	// again by the exit tail.
+	if tout != 1 {
+		t.Errorf("timed_out must be exactly 1 (single abandoned probe, counted once), got %v", tout)
+	}
+	if infl != 0 {
+		t.Errorf("inflight must drain to 0 after panic flush, got %v", infl)
+	}
+	if sent != rtt+tout+infl {
+		t.Errorf("balance invariant broken after panic restart: sent=%v rtt=%v timed_out=%v inflight=%v",
+			sent, rtt, tout, infl)
+	}
+}
+
 // TestEchoLoop_ReaderDeathDrainsReceivedEcho: an echo the reader already
 // delivered into respCh before it died was RECEIVED, so the reader-death
 // exit must drain it as an RTT sample rather than charge it as loss via the
