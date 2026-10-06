@@ -56,6 +56,21 @@ if exist "%INSTALL_DIR%" (
     if exist "%INSTALL_DIR%" echo WARNING: could not fully remove "%INSTALL_DIR%" - close anything using it and delete manually.
 )
 
+:: === Discover a custom log directory from the persisted service config =======
+:: The wizard snapshots -log-file="DIR\service.log" into the service ImagePath,
+:: so a wizard-custom log directory IS persisted - read it back so a custom
+:: location is not silently skipped by the default-path cleanup below. The
+:: value is parsed in PowerShell (never expanded into a cmd command line); if
+:: anything fails, the uninstall falls back to the default-path behavior.
+set "SVC_LOG_DIR="
+for /f "delims=" %%L in ('powershell -NoProfile -Command "$bp=(sc.exe qc '%SERVICE_NAME%' 2>$null | Select-String -SimpleMatch 'BINARY_PATH_NAME'); if ($bp -and $bp -match '-log-file="([^"]+)"') { Split-Path ($Matches[1]) -Parent }' 2^>nul') do set "SVC_LOG_DIR=%%L"
+if not "%SVC_LOG_DIR%"=="" if /i not "%SVC_LOG_DIR%"=="%LOG_DIR%" (
+    echo === Removing custom log directory "%SVC_LOG_DIR%" ===
+    icacls "%SVC_LOG_DIR%" /reset >nul 2>&1
+    rmdir /s /q "%SVC_LOG_DIR%" >nul 2>&1
+    if exist "%SVC_LOG_DIR%" echo WARNING: could not fully remove "%SVC_LOG_DIR%" - close anything using it and delete manually.
+)
+
 :: === Scrub credential environment variables ==================================
 set "ENV_KEY=HKLM\SYSTEM\CurrentControlSet\Services\%SERVICE_NAME%\Environment"
 reg delete "%ENV_KEY%" /v LINK_PING_METRICS_USER /f >nul 2>&1
