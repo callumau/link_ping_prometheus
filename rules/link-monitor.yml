@@ -312,6 +312,34 @@ groups:
             server. Subtract this rate before attributing a sent/
             received mismatch to the network.
 
+      - alert: LinkMonitorReflectorUnauthenticated
+        # Purely observational counter: the server WITHOUT -echo-secret
+        # still accepts and echoes HMAC-shaped (32-byte header) frames as
+        # ordinary bounded payload probes — acceptance is unchanged, so
+        # nothing drops, link_up stays 1, and no reason="hmac" drop is
+        # ever recorded. This rate is the ONLY signal the half-configured
+        # pairing (secret on clients, absent on the server) produces, and
+        # while it holds the allowlist is the reflector's only control.
+        # CAVEAT: a secret-less 24-byte header plus an exactly-8-byte
+        # payload probe has the same shape — rule out that payload size
+        # before reconfiguring.
+        expr: rate(link_server_unauth_hmac_frames_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            HMAC-shaped frames reaching {{ $labels.source }} which runs
+            without -echo-secret
+          description: >-
+            A client is sending HMAC-authenticated (32-byte header) probes
+            to this server, but the server runs without -echo-secret: the
+            tag cannot be verified and the frames are accepted and echoed
+            as ordinary bounded payload probes. The link reads healthy
+            while reflector protection (SEC22) is silently absent — the
+            allowlist is then the only control. Set -echo-secret on BOTH
+            ends (see the Wire Protocol section of the README).
+
       - alert: MetricsAuthFailures
         expr: increase(link_metrics_auth_failures_total[10m]) >= 5
         labels:

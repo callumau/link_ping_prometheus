@@ -409,6 +409,9 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 	// Pre-resolve the echo-failure counter once: a label lookup per write
 	// error would be pointless work on the hot path.
 	echoErrors := ServerEchoErrors.WithLabelValues(source)
+	// Half-configured-HMAC observability handle (see the increment site
+	// below): resolved once like echoErrors; the vec is keyed by {source} only.
+	unauthHMACFrames := ServerUnauthHMACFrames.WithLabelValues(source)
 
 	// Pre-resolve the fixed set of drop reasons once, so a dropped
 	// datagram (the flood case) costs no label-map hashing. If a new drop
@@ -632,6 +635,20 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 		if string(buf[0:8]) != MagicBytes {
 			drops.magic.Inc()
 			continue
+		}
+		// Half-configured-HMAC detection, purely observational: a server
+		// WITHOUT a secret accepts an HMAC-shaped frame — the bare 32-byte
+		// header, or 32B + payload, exactly the shapes this no-secret size
+		// gate above (expectedSize = PayloadSize = 24, n in [24, 24+
+		// MaxPayloadBytes]) admits — as an ordinary bounded payload probe and
+		// echoes it. Acceptance is deliberately unchanged, so the drop path
+		// stays silent for this pairing; the counter is what makes the
+		// mismatch (secret on clients, absent here) metric-visible. Note a
+		// secret-less 24-byte header plus an exactly-8-byte payload frame has
+		// the same shape — counted too, an ambiguity this frame size alone
+		// cannot resolve.
+		if echoSecret == "" && n >= PayloadSizeWithHMAC {
+			unauthHMACFrames.Inc()
 		}
 		// Authentication and the replay guard run BEFORE per-client handle
 		// resolution. resolve() allocates a {source,client} series pair and
