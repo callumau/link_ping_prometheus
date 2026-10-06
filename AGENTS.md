@@ -78,6 +78,7 @@ UDP is deliberate: no retransmission, so the loss ratio is true network loss (TC
 ## Conventions
 
 - Conventional Commits style in git log (`feat:`, `fix:`, `docs:`, etc.); one logical change per commit.
+- Release versions follow VERSIONING.md: patch = no observable change, minor = features/behavior changes (breaking allowed pre-1.0), and the v1.0.0 promotion gate lives there too.
 - `grafana-dashboard.json` is a tracked Grafana dashboard — edit carefully, it must stay valid JSON.
 - Dashboard ratio panels: numerator and denominator `rate()` windows MUST match (e.g. both `[5m]`). Mismatched windows produce wrong loss %/mean RTT across restarts and scrape gaps. Keep panel PromQL in sync with actual metric names/labels.
 
