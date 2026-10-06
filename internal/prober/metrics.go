@@ -106,7 +106,7 @@ var (
 	}, []string{"source"})
 	ServerProbesDropped = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "link_server_probes_dropped_total",
-		Help: "Total probes dropped by the server, labelled by source and reason (allowlist, rate_ip, rate_global, size, magic, hmac, replay, invalid_addr, client_overflow). Distinguishes misconfig (wrong secret, clock skew) and overload from true network loss.",
+		Help: "Total probes dropped by the server, labelled by source and reason (allowlist, rate_ip, rate_global, size, magic, hmac, replay, dup, invalid_addr, client_overflow). dup marks a frame identical to one recently echoed (same source, seq, timestamp) — replay or echo-loop guard; hmac/replay diagnose secret/NTP misconfig vs true loss; client_overflow means more distinct CIDR-allowlisted client IPs than the per-client series cap. Distinguishes misconfig (wrong secret, clock skew) and overload from true network loss.",
 	}, []string{"source", "reason"})
 	ServerClockSkew = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "link_server_clock_skew_seconds",

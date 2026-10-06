@@ -202,7 +202,10 @@ func TestServer_PerIPRateLimit(t *testing.T) {
 	defer conn.Close()
 
 	got := 0
-	for range 3 {
+	for i := range 3 {
+		// A live client never repeats a frame identity (seq advances per
+		// successful write), so each send is a fresh frame.
+		binary.LittleEndian.PutUint64(probe[8:16], uint64(i+1))
 		conn.Write(probe)
 		conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 		if n, err := conn.Read(make([]byte, prober.PayloadSize)); err == nil && n == prober.PayloadSize {
@@ -214,6 +217,7 @@ func TestServer_PerIPRateLimit(t *testing.T) {
 	}
 
 	// 4th datagram in the same rate window must be dropped.
+	binary.LittleEndian.PutUint64(probe[8:16], 4)
 	conn.Write(probe)
 	conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
 	if n, _ := conn.Read(make([]byte, prober.PayloadSize)); n != 0 {
@@ -555,9 +559,14 @@ func TestServer_PerIPRateLimitResumesNextWindow(t *testing.T) {
 
 	conn, probe := dialProbe(t, addr)
 	defer conn.Close()
+	var echoSeq uint64
 
 	echo := func(wait time.Duration) bool {
 		t.Helper()
+		// A live client never repeats a frame identity (seq advances per
+		// successful write), so each send is a fresh frame.
+		echoSeq++
+		binary.LittleEndian.PutUint64(probe[8:16], echoSeq)
 		conn.Write(probe)
 		conn.SetReadDeadline(time.Now().Add(wait))
 		n, _ := conn.Read(make([]byte, prober.PayloadSize))
@@ -610,7 +619,9 @@ func TestServer_GlobalRateLimitStarvesExcess(t *testing.T) {
 		probe := make([]byte, prober.PayloadSize)
 		copy(probe[0:8], prober.MagicBytes)
 		got := 0
-		for range sends {
+		for i := range sends {
+			// Fresh frame per send: a live client never repeats an identity.
+			binary.LittleEndian.PutUint64(probe[8:16], uint64(i+1))
 			conn.Write(probe)
 			conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 			if n, _ := conn.Read(make([]byte, prober.PayloadSize)); n == prober.PayloadSize {
@@ -1718,7 +1729,9 @@ func TestServer_ExactClientSeriesNeverEvicted(t *testing.T) {
 	// The counter must CONTINUE from where it was, not restart: a reset would
 	// show up as 1 (or as the series having been re-created at 0 by the read
 	// above). Metrics are process-global, so `before` counts every earlier test
-	// that probed 127.0.0.1 too.
+	// that probed 127.0.0.1 too. A live client never repeats a frame identity
+	// (seq advances per write), so this is a fresh frame, not a re-send.
+	binary.LittleEndian.PutUint64(probe[8:16], 2)
 	conn.Write(probe)
 	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	if n, _ := conn.Read(make([]byte, 1500)); n != prober.PayloadSize {
@@ -1808,4 +1821,101 @@ func TestServer_HMACSizeWindowAndDropReasons(t *testing.T) {
 	badTag := buildHMACFrame(secret, 4, now())
 	badTag[31] ^= 0xFF
 	expectDrop("hmac", badTag)
+}
+
+// TestServer_DupGuardBreaksEchoLoop (P1, red-team F1): one spoofed
+// datagram whose source is another link-ping server's listen socket used
+// to seed an infinite echo bounce (each leg spending rate-limit budget),
+// and a source equal to the server's own address self-looped at line
+// rate. The dup guard drops a frame identical to one recently echoed
+// (same source IP+port, seq, timestamp) instead of echoing it again.
+// Table rows are sequential and share one server because the guard is
+// stateful, like TestServer_ReplayWindowEdges.
+func TestServer_DupGuardBreaksEchoLoop(t *testing.T) {
+	prober.InitMetrics()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	addr := startServer(t, ctx)
+
+	s1, err := net.Dial("udp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s1.Close()
+	// Same allowlisted source IP, different port: the guard must key on
+	// the full source address, not just the IP.
+	s2, err := net.Dial("udp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+
+	frame := func(seq uint64) []byte {
+		f := make([]byte, prober.PayloadSize)
+		copy(f[0:8], prober.MagicBytes)
+		binary.LittleEndian.PutUint64(f[8:16], seq)
+		binary.LittleEndian.PutUint64(f[16:24], uint64(time.Now().UnixNano()))
+		return f
+	}
+	// Built ONCE and reused by both the echo row and the dup row: a real
+	// bounce re-sends the byte-identical datagram, and regenerating it
+	// would mint a fresh timestamp (a new identity) and dodge the guard.
+	seeded := frame(1)
+	send := func(conn net.Conn, f []byte) int {
+		t.Helper()
+		conn.Write(f)
+		conn.SetReadDeadline(time.Now().Add(400 * time.Millisecond))
+		n, _ := conn.Read(make([]byte, 1500))
+		return n
+	}
+	dupDrops := func() float64 { return getCounterValue(prober.ServerProbesDropped, "dup") }
+
+	cases := []struct {
+		name     string
+		conn     net.Conn
+		frame    []byte
+		wantEcho bool
+	}{
+		{"fresh frame echoes", s1, seeded, true},
+		// Byte-identical re-send from the same socket: an echo-loop seed,
+		// never a live probe — dropped as dup, no echo.
+		{"identical frame from same socket is dropped as dup", s1, seeded, false},
+		// Same seq+ts from a DIFFERENT source socket is an independent
+		// probe: the identity includes the source address, so the guard
+		// must not suppress it.
+		{"same seq+ts from a different source socket echoes", s2, seeded, true},
+		// The guard must not latch: a fresh frame from the dup-dropped
+		// socket is echoed normally.
+		{"fresh frame after dup still echoes", s1, frame(2), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			before := dupDrops()
+			n := send(tc.conn, tc.frame)
+			if tc.wantEcho && n != prober.PayloadSize {
+				t.Fatalf("frame must be echoed, got %d bytes", n)
+			}
+			if !tc.wantEcho {
+				if n != 0 {
+					t.Fatalf("dup frame must not be echoed, got %d bytes back", n)
+				}
+				deadline := time.Now().Add(2 * time.Second)
+				for dupDrops() < before+1 && time.Now().Before(deadline) {
+					time.Sleep(5 * time.Millisecond)
+				}
+				if got := dupDrops() - before; got != 1 {
+					t.Errorf("expected exactly one dup drop, counter moved %v", got)
+				}
+			}
+		})
+	}
+
+	// A dup is a rejection, not an arrival: of the four frames above only
+	// the three echoed ones count as received. Reading ServerProbesReceived
+	// before/after covers the whole table (WithLabelValues would re-create
+	// a missing series at 0, so baseline-first keeps this exact).
+	if got := getCounterValue(prober.ServerProbesReceived, "127.0.0.1"); got < 3 {
+		t.Errorf("dup drop must not count the frame as received; want >= 3 received total, got %v", got)
+	}
 }
