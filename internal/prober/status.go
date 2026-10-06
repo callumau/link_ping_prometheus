@@ -126,12 +126,13 @@ type ProcessStatus struct {
 }
 
 // processStatusTTL bounds how often /status pays for runtime.ReadMemStats.
-// That call STOPS THE WORLD to produce consistent numbers, and /status (unlike
-// /metrics) has no concurrency cap and is reachable without credentials when
-// no metrics auth is configured — so a burst of requests would inject pauses
-// into a process whose whole purpose is measuring RTT, inflating its own
-// samples. One second keeps the readout fresh while bounding the cost to one
-// ReadMemStats per second regardless of request rate.
+// That call STOPS THE WORLD to produce consistent numbers, and /status is
+// reachable without credentials when no metrics auth is configured — so a
+// burst of requests would inject pauses into a process whose whole purpose
+// is measuring RTT, inflating its own samples. One second keeps the readout
+// fresh while bounding the cost to one ReadMemStats per second regardless of
+// request rate. (In-flight requests themselves are bounded by the same
+// 2-request concurrency cap /metrics uses — limitConcurrent in main.go.)
 const processStatusTTL = time.Second
 
 var (
