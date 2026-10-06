@@ -87,6 +87,12 @@ func isValidHost(host string) bool {
 	if net.ParseIP(trimmed) != nil {
 		return false
 	}
+	isIPish := isIPishToken(host)
+	if isIPish {
+		if net.ParseIP(trimmed) == nil {
+			return false
+		}
+	}
 	host = trimmed
 	if len(host) > 253 {
 		return false
@@ -102,6 +108,25 @@ func isValidHost(host string) bool {
 			if !isASCIILetterDigit(c) && c != '-' {
 				return false
 			}
+		}
+	}
+	return true
+}
+
+// isIPishToken reports whether host looks like an attempt to write an IP
+// literal rather than a DNS name: either the whole string is digits and
+// dots (dotted-decimal attempt, e.g. 1.2.3.010 or 1.2.3.999), or it starts
+// with the 0x/0X prefix (hex form, e.g. 0x0a000001). Everything else —
+// including a hostname that begins with a digit but contains letters,
+// such as 10.0.0.1.example.com — is left to the label rules.
+func isIPishToken(host string) bool {
+	if len(host) > 2 && (host[:2] == "0x" || host[:2] == "0X") {
+		return true
+	}
+	for i := 0; i < len(host); i++ {
+		c := host[i]
+		if !('0' <= c && c <= '9') && c != '.' {
+			return false
 		}
 	}
 	return true
