@@ -1302,6 +1302,11 @@ func runEchoLoop(
 				state.linkUp = false
 			}
 			flushPending()
+			// The socket that just lost its reader can no longer deliver
+			// echoes: zero socketStart so the re-emit below — the snapshot
+			// /readyz is built on — reports socket_age_seconds=0 for the whole
+			// bounded re-dial pause instead of a stale age from a dead socket.
+			state.socketStart = time.Time{}
 			// Re-emit the snapshot so /status reflects the dropped link_up
 			// immediately rather than up to a full interval later.
 			emitTargetStatus(m, state, stats, timeout, writeFails, len(pending))
