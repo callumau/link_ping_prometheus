@@ -63,7 +63,23 @@ if exist "%INSTALL_DIR%" (
 :: value is parsed in PowerShell (never expanded into a cmd command line); if
 :: anything fails, the uninstall falls back to the default-path behavior.
 set "SVC_LOG_DIR="
-for /f "delims=" %%L in ('powershell -NoProfile -Command "$bp=(sc.exe qc '%SERVICE_NAME%' 2>$null | Select-String -SimpleMatch 'BINARY_PATH_NAME'); if ($bp -and $bp -match '-log-file="([^"]+)"') { Split-Path ($Matches[1]) -Parent }' 2^>nul') do set "SVC_LOG_DIR=%%L"
+REM PowerShell regex note: quote characters are written as \x22 escapes - a raw
+REM quote inside the cmd-quoted -Command string toggles cmd quoting and the
+REM .NET regex would then see an unterminated character set. sc.exe qc wraps
+REM long ImagePaths across lines, so the whole output is joined before
+REM matching. The regex handles both renderings kardianos/x-sys produces for
+REM the persisted ImagePath: a value with spaces is stored quoted
+REM (-log-file="C:\Logs X\service.log"), one without is stored bare
+REM (-log-file=C:\Logs\service.log); either way the log FILE path is captured
+REM and Split-Path yields its directory.
+REM The result is captured via a temp file, not for /f: nesting this command
+REM inside for /f's IN(...) clause re-enters cmd quoting for the caret and the
+REM single quotes, which is exactly the fragile layering the installer avoids
+REM elsewhere (flat lines, no parenthesized blocks around user-derived text).
+set "SVC_QC_TMP=%TEMP%\lpp_svc_qc.txt"
+powershell -NoProfile -Command "$bp=((sc.exe qc '%SERVICE_NAME%' 2>$null) -join ' '); if ($bp -match '-log-file=(?:\x22([^\x22]+)\x22|(\S+))') { if ($Matches[1]) { Split-Path ($Matches[1]) -Parent } else { Split-Path ($Matches[2]) -Parent } }" > "%SVC_QC_TMP%" 2>nul
+set /p SVC_LOG_DIR=<"%SVC_QC_TMP%"
+del "%SVC_QC_TMP%" >nul 2>&1
 if not "%SVC_LOG_DIR%"=="" if /i not "%SVC_LOG_DIR%"=="%LOG_DIR%" (
     echo === Removing custom log directory "%SVC_LOG_DIR%" ===
     icacls "%SVC_LOG_DIR%" /reset >nul 2>&1

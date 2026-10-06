@@ -219,6 +219,10 @@ if errorlevel 1 (
     goto :wiz_logdir
 )
 if "%LOG_DIR%"=="" set "LOG_DIR=%DEF_LOG_DIR%"
+:: Same trailing-backslash rationale as TARGETS_FILE above: "C:\Logs\" would
+:: escape the closing quote in the quoted expansions below (icacls, the
+:: -log-file argument) and swallow the rest of the command line.
+if "%LOG_DIR:~-1%"=="\" set "LOG_DIR=%LOG_DIR:~0,-1%"
 
 :wiz_account
 set "SERVICE_ACCOUNT="
@@ -283,7 +287,9 @@ icacls "%LOG_DIR%" /inheritance:r /grant "SYSTEM:(OI)(CI)F" "Administrators:(OI)
 :: forever on a foreground agent instead of installing the service. (-mode and
 :: -metrics are left bare: their values are validated literals with no sane
 :: space in them.)
-set "INSTALL_ARGS=-mode=%RUN_MODE% -metrics=%METRICS_ADDR%"
+REM (-mode is a validated literal; -metrics is free-text user input and is
+REM quoted like the other space-capable values.)
+set "INSTALL_ARGS=-mode=%RUN_MODE% -metrics="%METRICS_ADDR%""
 if not "%TARGETS_FILE%"==""  set "INSTALL_ARGS=%INSTALL_ARGS% -targets="%TARGETS_FILE%""
 if not "%SINGLE_TARGET%"=="" set "INSTALL_ARGS=%INSTALL_ARGS% -target="%SINGLE_TARGET%""
 if not "%ALLOW_LIST%"==""    set "INSTALL_ARGS=%INSTALL_ARGS% -allow="%ALLOW_LIST%""
@@ -451,7 +457,10 @@ exit /b 0
 ::   the raw value is NEVER expanded into a cmd command line - expanding a
 ::   value to search it would itself be the injection this guard exists for.
 :RejectQuoteAmp
-powershell -NoProfile -Command "if ($env:%~1 -match '[\"&]') { exit 1 } else { exit 0 }" >nul 2>&1
+REM The regex is written as \x22/\x26 escape sequences: a raw " or & inside
+REM the cmd-quoted -Command region would toggle cmd quoting and turn the &
+REM into a command separator (the exact hazard this guard exists for).
+powershell -NoProfile -Command "if ($env:%~1 -match '\x22|\x26') { exit 1 } else { exit 0 }" >nul 2>&1
 exit /b %errorlevel%
 
 :: CheckSecretLength VALUEVAR
