@@ -2,6 +2,11 @@
 # Example inventory for link_ping_prometheus deployments.
 # Copy to inventory.yml and fill in real hosts. Real secrets belong in
 # group_vars/all.yml (encrypted with ansible-vault), not in this file.
+#
+# WinRM certificate validation stays ON: the channel carries the service
+# credentials, so an unverified peer is an unauthenticated control node.
+# Point ansible_winrm_ca_bundle_path at your internal CA bundle (PEM,
+# concatenated intermediates) - never set the validation to `ignore`.
 
 all:
   children:
@@ -18,5 +23,7 @@ all:
         site-b-echo:
           ansible_host: 203.0.113.10
           ansible_connection: winrm
-          # EXAMPLE ONLY: pin a trusted CA in production.
-          ansible_winrm_server_cert_validation: ignore
+          # EXAMPLE ONLY: path to the internal CA bundle for this site,
+          # read on the CONTROL node (a C:\... path on a Windows one).
+          ansible_winrm_server_cert_validation: validate
+          ansible_winrm_ca_bundle_path: /etc/ansible/ca-bundle.pem

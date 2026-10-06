@@ -1,0 +1,15 @@
+# Code owners for the release path.
+#
+# REPLACE @YOUR-ORG/release-maintainers with a real team before relying on
+# this file: an unresolved handle matches nobody, so a required-review
+# ruleset built on it would match zero reviewers and never be satisfiable.
+# Until then, treat these paths as review-by-hand.
+#
+# Rationale: these three paths together decide what leaves the repository
+# and under what signature -- the release workflow (contents:write,
+# id-token:write), the artifact/signing manifest, and the enterprise
+# install/uninstall scripts that write service config and ACLs on the host.
+
+/.github/workflows/release.yml @YOUR-ORG/release-maintainers
+/.goreleaser.yaml @YOUR-ORG/release-maintainers
+/installer/ @YOUR-ORG/release-maintainers

@@ -16,6 +16,11 @@ import (
 // deliberately OUTSIDE the main sent/rtt/timed_out/corrupted balance so
 // MTU probing never pollutes the loss ratio. Each sweep opens its own DF
 // socket so the main probe socket's fragmentation behavior is untouched.
+// Echoes are held to the same identity checks as the main reader's
+// responses (see readEcho): echoed sequence, echoed timestamp byte-equality,
+// and the echoed HMAC tag when -echo-secret is set — the sweep socket is a
+// connected socket on the same public frame layout, so an echo that the
+// prober did not send must not steer the search.
 func runMTUSweep(ctx context.Context, t Target, cfg Config, m targetMetrics, state *probeLoopState, logger *slog.Logger) {
 	// NewTimer(0): the first sweep fires immediately so path_mtu_bytes
 	// is populated on startup instead of after the first full interval.
@@ -107,13 +112,21 @@ func mtuDeadline(cfg Config, state *probeLoopState) time.Duration {
 }
 
 // readEcho waits for an echo of exactly size bytes whose sequence is one of
-// seqs. Foreign datagrams and echoes of another size are SKIPPED rather than
+// seqs, whose timestamp byte-equals the ts this sweep sent for that sequence
+// (sent maps seq -> ts), and — when the sweep runs with -echo-secret — whose
+// trailing 8-byte tag matches computeHMAC(secret, seq, ts), compared
+// constant-time (validHMAC). The main reader applies the same identity
+// checks to its responses; without them a peer able to inject into the
+// connected DF socket could fabricate an echo for the currently probed size
+// (sequence numbers are deterministic) and steer the binary search.
+// Foreign datagrams and echoes of another size are SKIPPED rather than
 // taken as this probe's answer: one socket serves the whole sweep, so a late
 // echo of a larger size would otherwise be consumed as a failure of a smaller
 // size that may well survive, stepping the binary search below the real MTU.
-// The deadline is absolute, so skipping cannot extend the wait (and a stream
-// of foreign datagrams cannot spin the loop past it).
-func readEcho(conn net.Conn, buf []byte, size int, seqs []uint64, deadline time.Time) error {
+// Forged or stale frames are skipped the same way, and the deadline is
+// absolute, so skipping cannot extend the wait (and a stream of foreign
+// datagrams cannot spin the loop past it).
+func readEcho(conn net.Conn, buf []byte, size int, seqs []uint64, sent map[uint64]uint64, secret string, deadline time.Time) error {
 	if err := conn.SetReadDeadline(deadline); err != nil {
 		return err
 	}
@@ -126,11 +139,37 @@ func readEcho(conn net.Conn, buf []byte, size int, seqs []uint64, deadline time.
 			continue // a foreign or other-size datagram: keep waiting for ours
 		}
 		got := binary.LittleEndian.Uint64(buf[8:16])
+		var awaited uint64
+		awaitedOK := false
 		for _, s := range seqs {
 			if got == s {
-				return nil
+				awaited, awaitedOK = s, true
+				break
 			}
 		}
+		if !awaitedOK {
+			continue // a foreign sequence: keep waiting for ours
+		}
+		wantSent, ok := sent[awaited]
+		if !ok {
+			// The caller awaited this sequence but never recorded its
+			// timestamp: the frame layout is known but the echo cannot be
+			// authenticated against what we sent — treat as foreign.
+			continue
+		}
+		if binary.LittleEndian.Uint64(buf[16:24]) != wantSent {
+			// Echoed payload does not match what we sent: corruption,
+			// replay, or spoofing. Skip it exactly like the main reader;
+			// the probe stays lost at the absolute deadline.
+			continue
+		}
+		if secret != "" && !validHMAC(secret, got, wantSent, buf[24:32]) {
+			// buf[24:32] is in bounds here: secret set means size is at
+			// least PayloadSizeWithHMAC, and the size gate above already
+			// matched n == size.
+			continue // wrong tag: not an echo the prober sent
+		}
+		return nil
 	}
 }
 
@@ -149,6 +188,12 @@ func sweepOnce(ctx context.Context, conn net.Conn, cfg Config, m targetMetrics, 
 	deadline := mtuDeadline(cfg, state)
 	buf := make([]byte, headerSize+MaxPayloadBytes)
 	var seq uint64
+	// sent maps each sequence this sweep actually wrote to the timestamp it
+	// carried: readEcho needs both to authenticate an echoed frame (echoed
+	// ts must byte-equal what we sent, and the echoed tag must match the
+	// HMAC over that pair when -echo-secret is set). Bounded by one sweep's
+	// probe count (~2*log2(MaxPayloadBytes)+2).
+	sent := make(map[uint64]uint64)
 
 	// send writes one DF probe carrying payload bytes and returns the
 	// sequence it used; 0 means the write failed (already counted lost).
@@ -175,15 +220,17 @@ func sweepOnce(ctx context.Context, conn net.Conn, cfg Config, m targetMetrics, 
 			m.mtuLost.Inc()
 			return 0
 		}
+		sent[seq] = ts
 		return seq
 	}
 
 	// waitEcho waits for an echo of THIS payload size whose sequence is one we
-	// actually sent for it (see readEcho). Accepting every sequence sent for
-	// this payload keeps the retry semantics: an echo of the first attempt
-	// arriving during the retry still proves survival.
+	// actually sent for it and whose echoed timestamp and (when configured)
+	// HMAC tag match what we sent (see readEcho). Accepting every sequence
+	// sent for this payload keeps the retry semantics: an echo of the first
+	// attempt arriving during the retry still proves survival.
 	waitEcho := func(payload int, seqs ...uint64) bool {
-		if err := readEcho(conn, buf, headerSize+payload, seqs, time.Now().Add(deadline)); err != nil {
+		if err := readEcho(conn, buf, headerSize+payload, seqs, sent, cfg.EchoSecret, time.Now().Add(deadline)); err != nil {
 			m.mtuLost.Inc()
 			return false
 		}

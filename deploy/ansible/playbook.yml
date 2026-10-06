@@ -19,6 +19,48 @@
     link_ping_bin: "{{ link_ping_install_dir }}/link_ping_prometheus"
     link_ping_targets_path: "{{ link_ping_install_dir }}/targets.json"
   tasks:
+    # Pre-flight guardrail: -metrics is the management plane - /metrics AND
+    # /status carry the whole probe topology (target addresses, packet
+    # counts, build info). A wildcard bind with no credentials and no TLS
+    # hands that to every host that can route to the box, so refuse the
+    # install instead of shipping it silently. The host part is everything
+    # before the LAST colon: ":2112" -> "" and "[::]:2112" -> "[::]" are
+    # wildcards, "127.0.0.1:2112" -> "127.0.0.1" is not.
+    - name: Classify the metrics listener exposure
+      ansible.builtin.set_fact:
+        link_ping_metrics_host: >-
+          {{ link_ping_metrics_listen.split(':')[:-1] | join(':') }}
+        # Both halves or none: the binary refuses a half-configured pair
+        # (resolveMetricsAuth in main.go), so one empty var means auth off.
+        link_ping_metrics_auth: >-
+          {{ (link_ping_metrics_user | length > 0)
+             and (link_ping_metrics_pass | length > 0) }}
+        link_ping_metrics_tls: >-
+          {{ ('-metrics-tls-cert' in link_ping_extra_args)
+             or ('-metrics-tls-key' in link_ping_extra_args)
+             or ('-metrics-allow-insecure' in link_ping_extra_args) }}
+
+    - name: Refuse an unauthenticated all-interfaces metrics listener
+      ansible.builtin.assert:
+        that: >-
+          not (link_ping_metrics_host in ['', '0.0.0.0', '::', '[::]', '*']
+               and not (link_ping_metrics_auth | bool)
+               and not (link_ping_metrics_tls | bool))
+        fail_msg: >-
+          link_ping_metrics_listen={{ link_ping_metrics_listen }} publishes
+          /metrics and /status on every interface with no Basic auth and no
+          TLS: an unauthenticated management plane that exposes the whole
+          probe topology (target addresses, packet counts, build info) to
+          anything that can reach TCP 2112. Pick one: (1) bind
+          127.0.0.1:2112 and scrape through a tunnel/agent; (2) set
+          link_ping_metrics_user and link_ping_metrics_pass; (3) pass
+          -metrics-tls-cert/-metrics-tls-key (or -metrics-allow-insecure) in
+          link_ping_extra_args; (4) firewall TCP 2112 to the monitoring
+          hosts only. See deploy/ansible/README.md.
+        # Silent when safe: the guardrail must not add noise to the normal
+        # localhost default.
+        quiet: true
+
     - name: Create log directory
       ansible.builtin.file:
         path: "{{ link_ping_log_dir }}"
@@ -134,6 +176,41 @@
       HKLM:\SYSTEM\CurrentControlSet\Services\{{ link_ping_service_name
       }}\Environment
   tasks:
+    # Same guardrail as the Linux play: plays share no vars, so it is
+    # restated rather than factored into a file the play does not own.
+    # Here it also covers the missing TCP 2112 firewall rule - the play
+    # opens UDP 4000 but nothing restricts the metrics port.
+    - name: Classify the metrics listener exposure
+      ansible.builtin.set_fact:
+        link_ping_metrics_host: >-
+          {{ link_ping_metrics_listen.split(':')[:-1] | join(':') }}
+        link_ping_metrics_auth: >-
+          {{ (link_ping_metrics_user | length > 0)
+             and (link_ping_metrics_pass | length > 0) }}
+        link_ping_metrics_tls: >-
+          {{ ('-metrics-tls-cert' in link_ping_extra_args)
+             or ('-metrics-tls-key' in link_ping_extra_args)
+             or ('-metrics-allow-insecure' in link_ping_extra_args) }}
+
+    - name: Refuse an unauthenticated all-interfaces metrics listener
+      ansible.builtin.assert:
+        that: >-
+          not (link_ping_metrics_host in ['', '0.0.0.0', '::', '[::]', '*']
+               and not (link_ping_metrics_auth | bool)
+               and not (link_ping_metrics_tls | bool))
+        fail_msg: >-
+          link_ping_metrics_listen={{ link_ping_metrics_listen }} publishes
+          /metrics and /status on every interface with no Basic auth and no
+          TLS: an unauthenticated management plane that exposes the whole
+          probe topology (target addresses, packet counts, build info) to
+          anything that can reach TCP 2112. Pick one: (1) bind
+          127.0.0.1:2112 and scrape through a tunnel/agent; (2) set
+          link_ping_metrics_user and link_ping_metrics_pass; (3) pass
+          -metrics-tls-cert/-metrics-tls-key (or -metrics-allow-insecure) in
+          link_ping_extra_args; (4) firewall TCP 2112 to the monitoring
+          hosts only. See deploy/ansible/README.md.
+        quiet: true
+
     - name: Create install directory
       ansible.windows.win_file:
         path: "{{ link_ping_windows_install_dir }}"
@@ -237,6 +314,42 @@
       # The SCM reads the environment at process start: a rotated secret must
       # restart the service to take effect. Fires only when a value changed.
       notify: Restart link ping service (windows)
+
+    - name: Restrict the service Environment key ACL
+      # HKLM\SYSTEM\CurrentControlSet\Services\<svc>\Environment is
+      # readable by every local user by default, so the metrics password
+      # and HMAC secret written above are only as private as interactive
+      # logon on the host. Drop the inherited ACEs and keep SYSTEM +
+      # BUILTIN\Administrators - the same rule, and the same PowerShell
+      # calls, the batch installer
+      # (installer/windows/install-service.bat) applies. The SCM builds
+      # the service's environment block as SYSTEM, so the service process
+      # itself needs no read access here.
+      #
+      # win_script (not win_shell) so the snippet is written to a .ps1 and
+      # run as-is: cmd.exe or the outer PowerShell would otherwise re-parse
+      # the $variables and quotes. $ErrorActionPreference = 'Stop' turns a
+      # failed Get-Acl/Set-Acl into a non-zero exit, so the task fails
+      # instead of leaving the key world-readable and reporting success.
+      # NOTIFY: no service restart - the ACL does not change any value.
+      ansible.windows.win_script:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          $k = '{{ svc_env_key }}'
+          function New-AdminRule($n) {
+              $type = 'System.Security.AccessControl.RegistrySystemAccessRule'
+              $argList = @($n, 'FullControl',
+                           'ContainerInherit,ObjectInherit', 'None', 'Allow')
+              New-Object -TypeName $type -ArgumentList $argList
+          }
+          $a = Get-Acl $k
+          $a.SetAccessRuleProtection($true, $false)
+          foreach ($n in 'SYSTEM', 'BUILTIN\Administrators') {
+              $a.AddAccessRule((New-AdminRule $n))
+          }
+          Set-Acl -Path $k -AclObject $a
+      when: ansible_os_family == 'windows'
+      changed_when: false
 
     - name: Open UDP echo port (server/both mode)
       ansible.windows.win_shell: >-

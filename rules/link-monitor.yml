@@ -323,19 +323,100 @@ groups:
             /status in 10m. Either a scraper is misconfigured with the
             wrong credentials, or something is scanning the endpoints.
 
-      - alert: ClockSkewApproaching
+      # --- Time integrity ---------------------------------------------------
+      # The HMAC replay window (maxReplayWindow = 30s, internal/prober/
+      # server.go) is enforced against the REFLECTOR's clock: a probe whose
+      # embedded timestamp is more than 30s away from it is dropped as
+      # replay. A node whose clock has drifted therefore has its LEGITIMATE
+      # probes discarded and its peers read the link as down — a monitor
+      # failure, not a network fault. Clock skew is the likeliest cause of
+      # both the skew gauge above 20s and the replay drops below; an actual
+      # capture-replay attacker holding a valid HMAC is the alternative and
+      # is far rarer. Service installs depend on W32Time for exactly this
+      # reason (see the SCM dependency in the README).
+      #
+      # This two-tier pair (warning at 20s, critical at 25s) REPLACES the
+      # earlier ClockSkewApproaching alert, whose condition
+      # (abs(skew) > 25 for 5m) was identical to the critical tier here and
+      # paged twice for one condition. It was removed rather than kept as a
+      # duplicate.
+      #
+      # CAVEAT on link_server_clock_skew_seconds: the server sets the gauge
+      # only for frames that PASS the replay guard (one replayed frame must
+      # not peg it at hours), so a client that has already drifted past 30s
+      # stops updating it and its series is then TTL-evicted. The gauge
+      # freezes at the last in-window value rather than climbing. Read the
+      # >25s critical as "observed at or near the edge of the window", and
+      # pair it with ServerReplayDrops below, which keeps counting after the
+      # gauge has gone quiet.
+
+      - alert: LinkClockSkewHigh
+        # Two-thirds of the 30s window: a peer in this band is already
+        # losing probes to the replay guard, so this is the "resync the
+        # clock now" signal rather than the "already broken" one.
+        expr: abs(link_server_clock_skew_seconds) > 20
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            Clock skew over 20s on {{ $labels.source }} for client
+            {{ $labels.client }}
+          description: >-
+            The reflector sees this client's clock more than 20s out —
+            two-thirds of the 30s HMAC replay window — and has held that
+            skew for 15m, so probes are already being dropped as replay
+            before the window is fully crossed. Resynchronize NTP/W32Time
+            on the client; the path itself is not implicated.
+
+      - alert: LinkClockSkewCritical
+        # Within 5s of the window edge: almost every probe from this
+        # client is discarded as replay and its links read as down.
         expr: abs(link_server_clock_skew_seconds) > 25
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: >-
+            Clock skew within 5s of the replay window on {{ $labels.source }}
+            for client {{ $labels.client }}
+          description: >-
+            Observed skew is close to the 30s replay window, so probes
+            from this client are being dropped as replay and its links
+            read as down. Skew is the likeliest cause — fix NTP/W32Time
+            on the client before investigating the link. Once the skew
+            passes 30s this gauge freezes (see the note above); use
+            ServerReplayDrops to keep seeing the drops.
+
+      - alert: ServerReplayDrops
+        # Replay drops on a reflector whose own probes still complete:
+        # its links read healthy while a peer's probes are silently
+        # discarded, so nothing else in this file fires. Clock skew is
+        # the likeliest cause; a captured frame replayed by an attacker
+        # is the other possibility and deserves the same attention.
+        # ServerDropsObserved already catches reason="replay" among all
+        # non-allowlist reasons; this rule isolates the case that matters
+        # most, because the healthy link_up proves the path is fine.
+        # Drop the `and on (source)` clause to page on any reflector,
+        # including server-mode-only agents that export no link_up.
+        expr: >-
+          (increase(link_server_probes_dropped_total{reason="replay"}[10m])
+              > 0)
+          and on (source) (link_up == 1)
         for: 5m
         labels:
           severity: warning
         annotations:
           summary: >-
-            Clock skew approaching replay window for client
-            {{ $labels.client }}
+            Replay-window drops on {{ $labels.source }} while its own
+            probes still complete
           description: >-
-            Observed skew is within 5s of the 30s replay window. NTP
-            drift will soon cause valid probes to be rejected as
-            replays. Resynchronize clocks on the client.
+            The reflector is dropping probes as stale/replayed while
+            link_up still reads 1: a peer's probes are being discarded
+            by the 30s replay guard, not lost on the wire. Clock skew
+            against the reflector is the likeliest cause — check
+            NTP/W32Time on both ends. A captured frame replayed by an
+            attacker is the other possibility.
 
       - alert: PathMtuDropped
         expr: >-
