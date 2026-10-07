@@ -626,7 +626,7 @@ link_ping_prometheus -mode=<mode> [flags]
 | `-svc` | `""` | Windows service action: `install`, `uninstall`, `start`, `stop`, `run` |
 | `-echo-secret` | `""` | HMAC secret authenticating UDP probes (env `LINK_PING_ECHO_SECRET`; must be set on **both** client and server — a server without it accepts the client's HMAC frame as a plain payload probe, see [Wire Protocol](#wire-protocol); expands the wire frame to 32 bytes) |
 | `-echo-secret-old` | `""` | Server: previous HMAC secret still accepted during a zero-downtime rotation, alongside `-echo-secret` (env `LINK_PING_ECHO_SECRET_OLD`; server side only; startup error if set without `-echo-secret`) |
-| `-hmac-coverage` | `header` | Client: which frame bytes the HMAC tag covers when `-echo-secret` is set. `header` (default) tags the 24-byte header only — the v0.7 layout, byte-identical wire output. `full-frame` tags the header plus the `-payload` bytes (tag slot skipped), so a tampered payload — or a different payload riding a captured tag — no longer authenticates; needs `-payload > 0` to differ, and the echo server accepts BOTH coverages whenever it has `-echo-secret`, so an upgraded client needs no server change. Invalid values are a startup error. |
+| `-hmac-coverage` | `full-frame` | Client: which frame bytes the HMAC tag covers when `-echo-secret` is set. `full-frame` (default) tags the header plus the `-payload` bytes (tag slot skipped), so a tampered payload — or a different payload riding a captured tag — no longer authenticates; needs `-payload > 0` to differ from `header`. `header` (the v0.7 layout, byte-identical wire output) is the escape hatch for probing through a v0.7 echo server while using `-payload`. The echo server accepts BOTH coverages whenever it has `-echo-secret`; upgrading it to ≥ v0.8 clears the one broken pairing (v0.7 server + full-frame client). Invalid values are a startup error. |
 
 **Why MTU discovery (`-mtu-sweep`) matters:** 24-byte probes prove a path *exists* — they cannot prove it *carries full-size traffic*. VPN tunnels, PPPoE/GRE/VXLAN overlays and broken PMTUD routinely pass small packets while black-holing full-size ones — the classic "monitor says healthy, users say broken" failure. The sweep DF-marks probes on a dedicated socket, binary-searches the largest frame that round-trips, and publishes it as `link_path_mtu_bytes`; a shrinking gauge (or rising `link_mtu_probes_lost_total` while `link_up` stays 1) is that failure's signature. A size with no echo is retried once before the search shrinks — a single dropped probe on a lossy path would otherwise converge far below the real MTU and make the gauge flap between sweeps — so both MTU counters advance per attempt and read as a probe rate, not one probe per distinct size tested. It needs no ICMP and no extra firewall rules, uses separate counters that never enter the loss ratio, and is on by default (1m; `0` disables). Alert on `link_path_mtu_bytes < max_over_time(link_path_mtu_bytes[24h])`, or
 on MTU probe loss as a RATIO (`rate(link_mtu_probes_lost_total[10m]) /
@@ -914,26 +914,30 @@ same shape and is counted too. The server logs a startup warning when
 
 **Tag coverage (`-hmac-coverage`).** The 32-byte frame layout and the
 header tag position are fixed — the flag changes only what the tag is
-computed OVER. With `header` (default) the tag covers the 24-byte header
-exactly as in v0.7.0: byte-identical wire output, and an old server and an
-old client interoperate unchanged. With `full-frame` the client's tag
-covers the header plus the pattern payload (the 8-byte tag slot itself is
-skipped), so a payload tampered in flight — or a different payload riding
-a captured header tag — no longer authenticates. The server accepts BOTH
+computed OVER. Since v0.8.0 the default is `full-frame`: the client's tag
+now covers the header plus the pattern payload (the 8-byte tag slot itself
+is skipped), so a payload tampered in flight — or a different payload
+riding a captured header tag — no longer authenticates (in v0.7 and the
+`-hmac-coverage=header` escape hatch, the tag covers the 24-byte header
+only — byte-identical wire output to v0.7.0). The server accepts BOTH
 coverages for payload frames (header tag tried first, then full-frame;
-both constant-time) whenever it has `-echo-secret`, so a client can flip
-to `full-frame` independently of its server, and a bare 32-byte frame
-skips the second check (the two coverages coincide byte-for-byte there).
-Both coverages produce identical tags for zero-payload frames, so the
-mixed-fleet matrix is fully working: old server + old client, upgraded
-server + old client, upgraded server + upgraded client. The one broken
-pairing is v0.7 SERVER + `full-frame` CLIENT: an old server checks the
-header tag only, cannot verify a full-frame tag over a payload, drops the
-frame, and the client reads pure loss — flip servers to ≥ v0.8 first.
-There is deliberately no new drop reason: a drop is a drop, both
-coverages fail together on a wrong secret, and splitting the reason would
-fragment the `hmac`/`replay` misconfig alerting for a distinction the
-operator cannot act on.
+both constant-time) whenever it has `-echo-secret`, and a bare 32-byte
+frame skips the second check (the two coverages coincide byte-for-byte
+there). Both coverages produce identical tags for zero-payload frames,
+so the working pairings are: old server + `header`-coverage client
+(v0.7 as deployed — unchanged), upgraded server + any client, and
+upgraded client + upgraded server. Because the DEFAULT client coverage
+flipped to `full-frame` in the same release that taught the server the
+new form, upgrade servers to ≥ v0.8 BEFORE (or together with) clients.
+The one broken pairing is v0.7 SERVER + `full-frame` CLIENT (i.e. any
+v0.8 default client): an old server checks the header tag only, cannot
+verify a full-frame tag over a payload, drops the frame, and the client
+reads pure loss — until the server is upgraded, confine the client with
+`-hmac-coverage=header` instead of delaying the upgrade. There is
+deliberately no new drop reason: a drop is a drop, both coverages fail
+together on a wrong secret, and splitting the reason would fragment the
+`hmac`/`replay` misconfig alerting for a distinction the operator cannot
+act on.
 
 The server rate-limits echo processing to 2000 packets/s per remote IP
 and 10000 packets/s globally (fixed one-second window); excess datagrams

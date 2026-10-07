@@ -46,6 +46,27 @@ within a major it is a breaking (MAJOR) change to:
 The table-driven wire tests (good frame accepted, bad tag dropped, wrong
 size dropped) pin the frame contract; any PR touching the wire must extend
 them, since those tests are the interop guarantee's enforcement.
+
+### Bundled migrations (the dual-accept-then-flip template)
+
+A wire-subsystem flip MAY ship inside a single minor release — rather
+than as a dedicated flip release — when all three hold:
+
+1. the receiving side learned the new form FIRST, in the same release or
+   an earlier one (e.g. a dual-accept server), while the sending side's
+   output stayed byte-identical;
+2. the release notes name the upgrade ORDER and the exact broken pair
+   (e.g. v0.7 server + new-default client), plus which flag restores the
+   old emission as an escape hatch;
+3. the old form remains ACCEPTED by the receiving side indefinitely —
+   the guarantee degrades for the broken pair only.
+
+The v0.8.0 HMAC tag-coverage rollout is the template: the server accepts
+both coverages while the flag default flips, notes tell fleets with
+v0.7 servers to upgrade server-side first (or confine clients with
+`-hmac-coverage=header` until they do), and v0.7 servers keep working
+with every pairing except that named one.
+
 Everything above applies to post-v0.7 releases; v0.6 and earlier made no
 interop promises.
 
