@@ -60,8 +60,7 @@ func BenchmarkFillPayload(b *testing.B) {
 	buf := make([]byte, MaxPayloadBytes)
 	b.SetBytes(int64(len(buf)))
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for i := 0; b.Loop(); i++ {
 		fillPayload(buf, uint64(i), uint64(i))
 	}
 	benchSink = uint64(buf[0]) ^ uint64(buf[len(buf)-1])
@@ -86,8 +85,7 @@ func BenchmarkAllowlistContains(b *testing.B) {
 	v6 := netip.MustParseAddr("2001:db8::1")
 	src := netip.MustParseAddr("203.0.113.7")
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		ok := al.Contains(exact) && al.Contains(prefix) && al.Contains(v6) && !al.Contains(src)
 		if !ok {
 			b.Fatal("allowlist lookup regressed: a configured entry stopped matching")

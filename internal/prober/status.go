@@ -171,6 +171,9 @@ func ReadProcessStatus() ProcessStatus {
 func (r *StatusRegistry) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		// Encode errors (client disconnecting mid-write) are not actionable
+		// here and would spam per-scrape; the endpoint's contract is a best-
+		// effort JSON snapshot. Explicitly discarded so the intent is visible.
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"targets": r.Snapshot(),
 			"process": ReadProcessStatus(),
