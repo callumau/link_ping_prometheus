@@ -299,7 +299,8 @@ type HmacCoverage int
 
 const (
 	// HMACHeaderCoverage tags only the 24-byte header (magic+seq+ts): the
-	// v0.7 behavior and the default, so the wire bytes are unchanged.
+	// v0.7 behavior, the Go zero value, and the -hmac-coverage=header
+	// escape hatch for v0.7 peers; the wire bytes are unchanged.
 	HMACHeaderCoverage HmacCoverage = iota
 	// HMACFullFrameCoverage tags the header AND the pattern payload while
 	// skipping the 8-byte tag slot itself, closing the substitution gap

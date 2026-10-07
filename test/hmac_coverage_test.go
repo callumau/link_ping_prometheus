@@ -147,9 +147,10 @@ func TestServer_HMACCoverageDualAccept(t *testing.T) {
 // TestClient_HMACCoverageWireBytes pins the wire bytes the CLIENT emits
 // per coverage, against tag builders reimplemented from the layout:
 //
-//   - default (header): the 32-byte frame's tag equals the v0.7 header
-//     tag byte-for-byte — the golden-bytes guarantee that the default
-//     config emits byte-identical wire output to v0.7.0;
+//   - header (the Config zero value, i.e. the library default; the
+//     BINARY flag default is full-frame — the -hmac-coverage=header
+//     escape hatch yields this emission): the 32-byte frame's tag equals
+//     the v0.7 header tag byte-for-byte;
 //   - full-frame: the tag equals the full-frame tag over header+payload
 //     (tag slot skipped) — and for a zero-payload frame it equals the
 //     header tag, so empty-payload frames are identical under both
