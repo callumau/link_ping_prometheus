@@ -129,7 +129,7 @@ var (
 	flTarget        = flag.String("target", "", "Client: Single target address")
 	flTargets       = flag.String("targets", "", "Client: JSON file path with targets")
 	flMetrics       = flag.String("metrics", "127.0.0.1:2112", "Metrics: Listen address (default binds localhost only; use \":2112\" or \"0.0.0.0:2112\" to expose on all interfaces)")
-	flSvc           = flag.String("svc", "", "Service: install, uninstall, start, stop, run")
+	flSvc           = flag.String("svc", "", "Service: install, uninstall (Windows only; Linux uses the systemd unit), start, stop, run")
 	flJSONLogs      = flag.Bool("json-logs", false, "Log in JSON format")
 	flLogFile       = flag.String("log-file", "", "Log: append logs to this file in addition to stdout (stdout is discarded under the Windows service)")
 	flLogMaxSize    = flag.Int("log-file-max-mb", 10, "Log: max size in MB before rotation (0 disables rotation; requires -log-file)")
@@ -598,6 +598,10 @@ func absolutizeFlagValue(name, value string) string {
 // time, excluding -svc itself and sensitive flags (-metrics-user,
 // -metrics-pass).
 func handleService(action string, logSink *countedWriter) {
+	if !svcActionSupported(action) {
+		slog.Error("unsupported -svc action on this OS: install/uninstall are Windows-only (Linux deploys use the systemd unit in installer/linux)", "action", action, "os", runtime.GOOS)
+		os.Exit(1)
+	}
 	svcConfig := serviceConfig()
 
 	if action == "install" {
@@ -749,6 +753,25 @@ func (p *program) Start(s service.Service) error {
 // svcStopDeadline bounds program.Stop's drain wait. A var so the
 // timeout-arm test does not need a real 20s stall.
 var svcStopDeadline = 20 * time.Second
+
+// svcActionSupported reports whether the -svc lifecycle action is
+// supported on the current OS. install/uninstall are Windows-only: the
+// Linux install path would run the binary's own service renderers
+// (systemd/openrc/... unit and init-script generation), which no
+// supported deployment exercises - Linux installs use the static systemd
+// unit shipped via the Ansible play - and embedding configuration values
+// into generated shell/unit scripts is exactly the surface
+// supply-chain scanners flag on the OpenRC renderer (reachable only via
+// this action). Every other action (run via the framework, start/stop
+// helpers) stays cross-platform.
+func svcActionSupported(action string) bool {
+	switch action {
+	case "install", "uninstall":
+		return runtime.GOOS == "windows"
+	default:
+		return true
+	}
+}
 
 // Stop is called by the service framework to shut down gracefully. It
 // cancels the context and waits for the run goroutine (plus a bounded
