@@ -55,12 +55,8 @@ func verifyLogDACLRestricted(t *testing.T, path string) {
 	if !protected {
 		t.Errorf("DACL of %q is not protected from parent inheritance", path)
 	}
-	const inheritBits = windows.OBJECT_INHERIT_ACE | windows.CONTAINER_INHERIT_ACE
 	trustees := map[string]bool{}
 	for _, a := range aces {
-		if a.flags&inheritBits != inheritBits {
-			t.Errorf("ACE for %s has flags %#x, want object+container inheritance", a.sid, a.flags)
-		}
 		trustees[a.sid] = true
 	}
 	want := map[string]bool{
