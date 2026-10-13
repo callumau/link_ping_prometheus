@@ -194,6 +194,15 @@ func (c Config) Validate() error {
 	if c.ReconnectInterval < 0 {
 		return fmt.Errorf("reconnect interval must be >= 0, got %v", c.ReconnectInterval)
 	}
+	if c.ReloadInterval < 0 {
+		// A negative -targets-reload-interval silently DISABLED hot reload
+		// (ticker construction is gated on > 0), reading to the operator
+		// as configured reloading that never fires — on a Windows service
+		// there is no SIGHUP fallback, so the targets file would never
+		// be re-read for the life of the process. Reject instead; 0 is the
+		// documented way to disable the timer.
+		return fmt.Errorf("targets reload interval must be >= 0, got %v", c.ReloadInterval)
+	}
 	if c.DSCP < 0 || c.DSCP > 63 {
 		return fmt.Errorf("dscp must be 0-63, got %d", c.DSCP)
 	}
