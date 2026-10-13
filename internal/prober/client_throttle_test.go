@@ -130,10 +130,10 @@ func TestEchoLoop_PendingWindowThrottleSkipsSends(t *testing.T) {
 			time.Sleep(20 * time.Millisecond)
 			continue
 		}
-		sent0, th0 := wbCounter(ProbesSent, src, name, addr), wbCounter(ProbesThrottled, src, name, addr)
+		sent0, th0, tout0 := wbCounter(ProbesSent, src, name, addr), wbCounter(ProbesThrottled, src, name, addr), wbCounter(ProbesTimedOut, src, name, addr)
 		time.Sleep(300 * time.Millisecond)
 		infl = wbGauge(ProbesInflight, src, name, addr)
-		sent1, th1 := wbCounter(ProbesSent, src, name, addr), wbCounter(ProbesThrottled, src, name, addr)
+		sent1, th1, tout1 := wbCounter(ProbesSent, src, name, addr), wbCounter(ProbesThrottled, src, name, addr), wbCounter(ProbesTimedOut, src, name, addr)
 		if infl < float64(maxPendingWindow) {
 			// Window drained mid-sample; keep sampling for a pinned one.
 			continue
@@ -141,8 +141,8 @@ func TestEchoLoop_PendingWindowThrottleSkipsSends(t *testing.T) {
 		if infl > float64(maxPendingWindow) {
 			t.Errorf("inflight exceeded the cap during throttle: %v", infl)
 		}
-		if sent1 != sent0 {
-			t.Errorf("sent grew from %v to %v while the pending window was pinned at the cap — a throttled tick must not send", sent0, sent1)
+		if sent1 != sent0 && sent1-sent0 != tout1-tout0 {
+			t.Errorf("sent grew by %v while deletions grew by %v and the pending window was pinned — a throttled tick must not send, except exactly paired to sweep deletions", sent1-sent0, tout1-tout0)
 		}
 		if th1 <= th0 {
 			t.Errorf("throttled counter did not advance while the window was pinned (before=%v after=%v)", th0, th1)
