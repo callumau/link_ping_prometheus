@@ -106,6 +106,10 @@ jobs:
           govulncheck ./...
 
       - name: Run Tests (race detector)
+        # LPP_E2E_LINUX=1 enables the Linux systemd lifecycle e2e
+        # (test/e2e; the runner user has passwordless sudo for systemctl).
+        env:
+          LPP_E2E_LINUX: "1"
         run: go test -count=1 -race -v ./...
 
       - name: Build
