@@ -1539,3 +1539,27 @@ func TestWatchLogSinkReportsToStderr(t *testing.T) {
 		t.Fatal("no stderr alert within 2s")
 	}
 }
+
+// TestSvcActionSupported pins the OS gate for the -svc lifecycle actions:
+// install/uninstall are Windows-only (the binary would otherwise run the
+// kardianos Linux unit/init renderers, which no supported deployment
+// exercises - Linux installs use the static systemd unit - and whose
+// shell-containment surface supply-chain scanners flag), while the
+// run/start/stop helpers stay cross-platform.
+func TestSvcActionSupported(t *testing.T) {
+	for _, tc := range []struct {
+		action string
+		want   bool
+	}{
+		{"run", true},
+		{"start", true},
+		{"stop", true},
+		{"", true}, // unknown actions fail later in the switch, not here
+		{"install", runtime.GOOS == "windows"},
+		{"uninstall", runtime.GOOS == "windows"},
+	} {
+		if got := svcActionSupported(tc.action); got != tc.want {
+			t.Errorf("svcActionSupported(%q) = %v, want %v (os=%s)", tc.action, got, tc.want, runtime.GOOS)
+		}
+	}
+}
