@@ -1159,3 +1159,141 @@ func TestProbeTarget_BoundedReadErrorsRedial(t *testing.T) {
 		t.Fatal("probe loop did not stop after cancel")
 	}
 }
+
+// delayedEchoConn is a scripted conn for the exit-accounting pin: the
+// first probe Write starts a timer; the reader's first Read blocks until
+// released, then delivers that exact frame back (a genuine echo). Every
+// later Read returns net.ErrClosed, mirroring a closed socket. No real
+// UDP involved - the loop is driven through runEchoLoop directly.
+type delayedEchoConn struct {
+	mu        sync.Mutex
+	frame     []byte
+	echoReady chan struct{} // closed when the released echo becomes readable
+	delivered atomic.Bool   // set when the echo left this conn's Read
+	dead      chan struct{}
+	deadOnce  sync.Once
+}
+
+func newDelayedEchoConn(hold time.Duration) *delayedEchoConn {
+	c := &delayedEchoConn{echoReady: make(chan struct{}), dead: make(chan struct{})}
+	// `hold` starts when the probe is written: cancel always leads.
+	_ = hold
+	return c
+}
+
+func (c *delayedEchoConn) releaseEcho() {
+	c.mu.Lock()
+	f := c.frame
+	c.mu.Unlock()
+	if f != nil {
+		close(c.echoReady)
+	}
+}
+
+func (c *delayedEchoConn) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	if c.frame == nil {
+		cp := make([]byte, len(p))
+		copy(cp, p)
+		c.frame = cp
+	}
+	c.mu.Unlock()
+	return len(p), nil
+}
+
+func (c *delayedEchoConn) Close() error                       { c.deadOnce.Do(func() { close(c.dead) }); return nil }
+func (c *delayedEchoConn) LocalAddr() net.Addr                { return nil }
+func (c *delayedEchoConn) RemoteAddr() net.Addr               { return nil }
+func (c *delayedEchoConn) SetDeadline(t time.Time) error      { return nil }
+func (c *delayedEchoConn) SetWriteDeadline(t time.Time) error { return nil }
+func (c *delayedEchoConn) SetReadDeadline(t time.Time) error  { return nil }
+
+func (c *delayedEchoConn) Read(p []byte) (int, error) {
+	select {
+	case <-c.echoReady:
+	case <-c.dead:
+		return 0, net.ErrClosed
+	}
+	if c.delivered.Swap(true) {
+		// One echo only; afterwards mirror the closed socket so the
+		// reader exits via its ErrClosed path.
+		return 0, net.ErrClosed
+	}
+	c.mu.Lock()
+	frame := c.frame
+	c.mu.Unlock()
+	n := copy(p, frame)
+	return n, nil
+}
+
+// TestEchoLoop_ExitDrainsLateEchoAsRTT pins the exit-accounting fix
+// (release-lane MED-2): an echo the reader has already READ when the
+// probe loop is cancelled must still be accounted as RTT at exit, not
+// swept as a timeout. The reader parks holding the frame across the
+// loop's cancellation; the fixed exit path (close socket, bounded join
+// on readerDone, priority push bypassing the cancelled-ctx branch) then
+// drains it as a delivered sample. Without the diagnostic dump the two
+// relevant metrics go: rtt_count == 1, timed_out == 0, inflight == 0.
+func TestEchoLoop_ExitDrainsLateEchoAsRTT(t *testing.T) {
+	InitMetrics()
+	src := "test"
+	name, addr := "drain-late-echo", "127.0.0.1"
+
+	cfg := Config{
+		Source:       src,
+		BaseInterval: 5 * time.Second,
+		BaseTimeout:  5 * time.Second,
+	}
+	stats := NewAdaptiveStats(cfg.BaseTimeout)
+	m := newTargetMetrics(src, Target{Name: name, Address: addr})
+	m.status = nil
+	state := &probeLoopState{}
+	logger := slog.Default()
+
+	conn := newDelayedEchoConn(0)
+	// pi-lens-ignore: go-context-background-handler
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runEchoLoop(ctx, conn, cfg, stats, m, state, logger) }()
+
+	// Wait until exactly one probe is in flight (Write#1 done), then move
+	// the conn into the AUDIT WINDOW: echo readable, then observed as read
+	// by the reader (conn.delivered), while the loop is still alive. Only
+	// after that cancel: the reader holds an already-read echo at loop
+	// exit, and the fix must land it in respCh (priority push) before the
+	// joined drain charges anything.
+	deadline := time.Now().Add(2 * time.Second)
+	for wbGauge(ProbesInflight, src, name, addr) < 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("no probe in flight within 2s")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	conn.releaseEcho()
+	deadline = time.Now().Add(2 * time.Second)
+	for !conn.delivered.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("echo was not consumed by the reader in time")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("runEchoLoop did not exit within 3s")
+	}
+
+	// The late echo must be drained as a DELIVERED sample.
+	if got := wbHistCount(src, name, addr); got != 1 {
+		t.Fatalf("rtt sample count = %v, want 1 (late echo must be counted as RTT at exit)", got)
+	}
+	if got := wbCounter(ProbesTimedOut, src, name, addr); got != 0 {
+		t.Errorf("timed_out = %v, want 0 (an already-read echo must not be charged as loss)", got)
+	}
+	if got := wbGauge(ProbesInflight, src, name, addr); got != 0 {
+		t.Errorf("inflight = %v, want 0 (balance must drain to zero at exit)", got)
+	}
+	_ = conn.delivered.Load()
+}

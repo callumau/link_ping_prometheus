@@ -1184,12 +1184,25 @@ func runEchoLoop(
 				resp.corrupted = !bytes.Equal(payloadScratch, buf[plOff:plOff+cfg.Payload])
 			}
 
+			// Push with PRIORITY over cancellation: this select must not
+			// gamble on the random case pick when both the channel and
+			// ctx.Done are ready - an echo already parsed (read from the
+			// wire) and then dropped here would be swept as a timeout at
+			// loop exit (fabricated loss on a probe the link answered).
+			// respCh is sized to the pending-window cap, so a non-blocking
+			// send has room on every realistic path; the blocking fallback
+			// exists only for the pathological full-channel case, where the
+			// done/ctx branches still bound the reader (MED-2 audit fix).
 			select {
 			case respCh <- resp:
-			case <-ctx.Done():
-				return
-			case <-done:
-				return
+			default:
+				select {
+				case respCh <- resp:
+				case <-ctx.Done():
+					return
+				case <-done:
+					return
+				}
 			}
 		}
 	}()
