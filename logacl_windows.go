@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"reflect"
 	"time"
 	"unsafe"
 
@@ -77,19 +76,40 @@ func logDACLTable(sd *windows.SECURITY_DESCRIPTOR) (protected bool, aces []logAC
 // INHERITED_ACE canonicalization added by the security layer on
 // read-back, are not part of the restricted set). The protection bit is
 // checked by the caller, which runs both tables through logDACLTable.
+// sameLogDACL reports whether the two DACL ACE tables are semantically
+// equal: the same multiset of allow ACEs by trustee (raw SID string) and
+// access mask. ACE inheritance flags are deliberately NOT compared: the
+// target path is a FILE (no child objects to inherit into), and Windows
+// strips the object-inheritance bits from file ACEs (observed on
+// windows-latest: every template ACE applied with OI|CI reads back flags
+// 0x0), so a flags-aware comparison is a fixed point that never
+// converges - and the 5-minute recheck would re-apply and Warn forever.
+// The stripped form ("applies to the object only") is the semantically
+// correct state for the restricted set's purpose. (logACE.flags is kept
+// in the struct because the test helper still surfaces it for
+// diagnostics.)
 func sameLogDACL(want, cur []logACE) bool {
 	if len(want) != len(cur) {
 		return false
 	}
-	const inheritBits = windows.OBJECT_INHERIT_ACE | windows.CONTAINER_INHERIT_ACE
-	norm := func(aces []logACE) []logACE {
-		out := make([]logACE, len(aces))
-		for i, a := range aces {
-			out[i] = logACE{sid: a.sid, mask: a.mask, flags: a.flags & inheritBits}
-		}
-		return out
+	counts := make(map[logACEKey]int, len(want))
+	for _, a := range want {
+		counts[logACEKey{sid: a.sid, mask: a.mask}]++
 	}
-	return reflect.DeepEqual(norm(want), norm(cur))
+	for _, a := range cur {
+		k := logACEKey{sid: a.sid, mask: a.mask}
+		counts[k]--
+		if counts[k] < 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// logACEKey is the ACE identity the restricted set is defined by.
+type logACEKey struct {
+	sid  string
+	mask windows.ACCESS_MASK
 }
 
 // reapplyLogDACL re-restricts the CURRENT live log file's DACL.
