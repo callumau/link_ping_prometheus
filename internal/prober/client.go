@@ -1012,12 +1012,15 @@ func runEchoLoop(
 		seq uint64
 		ts  uint64
 		// recv is the receive time as UnixNano: int64 keeps the buffered
-		// entry at 32B instead of 48B, and respCh is sized to
-		// maxPendingWindow (1000) under -adaptive - at a 1000-target
-		// fleet the 16B/entry saving is ~16MB of steady-state heap, a
-		// third of the default GOMEMLIMIT. Callers convert back with
-		// time.Unix(0, ...).
+		// entry compact, and respCh is sized to maxPendingWindow (1000)
+		// under -adaptive - at a 1000-target fleet every byte/entry is
+		// ~8KB of steady-state heap. Callers convert back with
+		// time.Unix(0, ...). recvQPC is the same instant on the
+		// high-resolution Windows counter (0 when unavailable); the wall
+		// clock alone is interrupt-time quantized there, which computed
+		// sub-quantum RTTs as exactly 0.
 		recv      int64
+		recvQPC   uint64
 		corrupted bool
 	}
 
@@ -1172,7 +1175,9 @@ func runEchoLoop(
 					continue
 				}
 			}
-			resp := response{seq: seq, ts: ts, recv: time.Now().UnixNano()}
+			recvNS := time.Now().UnixNano()
+			recvQPC, _ := qpcNow()
+			resp := response{seq: seq, ts: ts, recv: recvNS, recvQPC: recvQPC}
 			if cfg.Payload > 0 {
 				// Validate the echoed payload byte-for-byte against the
 				// pattern regenerated from the frame's own seq/ts.
@@ -1226,12 +1231,20 @@ func runEchoLoop(
 	if cfg.EchoSecret != "" {
 		mac = newProbeMACer(cfg.EchoSecret)
 	}
-	pending := make(map[uint64]int64)
 	pendingHighWater := 0
 	// started bounds the socket lifetime: once ReconnectInterval has
 	// elapsed and no probes are in flight, the loop returns errReconnect
 	// so the caller re-dials and re-resolves DNS.
 	started := time.Now()
+
+	// sentStamp carries the send-time markers for one in-flight probe:
+	// sentNS for the wire-timestamp echo check and coarse /status ages,
+	// qpc for the RTT delta when the high-resolution clock is available.
+	type sentStamp struct {
+		sentNS int64
+		qpc    uint64
+	}
+	pending := make(map[uint64]sentStamp)
 
 	// drainResponses consumes every response the reader has already buffered
 	// and matches them against pending. It is the single definition of the
@@ -1243,11 +1256,11 @@ func runEchoLoop(
 		for {
 			select {
 			case resp := <-respCh:
-				sentTimeNS, ok := pending[resp.seq]
+				st, ok := pending[resp.seq]
 				if !ok {
 					continue
 				}
-				if resp.ts != uint64(sentTimeNS) {
+				if resp.ts != uint64(st.sentNS) {
 					// Echoed payload does not match what we sent:
 					// corruption, replay, or spoofing. Leave the probe
 					// pending so it is counted as a loss on timeout.
@@ -1274,7 +1287,17 @@ func runEchoLoop(
 					continue
 				}
 
-				rttSec := float64(resp.recv-sentTimeNS) / 1e9
+				// RTT basis: prefer the high-resolution counter pair (send/recv q
+				// pc stamps) and fall back to the wall clock. Go's time.Now() on
+				// Windows is interrupt-time quantized (sub-quantum RTTs compute 0),
+				// which pinned SRTT to 0 and RTO to its floor for loopback/LAN-class
+				// links there; the counter pair restores ~100ns fidelity.
+				var rttSec float64
+				if st.qpc != 0 && resp.recvQPC != 0 {
+					rttSec = qpcSeconds(resp.recvQPC - st.qpc)
+				} else {
+					rttSec = float64(resp.recv-st.sentNS) / 1e9
+				}
 
 				// With a fixed (non-adaptive) timeout, a true RTT above the
 				// timeout makes every probe read as loss — indistinguishable
@@ -1369,7 +1392,7 @@ func runEchoLoop(
 			if n := len(pending); n > 0 {
 				m.timedOut.Add(float64(n))
 				m.inflight.Sub(float64(n))
-				pending = make(map[uint64]int64)
+				pending = make(map[uint64]sentStamp)
 			}
 		}
 		// Probes still in flight die with the loop on cancellation. Whether
@@ -1410,7 +1433,7 @@ func runEchoLoop(
 		if n := len(pending); n > 0 {
 			m.timedOut.Add(float64(n))
 			m.inflight.Sub(float64(n))
-			pending = make(map[uint64]int64)
+			pending = make(map[uint64]sentStamp)
 		}
 	}
 
@@ -1507,8 +1530,8 @@ func runEchoLoop(
 		nowNS := time.Now().UnixNano()
 		var timeoutOccurred bool
 		if len(pending) > 0 {
-			for s, sentNS := range pending {
-				if nowNS-sentNS > timeout.Nanoseconds() {
+			for s, st := range pending {
+				if nowNS-st.sentNS > timeout.Nanoseconds() {
 					m.timedOut.Inc()
 					m.inflight.Dec()
 					delete(pending, s)
@@ -1526,7 +1549,7 @@ func runEchoLoop(
 		if len(pending) > pendingHighWater {
 			pendingHighWater = len(pending)
 		} else if len(pending) == 0 && pendingHighWater > 512 {
-			pending = make(map[uint64]int64)
+			pending = make(map[uint64]sentStamp)
 			pendingHighWater = 0
 		}
 
@@ -1597,6 +1620,7 @@ func runEchoLoop(
 		// sweep: that timestamp predates the response drain, so using it as
 		// sentTime would inflate every RTT by the tick's drain/sweep cost.
 		sendNS := time.Now().UnixNano()
+		sendQPC, _ := qpcNow()
 		seq := state.seq + 1
 		copy(buf[0:8], MagicBytes)
 		binary.LittleEndian.PutUint64(buf[8:16], seq)
@@ -1661,7 +1685,7 @@ func runEchoLoop(
 		warnedThrottle = false
 		state.seq = seq
 
-		pending[state.seq] = sendNS
+		pending[state.seq] = sentStamp{sentNS: sendNS, qpc: sendQPC}
 		m.inflight.Inc()
 		m.sent.Inc()
 	}
