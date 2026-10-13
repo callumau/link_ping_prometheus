@@ -92,7 +92,11 @@ func TestEchoLoop_PendingWindowThrottleSkipsSends(t *testing.T) {
 	// Phase 1: let the window fill. The inflight gauge is len(pending)
 	// exactly, so it must never exceed maxPendingWindow once throttling
 	// engages.
-	deadline := time.Now().Add(15 * time.Second)
+	// 60s (was 15s): under -race on a 2-core CI runner the 1ms tick loop
+	// slows to ~2-4ms/iteration and filling the 1000-probe window took
+	// longer than the previous cap (observed at 809/1000); the assertion
+	// is unchanged.
+	deadline := time.Now().Add(60 * time.Second)
 	var maxInflight float64
 	for time.Now().Before(deadline) {
 		if infl := wbGauge(ProbesInflight, src, name, addr); infl > maxInflight {
