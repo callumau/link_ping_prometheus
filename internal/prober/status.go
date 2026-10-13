@@ -32,6 +32,13 @@ type TargetStatus struct {
 	// seconds since the last matched echo, -1 when none has arrived.
 	PathMTUBytes       int     `json:"path_mtu_bytes"`
 	LastEchoAgeSeconds float64 `json:"last_echo_age_seconds"`
+	// Straggler is set while this target's probe loop was replaced but
+	// failed to join within stragglerStopTimeout and is still winding
+	// down (or, for a permanently wedged loop, for as long as it lasts):
+	// the target is NOT being probed right now, so a /status consumer
+	// must not read the last emitted values as live. Without a visible
+	// flag, a wedged straggler looks exactly like a healthy idle target.
+	Straggler bool `json:"straggler"`
 }
 
 // StatusRegistry collects per-target live state from the probe loops.
@@ -57,6 +64,21 @@ func (r *StatusRegistry) Update(s TargetStatus) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.targets[s.Name] = s
+}
+
+// MarkStraggler flips the Straggler flag on an existing snapshot.
+// Nil-receiver safe, like Update/Remove. The flag is cleared when the
+// straggler is released and its replacement loop emits its own snapshot.
+func (r *StatusRegistry) MarkStraggler(name string, straggler bool) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if s, ok := r.targets[name]; ok {
+		s.Straggler = straggler
+		r.targets[name] = s
+	}
 }
 
 // Remove drops a target's snapshot so a target deleted from the targets
