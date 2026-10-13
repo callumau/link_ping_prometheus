@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"syscall"
 	"time"
 	"unsafe"
 
@@ -124,15 +123,14 @@ func platformInstallService(argv []string) error {
 	if _, err := m.OpenService(spec.Name); err == nil {
 		return fmt.Errorf("service %q already exists; run -svc=uninstall or an in-place upgrade first", spec.Name)
 	}
-	// The SCM command line is built with syscall.EscapeArg per argument
-	// (the AGENTS-pinned quoting rule; values with spaces must arrive
-	// quoted or the service arguments never parse and -svc=run is
-	// never seen).
-	binaryPath := exe
-	for _, a := range argv {
-		binaryPath += " " + syscall.EscapeArg(a)
-	}
-	s, err := m.CreateService(spec.Name, binaryPath, mgr.Config{
+	// mgr.CreateService appends the variadic args with syscall.EscapeArg
+	// per argument (the AGENTS-pinned quoting rule) around the quoted
+	// exepath - passing a pre-formed "exe + args" string here would get
+	// Whole-string-quoted by mgr's own EscapeArg(exepath) and SCM Start
+	// then fails with ERROR_FILE_NOT_FOUND ("the file cannot be found":
+	// the closing quote swallows the args). The runner diagnostics
+	// (sc qc: BINARY_PATH_NAME quoted end-to-end) exposed exactly that.
+	s, err := m.CreateService(spec.Name, exe, mgr.Config{
 		DisplayName:      spec.DisplayName,
 		Description:      spec.Description,
 		StartType:        mgr.StartAutomatic,
