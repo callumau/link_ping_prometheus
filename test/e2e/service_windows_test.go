@@ -3,6 +3,7 @@
 package e2e
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -83,17 +84,31 @@ func TestE2EWindowsServiceLifecycle(t *testing.T) {
 	}
 
 	// start (through our own -svc=start path) and wait RUNNING. On failure
-	// dump the persisted SCM config (config query) so the failing edge is
-	// diagnosable from the runner log alone.
+	// run a three-way diagnostic so the runner log alone isolates the
+	// failing edge: (1) direct sc.exe start (removes our mgr layer),
+	// (2) the persisted recovery actions + binary existence, (3) a short
+	// CONSOLE -svc=run smoke check (the foreground path the SCM would
+	// otherwise go through).
 	if out, err = exec.Command(binPath, "-svc=start").CombinedOutput(); err != nil {
 		qc, _ := exec.Command("sc.exe", "qc", svcName).CombinedOutput()
-		sd, _ := exec.Command("sc.exe", "sdshow", svcName).CombinedOutput()
+		sdt, _ := exec.Command("sc.exe", "sdshow", svcName).CombinedOutput()
+		fa, _ := exec.Command("sc.exe", "failure", svcName).CombinedOutput()
 		exists := "no"
 		if _, stat := os.Stat(binPath); stat == nil {
 			exists = "yes"
 		}
-		t.Fatalf("-svc=start failed: %v\n-- bin exists: %s (%s)\n-- sc qc:\n%.800s\n-- sc sdshow:\n%.400s\n-- start output:\n%.400s",
-			err, exists, binPath, qc, sd, out)
+		dsc, derr := exec.Command("sc.exe", "start", svcName).CombinedOutput()
+		consoleCtx, consoleCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer consoleCancel()
+		consoleCmd := exec.CommandContext(consoleCtx, binPath, "-mode=server", "-allow=127.0.0.1",
+			"-log-file="+logFile)
+		cout, cerr := consoleCmd.CombinedOutput()
+		ccode := "running(until timeout)"
+		if cerr != nil {
+			ccode = fmt.Sprintf("exited: %v out: %.300s", cerr, cout)
+		}
+		t.Fatalf("-svc=start failed: %v\n-- bin exists: %s (%s)\n-- sc qc:\n%.800s\n-- sc failure:\n%.500s\n-- direct sc start: err=%v out=%.600s\n-- console -svc=run smoke: %s\n-- sdshow:\n%.400s\n-- -svc=start output:\n%.400s",
+			err, exists, binPath, qc, fa, derr, dsc, ccode, sdt, out)
 	}
 	deadline := time.Now().Add(20 * time.Second)
 	state := svc.Stopped
