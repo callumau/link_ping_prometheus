@@ -80,9 +80,18 @@ echo Parameters remain unchanged; swapping binary only.
 
 sc.exe stop "%SERVICE_NAME%" >nul 2>&1
 echo Waiting for service to stop...
+set "WAIT_STOP_COUNT=0"
 :wait_stop
 timeout /t 2 /nobreak >nul
-sc.exe query "%SERVICE_NAME%" | findstr /i "STOPPED" >nul || goto :wait_stop
+sc.exe query "%SERVICE_NAME%" 2>nul | findstr /i "STOPPED" >nul && goto :wait_done
+set /a WAIT_STOP_COUNT+=1
+if %WAIT_STOP_COUNT% GEQ 60 (
+    echo ERROR: service did not reach STOPPED within 120s - STOP_PENDING is stuck.
+    echo Run: taskkill /f /im link_ping_prometheus.exe   then rerun this script.
+    exit /b 1
+)
+goto :wait_stop
+:wait_done
 
 copy /y "%EXE_PATH%" "%INSTALLED_EXE%" >nul || (
     echo ERROR: failed to replace "%INSTALLED_EXE%" - service is STOPPED. Restore manually:
@@ -91,8 +100,14 @@ copy /y "%EXE_PATH%" "%INSTALLED_EXE%" >nul || (
 )
 
 echo === Starting updated service ===
-sc.exe start "%SERVICE_NAME%"
-sc.exe query "%SERVICE_NAME%" | findstr /i "STATE"
+sc.exe start "%SERVICE_NAME%" || (
+    echo ERROR: service failed to start after the upgrade - check the event log ^(Event 7000/7038; exit 1069 = service logon failed: a password-bearing account needs password=p via sc config^).
+    exit /b 1
+)
+timeout /t 3 /nobreak >nul
+set "WAIT_RUN_RESUME=finish_upgrade_start"
+goto :wait_running
+:finish_upgrade_start
 echo.
 echo Done. Verify version via metrics: link_ping_build_info{version=...}
 exit /b 0
@@ -234,6 +249,11 @@ if errorlevel 1 (
     echo   ERROR: the account name cannot contain a double-quote or ampersand.
     goto :wiz_account
 )
+REM Password-bearing accounts are NOT supported by this wizard: sc config obj=
+REM is set without password=, so such a service fails logon (1069) at start -
+REM the start below now reports that failure non-zero.
+REM Passwordless identities (LocalSystem/LocalService/NetworkService/gMSA)
+REM only.
 
 echo.
 echo === Summary ================================================================
@@ -308,10 +328,22 @@ if errorlevel 1 (
 sc.exe failure "%SERVICE_NAME%" reset= 86400 actions= restart/5000/restart/30000/restart/60000 >nul || echo WARNING: could not set failure actions ^(SCM recovery from install remains active^).
 
 :: Per-service SID lets us ACL resources to NT SERVICE\%SERVICE_NAME% itself
-:: instead of broad groups - least privilege for file access.
-sc.exe sidtype "%SERVICE_NAME%" unrestricted >nul || echo WARNING: could not set service SID type.
+:: instead of broad groups - least privilege for file access. Both steps are
+:: FATAL, not warnings: the log dir grants write ONLY to SYSTEM (LocalSystem
+:: runs), Administrators, and this per-service SID - under LocalService/
+:: NetworkService/gMSA the SID is the account's ONLY write path, and a failed
+:: grant here means the agent's fail-closed log open exits 1 on every start
+:: while the SCM restart ladder loops forever with the install already
+:: reported successful.
+sc.exe sidtype "%SERVICE_NAME%" unrestricted >nul || (
+    echo ERROR: could not set the service SID type - the per-service NT SERVICE SID is this account's only log-dir write path under a non-LocalSystem account.
+    exit /b 1
+)
 
-icacls "%LOG_DIR%" /grant "NT SERVICE\%SERVICE_NAME%:(OI)(CI)M" >nul || echo WARNING: could not grant log-dir write access to the service SID.
+icacls "%LOG_DIR%" /grant "NT SERVICE\%SERVICE_NAME%:(OI)(CI)M" >nul || (
+    echo ERROR: could not grant log-dir write access to the service SID - the agent will fail-closed on its log open and the SCM restart ladder will loop.
+    exit /b 1
+)
 
 :: Optional dedicated account (LocalSystem is the default otherwise).
 if not "%SERVICE_ACCOUNT%"=="" (
@@ -433,10 +465,14 @@ if not "%MUser%"=="" if not "%MPass%"=="" echo WARNING: metrics basic-auth crede
 :: Start and verify -------------------------------------------------------------
 echo.
 echo === Starting service ===
-sc.exe start "%SERVICE_NAME%"
+sc.exe start "%SERVICE_NAME%" || (
+    echo ERROR: service failed to start - check the event log ^(Event 7000/7038; exit 1069 = service logon failed: a password-bearing account needs password=p via sc config^).
+    exit /b 1
+)
 timeout /t 3 /nobreak >nul
-sc.exe query "%SERVICE_NAME%" | findstr /i "STATE"
-
+set "WAIT_RUN_RESUME=finish_fresh_start"
+goto :wait_running
+:finish_fresh_start
 echo.
 echo Done. Event Log source "%SERVICE_NAME%" (Application) carries lifecycle/fatal events.
 echo Logs: "%LOG_DIR%\service.log"
@@ -456,6 +492,28 @@ exit /b 0
 ::   The check itself runs in PowerShell against the process environment so
 ::   the raw value is NEVER expanded into a cmd command line - expanding a
 ::   value to search it would itself be the injection this guard exists for.
+:wait_running
+:: Bounded RUNNING-state poll (SCM start can sit in START_PENDING well past
+:: 3s on a cold host - a single 3s check would false-fail): up to 30x2s, and
+:: an early STOPPED read reports the start failure immediately. Returns to
+:: the caller's resume label (WAIT_RUN_RESUME) on success; exits /b 1 on
+:: any failure so the operator sees the failed deploy instead of "Done.".
+echo Waiting for service to reach RUNNING state...
+set "WAIT_RUN_COUNT=0"
+:wait_run
+timeout /t 2 /nobreak >nul
+sc.exe query "%SERVICE_NAME%" 2>nul | findstr /i "RUNNING" >nul && goto :wait_run_done
+sc.exe query "%SERVICE_NAME%" 2>nul | findstr /i "STOPPED" >nul && goto :wait_run_fail
+set /a WAIT_RUN_COUNT+=1
+if %WAIT_RUN_COUNT% GEQ 30 goto :wait_run_fail
+goto :wait_run
+:wait_run_fail
+echo ERROR: service did not reach RUNNING within 60s - check the event log and run: sc.exe query %SERVICE_NAME%
+exit /b 1
+:wait_run_done
+sc.exe query "%SERVICE_NAME%" | findstr /i "STATE"
+goto %WAIT_RUN_RESUME%
+
 :RejectQuoteAmp
 REM The regex is written as \x22/\x26 escape sequences: a raw " or & inside
 REM the cmd-quoted -Command region would toggle cmd quoting and turn the &
