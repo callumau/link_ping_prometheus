@@ -712,6 +712,33 @@ func responseBufferCapacity(cfg Config) int {
 	return bufSize
 }
 
+// sleepCtx sleeps d, returning false when ctx is cancelled first. Shared
+// by the three probeTarget retry pauses (dial failure, reader death,
+// panic restart), which were three copies of the same bounded timer
+// select.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	// pi-lens-ignore: waitgroup-done-scope
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+// stopDrain resets a timer and drains a possibly-queued tick so Reset
+// starts clean (Go's Reset contract), shared by three sites.
+func stopDrain(t *time.Timer) {
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+}
+
 // maxConsecutiveWriteFails bounds how many successive local send errors
 // are treated as transient before the target is marked down (link_up=0)
 // at Error level — a frozen link_up while nothing is being probed is the
@@ -863,21 +890,11 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 			// cannot even open a socket (DNS outage, firewall). Carry the MTU
 			// and last-echo age too so /status agrees with the gauges instead
 			// of rendering 0/-1 unknowns while the agent keeps retrying.
-			lastEchoAge := -1.0
-			if !state.lastEcho.IsZero() {
-				lastEchoAge = time.Since(state.lastEcho).Seconds()
-			}
-			m.status.Update(TargetStatus{
-				Name:               t.Name,
-				Address:            t.Address,
-				ConsecutiveMisses:  state.consecutiveMisses,
-				RTOSeconds:         stats.CurrentRTO().Seconds(),
-				JitterSeconds:      state.jitter,
-				SRTTSeconds:        stats.SRTT().Seconds(),
-				LastSeq:            state.seq,
-				PathMTUBytes:       int(state.pathMTU.Load()),
-				LastEchoAgeSeconds: lastEchoAge,
-			})
+			// Zero socketStart so the snapshot renders age 0 (not-ready)
+			// for the whole retry pause, then reuse the single snapshot
+			// shape shared with the reader-dead and panic paths.
+			state.socketStart = time.Time{}
+			emitTargetStatus(m, state, stats, stats.CurrentRTO(), 0, 0)
 			// A DNS outage retries every second; log the first failure
 			// immediately, then at most once per minute so an Error-level
 			// message does not flood the log for the duration of the outage.
@@ -887,15 +904,8 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 				logger.Error("Failed to open UDP socket; retrying", "err", err)
 				lastDialLog = time.Now()
 			}
-			t := time.NewTimer(time.Second)
-			select {
-			// pi-lens-ignore: waitgroup-done-scope
-			case <-ctx.Done():
-				if !t.Stop() {
-					<-t.C
-				}
+			if !sleepCtx(ctx, time.Second) {
 				return
-			case <-t.C:
 			}
 			continue
 		}
@@ -937,15 +947,8 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 				logger.Error("UDP reader stopped; re-dialing socket")
 				lastDialLog = time.Now()
 			}
-			t := time.NewTimer(time.Second)
-			select {
-			// pi-lens-ignore: waitgroup-done-scope
-			case <-ctx.Done():
-				if !t.Stop() {
-					<-t.C
-				}
+			if !sleepCtx(ctx, time.Second) {
 				return
-			case <-t.C:
 			}
 			continue
 		}
@@ -1006,9 +1009,15 @@ func runEchoLoop(
 ) (retErr error) {
 
 	type response struct {
-		seq       uint64
-		ts        uint64
-		recv      time.Time
+		seq uint64
+		ts  uint64
+		// recv is the receive time as UnixNano: int64 keeps the buffered
+		// entry at 32B instead of 48B, and respCh is sized to
+		// maxPendingWindow (1000) under -adaptive - at a 1000-target
+		// fleet the 16B/entry saving is ~16MB of steady-state heap, a
+		// third of the default GOMEMLIMIT. Callers convert back with
+		// time.Unix(0, ...).
+		recv      int64
 		corrupted bool
 	}
 
@@ -1057,12 +1066,25 @@ func runEchoLoop(
 		// Read into a buffer larger than the payload so an oversized
 		// datagram is not silently truncated to PayloadSize by the kernel
 		// and mistaken for a valid probe (Read truncates to the buffer).
+		// Frame shape: constant for this socket's lifetime (depends only
+		// on configuration fixed at loop start).
+		expectedSize := PayloadSize
+		if cfg.EchoSecret != "" {
+			expectedSize = PayloadSizeWithHMAC
+		}
+		expectedSize += cfg.Payload
 		buf := make([]byte, MaxDatagramSize)
 		// Scratch for regenerating the expected payload pattern; reused
 		// across packets (single reader goroutine).
 		var payloadScratch []byte
 		if cfg.Payload > 0 {
 			payloadScratch = make([]byte, cfg.Payload)
+		}
+		// One reusable HMAC state for the reader goroutine (the send loop
+		// has its own; crypto/hmac state is not safe for concurrent use).
+		var rMac *probeMACer
+		if cfg.EchoSecret != "" {
+			rMac = newProbeMACer(cfg.EchoSecret)
 		}
 		deadlineFails := 0
 		// readFails bounds consecutive non-timeout Read errors: they can be
@@ -1120,11 +1142,6 @@ func runEchoLoop(
 				continue
 			}
 			readFails = 0
-			expectedSize := PayloadSize
-			if cfg.EchoSecret != "" {
-				expectedSize = PayloadSizeWithHMAC
-			}
-			expectedSize += cfg.Payload
 			if n != expectedSize {
 				continue
 			}
@@ -1148,14 +1165,14 @@ func runEchoLoop(
 				// TestHMACCoverageZeroPayloadEquivalence), so the header
 				// check is the same check.
 				if cfg.HmacCoverage == HMACFullFrameCoverage && cfg.Payload > 0 {
-					if !validHMACFullFrame(cfg.EchoSecret, buf[:n]) {
+					if !rMac.verifyFullFrame(buf[:n]) {
 						continue
 					}
-				} else if !validHMAC(cfg.EchoSecret, seq, ts, buf[24:32]) {
+				} else if !rMac.verifyHeader(seq, ts, buf[24:32]) {
 					continue
 				}
 			}
-			resp := response{seq: seq, ts: ts, recv: time.Now()}
+			resp := response{seq: seq, ts: ts, recv: time.Now().UnixNano()}
 			if cfg.Payload > 0 {
 				// Validate the echoed payload byte-for-byte against the
 				// pattern regenerated from the frame's own seq/ts.
@@ -1190,7 +1207,13 @@ func runEchoLoop(
 		payloadSize = PayloadSizeWithHMAC
 	}
 	buf := make([]byte, payloadSize+cfg.Payload)
-	pending := make(map[uint64]time.Time)
+	// One reusable HMAC state for the send loop; the reader goroutine has
+	// its own (crypto/hmac state is not safe for concurrent use).
+	var mac *probeMACer
+	if cfg.EchoSecret != "" {
+		mac = newProbeMACer(cfg.EchoSecret)
+	}
+	pending := make(map[uint64]int64)
 	pendingHighWater := 0
 	// started bounds the socket lifetime: once ReconnectInterval has
 	// elapsed and no probes are in flight, the loop returns errReconnect
@@ -1207,11 +1230,11 @@ func runEchoLoop(
 		for {
 			select {
 			case resp := <-respCh:
-				sentTime, ok := pending[resp.seq]
+				sentTimeNS, ok := pending[resp.seq]
 				if !ok {
 					continue
 				}
-				if resp.ts != uint64(sentTime.UnixNano()) {
+				if resp.ts != uint64(sentTimeNS) {
 					// Echoed payload does not match what we sent:
 					// corruption, replay, or spoofing. Leave the probe
 					// pending so it is counted as a loss on timeout.
@@ -1234,11 +1257,11 @@ func runEchoLoop(
 						m.linkUp.Set(1)
 						state.linkUp = true
 					}
-					state.lastEcho = resp.recv
+					state.lastEcho = time.Unix(0, resp.recv)
 					continue
 				}
 
-				rttSec := resp.recv.Sub(sentTime).Seconds()
+				rttSec := float64(resp.recv-sentTimeNS) / 1e9
 
 				// With a fixed (non-adaptive) timeout, a true RTT above the
 				// timeout makes every probe read as loss — indistinguishable
@@ -1287,7 +1310,7 @@ func runEchoLoop(
 					m.linkUp.Set(1)
 					state.linkUp = true
 				}
-				state.lastEcho = resp.recv
+				state.lastEcho = time.Unix(0, resp.recv)
 			default:
 				return
 			}
@@ -1333,7 +1356,7 @@ func runEchoLoop(
 			if n := len(pending); n > 0 {
 				m.timedOut.Add(float64(n))
 				m.inflight.Sub(float64(n))
-				pending = make(map[uint64]time.Time)
+				pending = make(map[uint64]int64)
 			}
 		}
 		// Probes still in flight die with the loop on cancellation. Whether
@@ -1374,7 +1397,7 @@ func runEchoLoop(
 		if n := len(pending); n > 0 {
 			m.timedOut.Add(float64(n))
 			m.inflight.Sub(float64(n))
-			pending = make(map[uint64]time.Time)
+			pending = make(map[uint64]int64)
 		}
 	}
 
@@ -1406,12 +1429,7 @@ func runEchoLoop(
 
 		// Stop may race a firing timer; when Stop returns false the
 		// channel is drained so Reset starts clean.
-		if !intervalTimer.Stop() {
-			select {
-			case <-intervalTimer.C:
-			default:
-			}
-		}
+		stopDrain(intervalTimer)
 		delay := time.Until(next)
 		if delay < 0 {
 			// Fell behind (the loop's work exceeded the interval): skip the
@@ -1473,11 +1491,11 @@ func runEchoLoop(
 
 		drainResponses()
 
-		now := time.Now()
+		nowNS := time.Now().UnixNano()
 		var timeoutOccurred bool
 		if len(pending) > 0 {
-			for s, sentTime := range pending {
-				if now.Sub(sentTime) > timeout {
+			for s, sentNS := range pending {
+				if nowNS-sentNS > timeout.Nanoseconds() {
 					m.timedOut.Inc()
 					m.inflight.Dec()
 					delete(pending, s)
@@ -1495,7 +1513,7 @@ func runEchoLoop(
 		if len(pending) > pendingHighWater {
 			pendingHighWater = len(pending)
 		} else if len(pending) == 0 && pendingHighWater > 512 {
-			pending = make(map[uint64]time.Time)
+			pending = make(map[uint64]int64)
 			pendingHighWater = 0
 		}
 
@@ -1565,11 +1583,11 @@ func runEchoLoop(
 		// Capture the send time here, NOT the `now` used for the timeout
 		// sweep: that timestamp predates the response drain, so using it as
 		// sentTime would inflate every RTT by the tick's drain/sweep cost.
-		sendTime := time.Now()
+		sendNS := time.Now().UnixNano()
 		seq := state.seq + 1
 		copy(buf[0:8], MagicBytes)
 		binary.LittleEndian.PutUint64(buf[8:16], seq)
-		ts := uint64(sendTime.UnixNano())
+		ts := uint64(sendNS)
 		binary.LittleEndian.PutUint64(buf[16:24], ts)
 		if cfg.EchoSecret != "" && cfg.HmacCoverage == HMACFullFrameCoverage && cfg.Payload > 0 {
 			// Full-frame coverage: the tag covers header+payload, so the
@@ -1578,11 +1596,11 @@ func runEchoLoop(
 			// before; only the tag's INPUT changes, not the frame layout or
 			// the payload derivation.
 			fillPayload(buf[payloadSize:payloadSize+cfg.Payload], seq, ts)
-			h := computeHMACFullFrame(cfg.EchoSecret, buf)
+			h := mac.digestFrame(buf)
 			copy(buf[24:32], h[:])
 		} else {
 			if cfg.EchoSecret != "" {
-				h := computeHMAC(cfg.EchoSecret, seq, ts)
+				h := mac.digestHeader(seq, ts)
 				copy(buf[24:32], h[:])
 			}
 			if cfg.Payload > 0 {
@@ -1630,7 +1648,7 @@ func runEchoLoop(
 		warnedThrottle = false
 		state.seq = seq
 
-		pending[state.seq] = sendTime
+		pending[state.seq] = sendNS
 		m.inflight.Inc()
 		m.sent.Inc()
 	}
