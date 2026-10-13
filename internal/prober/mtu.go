@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"log/slog"
 	"net"
+	"os"
 	"time"
 )
 
@@ -130,13 +131,36 @@ func mtuDeadline(cfg Config, state *probeLoopState) time.Duration {
 // Forged or stale frames are skipped the same way, and the deadline is
 // absolute, so skipping cannot extend the wait (and a stream of foreign
 // datagrams cannot spin the loop past it).
-func readEcho(conn net.Conn, buf []byte, size int, seqs []uint64, sent map[uint64]uint64, secret string, coverage HmacCoverage, deadline time.Time) error {
-	if err := conn.SetReadDeadline(deadline); err != nil {
-		return err
-	}
+func readEcho(ctx context.Context, conn net.Conn, buf []byte, size int, seqs []uint64, sent map[uint64]uint64, secret string, coverage HmacCoverage, deadline time.Time) error {
 	for {
+		// The absolute probe deadline is SLICED into bounded re-arms: a
+		// mid-wait cancellation (reload stop, process shutdown) unblocks
+		// the sweep within one arm instead of stranding it for a whole
+		// applied RTO — the adaptive 2*SRTT floor is unbounded above, so
+		// the un-sliced wait could outlive the sweep's target loop by
+		// seconds (duplicate sweep traffic, stale link_path_mtu_bytes
+		// overwrite on kept-series restarts). The arm is clamped to the
+		// absolute deadline and never extends it, so the original
+		// contract — foreign datagrams cannot spin the loop past the
+		// deadline — is preserved; the ctx check between arms is bounded
+		// by the same constant as the main reader's cancellation check.
+		arm := deadline
+		if d := time.Until(deadline); d > mtuReadArm {
+			arm = time.Now().Add(mtuReadArm)
+		}
+		if err := conn.SetReadDeadline(arm); err != nil {
+			return err
+		}
 		n, err := conn.Read(buf)
 		if err != nil {
+			if os.IsTimeout(err) && !time.Now().After(deadline) {
+				// Bounded arm expired before the real deadline: re-arm.
+				// This is also the between-arms cancellation checkpoint.
+				if cerr := ctx.Err(); cerr != nil {
+					return cerr
+				}
+				continue
+			}
 			return err
 		}
 		if n != size || string(buf[0:8]) != MagicBytes {
@@ -188,6 +212,12 @@ func readEcho(conn net.Conn, buf []byte, size int, seqs []uint64, sent map[uint6
 		return nil
 	}
 }
+
+// mtuReadArm bounds a single MTU-sweep read arm: the sweep's absolute
+// probe deadline is re-armed in slices of this length so a cancellation
+// is honored within one arm instead of after a full applied RTO. Same
+// value the main UDP reader uses as its periodic ctx checkpoint.
+const mtuReadArm = 500 * time.Millisecond
 
 // sweepOnce binary-searches [0, MaxPayloadBytes] for the largest payload
 // that echoes back on the DF socket. A failed size is retried once
@@ -256,7 +286,7 @@ func sweepOnce(ctx context.Context, conn net.Conn, cfg Config, m targetMetrics, 
 	// sent for this payload keeps the retry semantics: an echo of the first
 	// attempt arriving during the retry still proves survival.
 	waitEcho := func(payload int, seqs ...uint64) bool {
-		if err := readEcho(conn, buf, headerSize+payload, seqs, sent, cfg.EchoSecret, cfg.HmacCoverage, time.Now().Add(deadline)); err != nil {
+		if err := readEcho(ctx, conn, buf, headerSize+payload, seqs, sent, cfg.EchoSecret, cfg.HmacCoverage, time.Now().Add(deadline)); err != nil {
 			m.mtuLost.Inc()
 			return false
 		}

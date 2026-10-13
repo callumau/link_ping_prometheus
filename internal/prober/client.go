@@ -11,6 +11,7 @@ import (
 	"math"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -283,7 +284,15 @@ func RunClient(ctx context.Context, cfg Config) error {
 	// target's absence can change while the old loop is still winding down:
 	// a removal that races the exit must not be missed (that left a ghost
 	// /status row and a frozen link_up series for the process lifetime).
+	// stragglerReLogInterval re-asserts the stranded-target state at Warn
+	// level: a permanently wedged loop (write with no deadline) leaves
+	// its target silently unprobed for the process lifetime — one Error
+	// line at mark time is invisible to log-frequency alerting, and
+	// nothing else re-states the condition. A var so tests can shorten it.
+	var stragglerReLogInterval = time.Minute
+
 	markStraggler := func(name string, r running) {
+		cfg.Status.MarkStraggler(name, true)
 		stragglersMu.Lock()
 		stragglers[name] = r
 		stragglersMu.Unlock()
@@ -320,6 +329,10 @@ func RunClient(ctx context.Context, cfg Config) error {
 			delete(stragglers, name)
 		}
 		stragglersMu.Unlock()
+		// Clear the flag even for a name whose snapshot was already
+		// removed (purge path deletes the whole entry): keeping the
+		// /status row honest for the keep-case replacement matters.
+		cfg.Status.MarkStraggler(name, false)
 		if !ok {
 			return
 		}
@@ -469,11 +482,62 @@ func RunClient(ctx context.Context, cfg Config) error {
 		apply(targets)
 	}
 
-	if cfg.ReloadSignal == nil && (cfg.ReloadInterval <= 0 || cfg.TargetsPath == "") {
-		// No reload path: original behavior — wait for every probe loop.
+	// drainLive waits for every live probe loop to exit, then gives any
+	// straggler one final bounded wait (stragglerStopTimeout). The
+	// per-loop cancels make every loop exit promptly; the bound exists
+	// for the pathological case (a wedged conn.Write with no deadline)
+	// where waiting forever would push the service Stop past the SCM
+	// deadline with no way out. Each probe loop joins its own MTU sweep
+	// before returning, so a sweep cannot outlive this drain by more
+	// than one sliced read arm (mtuReadArm).
+	drainLive := func() {
 		for _, r := range live {
 			<-r.done
 		}
+		stragglersMu.Lock()
+		dones := make([]chan struct{}, 0, len(stragglers))
+		for _, r := range stragglers {
+			dones = append(dones, r.done)
+		}
+		stragglersMu.Unlock()
+		if len(dones) == 0 {
+			return
+		}
+		t := time.NewTimer(stragglerStopTimeout)
+		defer t.Stop()
+		for _, d := range dones {
+			select {
+			case <-d:
+			case <-t.C:
+				return
+			}
+		}
+	}
+
+	// stragglerWarn re-states the stranded-target set at Warn level so a
+	// permanently wedged loop is visible to log alerting for the whole
+	// time the target stays unprobed (not just at mark time).
+	stragglerWarn := func() {
+		stragglersMu.Lock()
+		names := make([]string, 0, len(stragglers))
+		for name := range stragglers {
+			names = append(names, name)
+		}
+		stragglersMu.Unlock()
+		if len(names) == 0 {
+			return
+		}
+		slog.Warn("Probe targets stranded: loop did not exit in time; target is not being probed",
+			"targets", strings.Join(names, ","), "count", len(names))
+	}
+
+	stragglerReLog := time.NewTicker(stragglerReLogInterval)
+	defer stragglerReLog.Stop()
+
+	if cfg.ReloadSignal == nil && (cfg.ReloadInterval <= 0 || cfg.TargetsPath == "") {
+		// No reload path: original behavior — wait for every probe loop;
+		// stragglers get one bounded extra wait (drainLive).
+		drainLive()
 		return nil
 	}
 
@@ -486,14 +550,14 @@ func RunClient(ctx context.Context, cfg Config) error {
 	for {
 		select {
 		case <-ctx.Done():
-			for _, r := range live {
-				<-r.done
-			}
+			drainLive()
 			return nil
 		case <-cfg.ReloadSignal:
 			reload()
 		case <-reloadTick:
 			reload()
+		case <-stragglerReLog.C:
+			stragglerWarn()
 		case name := <-freed:
 			// A timed-out loop finally exited. Resolve it against the CURRENT
 			// desired set, then re-apply so a still-wanted target gets its
@@ -624,6 +688,28 @@ func deleteTargetSeries(source string, t Target) {
 	PathMTUBytes.DeletePartialMatch(labels)
 }
 
+// responseBufferCapacity computes respCh's buffer size for one probe
+// loop. A var-free function so tests can pin the sizing rule: the static
+// pair is clamped 100..maxPendingWindow, and -adaptive pins the channel
+// to maxPendingWindow because the applied RTO (floor max(200ms, 2*SRTT))
+// can legitimately hold the full window in flight.
+func responseBufferCapacity(cfg Config) int {
+	if cfg.Adaptive {
+		return maxPendingWindow
+	}
+	bufSize := 100
+	if cfg.BaseInterval > 0 {
+		n := int(cfg.BaseTimeout/cfg.BaseInterval) + 20
+		if n > bufSize {
+			bufSize = n
+		}
+		if bufSize > maxPendingWindow {
+			bufSize = maxPendingWindow
+		}
+	}
+	return bufSize
+}
+
 // maxConsecutiveWriteFails bounds how many successive local send errors
 // are treated as transient before the target is marked down (link_up=0)
 // at Error level — a frozen link_up while nothing is being probed is the
@@ -729,8 +815,26 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 	cfg = effectiveCfg
 	if cfg.MTUSweep > 0 {
 		// Own socket and counter namespace: MTU probing stays outside the
-		// main loss balance entirely.
-		go runMTUSweep(ctx, t, cfg, m, state, logger)
+		// main loss balance entirely. The sweep goroutine is TRACKED: the
+		// deferred join below keeps probeTarget from returning before the
+		// sweep has wound down, so stop()'s bounded join and the
+		// straggler/shutdown joins cover it too. With the sliced read
+		// arms in readEcho (mtuReadArm) the sweep exits within one arm
+		// (~500ms) of cancellation, so the join cannot stall a reload.
+		// Previously the sweep was fire-and-forget and could outlive its
+		// loop by a full applied RTO — duplicated DF probes and a stale
+		// link_path_mtu_bytes overwrite on a kept-series restart.
+		sweepDone := make(chan struct{})
+		go func() {
+			defer close(sweepDone)
+			runMTUSweep(ctx, t, cfg, m, state, logger)
+		}()
+		defer func() {
+			// Only reached while the loop is exiting for restart/shutdown;
+			// the sweep holds its own ctx copy and its reads are sliced,
+			// so this wait is bounded by mtuReadArm plus socket close.
+			<-sweepDone
+		}()
 	}
 	// Throttle dial-failure logging: first failure logs immediately, then
 	// at most once per minute (a DNS outage retries every second).
@@ -908,18 +1012,18 @@ func runEchoLoop(
 
 	// respCh buffers in-flight responses between the reader and the drain.
 	// Size scales with expected max inflight (timeout/interval) so aggressive
-	// intervals (e.g. 10ms/3s => 300) do not stall the reader. Clamped 100..1000.
-	bufSize := 100
-	if cfg.BaseInterval > 0 {
-		n := int(cfg.BaseTimeout/cfg.BaseInterval) + 20
-		if n > bufSize {
-			bufSize = n
-		}
-		if bufSize > 1000 {
-			bufSize = 1000
-		}
-	}
-	respCh := make(chan response, bufSize)
+	// intervals (e.g. 10ms/3s => 300) do not stall the reader. With
+	// -adaptive the applied timeout is the RFC 6298 RTO whose max(200ms,
+	// 2*SRTT) floor is unbounded above, so the STATIC pair under-counts:
+	// a healthy long-haul link can legitimately hold maxPendingWindow
+	// probes in flight, and a channel sized from the static pair then
+	// back-pressures the reader — parked in the send select, the kernel
+	// drops further echoes, which get swept as timed_out on a link that
+	// answered everything (fabricated loss on a healthy link). Under
+	// adaptive the channel is therefore sized to the same cap the send
+	// site enforces (maxPendingWindow); under a static pair the validated
+	// window always fits by construction.
+	respCh := make(chan response, responseBufferCapacity(cfg))
 
 	// done unblocks the reader when the loop exits via panic recovery:
 	// conn.Close() frees a reader blocked on the socket, but a reader
@@ -937,6 +1041,17 @@ func runEchoLoop(
 
 	go func() {
 		defer close(readerDone)
+		// Same panic contract as the echo loop below: a reader panic is
+		// per-event corruption, not a link condition. close(readerDone)
+		// still fires (deferred above), so the main loop re-dials via the
+		// errReaderDead path instead of probing into a void, and the
+		// failure is counted and logged at Error rather than vanishing.
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error("Panic in UDP reader; stopping reader", "panic", r)
+				m.internalPanic.Inc()
+			}
+		}()
 		// Read into a buffer larger than the payload so an oversized
 		// datagram is not silently truncated to PayloadSize by the kernel
 		// and mistaken for a valid probe (Read truncates to the buffer).

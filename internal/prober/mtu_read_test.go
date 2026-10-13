@@ -1,6 +1,7 @@
 package prober
 
 import (
+	"context"
 	"encoding/binary"
 	"net"
 	"os"
@@ -128,7 +129,7 @@ func TestReadEcho_SkipsForeignAndOtherSizedDatagrams(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			conn := &scriptedReadConn{frames: tc.frames}
 			buf := make([]byte, MaxDatagramSize)
-			err := readEcho(conn, buf, wantSize, []uint64{wantSeq}, sent, secret, HMACHeaderCoverage, deadline)
+			err := readEcho(context.Background(), conn, buf, wantSize, []uint64{wantSeq}, sent, secret, HMACHeaderCoverage, deadline)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatal("expected the probe to be lost, readEcho accepted a datagram that was not ours")
@@ -144,7 +145,7 @@ func TestReadEcho_SkipsForeignAndOtherSizedDatagrams(t *testing.T) {
 	// Any sequence sent for this size is accepted, so an echo of attempt 1
 	// arriving during attempt 2 still proves survival (the retry contract).
 	conn := &scriptedReadConn{frames: [][]byte{dfFrameFull(41, wantTS, wantSize, nil)}}
-	if err := readEcho(conn, make([]byte, MaxDatagramSize), wantSize, []uint64{41, 42}, sent, secret, HMACHeaderCoverage, deadline); err != nil {
+	if err := readEcho(context.Background(), conn, make([]byte, MaxDatagramSize), wantSize, []uint64{41, 42}, sent, secret, HMACHeaderCoverage, deadline); err != nil {
 		t.Errorf("an echo of either attempt's sequence must be accepted, got %v", err)
 	}
 }
@@ -210,7 +211,7 @@ func TestReadEcho_VerifiesHMACTag(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			conn := &scriptedReadConn{frames: tc.frames}
 			buf := make([]byte, MaxDatagramSize)
-			err := readEcho(conn, buf, wantSize, []uint64{wantSeq}, sent, secret, HMACHeaderCoverage, deadline)
+			err := readEcho(context.Background(), conn, buf, wantSize, []uint64{wantSeq}, sent, secret, HMACHeaderCoverage, deadline)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatal("expected the probe to be lost, readEcho accepted a frame that was not ours")
@@ -229,7 +230,7 @@ func TestReadEcho_VerifiesHMACTag(t *testing.T) {
 	both := map[uint64]uint64{41: s1TS, 42: s2TS}
 	tag1 := computeHMAC(secret, 41, s1TS)
 	conn2 := &scriptedReadConn{frames: [][]byte{dfFrameFull(41, s1TS, wantSize, tag1[:])}}
-	if err := readEcho(conn2, make([]byte, MaxDatagramSize), wantSize, []uint64{41, 42}, both, secret, HMACHeaderCoverage, deadline); err != nil {
+	if err := readEcho(context.Background(), conn2, make([]byte, MaxDatagramSize), wantSize, []uint64{41, 42}, both, secret, HMACHeaderCoverage, deadline); err != nil {
 		t.Errorf("an echo of either attempt's (seq, ts) pair must be accepted, got %v", err)
 	}
 }
@@ -287,7 +288,7 @@ func TestReadEcho_VerifiesHMACFullFrameTag(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			conn := &scriptedReadConn{frames: tc.frames}
 			buf := make([]byte, MaxDatagramSize)
-			err := readEcho(conn, buf, wantSize, []uint64{wantSeq}, sent, secret, HMACFullFrameCoverage, deadline)
+			err := readEcho(context.Background(), conn, buf, wantSize, []uint64{wantSeq}, sent, secret, HMACFullFrameCoverage, deadline)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatal("expected the probe to be lost, readEcho accepted a tampered frame")
