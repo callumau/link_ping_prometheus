@@ -7,15 +7,90 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"reflect"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
 
 // logDACLRecheckInterval is how often the live log file's DACL is
 // re-compared against the restricted set. Idempotent, so a compliant
-// file costs one GetSecurityInfo read per tick.
-const logDACLRecheckInterval = 5 * time.Minute
+// file costs one GetSecurityInfo read per tick. A var so tests can run
+// the ticker at a short interval (the stragglerStopTimeout/DynClientTTL
+// precedent).
+var logDACLRecheckInterval = 5 * time.Minute
+
+// logACE summarizes one allow ACE of the log DACL for comparison.
+type logACE struct {
+	// sid is the trustee in RAW SID-string form (SID.String()): the
+	// ConvertSecurityDescriptorToStringSecurityDescriptor renderer
+	// name-resolves well-known accounts into SDDL aliases (observed on
+	// the native Windows CI runner: the machine's RID-500 local
+	// Administrator account renders as "LA"), so the rendered string is
+	// environment-dependent and must never be used for equality — the
+	// raw conversion is not.
+	sid string
+	// mask and flags are the ACE's access mask and inheritance flags as
+	// stored (the renderer also collapses/canonicalizes those).
+	mask  windows.ACCESS_MASK
+	flags byte
+}
+
+// logDACLTable extracts the DACL's protected bit and every allow ACE.
+// Deny entries or exotic ACE types are a mismatch by construction: the
+// caller compares the table against the restricted template's table.
+func logDACLTable(sd *windows.SECURITY_DESCRIPTOR) (protected bool, aces []logACE, err error) {
+	control, _, err := sd.Control()
+	if err != nil {
+		return false, nil, fmt.Errorf("log DACL: read control bits: %w", err)
+	}
+	protected = control&windows.SE_DACL_PROTECTED != 0
+	dacl, _, err := sd.DACL()
+	if err != nil {
+		return false, nil, fmt.Errorf("log DACL: read ACL: %w", err)
+	}
+	if dacl == nil {
+		return false, nil, fmt.Errorf("log DACL: no DACL present")
+	}
+	base := unsafe.Pointer(dacl)
+	off := unsafe.Sizeof(windows.ACL{}) // 8-byte ACL header precedes the ACE list
+	for i := 0; i < int(dacl.AceCount); i++ {
+		head := (*windows.ACE_HEADER)(unsafe.Add(base, off))
+		switch head.AceType {
+		case windows.ACCESS_ALLOWED_ACE_TYPE:
+			ace := (*windows.ACCESS_ALLOWED_ACE)(unsafe.Add(base, off))
+			// SidStart marks where the trustee SID begins in the ACE.
+			sid := (*windows.SID)(unsafe.Add(base, off+unsafe.Offsetof(ace.SidStart)))
+			aces = append(aces, logACE{sid: sid.String(), mask: ace.Mask, flags: head.AceFlags})
+		default:
+			return false, nil, fmt.Errorf("log DACL: unexpected ACE type %d", head.AceType)
+		}
+		off += uintptr(head.AceSize)
+	}
+	return protected, aces, nil
+}
+
+// sameLogDACL reports whether the two DACL ACE tables are semantically
+// equal — the same multiset of allow ACEs, with ACE flags compared only
+// on the inheritance bits the template controls (other flag bits, e.g.
+// INHERITED_ACE canonicalization added by the security layer on
+// read-back, are not part of the restricted set). The protection bit is
+// checked by the caller, which runs both tables through logDACLTable.
+func sameLogDACL(want, cur []logACE) bool {
+	if len(want) != len(cur) {
+		return false
+	}
+	const inheritBits = windows.OBJECT_INHERIT_ACE | windows.CONTAINER_INHERIT_ACE
+	norm := func(aces []logACE) []logACE {
+		out := make([]logACE, len(aces))
+		for i, a := range aces {
+			out[i] = logACE{sid: a.sid, mask: a.mask, flags: a.flags & inheritBits}
+		}
+		return out
+	}
+	return reflect.DeepEqual(norm(want), norm(cur))
+}
 
 // reapplyLogDACL re-restricts the CURRENT live log file's DACL.
 // restrictLogDACL runs once at startup against the file that exists
@@ -118,7 +193,21 @@ func restrictLogDACL(f *os.File) (changed bool, err error) {
 	if err != nil {
 		return false, fmt.Errorf("log DACL: read current descriptor: %w", err)
 	}
-	if cur != nil && cur.String() == want.String() {
+	// Compare SEMANTICALLY (protection bit + per-ACE trustees/masks/flags,
+	// trustees rendered as raw SIDs), never by rendered SDDL string: the
+	// SDDL renderer name-resolves well-known accounts (the runner's
+	// RID-500 local Administrator comes back "LA") and canonicalizes ACE
+	// flags, so a string comparison never converges on such hosts — and
+	// the periodic recheck would re-apply and Warn every 5 minutes
+	// forever. Both tables derive from the same walker, so the
+	// comparison is a fixed-point for a compliant file.
+	wantProtected, wantAces, err := logDACLTable(want)
+	if err != nil {
+		return false, fmt.Errorf("log DACL: summarize restricted set: %w", err)
+	}
+	if cur == nil {
+		// No descriptor at all: fall through to replace.
+	} else if curProtected, curAces, cerr := logDACLTable(cur); cerr == nil && wantProtected && curProtected && sameLogDACL(wantAces, curAces) {
 		return false, nil
 	}
 	dacl, _, err := want.DACL()
