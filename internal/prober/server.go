@@ -236,6 +236,17 @@ func (r *rateLimiter) chargeIP(ip netip.Addr) string {
 	return ""
 }
 
+// skewReplayed reports whether an authenticated frame's timestamp skew
+// exceeds the ±maxReplayWindow replay window. Extracted from the read
+// loop so the boundary comparison is unit-pinnable: over a real socket
+// the exact ±30s edge is untestable (processing delay drifts the observed
+// skew in both directions between capture and compare), so the open/fair
+// and >=/< semantics of the edge can only be pinned here. Deliberately
+// strict > and < — a frame exactly at the window edge is a live probe.
+func skewReplayed(skew time.Duration) bool {
+	return skew > maxReplayWindow || skew < -maxReplayWindow
+}
+
 // FNV-1a 64-bit constants for the echo-loop guard's frame identity hash.
 const (
 	fnvOffset64 = 14695981039346656037
@@ -352,9 +363,18 @@ func RunServer(ctx context.Context, addr string, source string, allowed *Allowli
 	}
 	slog.Info("Echo server listening (UDP)", "addr", addr)
 
+	// ctxWatcher closes the socket on cancellation and exits as soon as
+	// ServePacketConn returns, so RunServer leaves no goroutine behind on
+	// any return path (a read loop killed by an external pc.Close, a
+	// panic recovery, or a live ctx) — the socket close is idempotent.
+	serveDone := make(chan struct{})
+	defer close(serveDone)
 	go func() {
-		<-ctx.Done()
-		pc.Close()
+		select {
+		case <-ctx.Done():
+			pc.Close()
+		case <-serveDone:
+		}
 	}()
 
 	if err := ServePacketConn(ctx, pc, source, allowed, echoSecret, echoSecretOld...); err != nil {
@@ -450,7 +470,7 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 		// pre-resolved exact-IP handles, which are never evicted.
 		lastSeen time.Time
 	}
-	handles := make(map[netip.Addr]clientHandles, allowed.Len())
+	handles := make(map[netip.Addr]clientHandles, len(allowed.exact))
 	for ip := range allowed.exact {
 		key := ip.String()
 		handles[ip] = clientHandles{
@@ -499,6 +519,7 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 			// above: spoofed sources inside an allowed CIDR could otherwise
 			// pin every slot and black out all other CIDR-matched clients
 			// (client_overflow) for as long as the flood lasts.
+			lastSweep = now
 			sweepExpired(now)
 		}
 		if len(dyn) >= MaxClientSeries {
@@ -692,7 +713,7 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 			// the window is a capture-replay, not a live probe. Clocks
 			// between nodes must be approximately synchronized (NTP).
 			skew = time.Since(time.Unix(0, int64(ts)))
-			if skew > maxReplayWindow || skew < -maxReplayWindow {
+			if skewReplayed(skew) {
 				drops.replay.Inc()
 				// Throttled like the write-error warning: a captured frame
 				// replayed at the per-IP cap — or a client with a large clock
@@ -726,6 +747,21 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 			drops.dup.Inc()
 			continue
 		}
+		// Record the identity IMMEDIATELY on acceptance, before the echo
+		// write (previously only after a successful write): the ring records
+		// per frame, so under a spoofed flood of near-identical identities
+		// the check→write→record window was wide enough for an attacker to
+		// slide a legitimate client's identity out of the 8192-slot ring
+		// faster than its echo could be re-checked — in secret-less mode
+		// this guard is the ONLY reflection-loop defense, so the window
+		// must not exist. The record call itself sits AFTER handle resolution,
+		// right before the echo write: recording a frame that resolve()
+		// rejects as client_overflow would ring-poison the source's own
+		// identity and dup-drop its legitimate retry once TTL frees a slot
+		// (seen in TestServer_DynamicClientEviction). A flood of
+		// near-identical identities from another source cannot land between
+		// this check and the record — the read loop is single-threaded, so
+		// only one frame is processed at a time.
 		// Resolve the per-client metric handles last: exact allowlist IPs hit
 		// the pre-resolved map with no lock, while prefix matches go through
 		// the capped dynamic map (H1 cardinality guard), and a frame dropped
@@ -747,6 +783,14 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 		}
 
 		h.recv.Inc()
+		// Record the identity immediately BEFORE the echo write, not after
+		// a successful write: the check→record window must not include the
+		// write syscall, and — in secret-less mode, where this guard is the
+		// ONLY reflection-loop defense — a registered-but-unechoed identity
+		// (the local write failed) merely loses that one echoed frame, which
+		// the client already counts as ordinary loss; there is no loop to
+		// break because the frame did not reflect.
+		guard.record(key)
 		if nw, err := pc.WriteTo(buf[:n], raddr); err != nil {
 			if ctx.Err() == nil {
 				// A failed echo is our fault, not the network's: count it so the
@@ -759,10 +803,6 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 					lastWriteLog = time.Now()
 				}
 			}
-		} else {
-			// Record the identity only when the echo actually left: a failed
-			// write never reflected the frame, so there is nothing to loop.
-			guard.record(key)
 		}
 	}
 }
