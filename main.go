@@ -35,7 +35,6 @@ import (
 
 	"link_ping_prometheus/internal/prober"
 
-	"github.com/kardianos/service"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"gopkg.in/natefinch/lumberjack.v2"
@@ -547,24 +546,42 @@ func resolveMetricsAuth() (string, string, error) {
 // The description deliberately omits the version string: it is frozen at
 // install time and goes stale on in-place upgrades — runtime truth lives
 // in the link_ping_build_info metric instead.
-func serviceConfig() *service.Config {
-	return &service.Config{
+// serviceInstallSpec is the OS-neutral shape of the service hardening
+// (portable so TestServiceConfigHardening pins it directly): nothing else
+// declares SCM behavior anywhere in the binary.
+type serviceInstallSpec struct {
+	Name                string
+	DisplayName         string
+	Description         string
+	Dependencies        []string
+	DelayedAutoStart    bool
+	RecoveryDelay       time.Duration
+	RecoveryResetPeriod uint32
+}
+
+func serviceSpec() serviceInstallSpec {
+	return serviceInstallSpec{
 		Name:        "link_ping_prometheus",
 		DisplayName: "Link Ping Prometheus",
 		Description: "UDP echo link monitor: Prometheus latency, packet loss, and jitter metrics",
-		Arguments:   []string{},
 		Dependencies: []string{
 			"Tcpip",
 			"W32Time",
 		},
-		Option: service.KeyValue{
-			"StartType":              "automatic",
-			"DelayedAutoStart":       true,
-			"OnFailure":              "restart",
-			"OnFailureDelayDuration": "5s",
-			"OnFailureResetPeriod":   86400,
-		},
+		DelayedAutoStart:    true,
+		RecoveryDelay:       5 * time.Second,
+		RecoveryResetPeriod: 86400,
 	}
+}
+
+// foregroundRun drives the plain signal-handling foreground run shared by
+// `main()` and the non-SCM -svc=run paths (Windows console debugging and
+// systemd/launchd on unix, which manage the process themselves).
+func foregroundRun(prg *program) error {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	prg.ctx, prg.cancel = ctx, cancel
+	return prg.run()
 }
 
 // absolutizeFlagValue returns the value to persist for a flag at service
@@ -593,27 +610,28 @@ func absolutizeFlagValue(name, value string) string {
 	return abs
 }
 
-// handleService manages the Windows service lifecycle via the
-// kardianos/service package. It reconstructs CLI arguments at install
-// time, excluding -svc itself and sensitive flags (-metrics-user,
-// -metrics-pass).
+// handleService manages the service lifecycle. Install/uninstall are
+// Windows-only (gated by svcActionSupported: Linux deploys use the static
+// systemd unit via the Ansible play, and the Linux renderers flagged by
+// supply-chain scanners are thereby unreachable). start/stop are
+// cross-platform conveniences around native service control. The service
+// run mode follows the windows_exporter pattern: x/sys/windows/svc under
+// the SCM, plain signal-driven foreground everywhere else.
 func handleService(action string, logSink *countedWriter) {
 	if !svcActionSupported(action) {
 		slog.Error("unsupported -svc action on this OS: install/uninstall are Windows-only (Linux deploys use the systemd unit in installer/linux)", "action", action, "os", runtime.GOOS)
 		os.Exit(1)
 	}
-	svcConfig := serviceConfig()
 
-	if action == "install" {
-		exePath, err := os.Executable()
-		if err != nil {
-			slog.Error("Failed to get executable path", "err", err)
-			os.Exit(1)
-		}
+	prg := &program{logSink: logSink}
+
+	switch action {
+	case "install":
+		// Build the SCM command line from the live flags at install
+		// time, excluding -svc itself and the credential flags (-metrics-
+		// user/-metrics-pass/-echo-secret/-echo-secret-old so credentials
+		// are never persisted; they are delivered via env vars).
 		var args []string
-		// The two auth flags and echo secret are stripped here (with -svc) so credentials
-		// are never persisted into the service configuration; they must be
-		// configured via env LINK_PING_METRICS_USER/PASS and LINK_PING_ECHO_SECRET.
 		flag.Visit(func(f *flag.Flag) {
 			if f.Name != "svc" && f.Name != "metrics-user" && f.Name != "metrics-pass" && f.Name != "echo-secret" && f.Name != "echo-secret-old" {
 				v := absolutizeFlagValue(f.Name, f.Value.String())
@@ -621,19 +639,20 @@ func handleService(action string, logSink *countedWriter) {
 			}
 		})
 		args = append(args, "-svc=run")
-		svcConfig.Arguments = args
-		svcConfig.Executable = exePath
-
+		if err := platformInstallService(args); err != nil {
+			slog.Error("Service install failed", "err", err)
+			os.Exit(1)
+		}
 		if *flMetricsBasicAuthUser != "" || *flMetricsBasicAuthPass != "" {
 			fmt.Println("WARNING: -metrics-user/-metrics-pass are NOT persisted into the service configuration.")
-			fmt.Println("Configure LINK_PING_METRICS_USER/LINK_PING_METRICS_PASS in the service environment instead.")
+			fmt.Println("Configure LINK_PING_METRICS_USER/LINK_PING_METRICUS/LINK_PING_METRICSPASS in the service environment instead.")
 		}
 		if *flEchoSecret != "" {
 			fmt.Println("WARNING: -echo-secret is NOT persisted into the service configuration.")
 			fmt.Println("Configure LINK_PING_ECHO_SECRET in the service environment instead.")
 		}
 		if *flEchoSecretOld != "" {
-			fmt.Println("WARNING: -echo-secret-old is NOT persisted into the service configuration.")
+			fmt.Println("WARNING: -echo-secret-old is NOT persisted into the service config.")
 			fmt.Println("Configure LINK_PING_ECHO_SECRET_OLD in the service environment instead.")
 		}
 		if *flLogFile == "" {
@@ -642,48 +661,31 @@ func handleService(action string, logSink *countedWriter) {
 			fmt.Println("WARNING: -log-file is not set; under the service stdout is discarded so NO logs will be captured anywhere.")
 			fmt.Println("Pass -log-file=<path> at install time (lifecycle events still reach the Windows event log).")
 		}
-	}
-
-	// Zero-value program: ctx is only ever set by Start(), which
-	// install/uninstall/start/stop never invoke. logSink carries the
-	// counted -log-file wrapper built in main() so the run goroutine can
-	// surface sink failures to the event log.
-	prg := &program{logSink: logSink}
-
-	s, err := service.New(prg, svcConfig)
-	if err != nil {
-		slog.Error("Failed to init service", "err", err)
-		os.Exit(1)
-	}
-
-	switch action {
-	case "install":
-		if err := s.Install(); err != nil {
-			slog.Error("Install failed", "err", err)
-			os.Exit(1)
-		}
 		fmt.Println("Service installed.")
 	case "uninstall":
-		if err := s.Uninstall(); err != nil {
-			slog.Error("Uninstall failed", "err", err)
+		if err := platformUninstallService(); err != nil {
+			slog.Error("Service uninstall failed", "err", err)
 			os.Exit(1)
 		}
 		fmt.Println("Service uninstalled.")
 	case "start":
-		if err := s.Start(); err != nil {
-			slog.Error("Start failed", "err", err)
+		if err := platformStartService(); err != nil {
+			slog.Error("Service start failed", "err", err)
 			os.Exit(1)
 		}
 		fmt.Println("Service started.")
 	case "stop":
-		if err := s.Stop(); err != nil {
-			slog.Error("Stop failed", "err", err)
+		if err := platformStopService(); err != nil {
+			slog.Error("Service stop failed", "err", err)
 			os.Exit(1)
 		}
 		fmt.Println("Service stopped.")
 	case "run":
-		if err := s.Run(); err != nil {
-			slog.Error("Run failed", "err", err)
+		// The exit contract matters more than the return value: a run
+		// error must leave the process unclean (non-zero) so the SCM
+		// restart ladder fires - never a clean "handled" exit.
+		if err := platformRunService(prg); err != nil {
+			slog.Error("Service run error", "err", err)
 			os.Exit(1)
 		}
 	default:
@@ -699,10 +701,11 @@ type program struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
-	// svc is the service handle Start() received (nil in foreground runs);
-	// the sink watcher uses its SystemLogger so log-sink failures reach
-	// the event log even when the log file itself is dead.
-	svc service.Service
+	// svc is the lifecycle-event logger Start() received (nil");
+	// anonymous foreground runs); the sink watcher writes log-sink
+	// failures there so they reach the Windows event log even when the
+	// log file itself is dead.
+	svc eventlogSink
 	// logSink wraps the -log-file writer (nil without -log-file) so
 	// runtime write failures become visible; see logsink.go.
 	logSink *countedWriter
@@ -717,16 +720,13 @@ type program struct {
 // The WaitGroup Add happens here — before the goroutine starts — so
 // Stop can never race it (the framework calls Stop only after Start
 // has returned).
-func (p *program) Start(s service.Service) error {
-	p.svc = s
+func (p *program) Start(sysLog eventlogSink) error {
+	p.svc = sysLog
 	// Lifecycle events go to the system logger (Windows event log under
-	// the SCM, syslog elsewhere): the only channel a fleet operator sees
-	// without access to -log-file. Best-effort — file logging stays the
-	// primary sink.
-	if s != nil {
-		if sysLog, err := s.SystemLogger(nil); err == nil {
-			sysLog.Infof("link_ping_prometheus service starting (version %s)", version)
-		}
+	// the SCM): the only channel a fleet operator sees without access to
+	// -log-file. Best-effort — file logging stays the primary sink.
+	if sysLog != nil {
+		sysLog.Info(fmt.Sprintf("link_ping_prometheus service starting (version %s)", version))
 	}
 	// pi-lens-ignore: go-context-background-handler
 	p.ctx, p.cancel = context.WithCancel(context.Background())
@@ -735,10 +735,8 @@ func (p *program) Start(s service.Service) error {
 		defer p.wg.Done()
 		if err := p.run(); err != nil {
 			slog.Error("Service run error", "err", err)
-			if s != nil {
-				if sysLog, lerr := s.SystemLogger(nil); lerr == nil {
-					sysLog.Errorf("service run failed: %v", err)
-				}
+			if sysLog := p.svc; sysLog != nil {
+				sysLog.Error(fmt.Sprintf("service run failed: %v", err))
 			}
 			// Die UNCLEANLY: exiting non-zero classifies this as a failure
 			// to the SCM so the OnFailure restart action fires. Calling
@@ -753,6 +751,10 @@ func (p *program) Start(s service.Service) error {
 // svcStopDeadline bounds program.Stop's drain wait. A var so the
 // timeout-arm test does not need a real 20s stall.
 var svcStopDeadline = 20 * time.Second
+
+// serviceName is the service identity across platforms (SCM name, the
+// event-log source, and the unit/labelctl label the unix adapters call).
+const serviceName = "link_ping_prometheus"
 
 // svcActionSupported reports whether the -svc lifecycle action is
 // supported on the current OS. install/uninstall are Windows-only: the
@@ -777,7 +779,7 @@ func svcActionSupported(action string) bool {
 // cancels the context and waits for the run goroutine (plus a bounded
 // straggler drain), returning nil even when the drain deadline is
 // exceeded so the SCM classifies an operator stop as clean.
-func (p *program) Stop(s service.Service) error {
+func (p *program) Stop(_ eventlogSink) error {
 	if p.cancel != nil {
 		p.cancel()
 	}

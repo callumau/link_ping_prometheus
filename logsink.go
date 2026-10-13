@@ -7,9 +7,15 @@ import (
 	"os"
 	"sync"
 	"time"
-
-	"github.com/kardianos/service"
 )
+
+// eventlogSink is the OS lifecycle-event logger the program and the
+// sink watcher write to: the Windows event log under the service
+// (svc/eventlog), nil elsewhere, where the fallthrough is stderr.
+type eventlogSink interface {
+	Info(msg string)
+	Error(msg string)
+}
 
 // countedWriter wraps the log sink and records whether any write has
 // failed since the last check. Runtime log-sink failures (disk full, log
@@ -58,7 +64,7 @@ const sinkCheckInterval = 30 * time.Second
 // channel that survives a dead log file under the SCM), to stderr
 // otherwise (live console). slog itself cannot be the channel — it writes
 // to the very sink that just failed.
-func watchLogSink(ctx context.Context, svc service.Service, sink *countedWriter, every time.Duration) {
+func watchLogSink(ctx context.Context, sysLog eventlogSink, sink *countedWriter, every time.Duration) {
 	if sink == nil || every <= 0 {
 		return
 	}
@@ -72,14 +78,12 @@ func watchLogSink(ctx context.Context, svc service.Service, sink *countedWriter,
 			case <-ticker.C:
 			}
 			if n := sink.drainFailures(); n > 0 {
-				msg := fmt.Sprintf("log sink write failures: %d writes failed since the last check; the log file may be full, missing, or access-denied", n)
-				if svc != nil {
-					if sysLog, err := svc.SystemLogger(nil); err == nil {
-						sysLog.Error(msg)
-						continue
-					}
-				}
 				// pi-lens-ignore: go-no-fmt-println
+				msg := fmt.Sprintf("log sink write failures: %d writes failed since the last check; the log file may be full, missing, or access-denied", n)
+				if sysLog != nil {
+					sysLog.Error(msg)
+					continue
+				}
 				fmt.Fprintln(os.Stderr, msg)
 			}
 		}

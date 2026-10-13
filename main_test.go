@@ -95,43 +95,40 @@ func TestMetricsHandlerInstrumentsScrapes(t *testing.T) {
 	}
 }
 
-// TestServiceConfigHardening pins the SCM hardening options: recovery
-// restart, delayed auto-start, and network/time dependencies. These were
-// shipped unconfigured once (a crash left the service stopped forever) —
-// this test fails if a refactor drops them again.
+// TestServiceConfigHardening pins the service hardening set (previously
+// the kardianos service.Config Option map; now the OS-neutral
+// serviceInstallSpec the windows manager applies): recovery restart,
+// delayed auto-start, and network/time dependencies. These were shipped
+// unconfigured once (a crash left the service stopped forever) — this
+// test fails if a refactor drops them again. Rewritten against
+// serviceInstallSpec with justification: the kardianous swap (supply-
+// chain remediation) replaced the config type, and a package-agnostic
+// spec keeps the pins testable on every platform.
 func TestServiceConfigHardening(t *testing.T) {
-	cfg := serviceConfig()
-	if cfg.Name != "link_ping_prometheus" {
-		t.Errorf("service name changed unexpectedly: %q", cfg.Name)
+	spec := serviceSpec()
+	if spec.Name != "link_ping_prometheus" {
+		t.Errorf("service name changed unexpectedly: %q", spec.Name)
 	}
-	if got := cfg.Option["OnFailure"]; got != "restart" {
-		t.Errorf("OnFailure must be restart so crashes self-heal, got %v", got)
+	if spec.RecoveryDelay != 5*time.Second {
+		t.Errorf("recovery delay must stay 5s (documented recovery ladder), got %v", spec.RecoveryDelay)
 	}
-	// The 5s delay is the recovery ladder the README and the installer
-	// scripts document; a default (1s) would change restart behaviour
-	// silently. OnFailureResetPeriod keeps repeated restarts inside one
-	// SCM failure-accounting window.
-	if got := cfg.Option["OnFailureDelayDuration"]; got != "5s" {
-		t.Errorf("OnFailureDelayDuration must stay 5s (documented recovery ladder), got %v", got)
+	// The reset period keeps repeated restarts inside one SCM
+	// failure-accounting window (24h = one healthy day resets).
+	if spec.RecoveryResetPeriod != 86400 {
+		t.Errorf("recovery reset period = %v, want 86400", spec.RecoveryResetPeriod)
 	}
-	if got := cfg.Option["OnFailureResetPeriod"]; got == nil {
-		t.Error("OnFailureResetPeriod must be set so the restart counter resets on a healthy day")
-	}
-	if got := cfg.Option["StartType"]; got != "automatic" {
-		t.Errorf("StartType must be automatic, got %v", got)
-	}
-	if cfg.Option["DelayedAutoStart"] != true {
+	if !spec.DelayedAutoStart {
 		t.Error("DelayedAutoStart must be true to avoid boot-race bind failures")
 	}
 	for _, dep := range []string{"Tcpip", "W32Time"} {
-		if !slices.Contains(cfg.Dependencies, dep) {
-			t.Errorf("missing service dependency %q (got %v)", dep, cfg.Dependencies)
+		if !slices.Contains(spec.Dependencies, dep) {
+			t.Errorf("required dependency %q missing (%v)", dep, spec.Dependencies)
 		}
 	}
 	// Version strings go stale after in-place upgrades; runtime truth is
 	// in link_ping_build_info.
-	if strings.Contains(cfg.Description, version) && version != "dev" {
-		t.Errorf("Description must not embed the build version: %q", cfg.Description)
+	if strings.Contains(spec.Description, version) && version != "dev" {
+		t.Errorf("Description must not embed the build version: %q", spec.Description)
 	}
 }
 
