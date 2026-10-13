@@ -584,6 +584,8 @@ go vet ./...
 SOAK_SECONDS=600 go test -count=1 -timeout 15m -run TestSoakMemory -v ./test/   # opt-in memory soak (heap must stay flat, +8MB ceiling; -timeout required, the default 10m expires mid-soak)
 ```
 
+**Test layout (Go ecosystem convention, as in prometheus/client_golang and windows_exporter):** unit tests live beside the code they exercise (`main_test.go` split by concern — `service_lifecycle_test.go`, `flags_test.go`, `http_endpoints_test.go`, `scavenger_test.go`, `rules_test.go`, `logsink_test.go`, `flags_test.go`; `internal/prober/*_test.go` beside the prober), and the **integration suite lives in `test/`** (`package prober_test`, one file per behavior — accuracy, jitter, reload, payload, HMAC coverage, MTU, server — with shared fixtures in `helpers_test.go` and the opt-in `soak_test.go`). Both suites run in CI; the Windows-only behavioral tests (winsock errno classification, DF socket options, log-DACL hardening) execute natively in the `test-windows` job.
+
 Release binaries for Linux, macOS, Windows at [Latest Release](https://github.com/callumau/link_ping_prometheus/releases/latest).
 
 ## Usage
