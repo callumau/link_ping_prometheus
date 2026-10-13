@@ -2,7 +2,10 @@
 
 package main
 
-import "os"
+import (
+	"context"
+	"os"
+)
 
 // restrictLogDACL is the Windows-only part of hardenLogSink (see
 // logacl_windows.go). On unix, log confidentiality is enforced by the POSIX
@@ -12,3 +15,8 @@ import "os"
 func restrictLogDACL(_ *os.File) (changed bool, err error) {
 	return false, nil
 }
+
+// startLogDACLRecheck is the Windows-only periodic DACL re-apply (see
+// logacl_windows.go); a no-op on unix, where POSIX perm bits never
+// regress on rotation.
+func startLogDACLRecheck(_ context.Context, _ string) {}

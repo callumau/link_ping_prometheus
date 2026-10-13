@@ -3,11 +3,73 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
 	"os"
+	"time"
 
 	"golang.org/x/sys/windows"
 )
+
+// logDACLRecheckInterval is how often the live log file's DACL is
+// re-compared against the restricted set. Idempotent, so a compliant
+// file costs one GetSecurityInfo read per tick.
+const logDACLRecheckInterval = 5 * time.Minute
+
+// reapplyLogDACL re-restricts the CURRENT live log file's DACL.
+// restrictLogDACL runs once at startup against the file that exists
+// then; after the first lumberjack rotation the fresh live file is
+// created by the framework and inherits the (possibly wide) parent
+// directory DACL, silently regressing the restricted set. Called from a
+// fixed ticker so a manual install into a wide directory regains the
+// "never world-readable" invariant within one interval of each rotation.
+// A file that does not exist right now (mid-rotation gap) is skipped;
+// the next tick covers it once lumberjack recreates it.
+func reapplyLogDACL(path string) error {
+	if path == "" {
+		return nil
+	}
+	// pi-lens-ignore: go-path-traversal
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("log DACL recheck: open %q: %w", path, err)
+	}
+	defer f.Close()
+	changed, err := restrictLogDACL(f)
+	if err != nil {
+		return fmt.Errorf("log DACL recheck %q: %w", path, err)
+	}
+	if changed {
+		slog.Warn("Log file had wider permissions; re-applied restricted DACL", "path", path)
+	}
+	return nil
+}
+
+// startLogDACLRecheck re-applies the restricted DACL on a fixed ticker.
+// The goroutine exits with ctx so it stops on shutdown in every mode.
+func startLogDACLRecheck(ctx context.Context, path string) {
+	if path == "" {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(logDACLRecheckInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+			if err := reapplyLogDACL(path); err != nil {
+				slog.Error("Log DACL recheck failed", "path", path, "err", err)
+			}
+		}
+	}()
+}
 
 // logACLSDDLTemplate is the DACL applied to the log sink, with the current
 // process token's user SID spliced in at the %s slot:
