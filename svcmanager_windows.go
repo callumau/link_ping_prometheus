@@ -39,6 +39,11 @@ func (a eventlogSinkAdapter) Error(msg string) { a.log.Error(1, msg) }
 // back to the shared signal-driven foreground run.
 func platformRunService(prg *program) error {
 	isSvc, err := svc.IsWindowsService()
+	// Sent at Warn to the -log-file sink even on the happy path: the
+	// dispatch decision is invisible under the SCM otherwise, and the
+	// e2e service test greps this line to pin which path the SCM start
+	// actually took.
+	slog.Warn("svc run dispatch", "isSvc", isSvc, "err", err)
 	if err != nil {
 		return fmt.Errorf("detect Windows service context: %w", err)
 	}

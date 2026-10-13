@@ -107,8 +107,15 @@ func TestE2EWindowsServiceLifecycle(t *testing.T) {
 		if cerr != nil {
 			ccode = fmt.Sprintf("exited: %v out: %.300s", cerr, cout)
 		}
-		t.Fatalf("-svc=start failed: %v\n-- bin exists: %s (%s)\n-- sc qc:\n%.800s\n-- sc failure:\n%.500s\n-- direct sc start: err=%v out=%.600s\n-- console -svc=run smoke: %s\n-- sdshow:\n%.400s\n-- -svc=start output:\n%.400s",
-			err, exists, binPath, qc, fa, derr, dsc, ccode, sdt, out)
+		// The SCM-run binary logs to -log-file; its content shows the
+		// dispatch decision and any silent failure inside the service.
+		time.Sleep(2 * time.Second)
+		logContent := "(missing)"
+		if b, rerr := os.ReadFile(logFile); rerr == nil {
+			logContent = string(b)
+		}
+		t.Fatalf("-svc=start failed: %v\n-- bin exists: %s (%s)\n-- sc qc:\n%.800s\n-- sc failure:\n%.500s\n-- direct sc start: err=%v out=%.600s\n-- console -svc=run smoke: %s\n-- service.log:\n%.1500s\n-- sdshow:\n%.400s\n-- -svc=start output:\n%.400s",
+			err, exists, binPath, qc, fa, derr, dsc, ccode, logContent, sdt, out)
 	}
 	deadline := time.Now().Add(20 * time.Second)
 	state := svc.Stopped
