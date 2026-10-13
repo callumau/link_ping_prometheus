@@ -5,7 +5,7 @@ go 1.25.0
 toolchain go1.27.1
 
 require (
-	github.com/kardianos/service v1.2.4
+	github.com/kardianos/service v1.3.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/prometheus/client_model v0.6.2
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
