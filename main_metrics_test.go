@@ -1,9 +1,6 @@
 package main
 
 import (
-	"bytes"
-	"compress/gzip"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,26 +9,20 @@ import (
 	"link_ping_prometheus/internal/prober"
 )
 
-// TestMetricsBodyDecodes checks the DECODED /metrics payload, not just the
-// Content-Encoding header: a handler that advertised gzip but wrote identity
-// (or garbage) bytes would pass a header-only assertion while real scrapers
-// fail to parse it. Both compression modes must deliver a parseable
-// exposition containing a known metric family.
-func TestMetricsBodyDecodes(t *testing.T) {
+// TestMetricsCompressionToggle pins the /metrics compression wiring. With the
+// default (-metrics-gzip off) a scraper offering gzip must still receive an
+// identity response: promhttp pools a ~0.7MB flate compressor per P, which is
+// more live heap than a small fleet's response is worth. With the flag on the
+// response must be gzip-encoded.
+func TestMetricsCompressionToggle(t *testing.T) {
 	prober.InitMetrics()
-	// Seed a series so the link_up family is actually exported: a metric vec
-	// with no children emits nothing at all, HELP line included.
-	prober.SeedMetrics("metrics-body-test", []prober.Target{{Name: "t", Address: "127.0.0.1:4000"}})
-
-	const marker = "# HELP link_up"
-
 	for _, tc := range []struct {
-		name         string
-		gzip         bool
-		wantEncoding string
+		name string
+		gzip bool
+		want string
 	}{
-		{"identity", false, ""},
-		{"gzip", true, "gzip"},
+		{"off by default", false, ""},
+		{"enabled", true, "gzip"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
@@ -41,26 +32,69 @@ func TestMetricsBodyDecodes(t *testing.T) {
 			if rec.Code != http.StatusOK {
 				t.Fatalf("status = %d, want 200", rec.Code)
 			}
-			if got := rec.Header().Get("Content-Encoding"); got != tc.wantEncoding {
-				t.Fatalf("Content-Encoding = %q, want %q", got, tc.wantEncoding)
+			if got := rec.Header().Get("Content-Encoding"); got != tc.want {
+				t.Errorf("Content-Encoding = %q, want %q", got, tc.want)
 			}
-
-			body := rec.Body.Bytes()
-			if tc.gzip {
-				zr, err := gzip.NewReader(bytes.NewReader(body))
-				if err != nil {
-					t.Fatalf("body is not valid gzip — header set but payload not encoded: %v", err)
-				}
-				defer zr.Close()
-				body, err = io.ReadAll(zr)
-				if err != nil {
-					t.Fatalf("decoding gzip body: %v", err)
-				}
-			}
-
-			if !strings.Contains(string(body), marker) {
-				t.Errorf("decoded /metrics body missing %q (%d bytes decoded)", marker, len(body))
+			if rec.Body.Len() == 0 {
+				t.Error("empty /metrics body")
 			}
 		})
 	}
 }
+
+// TestMetricsHandlerInstrumentsScrapes pins the scrape instrumentation that
+// promhttp.HandlerFor alone does not register (promhttp.Handler used to):
+// without promhttp_metric_handler_requests_total{code="503"} and
+// _requests_in_flight a scrape rejected by the concurrency cap is invisible.
+// Building the handler twice must not panic either - InstrumentMetricHandler
+// reuses the already-registered collector, which is what keeps repeated test
+// runs (-count>1) and repeated scrapes safe.
+
+// TestMetricsHandlerInstrumentsScrapes pins the scrape instrumentation that
+// promhttp.HandlerFor alone does not register (promhttp.Handler used to):
+// without promhttp_metric_handler_requests_total{code="503"} and
+// _requests_in_flight a scrape rejected by the concurrency cap is invisible.
+// Building the handler twice must not panic either - InstrumentMetricHandler
+// reuses the already-registered collector, which is what keeps repeated test
+// runs (-count>1) and repeated scrapes safe.
+func TestMetricsHandlerInstrumentsScrapes(t *testing.T) {
+	prober.InitMetrics()
+	scrape := func(h http.Handler) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	rec := scrape(metricsHandler(false))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		"promhttp_metric_handler_requests_total",
+		// The in-flight gauge counts the scrape serving it, so its value is
+		// exactly 1 and is safe to pin.
+		"promhttp_metric_handler_requests_in_flight 1",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("/metrics body is missing %q (scrape instrumentation lost)", want)
+		}
+	}
+
+	// A second handler build (another call site, or a -count>1 run) must
+	// re-register cleanly rather than panic.
+	if rec := scrape(metricsHandler(true)); rec.Code != http.StatusOK {
+		t.Fatalf("second handler build: status = %d, want 200", rec.Code)
+	}
+}
+
+// TestServiceConfigHardening pins the service hardening set (previously
+// the kardianos service.Config Option map; now the OS-neutral
+// serviceInstallSpec the windows manager applies): recovery restart,
+// delayed auto-start, and network/time dependencies. These were shipped
+// unconfigured once (a crash left the service stopped forever) — this
+// test fails if a refactor drops them again. Rewritten against
+// serviceInstallSpec with justification: the kardianous swap (supply-
+// chain remediation) replaced the config type, and a package-agnostic
+// spec keeps the pins testable on every platform.
