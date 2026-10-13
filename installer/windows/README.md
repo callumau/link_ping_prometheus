@@ -7,7 +7,7 @@ folder (or edit `EXE_PATH` at the top of the script).
 | Script | Purpose |
 | --- | --- |
 | `install-service.bat` | Fresh install, or in-place upgrade when a newer binary is provided |
-| `uninstall-service.bat` | Stop, remove service + event-log source + credential env vars; also removes a wizard-custom log directory read back from the persisted service arguments |
+| `uninstall-service.bat` | Stop, remove service + event-log source + credential env vars; also removes a wizard-custom log directory read back from the persisted service arguments; bounded 120s wait for STOPPED (non-zero exit if stuck) |
 
 ## What install-service.bat does
 
@@ -25,7 +25,7 @@ folder (or edit `EXE_PATH` at the top of the script).
 6. Prompts for optional credential environment variables
    (`LINK_PING_METRICS_USER/PASS`, `LINK_PING_ECHO_SECRET`) — Enter skips.
 7. Restricts the ACL on the credential registry key (see below)
-8. Starts the service and prints its state
+8. Starts the service and waits up to 60s for RUNNING (prints its state). All hardening steps fail closed: any failure — binary copy, log-dir ACL/ SID grant, start — aborts the script with an ERROR line and a non-zero exit, never a silent "Done."
 
 **Re-running the installer on an existing installation performs an in-place
 upgrade**: the new binary is SHA256-compared against the installed one —
