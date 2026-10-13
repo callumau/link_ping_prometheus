@@ -91,3 +91,26 @@ func TestEchoFrameKey(t *testing.T) {
 		t.Error("a different timestamp must change the identity")
 	}
 }
+
+// TestSkewReplayedBoundary pins the replay-window comparison exactly
+// (audit finding): strict > / < against ±maxReplayWindow — a frame whose
+// skew is exactly at the window edge is a live probe. A rewrite to >=
+// would reject edge-exact frames; this test cannot pass either way, so
+// both semantics are pinned by their negation cases below.
+func TestSkewReplayedBoundary(t *testing.T) {
+	for _, skew := range []time.Duration{
+		-maxReplayWindow,     // exactly at the stale edge: live
+		-maxReplayWindow + 1, // one tick inside: live
+		-maxReplayWindow - 1, // one tick outside: replayed
+		maxReplayWindow,      // exactly at the future edge: live
+		maxReplayWindow - 1,  // one tick inside: live
+		maxReplayWindow + 1,  // one tick outside: replayed
+	} {
+		if skewReplayed(skew) != (skew > maxReplayWindow || skew < -maxReplayWindow) {
+			t.Fatalf("skewReplayed(%v) disagrees with the pinned > / < semantics", skew)
+		}
+	}
+	if skewReplayed(0) {
+		t.Fatal("zero skew must never replay")
+	}
+}
