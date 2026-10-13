@@ -60,3 +60,34 @@ Full verification: `go build ./...`, `go vet ./...` (linux + GOOS=windows),
 | LOW (zone trailing dot passes validation) | FIXED — validZone rejects a trailing dot; pinned by test | validate.go |
 | LOW (mtu lost counts local write failures, undocumented) | FIXED (docs) — Help states the convention | metrics.go |
 | heap ratchet / /status / MTU sockets / reload purge | NO ISSUES FOUND | — |
+
+
+---
+
+# Phase-1 review-coverage pass (post release lanes)
+
+New artifacts: phase1-coverage-matrix.md (test<->finding mapping) and
+phase1-concurrency-hazards.md (thread profile + hazard ledger).
+
+Pinned during this pass (new tests, existing suites untouched):
+- MED-2 exit-accounting: TestEchoLoop_ExitDrainsLateEchoAsRTT (direct
+  pin; deterministic order release->observed-read->cancel). During
+  implementation the audit window was deepened: the reader's push-select
+  could drop an already-read echo on cancellation (random case pick), so
+  the reader push is now PRIORITY (non-blocking first) - combined with
+  the exit-time close+join it makes late-echo accounting deterministic.
+- LOW-3 straggler flag: (see status unit pin)
+- LOW-4 re-log interval: promoted to package var (done in release fix);
+  the 60s re-log WARN itself remains undocumented by direct pin (polled
+  every tick in client_straggler fixtures).
+
+Remaining direct-pin gaps (documented, not blocking): none for
+races-lane findings except the re-log WARN cadence noted above.
+
+Dependency dispositions for this phase:
+- client_golang v1.23.2 -> v1.25.0 (+client_model 0.6.3, common 0.72,
+  procfs 0.22, x/sys 0.48, protobuf 1.36.12; go directive 1.26.0).
+- kardianos OpenRC supply-chain finding: resolved by making
+  -svc=install/-svc=uninstall Windows-only (svcActionSupported) - the
+  flagged Linux renderer path is now unreachable in all supported
+  deployments (Linux installs use the shipped systemd unit).
