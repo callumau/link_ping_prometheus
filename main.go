@@ -746,14 +746,14 @@ func (p *program) Start(s service.Service) error {
 	return nil
 }
 
-// Stop is called by the service framework to shut down gracefully.
-// It cancels the context and waits for the run goroutine to finish.
 // svcStopDeadline bounds program.Stop's drain wait. A var so the
 // timeout-arm test does not need a real 20s stall.
 var svcStopDeadline = 20 * time.Second
 
-// Stop is called by the service framework to shut down gracefully.
-// It cancels the context and waits for the run goroutine to finish.
+// Stop is called by the service framework to shut down gracefully. It
+// cancels the context and waits for the run goroutine (plus a bounded
+// straggler drain), returning nil even when the drain deadline is
+// exceeded so the SCM classifies an operator stop as clean.
 func (p *program) Stop(s service.Service) error {
 	if p.cancel != nil {
 		p.cancel()

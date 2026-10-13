@@ -191,15 +191,27 @@ func newRateLimiter(perIPCap, globalCap int) *rateLimiter {
 	return &rateLimiter{perIP: make(map[netip.Addr]int), perIPCap: perIPCap, globalCap: globalCap}
 }
 
+// rateMapReallocHint is the per-IP map size at which a window reset
+// reallocates instead of clearing in place: clear() keeps the bucket
+// array sized to the high-water mark forever, so one flood of rotating
+// fake IPs inside an allowed CIDR (secret-less mode; per-IP charge is
+// post-authentication) would pin its buckets for the server's lifetime.
+// Below the hint, in-place clear wins on per-second GC churn.
+const rateMapReallocHint = 1024
+
 // resetLocked rolls the fixed window forward when a second has elapsed.
 // Caller must hold r.mu.
 func (r *rateLimiter) resetLocked(now time.Time) {
 	if now.Sub(r.window) >= time.Second {
 		r.window = now
-		// clear in place (Go 1.21+) instead of reallocating: the window
-		// resets every second for the lifetime of the server, so reusing
-		// the map avoids per-second GC churn.
-		clear(r.perIP)
+		if len(r.perIP) > rateMapReallocHint {
+			r.perIP = make(map[netip.Addr]int, 64)
+		} else {
+			// clear in place (Go 1.21+) instead of reallocating: the
+			// window resets every second for the lifetime of the
+			// server, so reusing the map avoids per-second GC churn.
+			clear(r.perIP)
+		}
 		r.global = 0
 	}
 }
@@ -471,6 +483,16 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 		lastSeen time.Time
 	}
 	handles := make(map[netip.Addr]clientHandles, len(allowed.exact))
+	// Reusable HMAC states for the read loop's verify chain (single
+	// goroutine, so one state per secret; crypto/hmac is not concurrent-
+	// safe). Built once instead of the previous 2-4 hmac.New per frame.
+	var curMAC, oldMAC *probeMACer
+	if echoSecret != "" {
+		curMAC = newProbeMACer(echoSecret)
+		if len(echoSecretOld) > 0 {
+			oldMAC = newProbeMACer(echoSecretOld[0])
+		}
+	}
 	for ip := range allowed.exact {
 		key := ip.String()
 		handles[ip] = clientHandles{
@@ -570,6 +592,13 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 		}
 	}()
 
+	// Frame shape constants: constant for the loop's lifetime (they depend
+	// only on configuration captured above).
+	expectedSize := PayloadSize
+	if echoSecret != "" {
+		expectedSize = PayloadSizeWithHMAC
+	}
+
 	for {
 		n, raddr, err := pc.ReadFrom(buf)
 		if err != nil {
@@ -640,10 +669,6 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 			continue
 		}
 
-		expectedSize := PayloadSize
-		if echoSecret != "" {
-			expectedSize = PayloadSizeWithHMAC
-		}
 		// Accept the header frame plus any bounded payload extension:
 		// clients can probe with a payload (MTU/data-path corruption
 		// detection) without coordinating server-side config. Reflection
@@ -682,10 +707,6 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 		// series.
 		var skew time.Duration
 		if echoSecret != "" {
-			oldSecret := ""
-			if len(echoSecretOld) > 0 {
-				oldSecret = echoSecretOld[0]
-			}
 			seq := binary.LittleEndian.Uint64(buf[8:16])
 			ts := binary.LittleEndian.Uint64(buf[16:24])
 			// Payload frames are accepted under EITHER tag coverage: the
@@ -699,12 +720,12 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 			// reason would fragment the hmac/replay misconfig alerting in
 			// rules/link-monitor.yml for a distinction the operator cannot
 			// act on.
-			if !validHMACAny(echoSecret, oldSecret, seq, ts, buf[24:32]) {
+			if !macAny(curMAC, oldMAC, seq, ts, buf[24:32]) {
 				// Bare 32-byte frames (n == expectedSize) skip the second
 				// attempt: the two coverages coincide byte-for-byte there
 				// (pinned by TestHMACCoverageZeroPayloadEquivalence), so the
 				// extra HMAC-SHA256 could never change the outcome.
-				if n == expectedSize || !validHMACFullFrameAny(echoSecret, oldSecret, buf[:n]) {
+				if n == expectedSize || !fullFrameAny(curMAC, oldMAC, buf[:n]) {
 					drops.hmac.Inc()
 					continue
 				}

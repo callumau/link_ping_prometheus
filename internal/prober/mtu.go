@@ -83,12 +83,7 @@ func runMTUSweep(ctx context.Context, t Target, cfg Config, m targetMetrics, sta
 			m.pathMTU.Set(float64(frame))
 			state.pathMTU.Store(frame)
 		}
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
+		stopDrain(timer)
 		timer.Reset(cfg.MTUSweep)
 	}
 }
@@ -132,6 +127,10 @@ func mtuDeadline(cfg Config, state *probeLoopState) time.Duration {
 // absolute, so skipping cannot extend the wait (and a stream of foreign
 // datagrams cannot spin the loop past it).
 func readEcho(ctx context.Context, conn net.Conn, buf []byte, size int, seqs []uint64, sent map[uint64]uint64, secret string, coverage HmacCoverage, deadline time.Time) error {
+	var verifyMac *probeMACer
+	if secret != "" {
+		verifyMac = newProbeMACer(secret)
+	}
 	for {
 		// The absolute probe deadline is SLICED into bounded re-arms: a
 		// mid-wait cancellation (reload stop, process shutdown) unblocks
@@ -208,13 +207,13 @@ func readEcho(ctx context.Context, conn net.Conn, buf []byte, size int, seqs []u
 			// tag we wrote. buf[24:32] is in bounds here: secret set means
 			// size is at least PayloadSizeWithHMAC, and the size gate above
 			// already matched n == size.
-			ok := validHMAC(secret, got, wantSent, buf[24:32])
+			ok := verifyMac.verifyHeader(got, wantSent, buf[24:32])
 			if !ok && coverage == HMACFullFrameCoverage {
 				// Full-frame coverage: the header check fails for a
 				// payload-bearing frame's full-frame tag, so verify the whole
 				// frame instead (tag slot skipped). Header-only probes
 				// already passed above — the coverages coincide there.
-				ok = validHMACFullFrame(secret, buf[:n])
+				ok = verifyMac.verifyFullFrame(buf[:n])
 			}
 			if !ok {
 				continue // wrong tag: not an echo the prober sent
@@ -245,6 +244,11 @@ func sweepOnce(ctx context.Context, conn net.Conn, cfg Config, m targetMetrics, 
 	deadline := mtuDeadline(cfg, state)
 	buf := make([]byte, headerSize+MaxPayloadBytes)
 	var seq uint64
+	// One reusable HMAC state for the sweep's own goroutine.
+	var mac *probeMACer
+	if cfg.EchoSecret != "" {
+		mac = newProbeMACer(cfg.EchoSecret)
+	}
 	// sent maps each sequence this sweep actually wrote to the timestamp it
 	// carried: readEcho needs both to authenticate an echoed frame (echoed
 	// ts must byte-equal what we sent, and the echoed tag must match the
@@ -269,11 +273,11 @@ func sweepOnce(ctx context.Context, conn net.Conn, cfg Config, m targetMetrics, 
 			// deterministic (seq, ts) pattern as before; only the tag's
 			// INPUT changes.
 			fillPayload(buf[headerSize:headerSize+payload], seq, ts)
-			h := computeHMACFullFrame(cfg.EchoSecret, buf[:headerSize+payload])
+			h := mac.digestFrame(buf[:headerSize+payload])
 			copy(buf[24:32], h[:])
 		} else {
 			if cfg.EchoSecret != "" {
-				h := computeHMAC(cfg.EchoSecret, seq, ts)
+				h := mac.digestHeader(seq, ts)
 				copy(buf[24:32], h[:])
 			}
 			if payload > 0 {
