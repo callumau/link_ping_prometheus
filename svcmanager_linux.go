@@ -33,5 +33,7 @@ func removeEventLogSource(name string) {}
 // platformInstallService / platformUninstallService are unreachable on
 // linux (svcActionSupported refuses install/uninstall off-Windows);
 // defined so the portable dispatcher compiles.
-func platformInstallService(argv []string) error { return fmt.Errorf("service install is Windows-only") }
-func platformUninstallService() error            { return fmt.Errorf("service install is Windows-only") }
+func platformInstallService(argv []string) error {
+	return fmt.Errorf("service install is Windows-only")
+}
+func platformUninstallService() error { return fmt.Errorf("service install is Windows-only") }

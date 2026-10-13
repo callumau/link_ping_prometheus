@@ -82,9 +82,18 @@ func TestE2EWindowsServiceLifecycle(t *testing.T) {
 		t.Errorf("dependencies not recorded: %v (want Tcpip + W32Time)", cfg.Dependencies)
 	}
 
-	// start (through our own -svc=start path) and wait RUNNING.
+	// start (through our own -svc=start path) and wait RUNNING. On failure
+	// dump the persisted SCM config (config query) so the failing edge is
+	// diagnosable from the runner log alone.
 	if out, err = exec.Command(binPath, "-svc=start").CombinedOutput(); err != nil {
-		t.Fatalf("-svc=start failed: %v\noutput: %.400s", err, out)
+		qc, _ := exec.Command("sc.exe", "qc", svcName).CombinedOutput()
+		sd, _ := exec.Command("sc.exe", "sdshow", svcName).CombinedOutput()
+		exists := "no"
+		if _, stat := os.Stat(binPath); stat == nil {
+			exists = "yes"
+		}
+		t.Fatalf("-svc=start failed: %v\n-- bin exists: %s (%s)\n-- sc qc:\n%.800s\n-- sc sdshow:\n%.400s\n-- start output:\n%.400s",
+			err, exists, binPath, qc, sd, out)
 	}
 	deadline := time.Now().Add(20 * time.Second)
 	state := svc.Stopped

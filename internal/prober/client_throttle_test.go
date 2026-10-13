@@ -118,7 +118,10 @@ func TestEchoLoop_PendingWindowThrottleSkipsSends(t *testing.T) {
 	// (a skipped send is not sent), throttled must grow, inflight must
 	// never cross the cap.
 	frozen := false
-	sampleDeadline := time.Now().Add(1500 * time.Millisecond)
+	// 4s (was 1.5s): under -race the tick loop slows ~2-3x and finding a
+	// fully-pinned 300ms window takes longer; the assertion itself is
+	// unchanged.
+	sampleDeadline := time.Now().Add(4 * time.Second)
 	for time.Now().Before(sampleDeadline) {
 		infl := wbGauge(ProbesInflight, src, name, addr)
 		if infl < float64(maxPendingWindow) {
@@ -158,7 +161,10 @@ func TestEchoLoop_PendingWindowThrottleSkipsSends(t *testing.T) {
 	// the throttle never touches the balance because the probe never
 	// existed. Sample until a zero-drift gather appears, never asserting
 	// exact zero on one snapshot (see test/reload_test.go waitForBalance).
-	drainDeadline := time.Now().Add(6 * time.Second)
+	// 20s (was 6s): the first RTO expiry is 2.4s after the loop started,
+	// but under -race the tick loop is slowed and the sweep's wall-clock
+	// boundary can land later than the old 6s cap; assertions unchanged.
+	drainDeadline := time.Now().Add(20 * time.Second)
 	drifts := []float64{}
 	for time.Now().Before(drainDeadline) {
 		sent := wbCounter(ProbesSent, src, name, addr)
