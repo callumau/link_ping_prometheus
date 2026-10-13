@@ -308,7 +308,12 @@ func main() {
 				os.Exit(1)
 			}
 			defer f.Close()
-			logW = io.MultiWriter(os.Stdout, f)
+			// File FIRST: io.MultiWriter stops at the first error, and under
+			// the SCM the std handle can be invalid rather than a silent NUL
+			// sink — stdout-first then silently swallows every line before
+			// the file ever sees one, the exact total-log-loss the install
+			// warning exists to prevent. Console-first was only ever cosmetic.
+			logW = io.MultiWriter(f, os.Stdout)
 		} else {
 			// ponytail: lumberjack handles rotation (10 MB ×5 ×28d default); no per-line overhead, reopens on rotation
 			// pi-lens-ignore: go-path-traversal
@@ -319,8 +324,16 @@ func main() {
 				MaxAge:     *flLogMaxAge,
 				Compress:   false,
 			}
-			logW = io.MultiWriter(os.Stdout, lj)
+			logW = io.MultiWriter(lj, os.Stdout)
 		}
+	}
+	// Surface runtime sink failures (disk full, log dir removed): the
+	// wrapper counts write errors and run()'s watcher reports them to the
+	// event log / stderr. Wrapping once here covers both sink modes.
+	var logSink *countedWriter
+	if *flLogFile != "" {
+		logSink = newCountedWriter(logW)
+		logW = logSink
 	}
 	opts := &slog.HandlerOptions{Level: slog.LevelInfo}
 	if *flJSONLogs {
@@ -336,7 +349,7 @@ func main() {
 	}
 
 	if *flSvc != "" {
-		handleService(*flSvc)
+		handleService(*flSvc, logSink)
 		return
 	}
 
@@ -345,7 +358,8 @@ func main() {
 	defer cancel()
 
 	prg := &program{
-		ctx: ctx,
+		ctx:     ctx,
+		logSink: logSink,
 	}
 	if err := prg.run(); err != nil {
 		slog.Error("Program exited with error", "err", err)
@@ -583,7 +597,7 @@ func absolutizeFlagValue(name, value string) string {
 // kardianos/service package. It reconstructs CLI arguments at install
 // time, excluding -svc itself and sensitive flags (-metrics-user,
 // -metrics-pass).
-func handleService(action string) {
+func handleService(action string, logSink *countedWriter) {
 	svcConfig := serviceConfig()
 
 	if action == "install" {
@@ -627,8 +641,10 @@ func handleService(action string) {
 	}
 
 	// Zero-value program: ctx is only ever set by Start(), which
-	// install/uninstall/start/stop never invoke.
-	prg := &program{}
+	// install/uninstall/start/stop never invoke. logSink carries the
+	// counted -log-file wrapper built in main() so the run goroutine can
+	// surface sink failures to the event log.
+	prg := &program{logSink: logSink}
 
 	s, err := service.New(prg, svcConfig)
 	if err != nil {
@@ -679,6 +695,13 @@ type program struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+	// svc is the service handle Start() received (nil in foreground runs);
+	// the sink watcher uses its SystemLogger so log-sink failures reach
+	// the event log even when the log file itself is dead.
+	svc service.Service
+	// logSink wraps the -log-file writer (nil without -log-file) so
+	// runtime write failures become visible; see logsink.go.
+	logSink *countedWriter
 	// testServeMetrics, when set (tests only), replaces startMetricsServer
 	// in run(): the test owns the *http.Server handle so it can kill the
 	// listener mid-run and observe the fatal path deterministically.
@@ -691,6 +714,7 @@ type program struct {
 // Stop can never race it (the framework calls Stop only after Start
 // has returned).
 func (p *program) Start(s service.Service) error {
+	p.svc = s
 	// Lifecycle events go to the system logger (Windows event log under
 	// the SCM, syslog elsewhere): the only channel a fleet operator sees
 	// without access to -log-file. Best-effort — file logging stays the
@@ -724,6 +748,12 @@ func (p *program) Start(s service.Service) error {
 
 // Stop is called by the service framework to shut down gracefully.
 // It cancels the context and waits for the run goroutine to finish.
+// svcStopDeadline bounds program.Stop's drain wait. A var so the
+// timeout-arm test does not need a real 20s stall.
+var svcStopDeadline = 20 * time.Second
+
+// Stop is called by the service framework to shut down gracefully.
+// It cancels the context and waits for the run goroutine to finish.
 func (p *program) Stop(s service.Service) error {
 	if p.cancel != nil {
 		p.cancel()
@@ -736,9 +766,17 @@ func (p *program) Stop(s service.Service) error {
 	select {
 	case <-done:
 		return nil
-	case <-time.After(20 * time.Second):
+	case <-time.After(svcStopDeadline):
+		// The drain missed the deadline, but this is an OPERATOR-requested
+		// stop, not a crash: returning an error makes kardianos report
+		// STOPPED with a service-specific exit code, which the SCM counts
+		// as a FAILURE and answers with the OnFailure restart ladder — the
+		// service the operator just stopped comes back up mid-maintenance.
+		// The process exits either way; clean-stop classification is the
+		// honest one. (The os.Exit(1) path in Start is the deliberate
+		// opposite: a genuine run failure WANTS the restart to fire.)
 		slog.Error("Service stop deadline exceeded")
-		return errors.New("service stop timed out after 20s")
+		return nil
 	}
 }
 
@@ -828,8 +866,10 @@ func limitConcurrent(limit int, handler http.Handler) http.Handler {
 			defer func() { <-sem }()
 			handler.ServeHTTP(w, r)
 		default:
-			// Same wording shape as promhttp's MaxRequestsInFlight body.
-			http.Error(w, "Limit of concurrent requests reached (2), try again later.", http.StatusServiceUnavailable)
+			// Same wording shape as promhttp's MaxRequestsInFlight body; the
+			// limit is interpolated, not hardcoded, so the body cannot drift
+			// from the cap a maintainer changes.
+			http.Error(w, fmt.Sprintf("Limit of concurrent requests reached (%d), try again later.", limit), http.StatusServiceUnavailable)
 		}
 	})
 }
@@ -954,6 +994,14 @@ func (p *program) run() error {
 	}
 	// Periodic scavenger: shares p.ctx so it stops with the mode loops.
 	startHeapScavenger(p.ctx, *flMemScavenge, minScavengeUnreleased, slog.Default())
+
+	// Log-durability watchers (see logsink.go / logacl_windows.go): sink
+	// write failures surfaced outside the dead sink, and — Windows only —
+	// a periodic idempotent re-apply of the restricted DACL, which a
+	// lumberjack rotation silently regresses when the fresh live file
+	// inherits a wide directory DACL. Both stop with p.ctx in every mode.
+	watchLogSink(p.ctx, p.svc, p.logSink, sinkCheckInterval)
+	startLogDACLRecheck(p.ctx, *flLogFile)
 
 	// Live per-target state for the /status debug endpoint. Always
 	// registered so server-only mode still serves an empty list.
