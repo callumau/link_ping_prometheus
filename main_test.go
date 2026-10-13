@@ -661,6 +661,9 @@ func TestHardenLogSink(t *testing.T) {
 			}
 			if repaired {
 				t.Error("repaired = true for an already-restricted DACL")
+				// Dump both tables so the runner log pins the exact
+				// field the template-vs-file comparison disagrees on.
+				dumpLogDACLTables(t, path)
 			}
 			verifyLogDACLRestricted(t, path)
 			return

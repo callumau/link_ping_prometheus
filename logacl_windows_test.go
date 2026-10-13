@@ -234,3 +234,31 @@ func isLogDACLRestricted(t *testing.T, path string) bool {
 	}
 	return wantProtected && curProtected && sameLogDACL(wantAces, curAces)
 }
+
+// dumpLogDACLTables logs the template-derived DACL table and the file's
+// live table to the test log, so a non-converging comparison can be
+// diagnosed from a runner log directly.
+func dumpLogDACLTables(t *testing.T, path string) {
+	t.Helper()
+	user, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		t.Logf("want: token user read error: %v", err)
+	} else if wsd, werr := windows.SecurityDescriptorFromString(fmt.Sprintf(logACLSDDLTemplate, user.User.Sid.String())); werr == nil {
+		if wp, wa, wterr := logDACLTable(wsd); wterr == nil {
+			t.Logf("want: protected=%v aces=%+v", wp, wa)
+		} else {
+			t.Logf("want walk error: %v", wterr)
+		}
+	} else {
+		t.Logf("want build error: %v", werr)
+	}
+	if csd, cerr := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION); cerr == nil && csd != nil {
+		if cp, ca, cterr := logDACLTable(csd); cterr == nil {
+			t.Logf("cur:  protected=%v aces=%+v", cp, ca)
+		} else {
+			t.Logf("cur walk error: %v", cterr)
+		}
+	} else {
+		t.Logf("cur read error: %v", cerr)
+	}
+}
