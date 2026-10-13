@@ -38,12 +38,14 @@ func (a eventlogSinkAdapter) Error(msg string) { a.log.Error(1, msg) }
 // svc.Run state machine; launched from a console (debugging) it falls
 // back to the shared signal-driven foreground run.
 func platformRunService(prg *program) error {
+	svcTraceMarker("run-entered")
 	isSvc, err := svc.IsWindowsService()
 	// Sent at Warn to the -log-file sink even on the happy path: the
 	// dispatch decision is invisible under the SCM otherwise, and the
 	// e2e service test greps this line to pin which path the SCM start
 	// actually took.
 	slog.Warn("svc run dispatch", "isSvc", isSvc, "err", err)
+	svcTraceMarker(fmt.Sprintf("dispatch isSvc=%v", isSvc))
 	if err != nil {
 		return fmt.Errorf("detect Windows service context: %w", err)
 	}

@@ -347,6 +347,7 @@ func main() {
 		slog.Warn("Log file had wider permissions; repaired to 0600", "path", *flLogFile)
 	}
 
+	svcTraceMarker("main-pre-svc")
 	if *flSvc != "" {
 		handleService(*flSvc, logSink)
 		return
@@ -838,6 +839,22 @@ func metricsHandlerFor(g prometheus.Gatherer, gzip bool) http.Handler {
 	// registrations): it reuses the already-registered collector instead of
 	// panicking.
 	return promhttp.InstrumentMetricHandler(prometheus.DefaultRegisterer, h)
+}
+
+// svcTraceMarker appends a diagnostic line to the -log-file sink
+// (windows e2e triage aid under the SCM where stderr is dead). It is
+// best-effort by design: any error is ignored, never a run failure.
+func svcTraceMarker(tag string) {
+	if *flLogFile == "" {
+		return
+	}
+	// pi-lens-ignore: go-path-traversal
+	f, err := os.OpenFile(*flLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return
+	}
+	defer f.Close() // pi-lens-ignore: go-ignored-call-result
+	fmt.Fprintf(f, "svc-trace[%s]\n", tag)
 }
 
 // readyToProbe reports whether a running agent can actually do its job, i.e.
