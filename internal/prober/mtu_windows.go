@@ -16,6 +16,13 @@ import (
 // TCP/IP providers respect this option for UDP"), and set the DF bit
 // while suppressing fragmentation — the same observable behavior our
 // sweep needs ("no echo at size N = the path does not survive N").
+//
+// Value audit (round-2 review): both slots being 14 is CORRECT, not a
+// copy-paste bug — unlike the other OSes (Linux/BSD v6 = 62, AIX = 45,
+// Solaris = 33), the Windows SDK's shared/IPPROTO_IPV6 option block
+// defines IPV6_DONTFRAG = 14 in ws2ipdef.h, mirroring (x86) the v4 slot:
+// pinned by win32metadata generation/WinSDK RecompiledIdlHeaders,
+// Wine/ReactOS include/ws2ipdef.h, and the windows-rs WinSock constants.
 const (
 	ipDontFragment = 14
 	ipv6DontFrag   = 14
