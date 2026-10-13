@@ -163,6 +163,17 @@ func readEcho(ctx context.Context, conn net.Conn, buf []byte, size int, seqs []u
 			}
 			return err
 		}
+		// Cancellation checkpoint on EVERY received datagram, not only
+		// on arm expiry: the skip paths below re-arm immediately, so a
+		// socket that receives at least one datagram per arm (late echoes
+		// of earlier sweep sizes, or any other traffic from the target
+		// address) would otherwise never let an arm expire and defer
+		// cancellation to the whole applied RTO — the adaptive 2*SRTT
+		// floor is unbounded above, which can outlive the target loop's
+		// join bound (spurious straggler marking on reload).
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
 		if n != size || string(buf[0:8]) != MagicBytes {
 			continue // a foreign or other-size datagram: keep waiting for ours
 		}
@@ -272,6 +283,13 @@ func sweepOnce(ctx context.Context, conn net.Conn, cfg Config, m targetMetrics, 
 			}
 		}
 		m.mtuSent.Inc()
+		// Bounded write, like every other socket-op in the sweep: a UDP
+		// send can block when the local send buffer is saturated (peer
+		// stopped reading), and the probe join at client.go's probeTarget
+		// waits on the sweep goroutine — a wedged send would otherwise keep
+		// the target unprobed past every bound.
+		// pi-lens-ignore: go-ignored-call-result
+		_ = conn.SetWriteDeadline(time.Now().Add(deadline))
 		if _, err := conn.Write(buf[:headerSize+payload]); err != nil {
 			m.mtuLost.Inc()
 			return 0

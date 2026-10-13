@@ -63,6 +63,16 @@ func (r *StatusRegistry) Update(s TargetStatus) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// Preserve the straggler flag against a racing per-interval snapshot:
+	// markStraggler(true) can land between the wedged loop's emissions, and
+	// its last whole-struct Update would otherwise clear the flag — a
+	// permanently wedged loop never emits again, so /status would then read
+	// a straggler as healthy (the exact readout failure the flag exists to
+	// prevent). MarkStraggler(false) on release is the only legitimate
+	// clearer; a replacement loop's fresh snapshots arrive after release.
+	if prev, ok := r.targets[s.Name]; ok && prev.Straggler {
+		s.Straggler = true
+	}
 	r.targets[s.Name] = s
 }
 

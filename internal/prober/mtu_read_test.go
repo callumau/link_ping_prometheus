@@ -3,6 +3,7 @@ package prober
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"net"
 	"os"
 	"sync/atomic"
@@ -299,5 +300,65 @@ func TestReadEcho_VerifiesHMACFullFrameTag(t *testing.T) {
 				t.Fatalf("readEcho must accept the intact full-frame echo, got %v", err)
 			}
 		})
+	}
+}
+
+// fakeDatagramConn delivers a foreign datagram on every Read (never the
+// awaited one), so readEcho must keep skipping — the exact condition that
+// previously deferred MTU-sweep cancellation past every read arm: skips
+// re-arm without ever letting an arm expire, so the only exit was the
+// absolute RTO deadline.
+type fakeDatagramConn struct {
+	calls atomic.Int64
+}
+
+func (c *fakeDatagramConn) Read(p []byte) (int, error) {
+	n := c.calls.Add(1)
+	// A valid-looking header frame of the WRONG size (size gate fails):
+	// foreign by the cheapest possible rule.
+	if n%2 == 0 {
+		return 24, nil
+	}
+	return 25, nil
+}
+
+func (c *fakeDatagramConn) Write(p []byte) (int, error)       { return len(p), nil }
+func (c *fakeDatagramConn) Close() error                      { return nil }
+func (c *fakeDatagramConn) LocalAddr() net.Addr               { return nil }
+func (c *fakeDatagramConn) RemoteAddr() net.Addr              { return nil }
+func (c *fakeDatagramConn) SetDeadline(time.Time) error       { return nil }
+func (c *fakeDatagramConn) SetWriteDeadline(time.Time) error  { return nil }
+func (c *fakeDatagramConn) SetReadDeadline(t time.Time) error { return nil }
+
+// TestReadEchoCancellationBoundedByDatagramStream pins the audit fix: a
+// foreign-datagram stream that never lets a read arm expire must not
+// defer cancellation to the whole applied RTO — the ctx checkpoint on
+// every received datagram bounds the exit:border one arm plus a read.
+func TestReadEchoCancellationBoundedByDatagramStream(t *testing.T) {
+	conn := &fakeDatagramConn{}
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan error, 1)
+	go func() {
+		// Artificially far-future deadline: pre-fix, the foreign stream
+		// kept re-arming forever and cancellation was unbounded.
+		deadline := time.Now().Add(time.Hour)
+		done <- readEcho(ctx, conn, make([]byte, MaxDatagramSize), 1400, []uint64{7, 8, 9}, map[uint64]uint64{7: 1, 8: 2, 9: 3}, "", HMACHeaderCoverage, deadline)
+	}()
+
+	// Let the skipping loop enter, then cancel while foreign datagrams
+	// keep arriving.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("readEcho must return the ctx error under a foreign-datagram stream, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		buf := make([]byte, 0)
+		_ = buf
+		t.Fatal("readEcho did not honor cancellation within 2s of cancel under a foreign-datagram stream (bounded-exit regression)")
 	}
 }

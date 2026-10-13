@@ -176,6 +176,14 @@ func LoadTargets(path string) ([]Target, error) {
 // is still in the file) once it does exit.
 var stragglerStopTimeout = 5 * time.Second
 
+// stragglerReLogInterval re-asserts the stranded-target state at Warn
+// level: a permanently wedged probe loop (write with no deadline) leaves
+// its target silently unprobed for the process lifetime — one Error line
+// at mark time is invisible to log-frequency alerting, and nothing else
+// re-states the condition. A package var so tests can shorten it (the
+// stragglerStopTimeout/DynClientTTL precedent).
+var stragglerReLogInterval = time.Minute
+
 // RunClient starts probe loops for every target in cfg.Targets. Each
 // target is probed in its own goroutine. Blocks until ctx is cancelled.
 func RunClient(ctx context.Context, cfg Config) error {
@@ -284,12 +292,6 @@ func RunClient(ctx context.Context, cfg Config) error {
 	// target's absence can change while the old loop is still winding down:
 	// a removal that races the exit must not be missed (that left a ghost
 	// /status row and a frozen link_up series for the process lifetime).
-	// stragglerReLogInterval re-asserts the stranded-target state at Warn
-	// level: a permanently wedged loop (write with no deadline) leaves
-	// its target silently unprobed for the process lifetime — one Error
-	// line at mark time is invisible to log-frequency alerting, and
-	// nothing else re-states the condition. A var so tests can shorten it.
-	var stragglerReLogInterval = time.Minute
 
 	markStraggler := func(name string, r running) {
 		cfg.Status.MarkStraggler(name, true)
@@ -1293,6 +1295,23 @@ func runEchoLoop(
 	}
 
 	defer func() {
+		// Close the socket FIRST and give the reader one bounded join
+		// before any accounting: the reader can be parked in its send-select
+		// or mid-parse of an already-read datagram, and an echo it pushes in
+		// AFTER the non-blocking drain below would be charged as a timeout
+		// on a probe the link actually answered — fabricated loss. conn
+		// Close unblocks its Read (net.ErrClosed), readerDone closes when
+		// the goroutine exits on any path, and the bound keeps a wedged
+		// reader from stretching any join deadline (Stop's 20s, a reload's
+		// 5s stragglerStopTimeout). The join cost is paid once per loop exit,
+		// never per event. (Deliberately also fixes the panic-recovery drain
+		// below, which runs inside this same defer.)
+		// pi-lens-ignore: go-ignored-call-result
+		_ = conn.Close()
+		select {
+		case <-readerDone:
+		case <-time.After(mtuReadArm):
+		}
 		if r := recover(); r != nil {
 			logger.Error("Panic in echo loop; continuing", "panic", r)
 			retErr = fmt.Errorf("panic in echo loop: %v", r)
