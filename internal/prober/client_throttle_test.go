@@ -197,3 +197,34 @@ func TestEchoLoop_PendingWindowThrottleSkipsSends(t *testing.T) {
 		t.Errorf("inflight must drain to 0 after shutdown, got %v", infl)
 	}
 }
+
+// TestResponseBufferCapacity pins the respCh sizing rule (audit fix): a
+// static pair sizes from timeout/interval clamped 100..maxPendingWindow,
+// while -adaptive pins the channel to maxPendingWindow because the
+// applied RTO (floor max(200ms, 2*SRTT)) is unbounded above and can
+// legitimately hold the full pending window in flight. Under-sizing a
+// healthy adaptive link back-pressures the reader into the kernel and
+// turns echoes into drops that get swept as fabricated loss.
+func TestResponseBufferCapacity(t *testing.T) {
+	if maxPendingWindow != 1000 {
+		t.Fatalf("test assumes maxPendingWindow = 1000, got %d", maxPendingWindow)
+	}
+
+	// Static pair: interval 10ms / timeout 3s -> 300+20 fits.
+	if got := responseBufferCapacity(Config{BaseInterval: 10 * time.Millisecond, BaseTimeout: 3 * time.Second}); got != 320 {
+		t.Fatalf("static 10ms/3s capacity = %d, want 320", got)
+	}
+	// Static aggressive pair clamps at the window cap.
+	if got := responseBufferCapacity(Config{BaseInterval: 2 * time.Millisecond, BaseTimeout: 3 * time.Second}); got != maxPendingWindow {
+		t.Fatalf("static 2ms/3s capacity = %d, want %d", got, maxPendingWindow)
+	}
+	// Small static window floors at 100.
+	if got := responseBufferCapacity(Config{BaseInterval: 500 * time.Millisecond, BaseTimeout: time.Second}); got != 100 {
+		t.Fatalf("static 500ms/1s capacity = %d, want 100", got)
+	}
+	// Adaptive always pins to the send-site window cap, however tight
+	// the static pair looks.
+	if got := responseBufferCapacity(Config{BaseInterval: 2 * time.Millisecond, BaseTimeout: 200 * time.Millisecond, Adaptive: true}); got != maxPendingWindow {
+		t.Fatalf("adaptive capacity = %d, want %d", got, maxPendingWindow)
+	}
+}
