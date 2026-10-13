@@ -147,6 +147,17 @@ func validZone(zone string) bool {
 	if zone == "" || len(zone) > maxZoneLen {
 		return false
 	}
+	// Reject a trailing dot inside the zone: the dot's purpose is VLAN
+	// sub-interface names ("eth0.100"), and a dangling trailing dot makes
+	// the whole host label checks pass through the zone branch while the
+	// FQDN trailing-dot strip (checked below it) never applies to an IP
+	// literal — validation would accept a host the dialer then rejects,
+	// stranding the target in the 1s dial-retry loop with recurring
+	// dial_retry errors instead of a clean startup failure
+	// (e.g. "fe80::1%eth0.:9100").
+	if zone[len(zone)-1] == '.' {
+		return false
+	}
 	for i := 0; i < len(zone); i++ {
 		c := zone[i]
 		if !isASCIILetterDigit(c) && c != '_' && c != '-' && c != '.' {

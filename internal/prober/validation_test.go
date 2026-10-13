@@ -38,6 +38,12 @@ func TestValidateTarget_IPishHosts(t *testing.T) {
 		{"FQDN trailing dot accepted", "example.com.:9100", false},
 		{"IPv6 literal accepted", "[::1]:9100", false},
 		{"IPv6 link-local with zone accepted", "[fe80::1%eth0]:9100", false},
+		// A zone's dot is for VLAN sub-interface names ("eth0.100"); a
+		// dangling trailing dot inside the zone would dodge the IP-literal
+		// check via the zone branch while the FQDN trailing-dot strip never
+		// applies to IP literals — rejected at load time so the target
+		// cannot strand in the dial-retry loop instead.
+		{"IPv6 zone with dangling trailing dot rejected", "[fe80::1%eth0.]:9100", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

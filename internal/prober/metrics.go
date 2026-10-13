@@ -57,7 +57,7 @@ var (
 	}, []string{"source", "target", "address"})
 	MTUProbesLost = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "link_mtu_probes_lost_total",
-		Help: "DF-set MTU probes with no echo, per attempt like link_mtu_probes_sent_total (a size that fails twice counts twice), so lost/sent stays a per-probe ratio. Rising lost with healthy main probes means fragmentation-requiring traffic is being blackholed (PMTUD failure) — the classic works-small-fails-big signature. Alert on the ratio, not on > 0: a single retried loss on a 1%-loss path moves this counter.",
+		Help: "DF-set MTU probes with no echo, per attempt like link_mtu_probes_sent_total (a size that fails twice counts twice), so lost/sent stays a per-probe ratio. A probe that never left the host (local UDP write error) is counted here too, unlike the main probes' send_errors counter — interpret rising lost alongside the main ratios before blaming the wire. Rising lost with healthy main probes means fragmentation-requiring traffic is being blackholed (PMTUD failure) — the classic works-small-fails-big signature. Alert on the ratio, not on > 0: a single retried loss on a 1%-loss path moves this counter.",
 	}, []string{"source", "target", "address"})
 	PathMTUBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "link_path_mtu_bytes",
