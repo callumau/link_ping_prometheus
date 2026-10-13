@@ -283,6 +283,7 @@ func main() {
 			os.Exit(1)
 		}
 	}
+	svcTraceMarker("main-pre-logsetup")
 	logW := io.Writer(os.Stdout)
 	var logRepaired bool
 	if *flLogFile != "" {
