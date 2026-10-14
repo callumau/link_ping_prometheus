@@ -144,6 +144,35 @@ func ParseAllowlist(s string) (*Allowlist, error) {
 	return a, nil
 }
 
+// AllowEntriesFromTargets returns a comma-separated allowlist spec derived
+// from the target addresses (for -allow-from-targets). Every address must be
+// an IP literal: allowlisting a DNS name would need a resolution at
+// config-load time, and load-time validation deliberately never touches the
+// network (a reload must not depend on DNS). The result is meant to be
+// combined with any explicit -allow entries and passed to ParseAllowlist
+// once, so the CIDR, IPv4-mapped and size rules are applied in one place.
+func AllowEntriesFromTargets(targets []Target) (string, error) {
+	entries := make([]string, 0, len(targets))
+	for _, t := range targets {
+		host, _, err := net.SplitHostPort(t.Address)
+		if err != nil {
+			return "", fmt.Errorf("target %q: %w", t.Name, err)
+		}
+		addr, err := netip.ParseAddr(host)
+		if err != nil {
+			return "", fmt.Errorf("target %q address %q is not an IP literal (%w): -allow-from-targets cannot allowlist a DNS name (config load never resolves); use IP addresses in the mesh targets file, or list the host in -allow", t.Name, t.Address, err)
+		}
+		if addr.Zone() != "" {
+			// ParseAllowlist would reject this too, but its message speaks of
+			// allowlist entries, not of the target that produced one; name the
+			// target so the fix is obvious.
+			return "", fmt.Errorf("target %q address %q has an IPv6 scope zone: a datagram source never carries one, so it cannot be allowlisted; use a global address", t.Name, t.Address)
+		}
+		entries = append(entries, addr.String())
+	}
+	return strings.Join(entries, ","), nil
+}
+
 // Len reports the number of allowlist entries (exact IPs + prefixes).
 // Nil-safe: an absent allowlist is empty.
 func (a *Allowlist) Len() int {

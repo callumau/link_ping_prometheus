@@ -36,7 +36,7 @@ func saveFlags(t *testing.T) {
 	oldTarget, oldTargets := *flTarget, *flTargets
 	oldUser, oldPass := *flMetricsBasicAuthUser, *flMetricsBasicAuthPass
 	oldCert, oldKey := *flMetricsTLSCert, *flMetricsTLSKey
-	oldAllow, oldSource := *flAllow, *flSource
+	oldAllow, oldAllowFromTargets, oldSource := *flAllow, *flAllowFromTargets, *flSource
 	oldAdaptive := *flAdaptive
 	oldInterval, oldTimeout := *flBaseInterval, *flBaseTimeout
 	oldLogFile, oldJSONLogs := *flLogFile, *flJSONLogs
@@ -49,6 +49,7 @@ func saveFlags(t *testing.T) {
 		*flMetricsBasicAuthUser, *flMetricsBasicAuthPass = oldUser, oldPass
 		*flMetricsTLSCert, *flMetricsTLSKey = oldCert, oldKey
 		*flAllow, *flSource = oldAllow, oldSource
+		*flAllowFromTargets = oldAllowFromTargets
 		*flAdaptive = oldAdaptive
 		*flBaseInterval, *flBaseTimeout = oldInterval, oldTimeout
 		*flLogFile, *flJSONLogs = oldLogFile, oldJSONLogs
