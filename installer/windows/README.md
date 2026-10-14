@@ -71,6 +71,16 @@ explicitly whenever a credential was entered:
   reads it as LocalSystem and injects the values into the service environment,
   so a custom service account is unaffected
 
+**Verifying delivery.** The SCM reads the key at service start, so a restart
+picks up changed values. A quick smoke check that the values actually reached
+the service: with credentials set, any HTTP client on the metrics endpoint
+must answer **401** without credentials and **200** with
+`LINK_PING_METRICS_USER`/`LINK_PING_METRICS_PASS`. The same is asserted
+automatically by the gated Windows e2e suite
+(`LPP_E2E_WINDOWS=1 go test -run TestE2EWindowsCredentialEnvDelivery ./test/e2e/`),
+which writes the values through the same `reg add` form and probes a real
+SCM-started service.
+
 The step fails loudly — if the ACL cannot be set the installer prints an
 `ERROR` line and exits non-zero rather than leaving a world-readable key
 behind. On success it echoes
