@@ -304,9 +304,7 @@ icacls "%LOG_DIR%" /inheritance:r /grant "SYSTEM:(OI)(CI)F" "Administrators:(OI)
 :: allowlist written as "10.0.0.1, 10.0.0.2" and paths under Program Files,
 :: and an unquoted space splits the argument list -- Go's flag parser then
 :: stops at the stray token, -svc=install is never seen and this script waits
-:: forever on a foreground agent instead of installing the service. (-mode and
-:: -metrics are left bare: their values are validated literals with no sane
-:: space in them.)
+:: forever on a foreground agent instead of installing the service.
 REM (-mode is a validated literal; -metrics is free-text user input and is
 REM quoted like the other space-capable values.)
 set "INSTALL_ARGS=-mode=%RUN_MODE% -metrics="%METRICS_ADDR%""
@@ -382,7 +380,22 @@ if errorlevel 1 (
     echo   those characters cannot be delivered safely through quoting below.
     goto :wiz_mpass
 )
-if "%MPass%"=="" goto :wiz_esecret
+:: Pair rule mirrors resolveMetricsAuth in main.go: a half-pair (user
+:: without password or the reverse) makes the binary exit at startup and
+:: loops the SCM restart ladder, so refuse it at install time. Redirecting
+:: to :wiz_muser also lets the operator abandon metrics auth entirely:
+:: an empty username followed by an empty password stores neither.
+if "%MUser%"=="" if not "%MPass%"=="" (
+    echo   ERROR: password without a username is a half-pair - the binary
+    echo   requires BOTH metrics credentials or NEITHER. Starting over:
+    echo   press Enter at the username prompt to skip metrics auth.
+    goto :wiz_muser
+)
+if "%MUser%"=="" if "%MPass%"=="" goto :wiz_esecret
+if not "%MPass%"=="" goto :wiz_esecret
+echo   The password is required together with the username. Re-enter both:
+echo   press Enter at the username prompt to skip metrics auth.
+goto :wiz_muser
 :wiz_esecret
 set "ESecret="
 set /p "ESecret=Echo HMAC secret: "
@@ -414,12 +427,32 @@ if errorlevel 1 (
     goto :wiz_esecretold
 )
 if "%ESecretOld%"=="" goto :wiz_creds_done
+:: Rotation pair: the binary rejects a previous secret WITHOUT a current one
+:: (run()'s rotation guard) and the service would crash-loop the restart
+:: ladder, so refuse the half-pair at install time. Re-entering from
+:: :wiz_esecret lets the operator skip rotation entirely with Enter.
+if "%ESecret%"=="" if not "%ESecretOld%"=="" (
+    echo   ERROR: a previous secret without a current one is invalid - the
+    echo   binary's rotation guard refuses it and the service would exit at
+    echo   startup. Re-enter the current secret, or press Enter at both
+    echo   secret prompts to skip HMAC authentication.
+    goto :wiz_esecret
+)
 call :CheckSecretLength ESecretOld
 if errorlevel 1 (
     echo   ERROR: the previous echo HMAC secret must also be at least 16 characters.
     goto :wiz_esecretold
 )
 :wiz_creds_done
+:: A trailing backslash in a credential value would escape the closing
+:: quote of the quoted /d argument below at reg.exe's CommandLineToArgvW
+:: parse, silently mangling the stored secret while the install still
+:: reports success. Same rationale as the TARGETS_FILE/LOG_DIR strips
+:: above; a credential has no legitimate trailing backslash.
+if "%MUser:~-1%"=="\" set "MUser=%MUser:~0,-1%"
+if "%MPass:~-1%"=="\" set "MPass=%MPass:~0,-1%"
+if "%ESecret:~-1%"=="\" set "ESecret=%ESecret:~0,-1%"
+if "%ESecretOld:~-1%"=="\" set "ESecretOld=%ESecretOld:~0,-1%"
 if not "%MUser%"=="" reg add "%ENV_KEY%" /v LINK_PING_METRICS_USER /t REG_SZ /d "%MUser%" /f >nul
 if not "%MPass%"=="" reg add "%ENV_KEY%" /v LINK_PING_METRICS_PASS /t REG_SZ /d "%MPass%" /f >nul
 if not "%ESecret%"=="" reg add "%ENV_KEY%" /v LINK_PING_ECHO_SECRET /t REG_SZ /d "%ESecret%" /f >nul

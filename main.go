@@ -647,7 +647,7 @@ func handleService(action string, logSink *countedWriter) {
 		}
 		if *flMetricsBasicAuthUser != "" || *flMetricsBasicAuthPass != "" {
 			fmt.Println("WARNING: -metrics-user/-metrics-pass are NOT persisted into the service configuration.")
-			fmt.Println("Configure LINK_PING_METRICS_USER/LINK_PING_METRICUS/LINK_PING_METRICSPASS in the service environment instead.")
+			fmt.Println("Configure LINK_PING_METRICS_USER/LINK_PING_METRICS_PASS in the service environment instead.")
 		}
 		if *flEchoSecret != "" {
 			fmt.Println("WARNING: -echo-secret is NOT persisted into the service configuration.")
