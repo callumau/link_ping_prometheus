@@ -1,0 +1,110 @@
+---
+# Mesh variables for deploy/ansible/mesh.yml. Copy this file to
+# group_vars/mesh.yml and adjust; encrypt it with ansible-vault whenever
+# it carries the HMAC secret or metrics credentials:
+#   cp group_vars/mesh.example.yml group_vars/mesh.yml
+#   ansible-vault encrypt group_vars/mesh.yml
+#
+# The inventory must place sites in the two mesh groups (see
+# inventory.example.yml / docs/mesh-deployment.md):
+#   link_ping_mesh_linux    (systemd hosts)
+#   link_ping_mesh_windows  (SCM hosts)
+
+# Service identity.
+link_ping_service_name: link_ping_prometheus
+
+# ---------------------------------------------------------------------------
+# The one shared topology. Every site is listed here, INCLUDING the site this
+# file is deployed to: the agent skips the target whose name equals its own
+# -source, so the same list is correct everywhere.
+#
+# Each host's own name comes from its link_ping_site host var (in the
+# inventory) and defaults to inventory_hostname. It MUST match one of the
+# names below - the self-skip is an exact, case-sensitive match, and the
+# playbook asserts the membership.
+#
+# `address` must be an IP literal (the allowlist is derived from it and
+# config load never resolves DNS). The port is the site's -listen port.
+# ---------------------------------------------------------------------------
+link_ping_mesh_peers:
+  - {name: site01, address: "192.0.2.11:4000"}
+  - {name: site02, address: "192.0.2.12:4000"}
+  - {name: site03, address: "192.0.2.13:4000"}
+  - {name: site04, address: "198.51.100.21:4000"}
+  - {name: site05, address: "198.51.100.22:4000"}
+  - {name: site06, address: "198.51.100.23:4000"}
+  - {name: site07, address: "203.0.113.31:4000"}
+  - {name: site08, address: "203.0.113.32:4000"}
+  - {name: site09, address: "203.0.113.33:4000"}
+  - {name: site10, address: "203.0.113.34:4000"}
+
+# Runtime configuration. A mesh site must run both: it echoes its peers and
+# probes them (-mode=server never loads the targets file and cannot derive
+# the allowlist).
+link_ping_mode: both
+link_ping_listen: ":4000"
+# Default matches the binary's localhost default. Set an explicit
+# all-interfaces value only with auth+TLS or a firewall rule for TCP 2112 -
+# the play refuses an unauthenticated wildcard bind.
+link_ping_metrics_listen: "127.0.0.1:2112"
+# How often each agent re-reads targets.json. Mandatory on Windows (a
+# service has no SIGHUP); on Linux `systemctl reload` works too.
+link_ping_mesh_reload_interval: "30s"
+# Derive the fail-closed client allowlist from link_ping_mesh_peers. This is
+# the flag that makes one shared file enough.
+link_ping_allow_from_targets: true
+# Optional EXTRA allowlist entries, comma-separated, never spaces. Use it for
+# non-mesh hosts and for site-range CIDRs (e.g. "192.0.2.0/24,
+# 198.51.100.0/24"), which is what lets a future site be added with no
+# restart at all. The derived exact-IP entries are added on top.
+link_ping_allow: ""
+# Appended verbatim to the CLI args, e.g. "-payload=1400 -mtu-sweep=10m".
+# Multiple flags are fine, but every whitespace-separated token must be one
+# complete -flag=value: a space INSIDE a value silently truncates the flag
+# list, and the playbook assert rejects tokens without a leading '-'.
+link_ping_extra_args: ""
+
+# Secrets - NEVER passed as CLI flags; delivered via the service
+# environment (EnvironmentFile on Linux, SCM Environment registry key on
+# Windows). Set the SAME value on every site. Encrypt with ansible-vault.
+link_ping_echo_secret: ""
+link_ping_echo_secret_old: ""   # only during a rotation, servers first
+link_ping_metrics_user: ""
+link_ping_metrics_pass: ""
+
+# Install locations.
+link_ping_install_dir: "/usr/local/bin"  # Linux; Windows overrides below
+link_ping_windows_install_dir: 'C:\Program Files\LinkPing'
+link_ping_log_dir: "/var/log/link-ping"
+
+# ---------------------------------------------------------------------------
+# Optional unattended pull model. Leave link_ping_config_repo empty to skip
+# it entirely (the playbook push above is then the only source of topology).
+# When set, each site pulls targets.json from this repo on a timer with a
+# read-only deploy key and installs it atomically; the config repo holds NO
+# secrets. See docs/mesh-deployment.md for the key and known_hosts setup.
+# ---------------------------------------------------------------------------
+link_ping_config_repo: ""
+link_ping_config_branch: "main"
+link_ping_config_file: "targets.json"
+# Where the pulled topology lands (the live -targets directory).
+link_ping_config_dest: "/etc/link_ping_prometheus"
+link_ping_config_dest_win: 'C:\Program Files\LinkPing'
+# Deploy key on the MANAGED host. link_ping_config_key_src is the optional
+# control-node path to copy it from; both are paths, and the key material is
+# a secret kept in the vault (or delivered out of band).
+link_ping_config_key_path: "/etc/link_ping_pull_config/deploy_key"
+# Folded scalars keep the long Windows paths inside the 80-column budget.
+link_ping_config_key_path_win: >-
+  C:\ProgramData\link_ping_prometheus\pull_config\deploy_key
+link_ping_config_key_src: ""
+# Pinned host keys (verify the fingerprints against GitHub's published set).
+link_ping_config_known_hosts: "/etc/link_ping_pull_config/known_hosts"
+link_ping_config_known_hosts_win: >-
+  C:\ProgramData\link_ping_prometheus\pull_config\known_hosts
+link_ping_config_known_hosts_src: ""
+# Pull cadence, expressed once per platform: systemd OnCalendar on Linux
+# (must be a valid calendar spec) and Task Scheduler minutes on Windows.
+link_ping_config_pull_calendar: "*:0/5"
+link_ping_config_pull_minutes: 5
+link_ping_config_pull_task: "LinkPing config pull"
