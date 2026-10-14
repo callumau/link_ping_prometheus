@@ -206,6 +206,11 @@ the secret-bearing tasks are marked `no_log` so they cannot leak into
 `-v`/`--diff` output. See `deploy/ansible/README.md` for prerequisites and
 usage.
 
+For a multi-site mesh — one identical targets file on every site, the
+allowlist derived from it (`-allow-from-targets`), and an unattended
+config-repo pull — see [Mesh deployment](docs/mesh-deployment.md) and
+`deploy/ansible/mesh.yml`.
+
 ## Usage
 
 Operator reference: the command-line flags, runnable examples, the targets
@@ -222,6 +227,7 @@ link_ping_prometheus -mode=<mode> [flags]
 | `-mode` | `server` | Operation mode: `server`, `client`, `both` |
 | `-listen` | `:4000` | Server listen address |
 | `-allow` | `""` | Server: comma-separated client IP allowlist — plain IPs or CIDR prefixes like `203.0.113.0/24` (fail-closed — required in `server`/`both` mode) |
+| `-allow-from-targets` | `false` | Server: derive the fail-closed allowlist from the `-targets` file addresses and skip the target whose `name` equals `-source`, so **one** targets file serves every site of a mesh (still combinable with `-allow` for extra CIDRs). Every target address must be an IP literal — a DNS name is a startup error, because config load never resolves (a reload must not depend on the network). This removes the per-site allowlist: adding or renumbering a site becomes a one-line edit to the shared file, picked up by reload. See [Mesh deployment](docs/mesh-deployment.md). |
 | `-target` | `""` | Client: single target `host:port` |
 | `-targets` | `""` | Client: path to JSON targets file |
 | `-metrics` | `127.0.0.1:2112` | Prometheus metrics HTTP listen address (localhost-only by default; use `:2112` to expose for remote scrape — firewall-restrict) |
@@ -306,6 +312,8 @@ Max 1000 targets, max file size 1 MB. Per-target interval/timeout must be >0 whe
 **Address syntax:** `address` is `host:port` with the port in 1-65535, checked syntactically at load time (no DNS lookup, so a reload never depends on the network). Two dialable forms go beyond plain RFC 1123 name labels: a DNS name may carry one trailing dot for the FQDN root (`mon.example.com.:5000`), and an IPv6 literal may carry a `%zone` scope suffix whose characters are letters, digits, `_`, `-` and `.` so VLAN interface names work (`[fe80::1%eth0.100]:5000`). A zone on a DNS name or an IPv4 literal is rejected (`example.com%eth0:80`, `1.2.3.4%eth0:80`), and so is a trailing dot on an IP literal (`1.2.3.4.:80`) — the root dot is only stripped from names.
 
 **Hot reload:** send `SIGHUP` to re-read the file without a restart (Unix), or run with `-targets-reload-interval` (e.g. `30s`) for automatic polling — the only option under a Windows service, which has no SIGHUP. On reload: new targets start probing, removed targets stop and their series are deleted from `/metrics` (Prometheus marks the vanished series stale, so `link_up`-keyed alerts stop firing for them — an `absent()`/`up` alert covers a fully dead client), and targets whose address/intervals changed restart with the new values. A file that is mid-edit or invalid keeps the previous set running — reload failures are logged at Error level, never fatal. A reload whose file parses to an empty array logs a warning that all probing has stopped. A probe loop that fails to join within 5s is left stopped (its socket may still be draining) and its series are purged once it does exit, so a stuck loop cannot leave a frozen `link_up=1` behind.
+
+**One file for a whole mesh:** run every site with `-mode=both -allow-from-targets` and deploy the *same* `targets.json` — listing every site, including the local one — on each of them; only `-source` differs per host. The agent drops the entry whose `name` matches its own `-source` (exact match) and derives its fail-closed allowlist from the remaining target addresses, so there is no per-site allowlist to maintain and adding a site is a one-line edit to one shared file. Addresses must be IP literals in this mode. See [Mesh deployment](docs/mesh-deployment.md) for the full runbook, the GitHub config-repo pull, and the Ansible playbook (`deploy/ansible/mesh.yml`).
 
 ### Memory & Runtime Tuning
 

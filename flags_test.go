@@ -321,3 +321,65 @@ func TestAbsolutizeFlagValue(t *testing.T) {
 // nothing is exactly the failure mode an orchestrator must be able to see.
 // socket_age_seconds is set only after a successful dial, so it is the signal
 // the gate reads.
+
+// TestBuildConfigMeshSelfSkip pins the mesh contract: with -allow-from-targets
+// one targets file lists every site including the local one, so the client set
+// must drop the entry whose name matches -source exactly — target names are
+// Prometheus label values and are case-sensitive, so a case variant is a
+// different series and must be kept. In client mode the flag is ignored
+// wholesale (warnIgnoredFlags says so), so the self entry stays.
+// pi-lens-ignore: go-test-functions
+func TestBuildConfigMeshSelfSkip(t *testing.T) {
+	saveFlags(t)
+	t.Setenv("LINK_PING_ECHO_SECRET", "")
+	path := filepath.Join(t.TempDir(), "targets.json")
+	body := `[
+		{"name": "syd", "address": "192.0.2.10:4000"},
+		{"name": "fra", "address": "192.0.2.11:4000"},
+		{"name": "SYD", "address": "192.0.2.12:4000"}
+	]`
+	// pi-lens-ignore: go-path-traversal
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("both mode drops the exact self name only", func(t *testing.T) {
+		saveFlags(t)
+		*flMode = "both"
+		*flTargets = path
+		*flSource = "syd"
+		*flAllowFromTargets = true
+		cfg, err := buildConfig()
+		if err != nil {
+			t.Fatalf("buildConfig: %v", err)
+		}
+		if !cfg.SkipSelf {
+			t.Error("SkipSelf must be set so the reload path drops self too")
+		}
+		names := make([]string, 0, len(cfg.Targets))
+		for _, tg := range cfg.Targets {
+			names = append(names, tg.Name)
+		}
+		if got, want := strings.Join(names, ","), "fra,SYD"; got != want {
+			t.Errorf("targets = %q, want %q (exact-match self removal, case variant kept)", got, want)
+		}
+	})
+
+	t.Run("client mode ignores the flag and keeps self", func(t *testing.T) {
+		saveFlags(t)
+		*flMode = "client"
+		*flTargets = path
+		*flSource = "syd"
+		*flAllowFromTargets = true
+		cfg, err := buildConfig()
+		if err != nil {
+			t.Fatalf("buildConfig: %v", err)
+		}
+		if cfg.SkipSelf {
+			t.Error("client mode has no allowlist, so mesh mode must not apply")
+		}
+		if len(cfg.Targets) != 3 {
+			t.Errorf("client mode must keep all 3 targets, got %d", len(cfg.Targets))
+		}
+	})
+}

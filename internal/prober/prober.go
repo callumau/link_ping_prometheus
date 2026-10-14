@@ -72,8 +72,13 @@ var ReconnectInterval = 5 * time.Minute
 type Config struct {
 	// Source is the topology label applied to every metric series, e.g.
 	// the local datacenter or site name ("sydney-dc").
-	Source       string
-	Targets      []Target
+	Source  string
+	Targets []Target
+	// SkipSelf is the mesh-mode (-allow-from-targets) marker: the caller has
+	// already removed the target whose Name equals Source, and the reload
+	// path must apply that same removal so a hot reload cannot re-add the
+	// local site as a probe target.
+	SkipSelf     bool
 	Adaptive     bool
 	BaseInterval time.Duration
 	BaseTimeout  time.Duration

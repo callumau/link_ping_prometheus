@@ -122,18 +122,19 @@ func startHeapScavenger(ctx context.Context, every time.Duration, minUnreleased 
 
 // CLI flags.
 var (
-	flMode          = flag.String("mode", "server", "Mode: server, client, both")
-	flListen        = flag.String("listen", ":4000", "Server: Listen address")
-	flAllow         = flag.String("allow", "", "Server: Comma-separated client IP allowlist (fail-closed: required in server/both mode)")
-	flTarget        = flag.String("target", "", "Client: Single target address")
-	flTargets       = flag.String("targets", "", "Client: JSON file path with targets")
-	flMetrics       = flag.String("metrics", "127.0.0.1:2112", "Metrics: Listen address (default binds localhost only; use \":2112\" or \"0.0.0.0:2112\" to expose on all interfaces)")
-	flSvc           = flag.String("svc", "", "Service: install, uninstall (Windows only; Linux uses the systemd unit), start, stop, run")
-	flJSONLogs      = flag.Bool("json-logs", false, "Log in JSON format")
-	flLogFile       = flag.String("log-file", "", "Log: append logs to this file in addition to stdout (stdout is discarded under the Windows service)")
-	flLogMaxSize    = flag.Int("log-file-max-mb", 10, "Log: max size in MB before rotation (0 disables rotation; requires -log-file)")
-	flLogMaxBackups = flag.Int("log-file-max-backups", 5, "Log: max rotated files to keep")
-	flLogMaxAge     = flag.Int("log-file-max-age", 28, "Log: max days to keep rotated files")
+	flMode             = flag.String("mode", "server", "Mode: server, client, both")
+	flListen           = flag.String("listen", ":4000", "Server: Listen address")
+	flAllow            = flag.String("allow", "", "Server: Comma-separated client IP allowlist (fail-closed: required in server/both mode)")
+	flAllowFromTargets = flag.Bool("allow-from-targets", false, "Server: derive the fail-closed allowlist from the -targets file addresses and skip the target whose name matches -source, so one targets file serves every site of a mesh (client/both mode; every target address must be an IP literal - a DNS name is an error, because config load never resolves). Combines with -allow for extra CIDRs.")
+	flTarget           = flag.String("target", "", "Client: Single target address")
+	flTargets          = flag.String("targets", "", "Client: JSON file path with targets")
+	flMetrics          = flag.String("metrics", "127.0.0.1:2112", "Metrics: Listen address (default binds localhost only; use \":2112\" or \"0.0.0.0:2112\" to expose on all interfaces)")
+	flSvc              = flag.String("svc", "", "Service: install, uninstall (Windows only; Linux uses the systemd unit), start, stop, run")
+	flJSONLogs         = flag.Bool("json-logs", false, "Log in JSON format")
+	flLogFile          = flag.String("log-file", "", "Log: append logs to this file in addition to stdout (stdout is discarded under the Windows service)")
+	flLogMaxSize       = flag.Int("log-file-max-mb", 10, "Log: max size in MB before rotation (0 disables rotation; requires -log-file)")
+	flLogMaxBackups    = flag.Int("log-file-max-backups", 5, "Log: max rotated files to keep")
+	flLogMaxAge        = flag.Int("log-file-max-age", 28, "Log: max days to keep rotated files")
 
 	flAdaptive          = flag.Bool("adaptive", true, "Client: Use adaptive timeout based on link quality (RFC 6298)")
 	flBaseInterval      = flag.Duration("interval", 500*time.Millisecond, "Client: Probe interval")
@@ -368,6 +369,15 @@ func main() {
 	}
 }
 
+// meshAllowFromTargets reports whether -allow-from-targets applies. The
+// derived allowlist is a server control, so the flag needs the echo responder
+// (server/both mode); in client mode it is ignored (warnIgnoredFlags says so)
+// and no target is skipped. One spelling of the condition, used by both the
+// config builder and the startup allowlist derivation so they cannot drift.
+func meshAllowFromTargets() bool {
+	return *flAllowFromTargets && *flMode != "client"
+}
+
 // resolveEchoSecret returns the echo HMAC secret from flag or env.
 func resolveEchoSecret() string {
 	if *flEchoSecret != "" {
@@ -391,7 +401,8 @@ func resolveEchoSecretOld() string {
 // but silent ingestion gaps are how a half-configured fleet ships.
 //   - echo-secret-old is consumed ONLY by the server (rotation acceptance in
 //     internal/prober/server.go), so it is ignored in client mode.
-//   - allow and listen gate the echo responder, so they are ignored in client mode.
+//   - allow, allow-from-targets and listen gate the echo responder, so they
+//     are ignored in client mode.
 //   - with both -targets and -target set, buildConfig's else-if means -targets wins.
 func warnIgnoredFlags(mode string) {
 	if *flEchoSecretOld != "" && mode == "client" {
@@ -401,6 +412,9 @@ func warnIgnoredFlags(mode string) {
 	// registered default: a client run with the default must not warn.
 	if *flAllow != "" && mode == "client" {
 		slog.Warn("-allow set but ignored: the client allowlist only applies to the echo server (server/both mode)")
+	}
+	if *flAllowFromTargets && mode == "client" {
+		slog.Warn("-allow-from-targets set but ignored: the derived allowlist and self-skip only apply to the echo server (server/both mode)")
 	}
 	if *flListen != "" && *flListen != flag.Lookup("listen").DefValue && mode == "client" {
 		slog.Warn("-listen set but ignored: the listen address only applies to the echo server (server/both mode)")
@@ -489,9 +503,19 @@ func buildConfig() (prober.Config, error) {
 	if err := prober.ValidateTargetName(source); err != nil {
 		return prober.Config{}, fmt.Errorf("invalid source: %w", err)
 	}
+	// Mesh mode (-allow-from-targets) deploys ONE targets file on every
+	// site, listing all of them including the local one. Drop the self entry
+	// so the shared file probes only remote peers, and record the choice in
+	// the config so the reload path applies the same filter — a reload that
+	// re-added self would probe and export the local site.
+	skipSelf := meshAllowFromTargets()
+	if skipSelf {
+		targets = prober.FilterSelfTargets(targets, source)
+	}
 	cfg := prober.Config{
 		Source:            source,
 		Targets:           targets,
+		SkipSelf:          skipSelf,
 		Adaptive:          *flAdaptive,
 		BaseInterval:      *flBaseInterval,
 		BaseTimeout:       *flBaseTimeout,
@@ -1084,7 +1108,31 @@ func (p *program) run() error {
 	// Fail-closed client allowlist: the echo responder refuses to run
 	// without an explicit -allow list, so spoofed/unauthorised sources
 	// can neither reflect datagrams nor grow metric label cardinality.
-	allow, err := prober.ParseAllowlist(*flAllow)
+	// Mesh mode derives it from the targets file instead: every peer the
+	// agent probes is allowed to probe it back, and the self target was
+	// already dropped by buildConfig. -allow still contributes, so a mesh
+	// can also allow extra CIDRs explicitly.
+	allowSpec := *flAllow
+	if meshAllowFromTargets() {
+		if len(cfg.Targets) == 0 {
+			// Server-only mode never loads the targets file, and a file that
+			// lists only this site has no peers left after the self filter:
+			// name that instead of falling through to the generic
+			// "requires -allow" refusal, which hides why the flag had no
+			// effect.
+			return errors.New("-allow-from-targets: no peers to derive an allowlist from (the targets file is empty or lists only this -source); run client/both with a mesh targets file, or pass -allow")
+		}
+		derived, err := prober.AllowEntriesFromTargets(cfg.Targets)
+		if err != nil {
+			return err
+		}
+		if allowSpec == "" {
+			allowSpec = derived
+		} else {
+			allowSpec = derived + "," + allowSpec
+		}
+	}
+	allow, err := prober.ParseAllowlist(allowSpec)
 	if err != nil {
 		return err
 	}

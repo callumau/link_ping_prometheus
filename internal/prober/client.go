@@ -130,6 +130,23 @@ func targetByName(targets []Target, name string) (Target, bool) {
 	return Target{}, false
 }
 
+// FilterSelfTargets drops the target whose Name equals source, so one targets
+// file listing every site (including the local one) can be deployed unchanged
+// on every site of a mesh. The match is exact: target names are Prometheus
+// label values and are case-sensitive, so a case variant is a different series
+// and must not be dropped. The input slice is not modified.
+func FilterSelfTargets(targets []Target, source string) []Target {
+	kept := make([]Target, 0, len(targets))
+	for _, t := range targets {
+		if t.Name == source {
+			slog.Info("Skipping self target (mesh mode: one targets file for every site)", "name", t.Name)
+			continue
+		}
+		kept = append(kept, t)
+	}
+	return kept
+}
+
 // LoadTargets reads and validates a JSON file containing an array of
 // Target objects. Each target address is verified via ValidateTarget.
 // The file must be ≤ MaxTargetsFileSize (1 MB) and contain ≤ MaxTargetsCount
@@ -464,6 +481,11 @@ func RunClient(ctx context.Context, cfg Config) error {
 			// keep probing the previous set.
 			slog.Error("Targets reload failed; keeping previous targets", "path", cfg.TargetsPath, "err", err)
 			return
+		}
+		if cfg.SkipSelf {
+			// Mesh mode: the shared file lists every site including this one,
+			// and the reload must drop self exactly as the initial load did.
+			targets = FilterSelfTargets(targets, cfg.Source)
 		}
 		// The effective-window check needs the GLOBAL interval/timeout, so it
 		// cannot live in LoadTargets: reject a reload that would build an

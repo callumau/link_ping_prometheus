@@ -4,6 +4,8 @@ import (
 	"context"
 	"flag"
 	"net/http"
+	"os"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
@@ -144,6 +146,7 @@ func TestWarnIgnoredFlags(t *testing.T) {
 	*flListen = flag.Lookup("listen").DefValue
 	*flTarget, *flTargets = "", ""
 	*flEchoSecretOld = ""
+	*flAllowFromTargets = false
 
 	for _, tc := range []struct {
 		name      string
@@ -202,6 +205,12 @@ func TestWarnIgnoredFlags(t *testing.T) {
 			mode:  "client",
 			setup: func() { *flTargets = "targets.json" },
 		},
+		{
+			name:      "allow-from-targets in client mode",
+			mode:      "client",
+			setup:     func() { *flAllowFromTargets = true },
+			wantWarns: []string{"-allow-from-targets set but ignored"},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			saveFlags(t)
@@ -217,6 +226,79 @@ func TestWarnIgnoredFlags(t *testing.T) {
 			}
 			if len(tc.wantWarns) == 0 && log != "" {
 				t.Errorf("expected no warnings, log:\n%s", log)
+			}
+		})
+	}
+}
+
+// TestRunRejectsAllowFromTargetsWithoutPeers pins the startup diagnostics for
+// -allow-from-targets. Server-only mode never loads the targets file, and a
+// file whose only entry is the local site has no peers left after the self
+// filter; both must name that reason rather than falling through to the
+// generic "requires -allow" refusal, which would hide why the flag had no
+// effect. A DNS-name target is refused before any bind, because the derived
+// allowlist cannot be built without a resolution and config load deliberately
+// never touches the network.
+// pi-lens-ignore: go-test-functions
+func TestRunRejectsAllowFromTargetsWithoutPeers(t *testing.T) {
+	saveFlags(t)
+	t.Setenv("LINK_PING_METRICS_USER", "")
+	t.Setenv("LINK_PING_METRICS_PASS", "")
+
+	writeTargets := func(t *testing.T, body string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "targets.json")
+		// pi-lens-ignore: go-path-traversal
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	for _, tc := range []struct {
+		name    string
+		mode    string
+		targets string
+		source  string
+		wantErr string
+	}{
+		{
+			name:    "server mode has no targets file to derive from",
+			mode:    "server",
+			wantErr: "no peers to derive",
+		},
+		{
+			name:    "a self-only file has no peers left",
+			mode:    "both",
+			targets: `[{"name":"syd","address":"192.0.2.10:4000"}]`,
+			source:  "syd",
+			wantErr: "no peers to derive",
+		},
+		{
+			name:    "a DNS-name target cannot be allowlisted",
+			mode:    "both",
+			targets: `[{"name":"syd","address":"192.0.2.10:4000"},{"name":"fra","address":"peer.example.com:4000"}]`,
+			source:  "syd",
+			wantErr: "not an IP literal",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			saveFlags(t)
+			*flMode = tc.mode
+			*flListen = "127.0.0.1:0"
+			*flMetrics = "127.0.0.1:0"
+			*flAllow = ""
+			*flTargets = ""
+			*flSource = tc.source
+			*flAllowFromTargets = true
+			if tc.targets != "" {
+				*flTargets = writeTargets(t, tc.targets)
+			}
+			// pi-lens-ignore: go-context-background-handler
+			prg := &program{ctx: context.Background()}
+			err := prg.run()
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("want error containing %q, got %v", tc.wantErr, err)
 			}
 		})
 	}
