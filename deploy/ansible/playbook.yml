@@ -425,14 +425,13 @@
       # the service's environment block as SYSTEM, so the service process
       # itself needs no read access here.
       #
-      # win_script (not win_shell) so the snippet is written to a .ps1 and
-      # run as-is: cmd.exe or the outer PowerShell would otherwise re-parse
-      # the $variables and quotes. $ErrorActionPreference = 'Stop' turns a
+      # win_shell (not win_command) so the snippet runs as PowerShell on the
+      # target rather than through cmd.exe, which would re-parse the
+      # $variables and quotes. $ErrorActionPreference = 'Stop' turns a
       # failed Get-Acl/Set-Acl into a non-zero exit, so the task fails
       # instead of leaving the key world-readable and reporting success.
       # NOTIFY: no service restart - the ACL does not change any value.
-      ansible.windows.win_script:
-        script: |
+      ansible.windows.win_shell: |
           $ErrorActionPreference = 'Stop'
           $k = '{{ svc_env_key }}'
           function New-AdminRule($n) {
