@@ -73,16 +73,16 @@ high-water mark returns to the OS. It is skipped unless at least 4MB of
 *releasable* heap is held (`HEAP_IDLE - HEAP_RELEASED`) — not total process
 memory — so an already-lean process pays nothing.
 
-`GOGC` trades heap for CPU:
+`GOGC` trades heap for CPU, and the right value depends on the scrape rate:
 
-- Bursty load (800 back-to-back scrapes): `heap_sys` 6.8MB at `GOGC=50` vs
-  14.7MB by default, for ~0.8ms more CPU per scrape.
-- Quiet agent: worse at `GOGC=50` — RSS 19.8MB vs 16.7MB, ~5x allocation
-  churn.
+- Bursty scrape load: `GOGC=50` keeps the heap high-water mark lower, at the
+  cost of extra CPU per scrape.
+- Quiet agent: `GOGC=50` backfires — the runtime collects a small heap more
+  often, burning CPU and GC metadata for no heap benefit.
 
-Set `GOGC=50` for scrape-heavy deployments, leave it unset for a quiet one.
-`GOMAXPROCS=1` measured the lowest footprint (RSS 14.6MB vs 16.7MB), at the
-cost of GC parallelism.
+Set `GOGC=50` only for scrape-heavy deployments; leave it unset (or raise it)
+for a quiet one. `GOMAXPROCS=1` gives the lowest footprint, at the cost of GC
+parallelism.
 
 `-metrics-gzip` is off by default: `promhttp` pools one gzip writer per CPU,
 each holding a ~0.7MB `flate` compressor, so compression can retain ~0.7MB x
