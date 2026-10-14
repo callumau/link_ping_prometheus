@@ -17,33 +17,25 @@ degrading?" — it is not a proxy for what TCP applications experience.
 
 - [Typical Deployment](#typical-deployment)
 - [Run with Docker](#run-with-docker)
-- [Metrics](#metrics)
-- [PromQL Examples](#promql-examples)
-  - [Quick Reference](#quick-reference)
-  - [Link Packet Loss](#link-packet-loss)
-  - [Latency](#latency)
-  - [Jitter](#jitter)
-  - [Baseline Shift Detection](#baseline-shift-detection)
-  - [Link Status](#link-status)
-  - [Outage Alerts](#outage-alerts)
-- [Alert Rules File](#alert-rules-file)
+- [Installation](#installation)
+  - [Windows service](#windows)
+  - [Linux (systemd)](#linux-systemd)
 - [Deployment (Ansible)](#deployment-ansible)
-- [Grafana Alloy Scraping](#grafana-alloy-scraping)
-- [Build](#build)
-- [Test](#test)
 - [Usage](#usage)
   - [Flags](#flags)
-  - [Memory & Runtime Tuning](#memory--runtime-tuning)
-  - [Targets File](#targets-file)
   - [Examples](#examples)
-- [Installation](#installation)
-  - [Service](#service)
-    - [Windows](#windows)
-    - [Linux (systemd)](#linux-systemd)
+  - [Targets File](#targets-file)
+  - [Memory & Runtime Tuning](#memory--runtime-tuning)
+- [Metrics](#metrics)
+- [PromQL Examples](#promql-examples)
+- [Alert Rules File](#alert-rules-file)
+- [Grafana Alloy Scraping](#grafana-alloy-scraping)
 - [Grafana Dashboard](#grafana-dashboard)
-- [Code Structure](#code-structure)
 - [Wire Protocol](#wire-protocol)
 - [Security](#security)
+- [Build](#build)
+- [Test](#test)
+- [Code Structure](#code-structure)
 - [Contributing](#contributing)
 - [License](#license)
 
@@ -104,9 +96,240 @@ All [flags](#usage) work the same as the bare binary; file-based flags
 (`-targets` JSON, TLS cert/key) need those files mounted into the scratch
 image, e.g. `-v /etc/link-ping:/cfg:ro -targets=/cfg/targets.json`.
 
+## Installation
+
+### Service
+
+#### Windows
+
+Use `-svc` to install/uninstall/start/stop/run. The tool records runtime flags at install time (excluding `-svc`, `-metrics-user`, `-metrics-pass`, `-echo-secret`, and `-echo-secret-old`). Metrics auth credentials and HMAC secrets are **not** persisted into the service configuration; set `LINK_PING_METRICS_USER` / `LINK_PING_METRICS_PASS` and `LINK_PING_ECHO_SECRET` / `LINK_PING_ECHO_SECRET_OLD` in the service environment instead (a warning is printed at install time).
+
+```sh
+link_ping_prometheus.exe -mode=both -targets=targets.json -allow=192.168.1.71 -metrics=":2112" -log-file="C:\ProgramData\link_ping_prometheus\logs\service.log" -svc=install
+```
+
+**Built-in service hardening (configured automatically at install):**
+
+- **Crash recovery**: SCM failure action is *restart* after 5s (reset period 24h). A crash or fatal internal error exits non-zero so recovery fires — a dead monitor never stays down silently. This includes a mid-run failure of the metrics HTTP server itself: if `/metrics`, `/status`, `/healthz` or `/readyz` die while the agent keeps probing, the agent exits non-zero so the restart ladder brings the whole monitor back (probing without a metrics endpoint is dead weight that looks healthy).
+- **Delayed auto-start** with dependencies on `Tcpip` (sockets) and `W32Time` (time sync — the HMAC replay window requires roughly NTP-synchronized clocks between nodes).
+- **Lifecycle events in the Windows Event Log** (Application source `link_ping_prometheus`): start, stop, and fatal errors are visible even with no access to the log file. When `-log-file` is configured, runtime log-sink write failures (disk full, log directory removed or ACL'd away) are surfaced to the same event log every 30s while the service runs — otherwise a dead sink is indistinguishable from silence.
+- **Credentials never persisted** into the service configuration.
+
+**Windows Server version support:** the agent runs as a service on any Windows the Go runtime supports; SCM recovery, log rotation, HMAC and the UDP echo path have no version-specific requirements. The optional `-mtu-sweep` DF discovery supports IPv4 targets on every Windows Server version (Server 2003+ via the classic `IP_DONTFRAGMENT` option, falling back from the richer `IP_MTU_DISCOVER` path-MTU option available on Server 2019+/Windows 10 1703+); IPv6 targets need Windows Server 2019+ (or Windows 10 1703+). On Windows versions lacking a needed option the sweep alone disables itself with a one-time warning — probing is unaffected.
+
+**Enterprise deployment checklist:**
+
+> `installer/windows/install-service.bat` / `uninstall-service.bat` in this repo automate steps 1–4 below (admin check, ACL'd log dir, escalating restart ladder, per-service SID, credential prompts). Run from an elevated prompt: an interactive wizard asks for mode (server/client/both), metrics address, targets — a JSON file or a single host:port — the **required** client IP allow-list for server/both modes, log directory, and optional service account, then shows a summary before installing.
+
+1. **Always pass `-log-file` at install.** Under the service, stdout is discarded; without a log file, verbose logs go nowhere (lifecycle/fatal events still reach the event log). Log rotation is built in (`-log-file-max-mb/-backups/-age`). A warning is printed if you skip it. The agent enforces `0600` on the log file at startup (repairing wider modes) and refuses symlinked log paths — place the log in a directory not writable by other local users (the installer's ACL'd log dir satisfies this). On Windows `chmod` cannot restrict a DACL, so the agent does the equivalent itself: at startup it replaces the log file's DACL with a protected set (no parent inheritance) granting full access only to `SYSTEM`, `Administrators` and the account the agent runs as, wherever `-log-file` points — a manual install now inherits no wide directory grant. The ACL'd log **directory** created by the installer remains defense-in-depth (log rotation creates fresh files that inherit the directory ACL), and the manual `icacls` recipe below stays useful for belt-and-braces (`icacls "<dir>" /inheritance:r /grant "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" "NT SERVICE\link_ping_prometheus:(OI)(CI)M"`). The restriction is also re-applied every 5 minutes at runtime, so a lumberjack rotation recreating the live file under a wide directory DACL is repaired without a service restart.
+2. **Service account.** By default the service installs as `LocalSystem`, which is more privilege than this prober needs (outbound UDP + a metrics port + its log directory). For least privilege, switch to a passwordless built-in or gMSA account after install:
+
+   ```sh
+   sc.exe config link_ping_prometheus obj= "NT AUTHORITY\LocalService"
+   ```
+
+   Use `NT AUTHORITY\NetworkService` instead of LocalService if network firewalls expect machine-account identity, or a domain gMSA (`DOMAIN\svc-linkping$`) if policy mandates managed accounts. Grant the chosen account write access to the log directory only. **If a log file already exists, delete it (or re-ACL it) before switching accounts**: the agent restricts the log file's DACL to SYSTEM + Administrators + the account that created it, so the *previous* account's log file denies the new account write access and the service exits at startup (loud, non-zero — the restart ladder will loop until the file is removed).
+3. **Secrets delivery.** Set the credential environment variables machine-wide via System Properties → Environment Variables, or per-service:
+
+   ```sh
+   reg add HKLM\SYSTEM\CurrentControlSet\Services\link_ping_prometheus\Environment /v LINK_PING_METRICS_USER /t REG_SZ /d <user> /f
+   reg add HKLM\SYSTEM\CurrentControlSet\Services\link_ping_prometheus\Environment /v LINK_PING_METRICS_PASS /t REG_SZ /d <pass> /f
+   reg add HKLM\SYSTEM\CurrentControlSet\Services\link_ping_prometheus\Environment /v LINK_PING_ECHO_SECRET /t REG_SZ /d <secret> /f
+   ```
+
+   The installer and the Ansible play both restrict this key's ACL to SYSTEM and Administrators once a value has been stored (inheritance off, so the inherited world-readable entry is dropped); run the same PowerShell snippet by hand if you add values with `reg add` yourself, and confirm a non-admin `reg query` of the key now fails. Values that sat in the key before that hardening should be treated as disclosed: rotate the echo secret (and metrics password) with the outage-free rotation runbook in the Security section, then restart the service. For higher assurance still, prefer an ACL-hardened secrets file sourced by your configuration management over the registry. The echo HMAC secret should be at least 16 characters regardless of how it is delivered — it is the key material for HMAC-SHA256 probe authentication and a short value is brute-forceable (the install wizard enforces this; there is no binary-side minimum).
+4. **Further hardening (optional, post-install):** the restart escalation ladder (`sc.exe failure ... actions= restart/5000/restart/30000/restart/60000`), the per-service SID (`sc.exe sidtype link_ping_prometheus unrestricted`) and its log-dir ACL are applied automatically by the installer; the manual `sc.exe` recipes above are for a hand-install or re-verification. Only the following remain manual: restrict who can reconfigure the service via `sc.exe sdset`; keep the binary under `%ProgramFiles%` with Admins-only write ACLs; Authenticode-sign the binary and allowlist via AppLocker/WDAC.
+
+   Note that a hand-install (`<binary> -svc=install`, no wizard) gets exactly ONE restart action (uniform 5s retry, 24h failure-reset period — what the kardianos install path can express); the installer's escalating 5s/30s/60s ladder requires the wizard's post-install `sc.exe failure` step above. The agent's own fatal-error behavior (non-zero unclean exit under the service so SCM recovery fires) is identical either way.
+5. **Upgrades:** re-run `installer/windows/install-service.bat` with the new binary — it detects the existing service, swaps the binary only when its SHA256 differs, and restarts (runtime truth updates via `link_ping_build_info`). Parameters are preserved. If any runtime flags changed, uninstall and reinstall instead — arguments are snapshotted at install time. Before running the installer (it is elevated and writes a service, so a tampered binary lands with SYSTEM rights), verify the release in this order:
+
+   ```sh
+   # 1. the signature: who published this checksums file (keyless sigstore)
+   cosign verify-blob --bundle checksums.txt.sigstore.json \
+     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+     --certificate-identity "https://github.com/<owner>/<repo>/.github/workflows/release.yml@refs/tags/<tag>" \
+     checksums.txt
+   # 2. the artifacts: against the now-trusted checksums file
+   sha256sum --check --ignore-missing checksums.txt
+   # 3. the provenance: this release workflow built the artifact (GitHub
+   #    attestation store). The cosign signature above only proves who
+   #    published the checksums file; the SLSA provenance attestation
+   #    proves which workflow run built each artifact, on what runner,
+   #    from what source commit — a swapped or out-of-pipeline artifact
+   #    fails this check even if the signature itself verifies.
+   gh attestation verify link_ping_prometheus_Linux_x86_64.tar.gz \
+     -R callumau/link_ping_prometheus
+   ```
+6. **Supply chain and fleet-wide auth, before scaling out:**
+   - Restrict who can create `v*` tags with a GitHub Ruleset — the release build reads the tag for `link_ping_build_info` and now also mints a sigstore signing identity from the run, so tag creation is release-authoring permission, not a general contributor one. `.github/CODEOWNERS` lists the release paths (replace its placeholder team first — an unresolved handle matches nobody, so a required-review ruleset on it would never be satisfiable).
+   - Pin the WinRM CA per host in the Ansible inventory (`deploy/ansible/inventory.example.yml`); an unpinned `winrm` connection trusts whatever CA answers first, which is the deploy host's supply chain.
+   - Clock sync is load-bearing, not hygiene: `-echo-secret` rejects any probe more than 30s from the reflector's clock, so a drifted node drops its own legitimate probes as replay and its peers read `link_up=0`. `LinkClockSkewHigh`, `LinkClockSkewCritical` and `ServerReplayDrops` in `rules/link-monitor.yml` alert on it — load them everywhere the service runs.
+
+#### Linux (systemd)
+
+Create `/etc/systemd/system/link_ping_prometheus.service`:
+
+```ini
+[Unit]
+Description=Link Ping Prometheus (UDP link monitor)
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
+
+[Service]
+ExecStart=/usr/local/bin/link_ping_prometheus -mode=server -listen=":4000" -allow=203.0.113.5 -metrics=":2112"
+Restart=always
+User=nobody
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`time-sync.target` ordering is load-bearing: with `-echo-secret` set the
+server's replay guard uses a 30s timestamp window, so clocks must be
+roughly NTP-synchronized. Note: In client/both mode, use an absolute path
+for `-targets` (e.g., `-targets=/etc/link_ping_prometheus/targets.json`).
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now link_ping_prometheus
+```
+
+## Deployment (Ansible)
+
+For fleets, `deploy/ansible/playbook.yml` deploys the pre-built binary
+and service definition to remote Linux (systemd, using
+`installer/linux/link_ping_prometheus.service` — the hardened unit, driven
+by `/etc/link_ping_prometheus.env`) and Windows (SCM via `sc.exe`, with the
+same failure-recovery ladder as `main.go`) hosts. Secrets are delivered via
+the service environment on both platforms — never service arguments, and
+the secret-bearing tasks are marked `no_log` so they cannot leak into
+`-v`/`--diff` output. See `deploy/ansible/README.md` for prerequisites and
+usage.
+
+## Usage
+
+Operator reference: the command-line flags, runnable examples, the targets
+file, and memory/runtime tuning.
+
+```sh
+link_ping_prometheus -mode=<mode> [flags]
+```
+
+### Flags
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `-mode` | `server` | Operation mode: `server`, `client`, `both` |
+| `-listen` | `:4000` | Server listen address |
+| `-allow` | `""` | Server: comma-separated client IP allowlist — plain IPs or CIDR prefixes like `203.0.113.0/24` (fail-closed — required in `server`/`both` mode) |
+| `-target` | `""` | Client: single target `host:port` |
+| `-targets` | `""` | Client: path to JSON targets file |
+| `-metrics` | `127.0.0.1:2112` | Prometheus metrics HTTP listen address (localhost-only by default; use `:2112` to expose for remote scrape — firewall-restrict) |
+| `-interval` | `500ms` | Client: probe interval (warns if `>= -timeout`; probes will queue). Values below `1ms` are rejected: the pending window grows as `RTO/interval`, so sub-millisecond intervals allocate without bound. The ratio is capped too — an effective `-timeout` more than 1000× the interval (e.g. `1ms`/`1m`) is rejected rather than accepted and swept every tick. |
+| `-timeout` | `1s` | Client: Base/initial probe timeout (with `-adaptive=false` warns if `<200ms`; spurious loss on moderate-RTT links). An effective timeout more than 1000× `-interval` (global or per-target) is rejected: that ratio is the in-flight window size. |
+| `-reconnect-interval` | `5m` | Client: How long to keep a UDP socket before re-dialing for DNS re-resolution (a non-zero value below `-interval` is rejected as an error; `0` falls back to the built-in 5m and only warns if that is below `-interval`; set e.g. `24h` to effectively disable) |
+| `-dscp` | `0` | Client: DSCP value 0-63 marked on probe packets (e.g. 46 = EF) so QoS-managed networks class them accordingly. 0 = unmarked (default). Best effort, requires OS support (Linux). |
+| `-payload` | `0` | Client: probe payload bytes beyond the 24/32-byte header (up to 1400), filled with a deterministic pattern and validated byte-for-byte on echo. Corruption counts in `link_probes_corrupted_total` — distinct from loss. Detects MTU/data-path corruption a small probe cannot see. |
+| `-targets-reload-interval` | `0` | Client: poll the `-targets` file at this interval and apply changes without a restart (0 disables; SIGHUP also reloads on Unix; Windows services need this flag to reload) |
+| `-mtu-sweep` | `1m` | Client: periodically sweep DF-set probe sizes to find the largest frame the path carries (`link_path_mtu_bytes`, `/status path_mtu_bytes`). 0 disables. Linux, and Windows for IPv4 targets on any Windows Server (2003+ via the DF flag; Server 2019+/Win10 1703+ use full path-MTU discovery); IPv6 targets need Server 2019+/Win10 1703+. Unsupported socket options disable just the sweep with a one-time warning. Separate counters — never in the loss ratio. |
+| `-adaptive` | `true` | Enable adaptive RTO based on link quality. With `false`, the fixed `-timeout` applies: links whose true RTT exceeds it read as 100% loss with no warning — pick a timeout comfortably above expected RTT |
+| `-source` | `""` | Source label applied to every metric series, e.g. the local site or datacenter (`sydney-dc`) (defaults to hostname) |
+| `-metrics-user` | `""` | Basic auth username for /metrics (empty = disabled; env `LINK_PING_METRICS_USER`; must not contain `:` — HTTP Basic Auth splits at the first colon, so such a user is unreachable and startup is refused) |
+| `-metrics-pass` | `""` | Basic auth password for /metrics (env `LINK_PING_METRICS_PASS`; prefer env over CLI to avoid `ps` exposure) |
+| `-metrics-tls-cert` | `""` | TLS certificate file for /metrics (requires `-metrics-tls-key`) |
+| `-metrics-tls-key` | `""` | TLS private key file for /metrics (requires `-metrics-tls-cert`) |
+| `-metrics-allow-insecure` | `false` | Allow Basic Auth without TLS (otherwise auth over plaintext HTTP is rejected) |
+| `-metrics-gzip` | `false` | Gzip-compress `/metrics` responses when the scraper offers it. Off by default because promhttp pools a gzip writer per CPU and each holds ~0.7MB of flate state, so compression costs up to ~0.7MB x `GOMAXPROCS` of live heap — more than a small fleet's whole response. Enable it for many targets. |
+| `-mem-scavenge` | `5m` | Runtime: force a heap scavenge at this interval so the unused heap high-water mark is returned to the OS (0 disables; skipped unless at least 4MB of releasable heap is held, see [Memory & Runtime Tuning](#memory--runtime-tuning)). |
+| `-json-logs` | `false` | Output logs in JSON format |
+| `-log-file` | `""` | Append logs to this file in addition to stdout (required for Windows service logging, where stdout is discarded). The agent enforces mode `0600` on this file at startup (repairing wider modes) and refuses symlinked log paths — logs carry peer IPs and topology. On Windows the equivalent DACL is applied for it: full access only to SYSTEM, Administrators and the service account, protected from parent inheritance |
+| `-log-file-max-mb` | `10` | Max log file size in MB before rotation (0 disables rotation) |
+| `-log-file-max-backups` | `5` | Max rotated log files to keep (`0` keeps all of them — pair with `-log-file-max-age` so the directory cannot grow forever) |
+| `-log-file-max-age` | `28` | Max days to keep rotated log files |
+| `-svc` | `""` | Windows service action: `install`, `uninstall` (Windows only; Linux deploys use the systemd unit), `start`, `stop`, `run` |
+| `-echo-secret` | `""` | HMAC secret authenticating UDP probes (env `LINK_PING_ECHO_SECRET`; must be set on **both** client and server — a server without it accepts the client's HMAC frame as a plain payload probe, see [Wire Protocol](#wire-protocol); expands the wire frame to 32 bytes) |
+| `-echo-secret-old` | `""` | Server: previous HMAC secret still accepted during a zero-downtime rotation, alongside `-echo-secret` (env `LINK_PING_ECHO_SECRET_OLD`; server side only; startup error if set without `-echo-secret`) |
+| `-hmac-coverage` | `full-frame` | Client: which frame bytes the HMAC tag covers when `-echo-secret` is set. `full-frame` (default) tags the header plus the `-payload` bytes (tag slot skipped), so a tampered payload — or a different payload riding a captured tag — no longer authenticates; needs `-payload > 0` to differ from `header`. `header` (the v0.7 layout, byte-identical wire output) is the escape hatch for probing through a v0.7 echo server while using `-payload`. The echo server accepts BOTH coverages whenever it has `-echo-secret`; upgrading it to ≥ v0.8 clears the one broken pairing (v0.7 server + full-frame client). Invalid values are a startup error. |
+
+**Why MTU discovery (`-mtu-sweep`) matters:** 24-byte probes prove a path *exists* — they cannot prove it *carries full-size traffic*. VPN tunnels, PPPoE/GRE/VXLAN overlays and broken PMTUD routinely pass small packets while black-holing full-size ones — the classic "monitor says healthy, users say broken" failure. The sweep DF-marks probes on a dedicated socket, binary-searches the largest frame that round-trips, and publishes it as `link_path_mtu_bytes`; a shrinking gauge (or rising `link_mtu_probes_lost_total` while `link_up` stays 1) is that failure's signature. A size with no echo is retried once before the search shrinks — a single dropped probe on a lossy path would otherwise converge far below the real MTU and make the gauge flap between sweeps — so both MTU counters advance per attempt and read as a probe rate, not one probe per distinct size tested. It needs no ICMP and no extra firewall rules, uses separate counters that never enter the loss ratio, and is on by default (1m; `0` disables). Alert on `link_path_mtu_bytes < max_over_time(link_path_mtu_bytes[24h])`, or
+on MTU probe loss as a RATIO (`rate(link_mtu_probes_lost_total[10m]) /
+rate(link_mtu_probes_sent_total[10m]) > 0.2`) — a bare `> 0` fires on a
+single retried probe, which a normal 1%-loss path produces routinely. `link_up`
+deliberately stays 1 through an MTU shrink (24-byte probes keep flowing), so
+the gauge — not `link_up` — is the MTU-specific alarm.
+
+Liveness endpoints `GET /healthz` and `GET /readyz` on the same metrics listener return `200 ok` (`text/plain`) for Kubernetes/container probes. They are deliberately unauthenticated — only `/metrics` and `/status` are gated — and are available over both HTTP and HTTPS. `/healthz` is always 200; `/readyz` returns `503` while a client-mode agent has no target with a working socket (server-only mode is always 200), so a rollout waits for a real link. `/metrics` itself serves at most 2 concurrent scrapes — a third concurrent request gets `503`, and responses are bounded by a 30s write timeout — so a scrape storm cannot multiply gather trees against `GOMEMLIMIT`.
+
+`GET /status` on the same listener serves a JSON snapshot of live per-target probe state — `link_up`, in-flight probes, consecutive misses, the current consecutive send-failure streak (`send_failures`, reset on any successful write; not a cumulative count), RTO/SRTT, `jitter_seconds`, last sequence number, socket age, `path_mtu_bytes` (largest DF frame proven to round-trip; 0 = no successful sweep yet), `last_echo_age_seconds` (-1 until the first echo) and `straggler` (1 while that target's probe loop was replaced but failed to join within 5s and is still winding down — its last values are not live) — for debugging a flapping target without log access. It also returns a `process` object with Go runtime memory and GC stats — `heap_alloc_bytes`, `heap_sys_bytes`, `heap_idle_bytes`, `heap_released_bytes`, `stack_inuse_bytes`, `gc_sys_bytes`, `sys_bytes`, `gc_count` and `goroutines` — so heap growth is observable remotely without a debugger. Like `/metrics`, `/status` serves at most 2 concurrent requests — a third concurrent request gets `503` — because the snapshot copies and sorts the whole registry and the `process` object can trigger a stop-the-world `runtime.ReadMemStats`. Unlike the health endpoints it is auth-gated exactly like `/metrics` (open only when no metrics auth is configured). The `process` snapshot is re-read at most once per second (`runtime.ReadMemStats` stops the world), so a burst of requests cannot inject pauses into the probe loop that inflate its own RTT samples.
+
+Resource footprint: metric handles are resolved once per target at startup (no per-probe label lookups), and the Go heap is soft-capped at 128MB (`GOMEMLIMIT` env overrides) so RSS stays flat on long runs. For >100 targets set `GOMEMLIMIT=256MiB` (or higher) as a system environment variable and restart the service.
+
+### Examples
+
+Client (single target):
+
+```sh
+./link_ping_prometheus -mode=client -target="192.168.1.71:4000" -metrics=":2112"
+```
+
+Client (multiple targets):
+
+```sh
+./link_ping_prometheus -mode=client -targets=targets.json -metrics=":2112"
+```
+
+Server:
+
+```sh
+./link_ping_prometheus -mode=server -listen=":4000" -allow=192.168.1.71 -metrics=":2112"
+```
+
+Both:
+
+```sh
+./link_ping_prometheus -mode=both -targets=targets.json -allow=192.168.1.71 -metrics=":2112"
+```
+
+### Targets File
+
+JSON file with an array of `{"name": "...", "address": "host:port"}` objects. Optional per-target `interval`/`timeout` override the global `-interval`/`-timeout` (duration strings like `"500ms"`, `"1s"`; 0 or absent means use global):
+
+```json
+[
+  {"name": "server1", "address": "192.168.1.10:4000"},
+  {"name": "server2", "address": "192.168.1.11:4000", "interval": "200ms", "timeout": "800ms"}
+]
+```
+
+Max 1000 targets, max file size 1 MB. Per-target interval/timeout must be >0 when set; `interval >= timeout` warns (global and per-target) and `reconnect-interval < interval` is an error.
+
+**Address syntax:** `address` is `host:port` with the port in 1-65535, checked syntactically at load time (no DNS lookup, so a reload never depends on the network). Two dialable forms go beyond plain RFC 1123 name labels: a DNS name may carry one trailing dot for the FQDN root (`mon.example.com.:5000`), and an IPv6 literal may carry a `%zone` scope suffix whose characters are letters, digits, `_`, `-` and `.` so VLAN interface names work (`[fe80::1%eth0.100]:5000`). A zone on a DNS name or an IPv4 literal is rejected (`example.com%eth0:80`, `1.2.3.4%eth0:80`), and so is a trailing dot on an IP literal (`1.2.3.4.:80`) — the root dot is only stripped from names.
+
+**Hot reload:** send `SIGHUP` to re-read the file without a restart (Unix), or run with `-targets-reload-interval` (e.g. `30s`) for automatic polling — the only option under a Windows service, which has no SIGHUP. On reload: new targets start probing, removed targets stop and their series are deleted from `/metrics` (Prometheus marks the vanished series stale, so `link_up`-keyed alerts stop firing for them — an `absent()`/`up` alert covers a fully dead client), and targets whose address/intervals changed restart with the new values. A file that is mid-edit or invalid keeps the previous set running — reload failures are logged at Error level, never fatal. A reload whose file parses to an empty array logs a warning that all probing has stopped. A probe loop that fails to join within 5s is left stopped (its socket may still be draining) and its series are purged once it does exit, so a stuck loop cannot leave a frozen `link_up=1` behind.
+
+### Memory & Runtime Tuning
+
+`GOMEMLIMIT` keeps its 128MiB default when the env var is unset; `GOGC` is left at Go's own default (100). Both remain env-overridable. A binding `GOMEMLIMIT` does not reduce the footprint of an idle agent — the runtime only reacts as the heap approaches the limit — so treat it as a safety valve for large target counts, not a footprint knob.
+
+Every `/metrics` scrape allocates (gather trees, text encoding, optional gzip) and ratchets Go's heap high-water mark upward; the runtime does not return it while the agent is otherwise idle because scavenging is allocation-rate driven. On Windows the visible number is commit/working set, so this ratchet shows up there as steady growth.
+
+`-mem-scavenge` (default `5m`, `0` disables) forces a scavenge on that interval so the high-water mark goes back to the OS; it is skipped unless at least 4MB of *releasable* heap is held (`HEAP_IDLE - HEAP_RELEASED`), the figure the scavenge can actually return, not total process memory — an already-lean process pays nothing. `/status` exposes the same picture as its `process` object for observing it remotely.
+
+`GOGC` is the other lever, and the right value depends on the scrape load (both measured on one target):
+
+- A bursty load (800 scrapes back to back) ended at `heap_sys` 14.7MB / total 22.5MB by default, versus 6.8MB / 14.4MB with `GOGC=50`, for ~0.8ms extra CPU per scrape.
+- A quiet agent (sparse scrapes) measured *worse* at `GOGC=50`: RSS 19.8MB vs 16.7MB, `gc_sys` 2.77MB vs 1.47MB, and ~5x the allocation churn, because it GCs a small heap more often.
+
+So set `GOGC=50` for scrape-heavy deployments and leave it unset (or raise it) for a quiet one. `GOMAXPROCS=1` was the lowest-footprint configuration measured (RSS 14.6MB vs 16.7MB) at the cost of GC parallelism.
+
+`-metrics-gzip` is off by default for the same reason: `promhttp` pools one gzip writer per CPU and each writer holds a `flate` compressor of roughly 0.7MB (`hashHead` 1<<17 + `hashPrev` 1<<15 plus a 32KB window), so compression can retain up to ~0.7MB x `GOMAXPROCS` of live heap across scrapes — more than the entire `/metrics` body of a small fleet. Measured with 400 plain versus 400 compressed scrapes on one target: live heap 1.24MB vs 3.98MB and `heap_sys` 10.8MB vs 14.7MB. Enable it (`-metrics-gzip=true`) when the response is large enough for the bandwidth saving to matter.
+
 ## Metrics
 
-The exporter exposes the following metrics at `/metrics` (default port 2112).
+With the agent running at both ends, wire its `/metrics` endpoint into
+Prometheus and Grafana — the sections that follow cover the series, queries,
+alert rules, scraping, and the bundled dashboard. The exporter exposes the
+following metrics at `/metrics` (default port 2112).
 
 | Metric Name | Type | Labels | Description |
 | --- | --- | --- | --- |
@@ -564,255 +787,6 @@ prometheus.scrape "link_ping" {
 }
 ```
 
-## Build
-
-```sh
-go build -o ./build/link_ping_prometheus .
-```
-
-Cross-compile for Windows:
-
-```sh
-CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o build/link_ping_prometheus.exe .
-```
-
-## Test
-
-```sh
-go test -count=1 ./...          # full suite (~2 min; CI also runs it under -race)
-go vet ./...
-SOAK_SECONDS=600 go test -count=1 -timeout 15m -run TestSoakMemory -v ./test/   # opt-in memory soak (heap must stay flat, +8MB ceiling; -timeout required, the default 10m expires mid-soak)
-```
-
-**Test layout (Go ecosystem convention, as in prometheus/client_golang and windows_exporter):** unit tests live beside the code they exercise (`main_test.go` split by concern — `service_lifecycle_test.go`, `flags_test.go`, `http_endpoints_test.go`, `scavenger_test.go`, `rules_test.go`, `logsink_test.go`, `flags_test.go`; `internal/prober/*_test.go` beside the prober), and the **integration suite lives in `test/`** (`package prober_test`, one file per behavior — accuracy, jitter, reload, payload, HMAC coverage, MTU, server — with shared fixtures in `helpers_test.go` and the opt-in `soak_test.go`). Both suites run in CI; the Windows-only behavioral tests (winsock errno classification, DF socket options, log-DACL hardening) execute natively in the `test-windows` job.
-
-Release binaries for Linux, macOS, Windows at [Latest Release](https://github.com/callumau/link_ping_prometheus/releases/latest).
-
-## Usage
-
-```sh
-link_ping_prometheus -mode=<mode> [flags]
-```
-
-### Flags
-
-| Flag | Default | Description |
-| --- | --- | --- |
-| `-mode` | `server` | Operation mode: `server`, `client`, `both` |
-| `-listen` | `:4000` | Server listen address |
-| `-allow` | `""` | Server: comma-separated client IP allowlist — plain IPs or CIDR prefixes like `203.0.113.0/24` (fail-closed — required in `server`/`both` mode) |
-| `-target` | `""` | Client: single target `host:port` |
-| `-targets` | `""` | Client: path to JSON targets file |
-| `-metrics` | `127.0.0.1:2112` | Prometheus metrics HTTP listen address (localhost-only by default; use `:2112` to expose for remote scrape — firewall-restrict) |
-| `-interval` | `500ms` | Client: probe interval (warns if `>= -timeout`; probes will queue). Values below `1ms` are rejected: the pending window grows as `RTO/interval`, so sub-millisecond intervals allocate without bound. The ratio is capped too — an effective `-timeout` more than 1000× the interval (e.g. `1ms`/`1m`) is rejected rather than accepted and swept every tick. |
-| `-timeout` | `1s` | Client: Base/initial probe timeout (with `-adaptive=false` warns if `<200ms`; spurious loss on moderate-RTT links). An effective timeout more than 1000× `-interval` (global or per-target) is rejected: that ratio is the in-flight window size. |
-| `-reconnect-interval` | `5m` | Client: How long to keep a UDP socket before re-dialing for DNS re-resolution (a non-zero value below `-interval` is rejected as an error; `0` falls back to the built-in 5m and only warns if that is below `-interval`; set e.g. `24h` to effectively disable) |
-| `-dscp` | `0` | Client: DSCP value 0-63 marked on probe packets (e.g. 46 = EF) so QoS-managed networks class them accordingly. 0 = unmarked (default). Best effort, requires OS support (Linux). |
-| `-payload` | `0` | Client: probe payload bytes beyond the 24/32-byte header (up to 1400), filled with a deterministic pattern and validated byte-for-byte on echo. Corruption counts in `link_probes_corrupted_total` — distinct from loss. Detects MTU/data-path corruption a small probe cannot see. |
-| `-targets-reload-interval` | `0` | Client: poll the `-targets` file at this interval and apply changes without a restart (0 disables; SIGHUP also reloads on Unix; Windows services need this flag to reload) |
-| `-mtu-sweep` | `1m` | Client: periodically sweep DF-set probe sizes to find the largest frame the path carries (`link_path_mtu_bytes`, `/status path_mtu_bytes`). 0 disables. Linux, and Windows for IPv4 targets on any Windows Server (2003+ via the DF flag; Server 2019+/Win10 1703+ use full path-MTU discovery); IPv6 targets need Server 2019+/Win10 1703+. Unsupported socket options disable just the sweep with a one-time warning. Separate counters — never in the loss ratio. |
-| `-adaptive` | `true` | Enable adaptive RTO based on link quality. With `false`, the fixed `-timeout` applies: links whose true RTT exceeds it read as 100% loss with no warning — pick a timeout comfortably above expected RTT |
-| `-source` | `""` | Source label applied to every metric series, e.g. the local site or datacenter (`sydney-dc`) (defaults to hostname) |
-| `-metrics-user` | `""` | Basic auth username for /metrics (empty = disabled; env `LINK_PING_METRICS_USER`; must not contain `:` — HTTP Basic Auth splits at the first colon, so such a user is unreachable and startup is refused) |
-| `-metrics-pass` | `""` | Basic auth password for /metrics (env `LINK_PING_METRICS_PASS`; prefer env over CLI to avoid `ps` exposure) |
-| `-metrics-tls-cert` | `""` | TLS certificate file for /metrics (requires `-metrics-tls-key`) |
-| `-metrics-tls-key` | `""` | TLS private key file for /metrics (requires `-metrics-tls-cert`) |
-| `-metrics-allow-insecure` | `false` | Allow Basic Auth without TLS (otherwise auth over plaintext HTTP is rejected) |
-| `-metrics-gzip` | `false` | Gzip-compress `/metrics` responses when the scraper offers it. Off by default because promhttp pools a gzip writer per CPU and each holds ~0.7MB of flate state, so compression costs up to ~0.7MB x `GOMAXPROCS` of live heap — more than a small fleet's whole response. Enable it for many targets. |
-| `-mem-scavenge` | `5m` | Runtime: force a heap scavenge at this interval so the unused heap high-water mark is returned to the OS (0 disables; skipped unless at least 4MB of releasable heap is held, see [Memory & Runtime Tuning](#memory--runtime-tuning)). |
-| `-json-logs` | `false` | Output logs in JSON format |
-| `-log-file` | `""` | Append logs to this file in addition to stdout (required for Windows service logging, where stdout is discarded). The agent enforces mode `0600` on this file at startup (repairing wider modes) and refuses symlinked log paths — logs carry peer IPs and topology. On Windows the equivalent DACL is applied for it: full access only to SYSTEM, Administrators and the service account, protected from parent inheritance |
-| `-log-file-max-mb` | `10` | Max log file size in MB before rotation (0 disables rotation) |
-| `-log-file-max-backups` | `5` | Max rotated log files to keep (`0` keeps all of them — pair with `-log-file-max-age` so the directory cannot grow forever) |
-| `-log-file-max-age` | `28` | Max days to keep rotated log files |
-| `-svc` | `""` | Windows service action: `install`, `uninstall` (Windows only; Linux deploys use the systemd unit), `start`, `stop`, `run` |
-| `-echo-secret` | `""` | HMAC secret authenticating UDP probes (env `LINK_PING_ECHO_SECRET`; must be set on **both** client and server — a server without it accepts the client's HMAC frame as a plain payload probe, see [Wire Protocol](#wire-protocol); expands the wire frame to 32 bytes) |
-| `-echo-secret-old` | `""` | Server: previous HMAC secret still accepted during a zero-downtime rotation, alongside `-echo-secret` (env `LINK_PING_ECHO_SECRET_OLD`; server side only; startup error if set without `-echo-secret`) |
-| `-hmac-coverage` | `full-frame` | Client: which frame bytes the HMAC tag covers when `-echo-secret` is set. `full-frame` (default) tags the header plus the `-payload` bytes (tag slot skipped), so a tampered payload — or a different payload riding a captured tag — no longer authenticates; needs `-payload > 0` to differ from `header`. `header` (the v0.7 layout, byte-identical wire output) is the escape hatch for probing through a v0.7 echo server while using `-payload`. The echo server accepts BOTH coverages whenever it has `-echo-secret`; upgrading it to ≥ v0.8 clears the one broken pairing (v0.7 server + full-frame client). Invalid values are a startup error. |
-
-**Why MTU discovery (`-mtu-sweep`) matters:** 24-byte probes prove a path *exists* — they cannot prove it *carries full-size traffic*. VPN tunnels, PPPoE/GRE/VXLAN overlays and broken PMTUD routinely pass small packets while black-holing full-size ones — the classic "monitor says healthy, users say broken" failure. The sweep DF-marks probes on a dedicated socket, binary-searches the largest frame that round-trips, and publishes it as `link_path_mtu_bytes`; a shrinking gauge (or rising `link_mtu_probes_lost_total` while `link_up` stays 1) is that failure's signature. A size with no echo is retried once before the search shrinks — a single dropped probe on a lossy path would otherwise converge far below the real MTU and make the gauge flap between sweeps — so both MTU counters advance per attempt and read as a probe rate, not one probe per distinct size tested. It needs no ICMP and no extra firewall rules, uses separate counters that never enter the loss ratio, and is on by default (1m; `0` disables). Alert on `link_path_mtu_bytes < max_over_time(link_path_mtu_bytes[24h])`, or
-on MTU probe loss as a RATIO (`rate(link_mtu_probes_lost_total[10m]) /
-rate(link_mtu_probes_sent_total[10m]) > 0.2`) — a bare `> 0` fires on a
-single retried probe, which a normal 1%-loss path produces routinely. `link_up`
-deliberately stays 1 through an MTU shrink (24-byte probes keep flowing), so
-the gauge — not `link_up` — is the MTU-specific alarm.
-
-Liveness endpoints `GET /healthz` and `GET /readyz` on the same metrics listener return `200 ok` (`text/plain`) for Kubernetes/container probes. They are deliberately unauthenticated — only `/metrics` and `/status` are gated — and are available over both HTTP and HTTPS. `/healthz` is always 200; `/readyz` returns `503` while a client-mode agent has no target with a working socket (server-only mode is always 200), so a rollout waits for a real link. `/metrics` itself serves at most 2 concurrent scrapes — a third concurrent request gets `503`, and responses are bounded by a 30s write timeout — so a scrape storm cannot multiply gather trees against `GOMEMLIMIT`.
-
-`GET /status` on the same listener serves a JSON snapshot of live per-target probe state — `link_up`, in-flight probes, consecutive misses, the current consecutive send-failure streak (`send_failures`, reset on any successful write; not a cumulative count), RTO/SRTT, `jitter_seconds`, last sequence number, socket age, `path_mtu_bytes` (largest DF frame proven to round-trip; 0 = no successful sweep yet), `last_echo_age_seconds` (-1 until the first echo) and `straggler` (1 while that target's probe loop was replaced but failed to join within 5s and is still winding down — its last values are not live) — for debugging a flapping target without log access. It also returns a `process` object with Go runtime memory and GC stats — `heap_alloc_bytes`, `heap_sys_bytes`, `heap_idle_bytes`, `heap_released_bytes`, `stack_inuse_bytes`, `gc_sys_bytes`, `sys_bytes`, `gc_count` and `goroutines` — so heap growth is observable remotely without a debugger. Like `/metrics`, `/status` serves at most 2 concurrent requests — a third concurrent request gets `503` — because the snapshot copies and sorts the whole registry and the `process` object can trigger a stop-the-world `runtime.ReadMemStats`. Unlike the health endpoints it is auth-gated exactly like `/metrics` (open only when no metrics auth is configured). The `process` snapshot is re-read at most once per second (`runtime.ReadMemStats` stops the world), so a burst of requests cannot inject pauses into the probe loop that inflate its own RTT samples.
-
-Resource footprint: metric handles are resolved once per target at startup (no per-probe label lookups), and the Go heap is soft-capped at 128MB (`GOMEMLIMIT` env overrides) so RSS stays flat on long runs. For >100 targets set `GOMEMLIMIT=256MiB` (or higher) as a system environment variable and restart the service.
-
-### Memory & Runtime Tuning
-
-`GOMEMLIMIT` keeps its 128MiB default when the env var is unset; `GOGC` is left at Go's own default (100). Both remain env-overridable. A binding `GOMEMLIMIT` does not reduce the footprint of an idle agent — the runtime only reacts as the heap approaches the limit — so treat it as a safety valve for large target counts, not a footprint knob.
-
-Every `/metrics` scrape allocates (gather trees, text encoding, optional gzip) and ratchets Go's heap high-water mark upward; the runtime does not return it while the agent is otherwise idle because scavenging is allocation-rate driven. On Windows the visible number is commit/working set, so this ratchet shows up there as steady growth.
-
-`-mem-scavenge` (default `5m`, `0` disables) forces a scavenge on that interval so the high-water mark goes back to the OS; it is skipped unless at least 4MB of *releasable* heap is held (`HEAP_IDLE - HEAP_RELEASED`), the figure the scavenge can actually return, not total process memory — an already-lean process pays nothing. `/status` exposes the same picture as its `process` object for observing it remotely.
-
-`GOGC` is the other lever, and the right value depends on the scrape load (both measured on one target):
-
-- A bursty load (800 scrapes back to back) ended at `heap_sys` 14.7MB / total 22.5MB by default, versus 6.8MB / 14.4MB with `GOGC=50`, for ~0.8ms extra CPU per scrape.
-- A quiet agent (sparse scrapes) measured *worse* at `GOGC=50`: RSS 19.8MB vs 16.7MB, `gc_sys` 2.77MB vs 1.47MB, and ~5x the allocation churn, because it GCs a small heap more often.
-
-So set `GOGC=50` for scrape-heavy deployments and leave it unset (or raise it) for a quiet one. `GOMAXPROCS=1` was the lowest-footprint configuration measured (RSS 14.6MB vs 16.7MB) at the cost of GC parallelism.
-
-`-metrics-gzip` is off by default for the same reason: `promhttp` pools one gzip writer per CPU and each writer holds a `flate` compressor of roughly 0.7MB (`hashHead` 1<<17 + `hashPrev` 1<<15 plus a 32KB window), so compression can retain up to ~0.7MB x `GOMAXPROCS` of live heap across scrapes — more than the entire `/metrics` body of a small fleet. Measured with 400 plain versus 400 compressed scrapes on one target: live heap 1.24MB vs 3.98MB and `heap_sys` 10.8MB vs 14.7MB. Enable it (`-metrics-gzip=true`) when the response is large enough for the bandwidth saving to matter.
-
-### Targets File
-
-JSON file with an array of `{"name": "...", "address": "host:port"}` objects. Optional per-target `interval`/`timeout` override the global `-interval`/`-timeout` (duration strings like `"500ms"`, `"1s"`; 0 or absent means use global):
-
-```json
-[
-  {"name": "server1", "address": "192.168.1.10:4000"},
-  {"name": "server2", "address": "192.168.1.11:4000", "interval": "200ms", "timeout": "800ms"}
-]
-```
-
-Max 1000 targets, max file size 1 MB. Per-target interval/timeout must be >0 when set; `interval >= timeout` warns (global and per-target) and `reconnect-interval < interval` is an error.
-
-**Address syntax:** `address` is `host:port` with the port in 1-65535, checked syntactically at load time (no DNS lookup, so a reload never depends on the network). Two dialable forms go beyond plain RFC 1123 name labels: a DNS name may carry one trailing dot for the FQDN root (`mon.example.com.:5000`), and an IPv6 literal may carry a `%zone` scope suffix whose characters are letters, digits, `_`, `-` and `.` so VLAN interface names work (`[fe80::1%eth0.100]:5000`). A zone on a DNS name or an IPv4 literal is rejected (`example.com%eth0:80`, `1.2.3.4%eth0:80`), and so is a trailing dot on an IP literal (`1.2.3.4.:80`) — the root dot is only stripped from names.
-
-**Hot reload:** send `SIGHUP` to re-read the file without a restart (Unix), or run with `-targets-reload-interval` (e.g. `30s`) for automatic polling — the only option under a Windows service, which has no SIGHUP. On reload: new targets start probing, removed targets stop and their series are deleted from `/metrics` (Prometheus marks the vanished series stale, so `link_up`-keyed alerts stop firing for them — an `absent()`/`up` alert covers a fully dead client), and targets whose address/intervals changed restart with the new values. A file that is mid-edit or invalid keeps the previous set running — reload failures are logged at Error level, never fatal. A reload whose file parses to an empty array logs a warning that all probing has stopped. A probe loop that fails to join within 5s is left stopped (its socket may still be draining) and its series are purged once it does exit, so a stuck loop cannot leave a frozen `link_up=1` behind.
-
-### Examples
-
-Client (single target):
-
-```sh
-./link_ping_prometheus -mode=client -target="192.168.1.71:4000" -metrics=":2112"
-```
-
-Client (multiple targets):
-
-```sh
-./link_ping_prometheus -mode=client -targets=targets.json -metrics=":2112"
-```
-
-Server:
-
-```sh
-./link_ping_prometheus -mode=server -listen=":4000" -allow=192.168.1.71 -metrics=":2112"
-```
-
-Both:
-
-```sh
-./link_ping_prometheus -mode=both -targets=targets.json -allow=192.168.1.71 -metrics=":2112"
-```
-
-## Installation
-
-### Service
-
-#### Windows
-
-Use `-svc` to install/uninstall/start/stop/run. The tool records runtime flags at install time (excluding `-svc`, `-metrics-user`, `-metrics-pass`, `-echo-secret`, and `-echo-secret-old`). Metrics auth credentials and HMAC secrets are **not** persisted into the service configuration; set `LINK_PING_METRICS_USER` / `LINK_PING_METRICS_PASS` and `LINK_PING_ECHO_SECRET` / `LINK_PING_ECHO_SECRET_OLD` in the service environment instead (a warning is printed at install time).
-
-```sh
-link_ping_prometheus.exe -mode=both -targets=targets.json -allow=192.168.1.71 -metrics=":2112" -log-file="C:\ProgramData\link_ping_prometheus\logs\service.log" -svc=install
-```
-
-**Built-in service hardening (configured automatically at install):**
-
-- **Crash recovery**: SCM failure action is *restart* after 5s (reset period 24h). A crash or fatal internal error exits non-zero so recovery fires — a dead monitor never stays down silently. This includes a mid-run failure of the metrics HTTP server itself: if `/metrics`, `/status`, `/healthz` or `/readyz` die while the agent keeps probing, the agent exits non-zero so the restart ladder brings the whole monitor back (probing without a metrics endpoint is dead weight that looks healthy).
-- **Delayed auto-start** with dependencies on `Tcpip` (sockets) and `W32Time` (time sync — the HMAC replay window requires roughly NTP-synchronized clocks between nodes).
-- **Lifecycle events in the Windows Event Log** (Application source `link_ping_prometheus`): start, stop, and fatal errors are visible even with no access to the log file. When `-log-file` is configured, runtime log-sink write failures (disk full, log directory removed or ACL'd away) are surfaced to the same event log every 30s while the service runs — otherwise a dead sink is indistinguishable from silence.
-- **Credentials never persisted** into the service configuration.
-
-**Windows Server version support:** the agent runs as a service on any Windows the Go runtime supports; SCM recovery, log rotation, HMAC and the UDP echo path have no version-specific requirements. The optional `-mtu-sweep` DF discovery supports IPv4 targets on every Windows Server version (Server 2003+ via the classic `IP_DONTFRAGMENT` option, falling back from the richer `IP_MTU_DISCOVER` path-MTU option available on Server 2019+/Windows 10 1703+); IPv6 targets need Windows Server 2019+ (or Windows 10 1703+). On Windows versions lacking a needed option the sweep alone disables itself with a one-time warning — probing is unaffected.
-
-**Enterprise deployment checklist:**
-
-> `installer/windows/install-service.bat` / `uninstall-service.bat` in this repo automate steps 1–4 below (admin check, ACL'd log dir, escalating restart ladder, per-service SID, credential prompts). Run from an elevated prompt: an interactive wizard asks for mode (server/client/both), metrics address, targets — a JSON file or a single host:port — the **required** client IP allow-list for server/both modes, log directory, and optional service account, then shows a summary before installing.
-
-1. **Always pass `-log-file` at install.** Under the service, stdout is discarded; without a log file, verbose logs go nowhere (lifecycle/fatal events still reach the event log). Log rotation is built in (`-log-file-max-mb/-backups/-age`). A warning is printed if you skip it. The agent enforces `0600` on the log file at startup (repairing wider modes) and refuses symlinked log paths — place the log in a directory not writable by other local users (the installer's ACL'd log dir satisfies this). On Windows `chmod` cannot restrict a DACL, so the agent does the equivalent itself: at startup it replaces the log file's DACL with a protected set (no parent inheritance) granting full access only to `SYSTEM`, `Administrators` and the account the agent runs as, wherever `-log-file` points — a manual install now inherits no wide directory grant. The ACL'd log **directory** created by the installer remains defense-in-depth (log rotation creates fresh files that inherit the directory ACL), and the manual `icacls` recipe below stays useful for belt-and-braces (`icacls "<dir>" /inheritance:r /grant "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" "NT SERVICE\link_ping_prometheus:(OI)(CI)M"`). The restriction is also re-applied every 5 minutes at runtime, so a lumberjack rotation recreating the live file under a wide directory DACL is repaired without a service restart.
-2. **Service account.** By default the service installs as `LocalSystem`, which is more privilege than this prober needs (outbound UDP + a metrics port + its log directory). For least privilege, switch to a passwordless built-in or gMSA account after install:
-
-   ```sh
-   sc.exe config link_ping_prometheus obj= "NT AUTHORITY\LocalService"
-   ```
-
-   Use `NT AUTHORITY\NetworkService` instead of LocalService if network firewalls expect machine-account identity, or a domain gMSA (`DOMAIN\svc-linkping$`) if policy mandates managed accounts. Grant the chosen account write access to the log directory only. **If a log file already exists, delete it (or re-ACL it) before switching accounts**: the agent restricts the log file's DACL to SYSTEM + Administrators + the account that created it, so the *previous* account's log file denies the new account write access and the service exits at startup (loud, non-zero — the restart ladder will loop until the file is removed).
-3. **Secrets delivery.** Set the credential environment variables machine-wide via System Properties → Environment Variables, or per-service:
-
-   ```sh
-   reg add HKLM\SYSTEM\CurrentControlSet\Services\link_ping_prometheus\Environment /v LINK_PING_METRICS_USER /t REG_SZ /d <user> /f
-   reg add HKLM\SYSTEM\CurrentControlSet\Services\link_ping_prometheus\Environment /v LINK_PING_METRICS_PASS /t REG_SZ /d <pass> /f
-   reg add HKLM\SYSTEM\CurrentControlSet\Services\link_ping_prometheus\Environment /v LINK_PING_ECHO_SECRET /t REG_SZ /d <secret> /f
-   ```
-
-   The installer and the Ansible play both restrict this key's ACL to SYSTEM and Administrators once a value has been stored (inheritance off, so the inherited world-readable entry is dropped); run the same PowerShell snippet by hand if you add values with `reg add` yourself, and confirm a non-admin `reg query` of the key now fails. Values that sat in the key before that hardening should be treated as disclosed: rotate the echo secret (and metrics password) with the outage-free rotation runbook in the Security section, then restart the service. For higher assurance still, prefer an ACL-hardened secrets file sourced by your configuration management over the registry. The echo HMAC secret should be at least 16 characters regardless of how it is delivered — it is the key material for HMAC-SHA256 probe authentication and a short value is brute-forceable (the install wizard enforces this; there is no binary-side minimum).
-4. **Further hardening (optional, post-install):** the restart escalation ladder (`sc.exe failure ... actions= restart/5000/restart/30000/restart/60000`), the per-service SID (`sc.exe sidtype link_ping_prometheus unrestricted`) and its log-dir ACL are applied automatically by the installer; the manual `sc.exe` recipes above are for a hand-install or re-verification. Only the following remain manual: restrict who can reconfigure the service via `sc.exe sdset`; keep the binary under `%ProgramFiles%` with Admins-only write ACLs; Authenticode-sign the binary and allowlist via AppLocker/WDAC.
-
-   Note that a hand-install (`<binary> -svc=install`, no wizard) gets exactly ONE restart action (uniform 5s retry, 24h failure-reset period — what the kardianos install path can express); the installer's escalating 5s/30s/60s ladder requires the wizard's post-install `sc.exe failure` step above. The agent's own fatal-error behavior (non-zero unclean exit under the service so SCM recovery fires) is identical either way.
-5. **Upgrades:** re-run `installer/windows/install-service.bat` with the new binary — it detects the existing service, swaps the binary only when its SHA256 differs, and restarts (runtime truth updates via `link_ping_build_info`). Parameters are preserved. If any runtime flags changed, uninstall and reinstall instead — arguments are snapshotted at install time. Before running the installer (it is elevated and writes a service, so a tampered binary lands with SYSTEM rights), verify the release in this order:
-
-   ```sh
-   # 1. the signature: who published this checksums file (keyless sigstore)
-   cosign verify-blob --bundle checksums.txt.sigstore.json \
-     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-     --certificate-identity "https://github.com/<owner>/<repo>/.github/workflows/release.yml@refs/tags/<tag>" \
-     checksums.txt
-   # 2. the artifacts: against the now-trusted checksums file
-   sha256sum --check --ignore-missing checksums.txt
-   # 3. the provenance: this release workflow built the artifact (GitHub
-   #    attestation store). The cosign signature above only proves who
-   #    published the checksums file; the SLSA provenance attestation
-   #    proves which workflow run built each artifact, on what runner,
-   #    from what source commit — a swapped or out-of-pipeline artifact
-   #    fails this check even if the signature itself verifies.
-   gh attestation verify link_ping_prometheus_Linux_x86_64.tar.gz \
-     -R callumau/link_ping_prometheus
-   ```
-6. **Supply chain and fleet-wide auth, before scaling out:**
-   - Restrict who can create `v*` tags with a GitHub Ruleset — the release build reads the tag for `link_ping_build_info` and now also mints a sigstore signing identity from the run, so tag creation is release-authoring permission, not a general contributor one. `.github/CODEOWNERS` lists the release paths (replace its placeholder team first — an unresolved handle matches nobody, so a required-review ruleset on it would never be satisfiable).
-   - Pin the WinRM CA per host in the Ansible inventory (`deploy/ansible/inventory.example.yml`); an unpinned `winrm` connection trusts whatever CA answers first, which is the deploy host's supply chain.
-   - Clock sync is load-bearing, not hygiene: `-echo-secret` rejects any probe more than 30s from the reflector's clock, so a drifted node drops its own legitimate probes as replay and its peers read `link_up=0`. `LinkClockSkewHigh`, `LinkClockSkewCritical` and `ServerReplayDrops` in `rules/link-monitor.yml` alert on it — load them everywhere the service runs.
-
-#### Linux (systemd)
-
-Create `/etc/systemd/system/link_ping_prometheus.service`:
-
-```ini
-[Unit]
-Description=Link Ping Prometheus (UDP link monitor)
-After=network-online.target time-sync.target
-Wants=network-online.target time-sync.target
-
-[Service]
-ExecStart=/usr/local/bin/link_ping_prometheus -mode=server -listen=":4000" -allow=203.0.113.5 -metrics=":2112"
-Restart=always
-User=nobody
-
-[Install]
-WantedBy=multi-user.target
-```
-
-`time-sync.target` ordering is load-bearing: with `-echo-secret` set the
-server's replay guard uses a 30s timestamp window, so clocks must be
-roughly NTP-synchronized. Note: In client/both mode, use an absolute path
-for `-targets` (e.g., `-targets=/etc/link_ping_prometheus/targets.json`).
-
-```sh
-sudo systemctl daemon-reload
-sudo systemctl enable --now link_ping_prometheus
-```
-
-## Deployment (Ansible)
-
-For fleets, `deploy/ansible/playbook.yml` deploys the pre-built binary
-and service definition to remote Linux (systemd, using
-`installer/linux/link_ping_prometheus.service` — the hardened unit, driven
-by `/etc/link_ping_prometheus.env`) and Windows (SCM via `sc.exe`, with the
-same failure-recovery ladder as `main.go`) hosts. Secrets are delivered via
-the service environment on both platforms — never service arguments, and
-the secret-bearing tasks are marked `no_log` so they cannot leak into
-`-v`/`--diff` output. See `deploy/ansible/README.md` for prerequisites and
-usage.
-
 ## Grafana Dashboard
 
 Prebuilt dashboard at [grafana-dashboard.json](grafana-dashboard.json).
@@ -823,62 +797,6 @@ it also has a `source` variable for filtering panels per site.
 Panels: link status, packet loss, RTT percentiles / average / current, adaptive RTO, jitter, probe throughput, plus the newer signals — smoothed RTT (SRTT), path MTU (DF-probed), DF probe loss, corruption % (with `-payload`) and send errors (local fault vs network loss). A **Server & prober health** section covers probes in flight, server probes received / dropped by reason / echo errors, clock skew, prober internal errors and metrics auth failures. `link_up` transitions are annotated on every panel and itemized with timestamps in the Link State Changes table. The `source` variable filters the per-site panels, so one dashboard serves the whole fleet (the global metrics-auth-failure panel is deliberately unfiltered).
 
 [![Grafana dashboard screenshot](.docs/screenshot01.png)](.docs/screenshot01.png)
-
-## Code Structure
-
-```text
-main.go                     — CLI wrapper, flag parsing, service lifecycle
-main_test.go                — lifecycle race, auth/TLS flag validation tests
-main_metrics_test.go        — /metrics body decoding (gzip on/off)
-internal/prober/
-  prober.go                 — Config, protocol constants, HMAC helpers, pending-window cap
-  adaptive.go               — RFC 6298 RTO estimation (AdaptiveStats)
-  client.go                 — Target, LoadTargets, RunClient, UDP probe loop
-  server.go                 — UDP echo responder, allowlist, rate limits, client series
-  metrics.go                — Prometheus metric vars, InitMetrics, MetricsAuth
-  status.go                 — /status registry (target snapshots + process memory)
-  validate.go               — Target address validation (ValidateTarget)
-  mtu.go                    — DF path-MTU sweep (shared search + state)
-  mtu_linux.go              — IP_MTU_DISCOVER/IPV6_MTU_DISCOVER socket option
-  mtu_windows.go            — Windows PMTUD with an IP_DONTFRAGMENT fallback ladder
-  mtu_other.go              — sweep disabled on platforms without a DF option
-  dscp_linux.go             — DSCP marking (IP_TOS/IPV6_TCLASS)
-  dscp_other.go             — no-op elsewhere
-  unreachable_other.go      — ICMP-derived read errnos (Unix)
-  unreachable_windows.go    — ICMP-derived read errnos (winsock codes)
-  adaptive_test.go          — RTO estimation, dynamic floor, backoff clamp
-  client_recovery_test.go   — reader death, panic restart, write failure, dial retry
-  client_retry_test.go      — dial failure retry, send-error accounting
-  client_straggler_test.go  — reload stragglers: restart when wanted, purge when removed
-  client_hmac_test.go       — client-side HMAC frames and the HMAC+payload offset
-  hmac_coverage_test.go     — HMAC tag coverage: zero-payload equivalence, full-frame tag rules, flag parsing
-  validation_test.go        — Config/target validation incl. the pending-window cap
-  allowlist_test.go         — allowlist parser accepts and rejects
-  unreachable_test.go       — peer-unreachable classification (Unix)
-  unreachable_windows_test.go — same for winsock codes
-  mtu_linux_test.go         — DF socket option applied to a v4 socket
-  dscp_test.go              — DSCP socket option
-  validate_dscp_test.go     — DSCP range validation
-  bench_test.go             — resolve-once vs per-event label lookup, payload fill, allowlist
-test/
-  helpers_test.go           — Test utilities (metric inspectors, UDP echo server)
-  adaptive_test.go          — AdaptiveStats logic and jitter adaptation
-  validation_test.go        — LoadTargets, target parsing, Config validation
-  server_test.go            — Server garbage handling, rate limits, allowlist, eviction
-  client_test.go            — Robustness: loss, latency, corruption, spoofing, stalls, duplicates
-  metrics_test.go           — Basic auth handler, metric seeding
-  integration_test.go       — Multi-target, server dropout, stress (10 targets)
-  accuracy_test.go          — Balance invariant, bucket placement, jitter ceiling, loss deadline
-  precision_test.go         — Exact analytic assertions (RTO floor, jitter convergence)
-  jitter_test.go            — RFC 3550 convergence, reset on gap, rebuild
-  mtu_test.go               — Path-MTU sweep and its separate counter namespace
-  hmac_coverage_test.go     — Server dual-accept rule + client wire bytes per coverage
-  payload_test.go           — Corruption detection, counted apart from loss
-  reload_test.go            — Hot reload: purge removed, keep changed, /status parity
-  status_test.go            — Live /status snapshot contents, process object, cache
-  timeout_override_test.go  — Per-target interval/timeout overrides
-  soak_test.go              — Opt-in memory/goroutine soak (SOAK_SECONDS)
-```
 
 ## Wire Protocol
 
@@ -1023,6 +941,86 @@ DNS failure at startup is retried, not fatal.
 - Mode-mismatched flags are not silently ignored: server-only flags (`-allow`, `-listen`, `-echo-secret-old`) set in client mode, and `-targets`/`-target` set together (`-targets` wins), each log a one-line startup warning — backward compatible, but visible.
 - Basic Auth without TLS sends credentials as base64 on the wire; a startup warning is logged in that configuration. Use `-metrics-tls-cert` / `-metrics-tls-key` to serve `/metrics` over HTTPS.
 - The wire protocol carries no sensitive data (sequence numbers and wall-clock timestamps only) and has no TLS — intended for internal network monitoring. Restrict access with a firewall on untrusted networks.
+
+## Build
+
+```sh
+go build -o ./build/link_ping_prometheus .
+```
+
+Cross-compile for Windows:
+
+```sh
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o build/link_ping_prometheus.exe .
+```
+
+## Test
+
+```sh
+go test -count=1 ./...          # full suite (~2 min; CI also runs it under -race)
+go vet ./...
+SOAK_SECONDS=600 go test -count=1 -timeout 15m -run TestSoakMemory -v ./test/   # opt-in memory soak (heap must stay flat, +8MB ceiling; -timeout required, the default 10m expires mid-soak)
+```
+
+**Test layout (Go ecosystem convention, as in prometheus/client_golang and windows_exporter):** unit tests live beside the code they exercise (`main_test.go` split by concern — `service_lifecycle_test.go`, `flags_test.go`, `http_endpoints_test.go`, `scavenger_test.go`, `rules_test.go`, `logsink_test.go`, `flags_test.go`; `internal/prober/*_test.go` beside the prober), and the **integration suite lives in `test/`** (`package prober_test`, one file per behavior — accuracy, jitter, reload, payload, HMAC coverage, MTU, server — with shared fixtures in `helpers_test.go` and the opt-in `soak_test.go`). Both suites run in CI; the Windows-only behavioral tests (winsock errno classification, DF socket options, log-DACL hardening) execute natively in the `test-windows` job.
+
+Release binaries for Linux, macOS, Windows at [Latest Release](https://github.com/callumau/link_ping_prometheus/releases/latest).
+
+## Code Structure
+
+```text
+main.go                     — CLI wrapper, flag parsing, service lifecycle
+main_test.go                — lifecycle race, auth/TLS flag validation tests
+main_metrics_test.go        — /metrics body decoding (gzip on/off)
+internal/prober/
+  prober.go                 — Config, protocol constants, HMAC helpers, pending-window cap
+  adaptive.go               — RFC 6298 RTO estimation (AdaptiveStats)
+  client.go                 — Target, LoadTargets, RunClient, UDP probe loop
+  server.go                 — UDP echo responder, allowlist, rate limits, client series
+  metrics.go                — Prometheus metric vars, InitMetrics, MetricsAuth
+  status.go                 — /status registry (target snapshots + process memory)
+  validate.go               — Target address validation (ValidateTarget)
+  mtu.go                    — DF path-MTU sweep (shared search + state)
+  mtu_linux.go              — IP_MTU_DISCOVER/IPV6_MTU_DISCOVER socket option
+  mtu_windows.go            — Windows PMTUD with an IP_DONTFRAGMENT fallback ladder
+  mtu_other.go              — sweep disabled on platforms without a DF option
+  dscp_linux.go             — DSCP marking (IP_TOS/IPV6_TCLASS)
+  dscp_other.go             — no-op elsewhere
+  unreachable_other.go      — ICMP-derived read errnos (Unix)
+  unreachable_windows.go    — ICMP-derived read errnos (winsock codes)
+  adaptive_test.go          — RTO estimation, dynamic floor, backoff clamp
+  client_recovery_test.go   — reader death, panic restart, write failure, dial retry
+  client_retry_test.go      — dial failure retry, send-error accounting
+  client_straggler_test.go  — reload stragglers: restart when wanted, purge when removed
+  client_hmac_test.go       — client-side HMAC frames and the HMAC+payload offset
+  hmac_coverage_test.go     — HMAC tag coverage: zero-payload equivalence, full-frame tag rules, flag parsing
+  validation_test.go        — Config/target validation incl. the pending-window cap
+  allowlist_test.go         — allowlist parser accepts and rejects
+  unreachable_test.go       — peer-unreachable classification (Unix)
+  unreachable_windows_test.go — same for winsock codes
+  mtu_linux_test.go         — DF socket option applied to a v4 socket
+  dscp_test.go              — DSCP socket option
+  validate_dscp_test.go     — DSCP range validation
+  bench_test.go             — resolve-once vs per-event label lookup, payload fill, allowlist
+test/
+  helpers_test.go           — Test utilities (metric inspectors, UDP echo server)
+  adaptive_test.go          — AdaptiveStats logic and jitter adaptation
+  validation_test.go        — LoadTargets, target parsing, Config validation
+  server_test.go            — Server garbage handling, rate limits, allowlist, eviction
+  client_test.go            — Robustness: loss, latency, corruption, spoofing, stalls, duplicates
+  metrics_test.go           — Basic auth handler, metric seeding
+  integration_test.go       — Multi-target, server dropout, stress (10 targets)
+  accuracy_test.go          — Balance invariant, bucket placement, jitter ceiling, loss deadline
+  precision_test.go         — Exact analytic assertions (RTO floor, jitter convergence)
+  jitter_test.go            — RFC 3550 convergence, reset on gap, rebuild
+  mtu_test.go               — Path-MTU sweep and its separate counter namespace
+  hmac_coverage_test.go     — Server dual-accept rule + client wire bytes per coverage
+  payload_test.go           — Corruption detection, counted apart from loss
+  reload_test.go            — Hot reload: purge removed, keep changed, /status parity
+  status_test.go            — Live /status snapshot contents, process object, cache
+  timeout_override_test.go  — Per-target interval/timeout overrides
+  soak_test.go              — Opt-in memory/goroutine soak (SOAK_SECONDS)
+```
 
 ## Contributing
 
