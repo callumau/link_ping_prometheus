@@ -1,8 +1,7 @@
 # PromQL Examples
 
-All queries run in both Prometheus and Grafana. Run them as **instant
-queries** (Prometheus console, Grafana stat panel) for "now", or in a
-**time series panel** for "over time" — the same expression renders both.
+Every query runs in both Prometheus and Grafana: as an **instant query**
+(console, stat panel) for "now", or in a **time series panel** for "over time".
 RTT metrics are **seconds**; multiply by `1000` for ms.
 
 ### Quick Reference
@@ -24,14 +23,14 @@ Copy-paste these.
 Two rules that trip people up:
 
 - **Never divide raw counter totals.** Counters accumulate forever, so
-  `timed_out / sent` on the raw /metrics dump is a *lifetime average*.
-  Always wrap them in `rate()` (or `increase()`) over a window.
-- **The rate window sets what you see.** It is both the smoothing period
-  and the shortest outage that reads as a full 100% loss block. A `[$__rate_interval]`
-  window shows a 3-minute outage as a partial spike; `[1m]` catches it as
-  100% but is noisier. Pick the window to match the outages you want to
-  catch (the exporter's probe cadence does not limit visibility — every
-  down second lands in the counters regardless of scrape interval).
+  `timed_out / sent` on the raw /metrics dump is a *lifetime average*. Always
+  wrap both in `rate()` (or `increase()`) over a window.
+- **The rate window sets what you see.** It is both the smoothing period and
+  the shortest outage that reads as a full 100% loss block. A
+  `[$__rate_interval]` window shows a 3-minute outage as a partial spike;
+  `[1m]` catches it as 100% but is noisier. Pick the window to match the outages
+  you want to catch — every down second lands in the counters regardless of
+  scrape interval.
 
 ### Link Packet Loss
 
@@ -39,34 +38,30 @@ Two rules that trip people up:
 100 * rate(link_probes_timed_out_total[$__rate_interval]) / rate(link_probes_sent_total[$__rate_interval])
 ```
 
-True network loss: each probe is a UDP datagram and UDP never
-retransmits, so a probe without an echo was genuinely lost on the wire.
-The deadline is the RTO, applied at the first probe tick after it expires
-(so with `-interval` ≤ `-timeout` a very late echo can still be recorded as
-latency instead of loss; see the [`link_probes_timed_out_total`](../README.md#metrics) row).
-With a link loss simulator (e.g. clumsy) at X%, expect the
-ratio to read X%. During a full outage probes are sent into the void and
-time out naturally, so the ratio reads **~100%** — no fabricated counters
-and no PromQL `OR` workaround. Pair with `link_up == 0` for reachability
-alerts.
+- UDP never retransmits, so a probe without an echo was lost on the wire.
+- The deadline is the RTO, applied at the first probe tick after it expires:
+  with `-interval` ≤ `-timeout` a very late echo is recorded as latency instead
+  of loss (see the [`link_probes_timed_out_total`](../README.md#metrics) row).
+- Against a loss simulator (e.g. clumsy) at X%, expect the ratio to read X%;
+  during a full outage it reads **~100%** — no fabricated counters, no PromQL
+  `OR` workaround.
+- Pair with `link_up == 0` for reachability alerts.
 
 **Sanity check:** `link_probes_sent_total` always equals
 `link_rtt_seconds_count` (received) + `link_probes_timed_out_total` +
-`link_probes_inflight` (plus `link_probes_corrupted_total` when `-payload`
-is enabled). If that sum ever differs, counters were lost or the client
-socket stalled.
+`link_probes_inflight`, plus `link_probes_corrupted_total` with `-payload`. Any
+difference means counters were lost or the client socket stalled.
 
-**Cross-check with the server** (server mode at the remote end):
-`link_server_probes_received_total` counts valid probes per remote client
-IP. Any mismatch with `link_probes_sent_total` is probes that never
-reached the server — genuinely lost on the wire. Two corrections apply
-before that mismatch can be called network loss. `link_server_echo_errors_total`:
-a validated probe the server failed to write back did reach the server but
-never returned, so the client counts it as loss — subtract that rate.
-`link_mtu_probes_sent_total`: the DF MTU sweep sends the same header frame
-to the same address, so the server counts those probes too and on a default
-`-mtu-sweep=1m` deployment `received` can exceed `sent`. Subtract the sweep
-before reading a mismatch as loss:
+**Cross-check with the server** (server mode at the remote end).
+`link_server_probes_received_total` counts valid probes per remote client IP,
+so a mismatch with `link_probes_sent_total` is probes that never arrived. Two
+corrections apply first:
+
+- `link_server_echo_errors_total`: the probe reached the server but its echo
+  never returned, and the client counts that as loss — subtract the rate.
+- `link_mtu_probes_sent_total`: the DF MTU sweep sends the same header frame to
+  the same address, so a default `-mtu-sweep=1m` deployment counts those probes
+  too and `received` can exceed `sent` — subtract the sweep.
 
 ```promql
 # Labels differ between the two families (the server side carries
@@ -80,33 +75,23 @@ before reading a mismatch as loss:
            / sum(rate(link_probes_sent_total{target="site-b"}[$__rate_interval])))
 ```
 
-Sweep probes are visible to the server and must be subtracted here before
-calling anything network loss — they are a separate counter namespace on the
-client, not in `link_probes_sent_total`.
+The MTU counters are a separate client-side namespace and never enter
+`link_probes_sent_total` or the loss ratio.
 
-**Why the loss ratio stays honest:** the adaptive RTO is RFC 6298
-(`SRTT + 4×RTTVAR`, doubled on consecutive timeouts so it recovers when
-latency jumps above the current value), floored at `max(200ms, 2×SRTT)`
-rather than a fixed 200ms — a fixed floor counts normal jitter on links
-whose RTT approaches it (e.g. ~185ms) as loss and pins the RTO at its 3s
-clamp. Flooring at twice the smoothed RTT guarantees headroom and keeps
-the loss ratio meaningful. Because the floor is unbounded above (a
-satellite-scale SRTT applies an RTO above the 3s cap), a fast `-interval`
-especially on such a link can grow the in-flight window past its cap; the
-loop then skips sends until probes resolve. Skipped probes are counted in
-`link_probes_throttled_total` — a probe-rate reduction, not loss: they are
-never built or sent, so neither `sent` nor the loss ratio is affected.
+**Why the loss ratio stays honest.** The adaptive RTO is RFC 6298
+(`SRTT + 4×RTTVAR`, doubled on consecutive timeouts) with a floor of
+`max(200ms, 2×SRTT)`, not a fixed 200ms: a fixed floor reads normal jitter as
+loss on links near it (e.g. ~185ms) and pins the RTO at its 3s cap.
 
-One deliberate exception: when probes are in flight across the periodic
-5-minute DNS re-dial (only possible with aggressive `-interval` values below
-the RTO), those probes are force-timed-out and count as a small synthetic
-loss each re-dial. On links whose RTT approaches or exceeds the probe
-interval this produces a small phantom loss floor — roughly `RTO/interval`
-probes per re-dial, i.e. ~0.3% loss on a 700ms-RTT link at the default
-500ms interval. If your loss-ratio alert threshold sits near that floor,
-raise `-reconnect-interval` (e.g. `24h`) so the re-dial happens at most
-daily; DNS changes are then picked up at the next re-dial rather than
-within 5 minutes.
+The floor is unbounded above, so a fast `-interval` on a high-SRTT link can fill
+the pending window; that tick then skips its send until probes resolve, counted
+in `link_probes_throttled_total` — a probe-rate reduction, not loss.
+
+One deliberate exception: probes in flight across the periodic 5-minute DNS
+re-dial (possible only when `-interval` is below the RTO) are force-timed-out —
+a small synthetic loss each re-dial, roughly `RTO/interval` probes, ~0.3% on a
+700ms-RTT link at the default 500ms interval. If your loss alert sits near that
+floor, raise `-reconnect-interval` (e.g. `24h`).
 
 ### Latency
 
@@ -117,27 +102,23 @@ histogram_quantile(0.9,  rate(link_rtt_seconds_bucket[$__rate_interval]))       
 histogram_quantile(0.99, rate(link_rtt_seconds_bucket[$__rate_interval]))         # p99
 ```
 
-Returns seconds; `* 1000` for ms. No RTT samples exist while the link is
-fully down, so latency is a gap (not 0) during an outage — combine with
-`link_up`.
+Returns seconds; `* 1000` for ms. No samples exist while the link is fully down,
+so latency is a gap (not 0) during an outage — combine with `link_up`.
 
-Explicit buckets cover sub-100ms LAN RTTs (5ms lower bound) up to the
-adaptive RTO cap at 3s; values beyond 3s land in `+Inf`. On a normal link
-they are rare — an echo that outlives its own RTO by up to one probe
-interval (the deadline is the first tick after it expires) is the regular
-way to land there, and two configurations make it routine: a link whose
-SRTT exceeds 1.5s (its applied timeout floors at 2×SRTT, above the 3s cap,
-on purpose) and a fixed `-timeout` above 3s. The native
-histogram (bucket factor 1.1) carries fine-grained data; Prometheus
-scrapes and aggregates it transparently when native-histogram support is
-enabled.
+Buckets cover sub-100ms LAN RTTs (5ms lower bound) through the adaptive RTO cap
+at 3s; values beyond land in `+Inf`, which normally takes an echo outliving its
+own RTO by up to one probe interval.
 
-RTT samples are conservative by construction: a probe is timed when the
-reader goroutine drains the echo, so reader-side buffering can only
-inflate a sample, never deflate it. The echo server is also
-single-threaded, so at very high aggregate probe rates the measured RTT
-includes server queueing — keep the total probe rate well under the
-documented per-IP and global rate caps.
+Two configurations make it routine: an SRTT above 1.5s (the applied timeout
+floors at 2×SRTT, above the 3s cap, on purpose) and a fixed `-timeout` above 3s.
+The native histogram (bucket factor 1.1) carries fine-grained data that
+Prometheus aggregates transparently when native-histogram support is enabled.
+
+RTT samples are conservative by construction: a probe is timed when the reader
+drains the echo, so buffering can only inflate a sample, never deflate it. The
+echo server is single-threaded, so at very high probe rates the measured RTT
+includes server queueing — keep the total probe rate under the per-IP and global
+rate caps.
 
 ### Jitter
 
@@ -145,13 +126,11 @@ documented per-IP and global rate caps.
 link_rtt_jitter_seconds * 1000
 ```
 
-Smoothed RFC 3550 jitter computed in the probe binary from consecutive
-RTT deltas — instantaneous value, no window needed. The estimate resets
-to 0 on the first echo after a sequence gap, so recovery does not show an
-artificial spike; during a full outage the gauge holds its last value
-until that echo arrives.
-For jitter over a specific time range, use the p90−p50 spread as a
-window-based approximation:
+Smoothed RFC 3550 jitter, computed in the probe binary from consecutive RTT
+deltas: an instantaneous value, no window needed. It resets to 0 on the first
+echo after a sequence gap, so recovery shows no artificial spike; during a full
+outage the gauge holds its last value until that echo arrives. For jitter over a
+time range, approximate it with the p90−p50 spread:
 
 ```promql
 (histogram_quantile(0.9, rate(link_rtt_seconds_bucket[$__rate_interval]))
@@ -169,10 +148,10 @@ median) and `link:rtt_seconds_p50_24h_min` (its 24h floor). Written out
 directly, the baseline needs a subquery — `min_over_time((expr)[24h:5m])` —
 because PromQL range selectors do not apply to function calls.
 
-Latency drift on a long-running link shows up as the recent p50 diverging
-from a 24h minimum. Outages show up immediately in `link_up == 0`,
-`rate(link_probes_timed_out_total[$__rate_interval]) > 0`, and the adaptive RTO climbing
-via `link_rto_seconds`.
+Latency drift on a long-running link shows up as the recent p50 diverging from a
+24h minimum. Outages show up in `link_up == 0`,
+`rate(link_probes_timed_out_total[$__rate_interval]) > 0`, and the adaptive RTO
+climbing via `link_rto_seconds`.
 
 ### Link Status
 
@@ -182,14 +161,11 @@ link_up
 
 ### Outage Alerts
 
-All outage alerts use a `for:` of at least 5m (loss and latency
-warnings 10m) so brief events — host reboots, single probe blips, a 60s
-maintenance restart — ride through without paging.
-Anything that survives that window of continuous failure is a real outage.
-Sub-scrape outages are still captured by the counters: a 30s blip between
-scrapes never touches `link_up`, but it does land in
-`rate(timed_out)/rate(sent)`, so the loss alert is the primary detector
-and `link_up` is the state view for long outages.
+Every outage alert uses a `for:` of at least 5m (loss and latency warnings 10m),
+so host reboots, single-probe blips and 60s maintenance restarts ride through
+without paging. Sub-scrape outages still land in `rate(timed_out)/rate(sent)`:
+a 30s blip never touches `link_up`, so the loss alert is the primary detector
+and `link_up` the state view for long outages.
 
 ```yaml
 alert: HighPacketLoss
@@ -225,14 +201,12 @@ alert: LinkLatencyDegraded
 ```
 
 **`LinkProbesStalled` is required alongside the loss alert.** If the local
-interface or route dies, probe writes fail and neither `sent` nor
-`timed_out` moves — the loss ratio reads 0/0 (no data), not 100%. Only
-`link_up == 0` (after 3 consecutive local send failures) and a flat
-`rate(link_probes_sent_total)` reveal it; without this alert a dead local
-link can look like a quiet, healthy monitor.
+interface or route dies, probe writes fail and neither `sent` nor `timed_out`
+moves — the loss ratio reads 0/0 (no data), not 100%. Only `link_up == 0` (after
+3 consecutive local send failures) and a flat `rate(link_probes_sent_total)`
+reveal it.
 
-**Loss threshold:** 20% over the rate window means roughly 1 in 5 probes
-lost for 5 continuous minutes — a heavily degraded but routing link.
-Tune down (10%) for links where any sustained loss matters; a full outage
-reads ~100% and is caught immediately by `SeverePacketLoss` regardless of
-threshold, since the condition persists through the `for` duration.
+**Loss threshold:** 20% over the rate window is roughly 1 in 5 probes lost for 5
+continuous minutes. Tune down (10%) where any sustained loss matters; a full
+outage reads ~100% and `SeverePacketLoss` catches it immediately regardless of
+threshold, because the condition persists through the `for` duration.

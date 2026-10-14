@@ -1,15 +1,15 @@
 # Documentation
 
-Guides for deploying and operating link_ping_prometheus. The [main
-README](../README.md) covers what the exporter is, its flags and its metrics;
-the pages here go deeper.
+Guides for deploying and operating link_ping_prometheus. The
+[main README](../README.md) covers the exporter, its flags, and its metrics; the
+pages here go deeper.
 
 ## Deployment
 
 | Guide | Use it when |
 | --- | --- |
 | [Deployment overview](deployment.md) | Choosing between the options below |
-| [Windows service](windows-service.md) | Installing as an SCM service — includes the built-in hardening and the enterprise checklist |
+| [Windows service](windows-service.md) | Installing as an SCM service — hardening and the enterprise checklist |
 | [Linux (systemd)](linux-systemd.md) | Installing the hardened systemd unit |
 | [Docker](docker.md) | Running the published container images |
 | [Ansible](ansible.md) | Deploying a fleet from a control node |
@@ -20,7 +20,7 @@ the pages here go deeper.
 | Guide | Covers |
 | --- | --- |
 | [Targets file](targets-file.md) | Target schema, address syntax, hot reload, and one file for a whole mesh |
-| [Operations](operations.md) | MTU sweeps, the `/healthz`, `/readyz` and `/status` endpoints, memory and runtime tuning |
+| [Operations](operations.md) | MTU sweeps, `/healthz`, `/readyz` and `/status` endpoints, memory and runtime tuning |
 
 ## Monitoring and alerting
 
