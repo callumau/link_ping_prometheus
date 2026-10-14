@@ -2,7 +2,6 @@
 
 ## Build
 
-
 ```sh
 go build -o ./build/link_ping_prometheus .
 ```
@@ -15,19 +14,35 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o build/link_ping_prometheus.e
 
 ## Test
 
-
 ```sh
 go test -count=1 ./...          # full suite (~2 min; CI also runs it under -race)
 go vet ./...
-SOAK_SECONDS=600 go test -count=1 -timeout 15m -run TestSoakMemory -v ./test/   # opt-in memory soak (heap must stay flat, +8MB ceiling; -timeout required, the default 10m expires mid-soak)
+SOAK_SECONDS=600 go test -count=1 -timeout 15m -run TestSoakMemory -v ./test/
 ```
 
-**Test layout (Go ecosystem convention, as in prometheus/client_golang and windows_exporter):** unit tests live beside the code they exercise (`main_test.go` split by concern — `service_lifecycle_test.go`, `flags_test.go`, `http_endpoints_test.go`, `scavenger_test.go`, `rules_test.go`, `logsink_test.go`, `flags_test.go`; `internal/prober/*_test.go` beside the prober), and the **integration suite lives in `test/`** (`package prober_test`, one file per behavior — accuracy, jitter, reload, payload, HMAC coverage, MTU, server — with shared fixtures in `helpers_test.go` and the opt-in `soak_test.go`). Both suites run in CI; the Windows-only behavioral tests (winsock errno classification, DF socket options, log-DACL hardening) execute natively in the `test-windows` job.
+The soak test is opt-in; `-timeout` is mandatory because the default 10m expires
+mid-run. The heap must stay flat (+8MB ceiling).
 
-Release binaries for Linux, macOS, Windows at [Latest Release](https://github.com/callumau/link_ping_prometheus/releases/latest).
+The test layout follows Go ecosystem convention, as in prometheus/client_golang
+and windows_exporter:
+
+- Unit tests live beside the code they exercise. `main_test.go` is split by
+  concern: `service_lifecycle_test.go`, `flags_test.go`,
+  `http_endpoints_test.go`, `scavenger_test.go`, `rules_test.go`,
+  `logsink_test.go`. The prober's tests sit in `internal/prober/*_test.go`.
+- The integration suite lives in `test/` (`package prober_test`, one file per
+  behavior — accuracy, jitter, reload, payload, HMAC coverage, MTU, server — with
+  shared fixtures in `helpers_test.go` and the opt-in `soak_test.go`).
+
+Both suites run in CI. The Windows-only behavioral tests (winsock errno
+classification, DF socket options, log-DACL hardening) execute natively in the
+`test-windows` job.
+
+Release binaries for Linux, macOS, and Windows are on the
+[Latest Release](https://github.com/callumau/link_ping_prometheus/releases/latest)
+page.
 
 ## Code Structure
-
 
 ```text
 main.go                     — CLI wrapper, flag parsing, service lifecycle
@@ -85,7 +100,6 @@ test/
 
 ## Contributing
 
-
 Bug reports and pull requests are welcome. Before opening a PR:
 
 ```sh
@@ -94,5 +108,7 @@ go build ./... && go vet ./... && go test -count=1 -race ./...
 
 The integration tests run real UDP traffic on `127.0.0.1` and take a few
 minutes. Keep changes one logical commit each (Conventional Commits style:
-`feat:`, `fix:`, `docs:`). If a change touches metrics, flags, or constants,
-update the README table in the same PR — docs and code drift together.
+`feat:`, `fix:`, `docs:`).
+
+If a change touches metrics, flags, or constants, update the README table in the
+same PR — docs and code drift together.

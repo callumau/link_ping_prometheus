@@ -17,10 +17,10 @@ User=nobody
 WantedBy=multi-user.target
 ```
 
-`time-sync.target` ordering is load-bearing: with `-echo-secret` set the
-server's replay guard uses a 30s timestamp window, so clocks must be
-roughly NTP-synchronized. Note: In client/both mode, use an absolute path
-for `-targets` (e.g., `-targets=/etc/link_ping_prometheus/targets.json`).
+`time-sync.target` ordering is load-bearing: with `-echo-secret` set the server's
+replay guard uses a 30s timestamp window, so clocks must be roughly
+NTP-synchronized. In client/both mode, use an absolute path for `-targets`
+(e.g. `-targets=/etc/link_ping_prometheus/targets.json`).
 
 ```sh
 sudo systemctl daemon-reload

@@ -1,14 +1,11 @@
 # Grafana Alloy Scraping
 
-The example below scrapes the metrics endpoint, keeps only `link_*`
-metrics (dropping `go_*`, `process_*`, and the Prometheus client's own
-internals to save remote-write bandwidth and storage), and forwards the
-result to a `prometheus.remote_write` component.
+The example scrapes `/metrics`, keeps only `link_*` metrics (dropping `go_*`
+and `process_*` to save bandwidth), and forwards them to
+`prometheus.remote_write`.
 
-Add your own `prometheus.remote_write "default"` block (endpoint URL,
-credentials) — it is intentionally not included here. If the remote
-write component has a different name, update the
-`prometheus.remote_write.default.receiver` reference below.
+Add your own `prometheus.remote_write "default"` block; renaming it means
+updating the `prometheus.remote_write.default.receiver` reference.
 
 ```river
 prometheus.scrape "link_ping" {
@@ -31,9 +28,8 @@ prometheus.relabel "link_ping_keep" {
 }
 ```
 
-If the agent and the prober run on different hosts, replace
-`localhost:2112` with the prober's address. With metrics basic auth
-enabled, add a `basic_auth` block to the scrape targets instead:
+On different hosts, replace `localhost:2112` with the prober's address. With
+metrics basic auth enabled, add a `basic_auth` block to the targets:
 
 ```river
 prometheus.scrape "link_ping" {
@@ -50,11 +46,17 @@ prometheus.scrape "link_ping" {
 
 ## Grafana Dashboard
 
-Prebuilt dashboard at [grafana-dashboard.json](../grafana-dashboard.json).
-It uses the Grafana v2 dashboard resource format
-(`dashboard.grafana.app/v2`) and needs a Grafana version that supports it;
-it also has a `source` variable for filtering panels per site.
+Prebuilt dashboard: [grafana-dashboard.json](../grafana-dashboard.json) —
+Grafana v2 resource format (`dashboard.grafana.app/v2`), needing a Grafana
+version that supports it.
 
-Panels: link status, packet loss, RTT percentiles / average / current, adaptive RTO, jitter, probe throughput, plus the newer signals — smoothed RTT (SRTT), path MTU (DF-probed), DF probe loss, corruption % (with `-payload`) and send errors (local fault vs network loss). A **Server & prober health** section covers probes in flight, server probes received / dropped by reason / echo errors, clock skew, prober internal errors and metrics auth failures. `link_up` transitions are annotated on every panel and itemized with timestamps in the Link State Changes table. The `source` variable filters the per-site panels, so one dashboard serves the whole fleet (the global metrics-auth-failure panel is deliberately unfiltered).
+- Panels: link status, packet loss, RTT percentiles / average / current,
+  adaptive RTO, jitter, throughput, SRTT, path MTU (DF-probed), DF probe loss,
+  corruption % (`-payload`), send errors, server probes received/dropped/echo
+  errors, clock skew, prober internal errors, metrics auth failures.
+- `link_up` transitions are annotated and itemized in the Link State Changes
+  table.
+- A `source` variable filters per-site panels; the metrics-auth-failure panel
+  is unfiltered.
 
 [![Grafana dashboard screenshot](../.docs/screenshot01.png)](../.docs/screenshot01.png)
