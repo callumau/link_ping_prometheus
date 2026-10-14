@@ -11,7 +11,7 @@ UDP is deliberate: no retransmission, so the loss ratio is true network loss (TC
 - Verify before commit: `go build ./... && go vet ./... && go test -count=1 -race ./...`
 - Focused: `go test -count=1 -run TestName ./test/`
 - Verify before commit: `go build ./... && go vet ./... && go test -count=1 ./...`
-- No linter configured; CI runs `go vet ./...` + `GOOS=windows go vet ./...`/`go build ./...` (compile parity only on the ubuntu runner) + `promtool check rules rules/link-monitor.yml` + `dashboard-linter lint --strict grafana-dashboard.json` (style rules excluded with reasons in `.github/dashboard-linter.yaml`) + `govulncheck ./...` + `go test -race -v ./...` + `go build -v ./...` + a native `windows-latest` `go test -count=1 -race -timeout 30m -v ./...` job (the Windows-only behavioral tests — winsock errno classification, DF socket options, DACL hardening — are actually EXECUTED there, not just cross-compiled)
+- No linter configured; CI runs `go vet ./...` + `GOOS=windows go vet ./...`/`go build ./...` (compile parity only on the ubuntu runner) + static infra checks (`ansible-playbook --syntax-check` on both `deploy/ansible/` playbooks with pinned ansible-core 2.17.6 + ansible.windows 3.8.0 — syntax-check resolves module FQCNs, so a task naming a module that exists in no collection fails the build; `sh -n` on `deploy/mesh/pull-config.sh`; PowerShell's own parser over every `.ps1`) + `promtool check rules rules/link-monitor.yml` + `dashboard-linter lint --strict grafana-dashboard.json` (style rules excluded with reasons in `.github/dashboard-linter.yaml`) + `govulncheck ./...` + `go test -race -v ./...` + `go build -v ./...` + a native `windows-latest` `go test -count=1 -race -timeout 30m -v ./...` job (the Windows-only behavioral tests — winsock errno classification, DF socket options, DACL hardening — are actually EXECUTED there, not just cross-compiled)
 
 ## Architecture
 
@@ -50,6 +50,7 @@ UDP is deliberate: no retransmission, so the loss ratio is true network loss (TC
 - Auth comparisons are hash-then-compare constant-time — don't replace with direct string/byte comparison.
 - The metrics listener defaults to localhost; Basic auth + TLS are opt-in. Don't widen defaults.
 - Security controls added to the wire protocol need table-driven tests (good frame accepted, bad tag dropped, wrong size dropped) — the SEC22 HMAC path shipped untested once already.
+- `-allow-from-targets` derives the server allowlist from the `-targets` addresses (IP literals only: a DNS name is a startup error, because config load never resolves) and skips the target whose `name` equals `-source` by exact, case-sensitive match, so one targets file is identical on every mesh site. The self-skip MUST also run on the reload path (`Config.SkipSelf` → `FilterSelfTargets` in RunClient's reload): applying it only at startup lets a reload re-add the local site as a probe target and silently measure self.
 
 ## Failure visibility
 
