@@ -275,6 +275,72 @@ func TestEchoLoop_PanicFlushCountsTimeouts(t *testing.T) {
 	}
 }
 
+// TestEchoLoop_PanicFlushRestartNoDoubleCount pins the PRODUCTION panic
+// restart path: a RunClient-managed loop carries the runClientDoneKey marker
+// (client.go start()), so on a restart the root context is still alive and
+// runClientShuttingDown is false. The panic-recovery flush counts the
+// abandoned probes AND clears the pending map; the exit tail then sees an
+// empty map and must not count them again. Falsification: remove the
+// pending = make(...) clear in the recover block and this test sees
+// timed_out=2 for a single abandoned probe (double count) — the two older
+// panic tests both pass unmarked contexts, which silently take the
+// "no marker = shutdown" defensive branch and never exercise the tail.
+func TestEchoLoop_PanicFlushRestartNoDoubleCount(t *testing.T) {
+	InitMetrics()
+
+	// Marker-carrying context whose root Done channel is NEVER closed:
+	// exactly what a RunClient-managed restart sees.
+	rootDone := make(chan struct{})
+	defer close(rootDone) // test cleanup only; the loop is gone by then
+	// RunClient stores ctx.Done(), a receive-only channel, as the marker
+	// value — the type assertion in runClientShuttingDown requires it.
+	ctx := context.WithValue(context.Background(), runClientDoneKey{}, (<-chan struct{})(rootDone))
+	if runClientShuttingDown(ctx) {
+		t.Fatal("test setup: marker-carrying ctx must not report shutdown")
+	}
+
+	// Delay echoes past the second write so probe #1 is still pending when
+	// the panic fires.
+	addr := wbEchoServer(t, ctx, func(buf []byte) {
+		time.Sleep(150 * time.Millisecond)
+	})
+
+	realConn, err := dialUDP(ctx, "udp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := &scriptedConn{Conn: realConn, hook: func(n int64) (bool, bool) {
+		return false, n == 2 // panic on the second write
+	}}
+
+	const src, name = "test", "panic_restart_balance"
+	m := newTargetMetrics(src, Target{Name: name, Address: addr})
+	cfg := Config{Source: src, BaseInterval: 30 * time.Millisecond, BaseTimeout: time.Second}
+
+	err = runEchoLoop(ctx, conn, cfg, NewAdaptiveStats(cfg.BaseTimeout), m, &probeLoopState{}, slog.Default())
+	if err == nil || !strings.Contains(err.Error(), "panic") {
+		t.Fatalf("expected panic error from runEchoLoop, got %v", err)
+	}
+
+	sent := wbCounter(ProbesSent, src, name, addr)
+	rtt := wbHistCount(src, name, addr)
+	tout := wbCounter(ProbesTimedOut, src, name, addr)
+	infl := wbGauge(ProbesInflight, src, name, addr)
+
+	// Exactly one abandoned probe: counted once by the panic flush, NOT
+	// again by the exit tail.
+	if tout != 1 {
+		t.Errorf("timed_out must be exactly 1 (single abandoned probe, counted once), got %v", tout)
+	}
+	if infl != 0 {
+		t.Errorf("inflight must drain to 0 after panic flush, got %v", infl)
+	}
+	if sent != rtt+tout+infl {
+		t.Errorf("balance invariant broken after panic restart: sent=%v rtt=%v timed_out=%v inflight=%v",
+			sent, rtt, tout, infl)
+	}
+}
+
 // TestEchoLoop_ReaderDeathDrainsReceivedEcho: an echo the reader already
 // delivered into respCh before it died was RECEIVED, so the reader-death
 // exit must drain it as an RTT sample rather than charge it as loss via the
@@ -312,6 +378,51 @@ func TestEchoLoop_ReaderDeathDrainsReceivedEcho(t *testing.T) {
 	}
 	if infl := wbGauge(ProbesInflight, src, name, addr); infl != 0 {
 		t.Errorf("inflight must drain to 0, got %v", infl)
+	}
+}
+
+// TestEchoLoop_ReaderDeathStatusNotReady: the reader-death re-emit must
+// report socket_age_seconds=0 (socketStart zeroed), not the dead socket's
+// stale age — AnyReady (and thus /readyz) is built on SocketAgeSeconds > 0,
+// so a stale age would keep the agent "ready" through the 1s re-dial pause
+// while no echo can be read at all.
+// pi-lens-ignore: go-test-functions
+func TestEchoLoop_ReaderDeathStatusNotReady(t *testing.T) {
+	InitMetrics()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	addr := wbEchoServer(t, ctx, nil)
+	realConn, err := dialUDP(ctx, "udp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := &firstDeadlineOKConn{Conn: realConn}
+
+	const src, name = "test", "reader_death_status"
+	reg := NewStatusRegistry()
+	m := newTargetMetrics(src, Target{Name: name, Address: addr})
+	m.status = reg
+	// Pretend a socket was dialed long ago: without the socketStart zeroing,
+	// the re-emit would carry a large socket_age_seconds and AnyReady would
+	// stay true across the re-dial pause.
+	state := &probeLoopState{socketStart: time.Now().Add(-time.Hour)}
+
+	cfg := Config{Source: src, BaseInterval: 40 * time.Millisecond, BaseTimeout: 2 * time.Second}
+	if err := runEchoLoop(ctx, conn, cfg, NewAdaptiveStats(cfg.BaseTimeout), m, state, slog.Default()); !errors.Is(err, errReaderDead) {
+		t.Fatalf("expected errReaderDead from the reader-death exit, got %v", err)
+	}
+
+	snap := reg.Snapshot()
+	if len(snap) != 1 {
+		t.Fatalf("expected exactly one status snapshot, got %d", len(snap))
+	}
+	if got := snap[0].SocketAgeSeconds; got != 0 {
+		t.Errorf("reader-death re-emit must report socket_age_seconds=0 (dead socket is not ready), got %v", got)
+	}
+	if reg.AnyReady() {
+		t.Errorf("a dead reader must not satisfy AnyReady (/readyz must read not-ready during the re-dial pause)")
 	}
 }
 
@@ -1047,4 +1158,142 @@ func TestProbeTarget_BoundedReadErrorsRedial(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("probe loop did not stop after cancel")
 	}
+}
+
+// delayedEchoConn is a scripted conn for the exit-accounting pin: the
+// first probe Write starts a timer; the reader's first Read blocks until
+// released, then delivers that exact frame back (a genuine echo). Every
+// later Read returns net.ErrClosed, mirroring a closed socket. No real
+// UDP involved - the loop is driven through runEchoLoop directly.
+type delayedEchoConn struct {
+	mu        sync.Mutex
+	frame     []byte
+	echoReady chan struct{} // closed when the released echo becomes readable
+	delivered atomic.Bool   // set when the echo left this conn's Read
+	dead      chan struct{}
+	deadOnce  sync.Once
+}
+
+func newDelayedEchoConn(hold time.Duration) *delayedEchoConn {
+	c := &delayedEchoConn{echoReady: make(chan struct{}), dead: make(chan struct{})}
+	// `hold` starts when the probe is written: cancel always leads.
+	_ = hold
+	return c
+}
+
+func (c *delayedEchoConn) releaseEcho() {
+	c.mu.Lock()
+	f := c.frame
+	c.mu.Unlock()
+	if f != nil {
+		close(c.echoReady)
+	}
+}
+
+func (c *delayedEchoConn) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	if c.frame == nil {
+		cp := make([]byte, len(p))
+		copy(cp, p)
+		c.frame = cp
+	}
+	c.mu.Unlock()
+	return len(p), nil
+}
+
+func (c *delayedEchoConn) Close() error                       { c.deadOnce.Do(func() { close(c.dead) }); return nil }
+func (c *delayedEchoConn) LocalAddr() net.Addr                { return nil }
+func (c *delayedEchoConn) RemoteAddr() net.Addr               { return nil }
+func (c *delayedEchoConn) SetDeadline(t time.Time) error      { return nil }
+func (c *delayedEchoConn) SetWriteDeadline(t time.Time) error { return nil }
+func (c *delayedEchoConn) SetReadDeadline(t time.Time) error  { return nil }
+
+func (c *delayedEchoConn) Read(p []byte) (int, error) {
+	select {
+	case <-c.echoReady:
+	case <-c.dead:
+		return 0, net.ErrClosed
+	}
+	if c.delivered.Swap(true) {
+		// One echo only; afterwards mirror the closed socket so the
+		// reader exits via its ErrClosed path.
+		return 0, net.ErrClosed
+	}
+	c.mu.Lock()
+	frame := c.frame
+	c.mu.Unlock()
+	n := copy(p, frame)
+	return n, nil
+}
+
+// TestEchoLoop_ExitDrainsLateEchoAsRTT pins the exit-accounting fix
+// (release-lane MED-2): an echo the reader has already READ when the
+// probe loop is cancelled must still be accounted as RTT at exit, not
+// swept as a timeout. The reader parks holding the frame across the
+// loop's cancellation; the fixed exit path (close socket, bounded join
+// on readerDone, priority push bypassing the cancelled-ctx branch) then
+// drains it as a delivered sample. Without the diagnostic dump the two
+// relevant metrics go: rtt_count == 1, timed_out == 0, inflight == 0.
+func TestEchoLoop_ExitDrainsLateEchoAsRTT(t *testing.T) {
+	InitMetrics()
+	src := "test"
+	name, addr := "drain-late-echo", "127.0.0.1"
+
+	cfg := Config{
+		Source:       src,
+		BaseInterval: 5 * time.Second,
+		BaseTimeout:  5 * time.Second,
+	}
+	stats := NewAdaptiveStats(cfg.BaseTimeout)
+	m := newTargetMetrics(src, Target{Name: name, Address: addr})
+	m.status = nil
+	state := &probeLoopState{}
+	logger := slog.Default()
+
+	conn := newDelayedEchoConn(0)
+	// pi-lens-ignore: go-context-background-handler
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runEchoLoop(ctx, conn, cfg, stats, m, state, logger) }()
+
+	// Wait until exactly one probe is in flight (Write#1 done), then move
+	// the conn into the AUDIT WINDOW: echo readable, then observed as read
+	// by the reader (conn.delivered), while the loop is still alive. Only
+	// after that cancel: the reader holds an already-read echo at loop
+	// exit, and the fix must land it in respCh (priority push) before the
+	// joined drain charges anything.
+	deadline := time.Now().Add(2 * time.Second)
+	for wbGauge(ProbesInflight, src, name, addr) < 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("no probe in flight within 2s")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	conn.releaseEcho()
+	deadline = time.Now().Add(2 * time.Second)
+	for !conn.delivered.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("echo was not consumed by the reader in time")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("runEchoLoop did not exit within 3s")
+	}
+
+	// The late echo must be drained as a DELIVERED sample.
+	if got := wbHistCount(src, name, addr); got != 1 {
+		t.Fatalf("rtt sample count = %v, want 1 (late echo must be counted as RTT at exit)", got)
+	}
+	if got := wbCounter(ProbesTimedOut, src, name, addr); got != 0 {
+		t.Errorf("timed_out = %v, want 0 (an already-read echo must not be charged as loss)", got)
+	}
+	if got := wbGauge(ProbesInflight, src, name, addr); got != 0 {
+		t.Errorf("inflight = %v, want 0 (balance must drain to zero at exit)", got)
+	}
+	_ = conn.delivered.Load()
 }

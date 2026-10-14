@@ -37,8 +37,7 @@
              and (link_ping_metrics_pass | length > 0) }}
         link_ping_metrics_tls: >-
           {{ ('-metrics-tls-cert' in link_ping_extra_args)
-             or ('-metrics-tls-key' in link_ping_extra_args)
-             or ('-metrics-allow-insecure' in link_ping_extra_args) }}
+             or ('-metrics-tls-key' in link_ping_extra_args) }}
 
     - name: Refuse an unauthenticated all-interfaces metrics listener
       ansible.builtin.assert:
@@ -53,12 +52,61 @@
           probe topology (target addresses, packet counts, build info) to
           anything that can reach TCP 2112. Pick one: (1) bind
           127.0.0.1:2112 and scrape through a tunnel/agent; (2) set
-          link_ping_metrics_user and link_ping_metrics_pass; (3) pass
-          -metrics-tls-cert/-metrics-tls-key (or -metrics-allow-insecure) in
+          link_ping_metrics_user and link_ping_metrics_pass (add
+          -metrics-allow-insecure to link_ping_extra_args as well when
+          keeping plaintext HTTP — it does nothing without credentials);
+          (3) pass -metrics-tls-cert/-metrics-tls-key in
           link_ping_extra_args; (4) firewall TCP 2112 to the monitoring
           hosts only. See deploy/ansible/README.md.
         # Silent when safe: the guardrail must not add noise to the normal
         # localhost default.
+        quiet: true
+
+    - name: Require a client allowlist in server/both mode
+      # The binary refuses server/both mode with an empty -allow list
+      # (fail-closed), and the unit's Restart=on-failure would then
+      # crash-loop it every 5s — fail here with the fix instead.
+      ansible.builtin.assert:
+        that: >-
+          link_ping_mode not in ['server', 'both']
+          or (link_ping_allow | length > 0)
+        fail_msg: >-
+          link_ping_mode={{ link_ping_mode }} with an empty link_ping_allow
+          cannot start: the binary refuses server/both mode without -allow
+          (fail-closed client allowlist), so Restart=on-failure would
+          crash-loop the service every 5s. Set link_ping_allow in
+          group_vars/all.yml to the comma-separated client IPs or CIDR
+          prefixes allowed to echo, e.g. "203.0.113.5,10.0.0.0/24". See
+          deploy/ansible/README.md.
+        quiet: true
+
+    - name: Reject whitespace that would split the rendered flag list
+      # systemd word-splits the unquoted $OPTIONS expansion, so a space
+      # inside a flag value silently truncates the flag list (the stray
+      # remainder becomes a positional argument the flag parser ignores) —
+      # the hazard installer/windows/install-service.bat quotes against.
+      # Between-flag spaces are fine; every whitespace-separated token in
+      # link_ping_extra_args must therefore be one complete -flag=value.
+      vars:
+        link_ping_bad_extra_args: >-
+          {{ link_ping_extra_args.split()
+             | reject('match', '^-\S+$') | list }}
+      ansible.builtin.assert:
+        that:
+          - link_ping_allow is not search('\s')
+          - link_ping_metrics_listen is not search('\s')
+          - link_ping_bad_extra_args | length == 0
+        fail_msg: >-
+          Whitespace inside a flag value splits the rendered command line
+          (systemd word-splits the unquoted $OPTIONS expansion), silently
+          truncating the flag list. Offending value(s):
+          link_ping_allow='{{ link_ping_allow }}',
+          link_ping_metrics_listen='{{ link_ping_metrics_listen }}',
+          link_ping_extra_args token(s) without a leading '-':
+          {{ link_ping_bad_extra_args }}. Fix in group_vars/all.yml:
+          separate multiple allowlist entries with commas, never spaces,
+          and keep every -flag=value token in link_ping_extra_args free
+          of spaces. See deploy/ansible/README.md.
         quiet: true
 
     - name: Create log directory
@@ -189,8 +237,7 @@
              and (link_ping_metrics_pass | length > 0) }}
         link_ping_metrics_tls: >-
           {{ ('-metrics-tls-cert' in link_ping_extra_args)
-             or ('-metrics-tls-key' in link_ping_extra_args)
-             or ('-metrics-allow-insecure' in link_ping_extra_args) }}
+             or ('-metrics-tls-key' in link_ping_extra_args) }}
 
     - name: Refuse an unauthenticated all-interfaces metrics listener
       ansible.builtin.assert:
@@ -205,10 +252,62 @@
           probe topology (target addresses, packet counts, build info) to
           anything that can reach TCP 2112. Pick one: (1) bind
           127.0.0.1:2112 and scrape through a tunnel/agent; (2) set
-          link_ping_metrics_user and link_ping_metrics_pass; (3) pass
-          -metrics-tls-cert/-metrics-tls-key (or -metrics-allow-insecure) in
+          link_ping_metrics_user and link_ping_metrics_pass (add
+          -metrics-allow-insecure to link_ping_extra_args as well when
+          keeping plaintext HTTP — it does nothing without credentials);
+          (3) pass -metrics-tls-cert/-metrics-tls-key in
           link_ping_extra_args; (4) firewall TCP 2112 to the monitoring
           hosts only. See deploy/ansible/README.md.
+        quiet: true
+
+    - name: Require a client allowlist in server/both mode
+      # Same guardrail as the Linux play. The binary refuses server/both
+      # mode with an empty -allow list (fail-closed), and the SCM
+      # OnFailure restart ladder would then crash-loop it every 5s —
+      # fail here with the fix instead.
+      ansible.builtin.assert:
+        that: >-
+          link_ping_mode not in ['server', 'both']
+          or (link_ping_allow | length > 0)
+        fail_msg: >-
+          link_ping_mode={{ link_ping_mode }} with an empty link_ping_allow
+          cannot start: the binary refuses server/both mode without -allow
+          (fail-closed client allowlist), so the SCM restart ladder would
+          crash-loop the service every 5s. Set link_ping_allow in
+          group_vars/all.yml to the comma-separated client IPs or CIDR
+          prefixes allowed to echo, e.g. "203.0.113.5,10.0.0.0/24". See
+          deploy/ansible/README.md.
+        quiet: true
+
+    - name: Reject whitespace that would split the rendered flag list
+      # Same guardrail as the Linux play, restated because plays share no
+      # vars. The Windows service command line is rendered unquoted into
+      # one win_shell invocation, so a space inside a flag value silently
+      # truncates the flag list (the stray remainder becomes a positional
+      # argument the flag parser ignores) — the hazard
+      # installer/windows/install-service.bat quotes against. Between-flag
+      # spaces are fine; every whitespace-separated token in
+      # link_ping_extra_args must therefore be one complete -flag=value.
+      vars:
+        link_ping_bad_extra_args: >-
+          {{ link_ping_extra_args.split()
+             | reject('match', '^-\S+$') | list }}
+      ansible.builtin.assert:
+        that:
+          - link_ping_allow is not search('\s')
+          - link_ping_metrics_listen is not search('\s')
+          - link_ping_bad_extra_args | length == 0
+        fail_msg: >-
+          Whitespace inside a flag value splits the rendered command line
+          (the options are rendered into one unquoted command line),
+          silently truncating the flag list. Offending value(s):
+          link_ping_allow='{{ link_ping_allow }}',
+          link_ping_metrics_listen='{{ link_ping_metrics_listen }}',
+          link_ping_extra_args token(s) without a leading '-':
+          {{ link_ping_bad_extra_args }}. Fix in group_vars/all.yml:
+          separate multiple allowlist entries with commas, never spaces,
+          and keep every -flag=value token in link_ping_extra_args free
+          of spaces. See deploy/ansible/README.md.
         quiet: true
 
     - name: Create install directory
@@ -326,14 +425,13 @@
       # the service's environment block as SYSTEM, so the service process
       # itself needs no read access here.
       #
-      # win_script (not win_shell) so the snippet is written to a .ps1 and
-      # run as-is: cmd.exe or the outer PowerShell would otherwise re-parse
-      # the $variables and quotes. $ErrorActionPreference = 'Stop' turns a
+      # win_shell (not win_command) so the snippet runs as PowerShell on the
+      # target rather than through cmd.exe, which would re-parse the
+      # $variables and quotes. $ErrorActionPreference = 'Stop' turns a
       # failed Get-Acl/Set-Acl into a non-zero exit, so the task fails
       # instead of leaving the key world-readable and reporting success.
       # NOTIFY: no service restart - the ACL does not change any value.
-      ansible.windows.win_script:
-        script: |
+      ansible.windows.win_shell: |
           $ErrorActionPreference = 'Stop'
           $k = '{{ svc_env_key }}'
           function New-AdminRule($n) {

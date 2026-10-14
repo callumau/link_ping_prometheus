@@ -87,6 +87,12 @@ func isValidHost(host string) bool {
 	if net.ParseIP(trimmed) != nil {
 		return false
 	}
+	isIPish := isIPishToken(host)
+	if isIPish {
+		if net.ParseIP(trimmed) == nil {
+			return false
+		}
+	}
 	host = trimmed
 	if len(host) > 253 {
 		return false
@@ -107,6 +113,25 @@ func isValidHost(host string) bool {
 	return true
 }
 
+// isIPishToken reports whether host looks like an attempt to write an IP
+// literal rather than a DNS name: either the whole string is digits and
+// dots (dotted-decimal attempt, e.g. 1.2.3.010 or 1.2.3.999), or it starts
+// with the 0x/0X prefix (hex form, e.g. 0x0a000001). Everything else —
+// including a hostname that begins with a digit but contains letters,
+// such as 10.0.0.1.example.com — is left to the label rules.
+func isIPishToken(host string) bool {
+	if len(host) > 2 && (host[:2] == "0x" || host[:2] == "0X") {
+		return true
+	}
+	for i := 0; i < len(host); i++ {
+		c := host[i]
+		if !('0' <= c && c <= '9') && c != '.' {
+			return false
+		}
+	}
+	return true
+}
+
 // maxZoneLen bounds an IPv6 scope zone. A real zone is an interface name
 // (Linux caps those at 15 bytes) or a small numeric interface id; 255 is
 // a generous syntax bound that still rejects absurd inputs without
@@ -120,6 +145,17 @@ const maxZoneLen = 255
 // zone and must not validate.
 func validZone(zone string) bool {
 	if zone == "" || len(zone) > maxZoneLen {
+		return false
+	}
+	// Reject a trailing dot inside the zone: the dot's purpose is VLAN
+	// sub-interface names ("eth0.100"), and a dangling trailing dot makes
+	// the whole host label checks pass through the zone branch while the
+	// FQDN trailing-dot strip (checked below it) never applies to an IP
+	// literal — validation would accept a host the dialer then rejects,
+	// stranding the target in the 1s dial-retry loop with recurring
+	// dial_retry errors instead of a clean startup failure
+	// (e.g. "fe80::1%eth0.:9100").
+	if zone[len(zone)-1] == '.' {
 		return false
 	}
 	for i := 0; i < len(zone); i++ {

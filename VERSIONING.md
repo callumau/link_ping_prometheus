@@ -46,8 +46,55 @@ within a major it is a breaking (MAJOR) change to:
 The table-driven wire tests (good frame accepted, bad tag dropped, wrong
 size dropped) pin the frame contract; any PR touching the wire must extend
 them, since those tests are the interop guarantee's enforcement.
+
+### Bundled migrations (the dual-accept-then-flip template)
+
+A wire-subsystem flip MAY ship inside a single minor release — rather
+than as a dedicated flip release — when all three hold:
+
+1. the receiving side learned the new form FIRST, in the same release or
+   an earlier one (e.g. a dual-accept server), while the sending side's
+   output stayed byte-identical;
+2. the release notes name the upgrade ORDER and the exact broken pair
+   (e.g. v0.7 server + new-default client), plus which flag restores the
+   old emission as an escape hatch;
+3. the old form remains ACCEPTED by the receiving side indefinitely —
+   the guarantee degrades for the broken pair only.
+
+The v0.8.0 HMAC tag-coverage rollout is the template: the server accepts
+both coverages while the flag default flips, notes tell fleets with
+v0.7 servers to upgrade server-side first (or confine clients with
+`-hmac-coverage=header` until they do), and v0.7 servers keep working
+with every pairing except that named one.
+
 Everything above applies to post-v0.7 releases; v0.6 and earlier made no
 interop promises.
+
+## Cross-major upgrade path (a new MAJOR's .0 vs the last minor)
+
+A MAJOR bump is where the wire or contract may genuinely change, so
+same-major guarantees end at the major boundary. The upgrade EXPECTATION,
+not a hard guarantee: **a new major's `.0` release aims to interoperate
+with the previous major's LAST minor**, so a fleet can roll onto the new
+major one site at a time without a flag day. "Aims to" is deliberate —
+some major changes are exactly the reason for the bump (a retired cipher,
+a reworked authentication), so full bidirectional interop may be
+impossible; the release notes must then state PRECISELY which
+directions work:
+
+- which pairs are fully compatible (e.g. new server ↔ last-minor client);
+- which pairs are degraded and how (e.g. probes flow, but a deprecated
+  feature no longer authenticates);
+- which pairs are broken and what the upgrade ORDER is (e.g. upgrade
+  servers first; clients may then flip; the last release that supports
+  the old wire is X).
+
+Design majors with a transition shape when the change allows one (the
+v0.8 HMAC-tag dual-acceptance is the template: the server learns to
+accept both coverages while the default wire output is unchanged; the
+observable flip rides the next minor; the old acceptance path stays for
+peers that never upgrade). A major that ships with NO transition path
+must justify it in the notes and name the last compatible release.
 
 ## v1.0.0 — the stable, hardened promotion gate
 

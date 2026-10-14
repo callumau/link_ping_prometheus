@@ -35,7 +35,6 @@ import (
 
 	"link_ping_prometheus/internal/prober"
 
-	"github.com/kardianos/service"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"gopkg.in/natefinch/lumberjack.v2"
@@ -59,6 +58,13 @@ const minScavengeUnreleased = 4 << 20
 // response (risking a truncated scrape, i.e. the monitor reporting ITSELF
 // down). Excess scrapes get a 503 instead; Prometheus retries.
 const maxConcurrentScrapes = 2
+
+// shutdownJoinGrace bounds the wait for the metrics serve goroutine to exit
+// after Shutdown: an in-flight scrape holds Serve open up to the 30s
+// WriteTimeout, which exceeds the service Stop deadline (20s). The drain is
+// best-effort, so the join is cut short rather than making Stop report a
+// timeout while the process drains a clean shutdown.
+const shutdownJoinGrace = 2 * time.Second
 
 // releasableHeap returns the idle heap bytes a scavenge could actually return
 // to the OS, i.e. HeapIdle minus what has already been released. Deliberately
@@ -116,18 +122,19 @@ func startHeapScavenger(ctx context.Context, every time.Duration, minUnreleased 
 
 // CLI flags.
 var (
-	flMode          = flag.String("mode", "server", "Mode: server, client, both")
-	flListen        = flag.String("listen", ":4000", "Server: Listen address")
-	flAllow         = flag.String("allow", "", "Server: Comma-separated client IP allowlist (fail-closed: required in server/both mode)")
-	flTarget        = flag.String("target", "", "Client: Single target address")
-	flTargets       = flag.String("targets", "", "Client: JSON file path with targets")
-	flMetrics       = flag.String("metrics", "127.0.0.1:2112", "Metrics: Listen address (default binds localhost only; use \":2112\" or \"0.0.0.0:2112\" to expose on all interfaces)")
-	flSvc           = flag.String("svc", "", "Service: install, uninstall, start, stop, run")
-	flJSONLogs      = flag.Bool("json-logs", false, "Log in JSON format")
-	flLogFile       = flag.String("log-file", "", "Log: append logs to this file in addition to stdout (stdout is discarded under the Windows service)")
-	flLogMaxSize    = flag.Int("log-file-max-mb", 10, "Log: max size in MB before rotation (0 disables rotation; requires -log-file)")
-	flLogMaxBackups = flag.Int("log-file-max-backups", 5, "Log: max rotated files to keep")
-	flLogMaxAge     = flag.Int("log-file-max-age", 28, "Log: max days to keep rotated files")
+	flMode             = flag.String("mode", "server", "Mode: server, client, both")
+	flListen           = flag.String("listen", ":4000", "Server: Listen address")
+	flAllow            = flag.String("allow", "", "Server: Comma-separated client IP allowlist (fail-closed: required in server/both mode)")
+	flAllowFromTargets = flag.Bool("allow-from-targets", false, "Server: derive the fail-closed allowlist from the -targets file addresses and skip the target whose name matches -source, so one targets file serves every site of a mesh (client/both mode; every target address must be an IP literal - a DNS name is an error, because config load never resolves). Combines with -allow for extra CIDRs.")
+	flTarget           = flag.String("target", "", "Client: Single target address")
+	flTargets          = flag.String("targets", "", "Client: JSON file path with targets")
+	flMetrics          = flag.String("metrics", "127.0.0.1:2112", "Metrics: Listen address (default binds localhost only; use \":2112\" or \"0.0.0.0:2112\" to expose on all interfaces)")
+	flSvc              = flag.String("svc", "", "Service: install, uninstall (Windows only; Linux uses the systemd unit), start, stop, run")
+	flJSONLogs         = flag.Bool("json-logs", false, "Log in JSON format")
+	flLogFile          = flag.String("log-file", "", "Log: append logs to this file in addition to stdout (stdout is discarded under the Windows service)")
+	flLogMaxSize       = flag.Int("log-file-max-mb", 10, "Log: max size in MB before rotation (0 disables rotation; requires -log-file)")
+	flLogMaxBackups    = flag.Int("log-file-max-backups", 5, "Log: max rotated files to keep")
+	flLogMaxAge        = flag.Int("log-file-max-age", 28, "Log: max days to keep rotated files")
 
 	flAdaptive          = flag.Bool("adaptive", true, "Client: Use adaptive timeout based on link quality (RFC 6298)")
 	flBaseInterval      = flag.Duration("interval", 500*time.Millisecond, "Client: Probe interval")
@@ -150,6 +157,7 @@ var (
 	flMetricsGzip          = flag.Bool("metrics-gzip", false, "Metrics: gzip-compress /metrics responses when the scraper offers it. Off by default: promhttp pools a gzip writer per CPU, and each holds ~0.7MB of flate state, so compression costs up to ~0.7MB x GOMAXPROCS of live heap - more than a small fleet's whole response. Enable it for many targets, where the response size matters.")
 	flEchoSecret           = flag.String("echo-secret", "", "Wire: HMAC secret for UDP echo authentication (env LINK_PING_ECHO_SECRET; mitigates reflector spoof when set on both client and server)")
 	flEchoSecretOld        = flag.String("echo-secret-old", "", "Wire: previous HMAC secret, still accepted by the SERVER during a zero-downtime rotation alongside -echo-secret (env LINK_PING_ECHO_SECRET_OLD; server side only)")
+	flHMACCoverage         = flag.String("hmac-coverage", "full-frame", "Wire: which frame bytes the client's HMAC tag covers when -echo-secret is set: 'full-frame' (default: header plus the -payload bytes, so a tampered payload or a payload riding a captured tag no longer authenticates; needs -payload > 0 to differ) or 'header' (the 24-byte header only — the v0.7 layout, byte-identical wire output; the escape hatch for probing through a v0.7 echo server while using -payload). The server side accepts both coverages whenever it has -echo-secret, so upgrading to ≥ v0.8 clears the one broken pairing (v0.7 server + full-frame client = payload probes read as loss).")
 )
 
 // flagDefaultInt returns the registered default value of an int flag so
@@ -176,6 +184,15 @@ func flagDefaultInt(name string) (int, error) {
 // protects future rotations. A symlinked path is refused outright: it can
 // redirect topology-bearing log lines into a file owned by another local
 // user. Fail-closed: the caller exits on error, like the allowlist refusal.
+// Windows: os.OpenFile's 0600 mode, os.Stat (always 0666) and f.Chmod (an
+// attribute toggle) are all meaningless for a DACL, so the POSIX enforcement
+// below cannot restrict one there — Windows delegates to restrictLogDACL
+// (logacl_windows.go), which replaces the file's DACL with a protected set
+// granting full access only to SYSTEM, Administrators and the account this
+// process runs as. The installer's ACL'd log DIRECTORY remains
+// defense-in-depth: log rotation creates fresh files that inherit the
+// directory's DACL, and restricting those on the fly would add a rotation
+// path to hardenLogSink.
 func hardenLogSink(path string) (repaired bool, err error) {
 	fi, err := os.Lstat(path)
 	if err != nil {
@@ -189,6 +206,14 @@ func hardenLogSink(path string) (repaired bool, err error) {
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 		if err != nil {
 			return false, err
+		}
+		if runtime.GOOS == "windows" {
+			// A fresh file inherits its parent directory's DACL, which may be
+			// wide (a manual install pointing -log-file into a Users-writable
+			// directory); restrict it now so the repair path does not have to
+			// wait for the next start.
+			defer f.Close()
+			return restrictLogDACL(f)
 		}
 		return false, f.Close()
 	}
@@ -207,6 +232,14 @@ func hardenLogSink(path string) (repaired bool, err error) {
 	got, err := f.Stat()
 	if err != nil {
 		return false, err
+	}
+	if runtime.GOOS == "windows" {
+		// os.Stat always reports 0666 on Windows, so the perm-bit comparison
+		// is meaningless there: restrictLogDACL reads the actual DACL of the
+		// open descriptor, compares it against the restricted set it pins,
+		// and only rewrites it when it differs (repaired=false for an
+		// already-compliant file).
+		return restrictLogDACL(f)
 	}
 	if got.Mode().Perm() != 0o600 {
 		if err := f.Chmod(0o600); err != nil {
@@ -251,6 +284,7 @@ func main() {
 			os.Exit(1)
 		}
 	}
+	svcTraceMarker("main-pre-logsetup")
 	logW := io.Writer(os.Stdout)
 	var logRepaired bool
 	if *flLogFile != "" {
@@ -275,7 +309,12 @@ func main() {
 				os.Exit(1)
 			}
 			defer f.Close()
-			logW = io.MultiWriter(os.Stdout, f)
+			// File FIRST: io.MultiWriter stops at the first error, and under
+			// the SCM the std handle can be invalid rather than a silent NUL
+			// sink — stdout-first then silently swallows every line before
+			// the file ever sees one, the exact total-log-loss the install
+			// warning exists to prevent. Console-first was only ever cosmetic.
+			logW = io.MultiWriter(f, os.Stdout)
 		} else {
 			// ponytail: lumberjack handles rotation (10 MB ×5 ×28d default); no per-line overhead, reopens on rotation
 			// pi-lens-ignore: go-path-traversal
@@ -286,8 +325,16 @@ func main() {
 				MaxAge:     *flLogMaxAge,
 				Compress:   false,
 			}
-			logW = io.MultiWriter(os.Stdout, lj)
+			logW = io.MultiWriter(lj, os.Stdout)
 		}
+	}
+	// Surface runtime sink failures (disk full, log dir removed): the
+	// wrapper counts write errors and run()'s watcher reports them to the
+	// event log / stderr. Wrapping once here covers both sink modes.
+	var logSink *countedWriter
+	if *flLogFile != "" {
+		logSink = newCountedWriter(logW)
+		logW = logSink
 	}
 	opts := &slog.HandlerOptions{Level: slog.LevelInfo}
 	if *flJSONLogs {
@@ -302,8 +349,9 @@ func main() {
 		slog.Warn("Log file had wider permissions; repaired to 0600", "path", *flLogFile)
 	}
 
+	svcTraceMarker("main-pre-svc")
 	if *flSvc != "" {
-		handleService(*flSvc)
+		handleService(*flSvc, logSink)
 		return
 	}
 
@@ -312,12 +360,22 @@ func main() {
 	defer cancel()
 
 	prg := &program{
-		ctx: ctx,
+		ctx:     ctx,
+		logSink: logSink,
 	}
 	if err := prg.run(); err != nil {
 		slog.Error("Program exited with error", "err", err)
 		os.Exit(1)
 	}
+}
+
+// meshAllowFromTargets reports whether -allow-from-targets applies. The
+// derived allowlist is a server control, so the flag needs the echo responder
+// (server/both mode); in client mode it is ignored (warnIgnoredFlags says so)
+// and no target is skipped. One spelling of the condition, used by both the
+// config builder and the startup allowlist derivation so they cannot drift.
+func meshAllowFromTargets() bool {
+	return *flAllowFromTargets && *flMode != "client"
 }
 
 // resolveEchoSecret returns the echo HMAC secret from flag or env.
@@ -335,6 +393,41 @@ func resolveEchoSecretOld() string {
 		return *flEchoSecretOld
 	}
 	return os.Getenv("LINK_PING_ECHO_SECRET_OLD")
+}
+
+// warnIgnoredFlags emits one-line slog.Warn diagnostics for flags that are
+// set but silently unused in the selected mode. Warnings, not errors: every
+// case is backward compatible (the previous behavior ignored the flag too),
+// but silent ingestion gaps are how a half-configured fleet ships.
+//   - echo-secret-old is consumed ONLY by the server (rotation acceptance in
+//     internal/prober/server.go), so it is ignored in client mode.
+//   - allow, allow-from-targets and listen gate the echo responder, so they
+//     are ignored in client mode.
+//   - with both -targets and -target set, buildConfig's else-if means -targets wins.
+func warnIgnoredFlags(mode string) {
+	if *flEchoSecretOld != "" && mode == "client" {
+		slog.Warn("-echo-secret-old set but ignored: the old secret is only accepted by the echo server (server/both mode), not by the client")
+	}
+	// -listen's default (":4000") is non-empty, so compare against the
+	// registered default: a client run with the default must not warn.
+	if *flAllow != "" && mode == "client" {
+		slog.Warn("-allow set but ignored: the client allowlist only applies to the echo server (server/both mode)")
+	}
+	if *flAllowFromTargets && mode == "client" {
+		slog.Warn("-allow-from-targets set but ignored: the derived allowlist and self-skip only apply to the echo server (server/both mode)")
+	}
+	if *flListen != "" && *flListen != flag.Lookup("listen").DefValue && mode == "client" {
+		slog.Warn("-listen set but ignored: the listen address only applies to the echo server (server/both mode)")
+	}
+	if *flTargets != "" && *flTarget != "" && mode != "server" {
+		slog.Warn("-targets and -target are both set: -targets wins, -target is ignored")
+	}
+	// -hmac-coverage shapes the tag the CLIENT writes; the echo server
+	// accepts both coverages whenever -echo-secret is set, so the flag has
+	// no effect in server-only mode.
+	if *flHMACCoverage != flag.Lookup("hmac-coverage").DefValue && mode == "server" {
+		slog.Warn("-hmac-coverage set but ignored: tag coverage is a client-side choice; the echo server accepts both coverages whenever -echo-secret is set")
+	}
 }
 
 func sanitizeHostname(s string) string {
@@ -410,9 +503,19 @@ func buildConfig() (prober.Config, error) {
 	if err := prober.ValidateTargetName(source); err != nil {
 		return prober.Config{}, fmt.Errorf("invalid source: %w", err)
 	}
+	// Mesh mode (-allow-from-targets) deploys ONE targets file on every
+	// site, listing all of them including the local one. Drop the self entry
+	// so the shared file probes only remote peers, and record the choice in
+	// the config so the reload path applies the same filter — a reload that
+	// re-added self would probe and export the local site.
+	skipSelf := meshAllowFromTargets()
+	if skipSelf {
+		targets = prober.FilterSelfTargets(targets, source)
+	}
 	cfg := prober.Config{
 		Source:            source,
 		Targets:           targets,
+		SkipSelf:          skipSelf,
 		Adaptive:          *flAdaptive,
 		BaseInterval:      *flBaseInterval,
 		BaseTimeout:       *flBaseTimeout,
@@ -422,6 +525,11 @@ func buildConfig() (prober.Config, error) {
 		Payload:           *flPayload,
 		MTUSweep:          *flMTUSweep,
 	}
+	coverage, err := prober.ParseHMACCoverage(*flHMACCoverage)
+	if err != nil {
+		return prober.Config{}, err
+	}
+	cfg.HmacCoverage = coverage
 	return cfg, nil
 }
 
@@ -442,6 +550,13 @@ func resolveMetricsAuth() (string, string, error) {
 	if (user == "") != (pass == "") {
 		return "", "", errors.New("metrics basic auth requires both username and password (-metrics-user/-metrics-pass or LINK_PING_METRICS_USER/LINK_PING_METRICS_PASS)")
 	}
+	// r.BasicAuth() splits the header at the FIRST colon, so a username
+	// containing ':' can never be produced by a client: the part before
+	// the colon is what must match. Accepting such a user here would make
+	// the endpoint permanently unreachable (401 for every attempt).
+	if strings.Contains(user, ":") {
+		return "", "", errors.New("metrics basic auth username must not contain ':' (HTTP Basic Auth splits user:pass at the first colon, so this user is unreachable and every request 401s)")
+	}
 	return user, pass, nil
 }
 
@@ -457,24 +572,42 @@ func resolveMetricsAuth() (string, string, error) {
 // The description deliberately omits the version string: it is frozen at
 // install time and goes stale on in-place upgrades — runtime truth lives
 // in the link_ping_build_info metric instead.
-func serviceConfig() *service.Config {
-	return &service.Config{
+// serviceInstallSpec is the OS-neutral shape of the service hardening
+// (portable so TestServiceConfigHardening pins it directly): nothing else
+// declares SCM behavior anywhere in the binary.
+type serviceInstallSpec struct {
+	Name                string
+	DisplayName         string
+	Description         string
+	Dependencies        []string
+	DelayedAutoStart    bool
+	RecoveryDelay       time.Duration
+	RecoveryResetPeriod uint32
+}
+
+func serviceSpec() serviceInstallSpec {
+	return serviceInstallSpec{
 		Name:        "link_ping_prometheus",
 		DisplayName: "Link Ping Prometheus",
 		Description: "UDP echo link monitor: Prometheus latency, packet loss, and jitter metrics",
-		Arguments:   []string{},
 		Dependencies: []string{
 			"Tcpip",
 			"W32Time",
 		},
-		Option: service.KeyValue{
-			"StartType":              "automatic",
-			"DelayedAutoStart":       true,
-			"OnFailure":              "restart",
-			"OnFailureDelayDuration": "5s",
-			"OnFailureResetPeriod":   86400,
-		},
+		DelayedAutoStart:    true,
+		RecoveryDelay:       5 * time.Second,
+		RecoveryResetPeriod: 86400,
 	}
+}
+
+// foregroundRun drives the plain signal-handling foreground run shared by
+// `main()` and the non-SCM -svc=run paths (Windows console debugging and
+// systemd/launchd on unix, which manage the process themselves).
+func foregroundRun(prg *program) error {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	prg.ctx, prg.cancel = ctx, cancel
+	return prg.run()
 }
 
 // absolutizeFlagValue returns the value to persist for a flag at service
@@ -503,23 +636,28 @@ func absolutizeFlagValue(name, value string) string {
 	return abs
 }
 
-// handleService manages the Windows service lifecycle via the
-// kardianos/service package. It reconstructs CLI arguments at install
-// time, excluding -svc itself and sensitive flags (-metrics-user,
-// -metrics-pass).
-func handleService(action string) {
-	svcConfig := serviceConfig()
+// handleService manages the service lifecycle. Install/uninstall are
+// Windows-only (gated by svcActionSupported: Linux deploys use the static
+// systemd unit via the Ansible play, and the Linux renderers flagged by
+// supply-chain scanners are thereby unreachable). start/stop are
+// cross-platform conveniences around native service control. The service
+// run mode follows the windows_exporter pattern: x/sys/windows/svc under
+// the SCM, plain signal-driven foreground everywhere else.
+func handleService(action string, logSink *countedWriter) {
+	if !svcActionSupported(action) {
+		slog.Error("unsupported -svc action on this OS: install/uninstall are Windows-only (Linux deploys use the systemd unit in installer/linux)", "action", action, "os", runtime.GOOS)
+		os.Exit(1)
+	}
 
-	if action == "install" {
-		exePath, err := os.Executable()
-		if err != nil {
-			slog.Error("Failed to get executable path", "err", err)
-			os.Exit(1)
-		}
+	prg := &program{logSink: logSink}
+
+	switch action {
+	case "install":
+		// Build the SCM command line from the live flags at install
+		// time, excluding -svc itself and the credential flags (-metrics-
+		// user/-metrics-pass/-echo-secret/-echo-secret-old so credentials
+		// are never persisted; they are delivered via env vars).
 		var args []string
-		// The two auth flags and echo secret are stripped here (with -svc) so credentials
-		// are never persisted into the service configuration; they must be
-		// configured via env LINK_PING_METRICS_USER/PASS and LINK_PING_ECHO_SECRET.
 		flag.Visit(func(f *flag.Flag) {
 			if f.Name != "svc" && f.Name != "metrics-user" && f.Name != "metrics-pass" && f.Name != "echo-secret" && f.Name != "echo-secret-old" {
 				v := absolutizeFlagValue(f.Name, f.Value.String())
@@ -527,9 +665,10 @@ func handleService(action string) {
 			}
 		})
 		args = append(args, "-svc=run")
-		svcConfig.Arguments = args
-		svcConfig.Executable = exePath
-
+		if err := platformInstallService(args); err != nil {
+			slog.Error("Service install failed", "err", err)
+			os.Exit(1)
+		}
 		if *flMetricsBasicAuthUser != "" || *flMetricsBasicAuthPass != "" {
 			fmt.Println("WARNING: -metrics-user/-metrics-pass are NOT persisted into the service configuration.")
 			fmt.Println("Configure LINK_PING_METRICS_USER/LINK_PING_METRICS_PASS in the service environment instead.")
@@ -539,7 +678,7 @@ func handleService(action string) {
 			fmt.Println("Configure LINK_PING_ECHO_SECRET in the service environment instead.")
 		}
 		if *flEchoSecretOld != "" {
-			fmt.Println("WARNING: -echo-secret-old is NOT persisted into the service configuration.")
+			fmt.Println("WARNING: -echo-secret-old is NOT persisted into the service config.")
 			fmt.Println("Configure LINK_PING_ECHO_SECRET_OLD in the service environment instead.")
 		}
 		if *flLogFile == "" {
@@ -548,46 +687,31 @@ func handleService(action string) {
 			fmt.Println("WARNING: -log-file is not set; under the service stdout is discarded so NO logs will be captured anywhere.")
 			fmt.Println("Pass -log-file=<path> at install time (lifecycle events still reach the Windows event log).")
 		}
-	}
-
-	// Zero-value program: ctx is only ever set by Start(), which
-	// install/uninstall/start/stop never invoke.
-	prg := &program{}
-
-	s, err := service.New(prg, svcConfig)
-	if err != nil {
-		slog.Error("Failed to init service", "err", err)
-		os.Exit(1)
-	}
-
-	switch action {
-	case "install":
-		if err := s.Install(); err != nil {
-			slog.Error("Install failed", "err", err)
-			os.Exit(1)
-		}
 		fmt.Println("Service installed.")
 	case "uninstall":
-		if err := s.Uninstall(); err != nil {
-			slog.Error("Uninstall failed", "err", err)
+		if err := platformUninstallService(); err != nil {
+			slog.Error("Service uninstall failed", "err", err)
 			os.Exit(1)
 		}
 		fmt.Println("Service uninstalled.")
 	case "start":
-		if err := s.Start(); err != nil {
-			slog.Error("Start failed", "err", err)
+		if err := platformStartService(); err != nil {
+			slog.Error("Service start failed", "err", err)
 			os.Exit(1)
 		}
 		fmt.Println("Service started.")
 	case "stop":
-		if err := s.Stop(); err != nil {
-			slog.Error("Stop failed", "err", err)
+		if err := platformStopService(); err != nil {
+			slog.Error("Service stop failed", "err", err)
 			os.Exit(1)
 		}
 		fmt.Println("Service stopped.")
 	case "run":
-		if err := s.Run(); err != nil {
-			slog.Error("Run failed", "err", err)
+		// The exit contract matters more than the return value: a run
+		// error must leave the process unclean (non-zero) so the SCM
+		// restart ladder fires - never a clean "handled" exit.
+		if err := platformRunService(prg); err != nil {
+			slog.Error("Service run error", "err", err)
 			os.Exit(1)
 		}
 	default:
@@ -603,21 +727,32 @@ type program struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+	// svc is the lifecycle-event logger Start() received (nil");
+	// anonymous foreground runs); the sink watcher writes log-sink
+	// failures there so they reach the Windows event log even when the
+	// log file itself is dead.
+	svc eventlogSink
+	// logSink wraps the -log-file writer (nil without -log-file) so
+	// runtime write failures become visible; see logsink.go.
+	logSink *countedWriter
+	// testServeMetrics, when set (tests only), replaces startMetricsServer
+	// in run(): the test owns the *http.Server handle so it can kill the
+	// listener mid-run and observe the fatal path deterministically.
+	// Production leaves it nil; nil selects the real binder.
+	testServeMetrics func() (*http.Server, <-chan struct{}, error)
 }
 
 // Start is called by the service framework to begin execution.
 // The WaitGroup Add happens here — before the goroutine starts — so
 // Stop can never race it (the framework calls Stop only after Start
 // has returned).
-func (p *program) Start(s service.Service) error {
+func (p *program) Start(sysLog eventlogSink) error {
+	p.svc = sysLog
 	// Lifecycle events go to the system logger (Windows event log under
-	// the SCM, syslog elsewhere): the only channel a fleet operator sees
-	// without access to -log-file. Best-effort — file logging stays the
-	// primary sink.
-	if s != nil {
-		if sysLog, err := s.SystemLogger(nil); err == nil {
-			sysLog.Infof("link_ping_prometheus service starting (version %s)", version)
-		}
+	// the SCM): the only channel a fleet operator sees without access to
+	// -log-file. Best-effort — file logging stays the primary sink.
+	if sysLog != nil {
+		sysLog.Info(fmt.Sprintf("link_ping_prometheus service starting (version %s)", version))
 	}
 	// pi-lens-ignore: go-context-background-handler
 	p.ctx, p.cancel = context.WithCancel(context.Background())
@@ -626,10 +761,8 @@ func (p *program) Start(s service.Service) error {
 		defer p.wg.Done()
 		if err := p.run(); err != nil {
 			slog.Error("Service run error", "err", err)
-			if s != nil {
-				if sysLog, lerr := s.SystemLogger(nil); lerr == nil {
-					sysLog.Errorf("service run failed: %v", err)
-				}
+			if sysLog := p.svc; sysLog != nil {
+				sysLog.Error(fmt.Sprintf("service run failed: %v", err))
 			}
 			// Die UNCLEANLY: exiting non-zero classifies this as a failure
 			// to the SCM so the OnFailure restart action fires. Calling
@@ -641,9 +774,38 @@ func (p *program) Start(s service.Service) error {
 	return nil
 }
 
-// Stop is called by the service framework to shut down gracefully.
-// It cancels the context and waits for the run goroutine to finish.
-func (p *program) Stop(s service.Service) error {
+// svcStopDeadline bounds program.Stop's drain wait. A var so the
+// timeout-arm test does not need a real 20s stall.
+var svcStopDeadline = 20 * time.Second
+
+// serviceName is the service identity across platforms (SCM name, the
+// event-log source, and the unit/labelctl label the unix adapters call).
+const serviceName = "link_ping_prometheus"
+
+// svcActionSupported reports whether the -svc lifecycle action is
+// supported on the current OS. install/uninstall are Windows-only: the
+// Linux install path would run the binary's own service renderers
+// (systemd/openrc/... unit and init-script generation), which no
+// supported deployment exercises - Linux installs use the static systemd
+// unit shipped via the Ansible play - and embedding configuration values
+// into generated shell/unit scripts is exactly the surface
+// supply-chain scanners flag on the OpenRC renderer (reachable only via
+// this action). Every other action (run via the framework, start/stop
+// helpers) stays cross-platform.
+func svcActionSupported(action string) bool {
+	switch action {
+	case "install", "uninstall":
+		return runtime.GOOS == "windows"
+	default:
+		return true
+	}
+}
+
+// Stop is called by the service framework to shut down gracefully. It
+// cancels the context and waits for the run goroutine (plus a bounded
+// straggler drain), returning nil even when the drain deadline is
+// exceeded so the SCM classifies an operator stop as clean.
+func (p *program) Stop(_ eventlogSink) error {
 	if p.cancel != nil {
 		p.cancel()
 	}
@@ -655,9 +817,17 @@ func (p *program) Stop(s service.Service) error {
 	select {
 	case <-done:
 		return nil
-	case <-time.After(20 * time.Second):
+	case <-time.After(svcStopDeadline):
+		// The drain missed the deadline, but this is an OPERATOR-requested
+		// stop, not a crash: returning an error makes kardianos report
+		// STOPPED with a service-specific exit code, which the SCM counts
+		// as a FAILURE and answers with the OnFailure restart ladder — the
+		// service the operator just stopped comes back up mid-maintenance.
+		// The process exits either way; clean-stop classification is the
+		// honest one. (The os.Exit(1) path in Start is the deliberate
+		// opposite: a genuine run failure WANTS the restart to fire.)
 		slog.Error("Service stop deadline exceeded")
-		return errors.New("service stop timed out after 20s")
+		return nil
 	}
 }
 
@@ -696,6 +866,22 @@ func metricsHandlerFor(g prometheus.Gatherer, gzip bool) http.Handler {
 	return promhttp.InstrumentMetricHandler(prometheus.DefaultRegisterer, h)
 }
 
+// svcTraceMarker appends a diagnostic line to the -log-file sink
+// (windows e2e triage aid under the SCM where stderr is dead). It is
+// best-effort by design: any error is ignored, never a run failure.
+func svcTraceMarker(tag string) {
+	if *flLogFile == "" {
+		return
+	}
+	// pi-lens-ignore: go-path-traversal
+	f, err := os.OpenFile(*flLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return
+	}
+	defer f.Close() // pi-lens-ignore: go-ignored-call-result
+	fmt.Fprintf(f, "svc-trace[%s]\n", tag)
+}
+
 // readyToProbe reports whether a running agent can actually do its job, i.e.
 // /readyz's notion of readiness as opposed to /healthz's liveness.
 // SocketAgeSeconds is nonzero only while the target currently holds a socket:
@@ -730,6 +916,31 @@ func readinessHandler(mode string, statusReg *prober.StatusRegistry) http.Handle
 	})
 }
 
+// limitConcurrent wraps handler in a counting semaphore of limit slots:
+// the first limit concurrent requests are served normally, any further
+// request gets a plain-text 503 (the same status and message shape the
+// /metrics cap produces) and never reaches the handler. Slot release is
+// tied to the ServeHTTP call itself (not to the handler's return), so a
+// panic among the admitted requests unwinds through the deferred release
+// and cannot leak a slot forever. The semaphore is a channel, exactly
+// the promhttp MaxRequestsInFlight pattern, which /status cannot reuse
+// because it is bound to a Gatherer rather than a plain handler.
+func limitConcurrent(limit int, handler http.Handler) http.Handler {
+	sem := make(chan struct{}, limit)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case sem <- struct{}{}:
+			defer func() { <-sem }()
+			handler.ServeHTTP(w, r)
+		default:
+			// Same wording shape as promhttp's MaxRequestsInFlight body; the
+			// limit is interpolated, not hardcoded, so the body cannot drift
+			// from the cap a maintainer changes.
+			http.Error(w, fmt.Sprintf("Limit of concurrent requests reached (%d), try again later.", limit), http.StatusServiceUnavailable)
+		}
+	})
+}
+
 func (p *program) startMetricsServer(addr, user, pass, cert, key string, statusReg *prober.StatusRegistry, gzip bool, mode string) (*http.Server, <-chan struct{}, error) {
 	metricsLn, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -752,8 +963,12 @@ func (p *program) startMetricsServer(addr, user, pass, cert, key string, statusR
 	mx.Handle("/readyz", readinessHandler(mode, statusReg))
 	// /status exposes live per-target probe state (link_up, inflight,
 	// misses, RTO, socket age). Gated like /metrics: open only when no
-	// metrics auth is configured.
-	mx.Handle("/status", prober.MetricsAuth(user, pass, statusReg.Handler()))
+	// metrics auth is configured. Capped like /metrics too: the snapshot
+	// copies and sorts the whole registry and the process snapshot does a
+	// potentially STW ReadMemStats, so a local burst loop must not pile
+	// those on top of each other. /healthz and /readyz stay uncapped —
+	// they are cheap booleans an orchestrator must always reach.
+	mx.Handle("/status", prober.MetricsAuth(user, pass, limitConcurrent(maxConcurrentScrapes, statusReg.Handler())))
 	metricsSrv := &http.Server{
 		Handler: mx,
 		// Addr is informational (Serve uses the already-bound listener) but
@@ -806,6 +1021,17 @@ func (p *program) run() error {
 		return fmt.Errorf("unknown mode: %s", mode)
 	}
 
+	// Rotation guard. ServePacketConn consults echoSecretOld only inside
+	// its `if echoSecret != ""` branch (internal/prober/server.go), so an
+	// old secret on its own authenticates NOTHING: with the primary secret
+	// empty the agent runs unauthenticated while an operator mid-rotation
+	// believes the rotation protection is active. Fail fast instead.
+	echoSecret, echoSecretOld := resolveEchoSecret(), resolveEchoSecretOld()
+	if echoSecret == "" && echoSecretOld != "" {
+		return errors.New("-echo-secret-old is set without -echo-secret: the old secret alone provides no authentication (it is only accepted alongside a primary secret), so the agent would run unauthenticated; set -echo-secret or clear -echo-secret-old")
+	}
+	warnIgnoredFlags(*flMode)
+
 	user, pass, err := resolveMetricsAuth()
 	if err != nil {
 		return err
@@ -835,6 +1061,14 @@ func (p *program) run() error {
 	}
 	// Periodic scavenger: shares p.ctx so it stops with the mode loops.
 	startHeapScavenger(p.ctx, *flMemScavenge, minScavengeUnreleased, slog.Default())
+
+	// Log-durability watchers (see logsink.go / logacl_windows.go): sink
+	// write failures surfaced outside the dead sink, and — Windows only —
+	// a periodic idempotent re-apply of the restricted DACL, which a
+	// lumberjack rotation silently regresses when the fresh live file
+	// inherits a wide directory DACL. Both stop with p.ctx in every mode.
+	watchLogSink(p.ctx, p.svc, p.logSink, sinkCheckInterval)
+	startLogDACLRecheck(p.ctx, *flLogFile)
 
 	// Live per-target state for the /status debug endpoint. Always
 	// registered so server-only mode still serves an empty list.
@@ -874,7 +1108,31 @@ func (p *program) run() error {
 	// Fail-closed client allowlist: the echo responder refuses to run
 	// without an explicit -allow list, so spoofed/unauthorised sources
 	// can neither reflect datagrams nor grow metric label cardinality.
-	allow, err := prober.ParseAllowlist(*flAllow)
+	// Mesh mode derives it from the targets file instead: every peer the
+	// agent probes is allowed to probe it back, and the self target was
+	// already dropped by buildConfig. -allow still contributes, so a mesh
+	// can also allow extra CIDRs explicitly.
+	allowSpec := *flAllow
+	if meshAllowFromTargets() {
+		if len(cfg.Targets) == 0 {
+			// Server-only mode never loads the targets file, and a file that
+			// lists only this site has no peers left after the self filter:
+			// name that instead of falling through to the generic
+			// "requires -allow" refusal, which hides why the flag had no
+			// effect.
+			return errors.New("-allow-from-targets: no peers to derive an allowlist from (the targets file is empty or lists only this -source); run client/both with a mesh targets file, or pass -allow")
+		}
+		derived, err := prober.AllowEntriesFromTargets(cfg.Targets)
+		if err != nil {
+			return err
+		}
+		if allowSpec == "" {
+			allowSpec = derived
+		} else {
+			allowSpec = derived + "," + allowSpec
+		}
+	}
+	allow, err := prober.ParseAllowlist(allowSpec)
 	if err != nil {
 		return err
 	}
@@ -886,24 +1144,87 @@ func (p *program) run() error {
 	// failure (port taken, permission denied) aborts startup instead of
 	// leaving the agent running with no /metrics endpoint — a silent
 	// partial failure for a monitoring agent.
-	metricsSrv, metricsDone, err := p.startMetricsServer(*flMetrics, user, pass, cert, key, statusReg, *flMetricsGzip, *flMode)
+	startMetrics := p.testServeMetrics
+	if startMetrics == nil {
+		startMetrics = func() (*http.Server, <-chan struct{}, error) {
+			return p.startMetricsServer(*flMetrics, user, pass, cert, key, statusReg, *flMetricsGzip, *flMode)
+		}
+	}
+	metricsSrv, metricsDone, err := startMetrics()
 	if err != nil {
 		return err
 	}
 
-	echoSecret := resolveEchoSecret()
-	echoSecretOld := resolveEchoSecretOld()
+	// echoSecret/echoSecretOld resolved at the top of run(): the rotation
+	// guard must fire before any bind, not after the metrics server is up.
 	mode := *flMode
+	// runCtx: a mid-run metrics-serve failure must cancel the mode loops.
+	// A monitor without a live /metrics endpoint is dead weight that looks
+	// healthy — probes continue, the SCM/OS-level process is "running", and
+	// nothing restarts until manual intervention. The serve goroutine runs
+	// until Serve returns; any return other than deliberate Shutdown closes
+	// metricsDone, which is fatal below.
+	runCtx, runCancel := context.WithCancel(p.ctx)
+	defer runCancel()
+	modeDone := make(chan error, 1)
+	go func() { modeDone <- runModes(runCtx, mode, cfg, sourceForServer, allow, echoSecret, echoSecretOld) }()
 	var modeErr error
+	select {
+	case modeErr = <-modeDone:
+	case <-metricsDone:
+		// The serve goroutine returned before Shutdown: the listener or an
+		// accept failed mid-run. Cancel the mode loops and fail the run so
+		// the agent exits non-zero and service recovery can fire, instead of
+		// probing without an endpoint for the remaining uptime.
+		runCancel()
+		<-modeDone
+		modeErr = errors.New("metrics server terminated unexpectedly; monitor cannot serve metrics, status, or health endpoints")
+	}
+	// Drain the metrics server on the way out so an in-flight scrape
+	// finishes instead of being cut off by process exit. On the
+	// metricsDone path the server is already gone and Shutdown is a no-op;
+	// on a normal mode exit it stops the listener and unblocks the select's
+	// second case only if it had not fired yet.
+	// pi-lens-ignore: go-context-background-handler
+	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	// pi-lens-ignore: go-ignored-call-result
+	_ = metricsSrv.Shutdown(shutCtx)
+	// Bounded join: a scrape mid-write holds Serve open up to the 30s
+	// WriteTimeout, which exceeds the service Stop deadline (20s) - waiting
+	// unconditionally would make Stop report "timed out" while the process
+	// was still draining a clean shutdown. The drain is best-effort (the
+	// agent's own metrics die with the process), so after the Shutdown
+	// deadline a short grace is all an in-flight scrape gets.
+	select {
+	case <-metricsDone:
+	case <-time.After(shutdownJoinGrace):
+		slog.Warn("metrics server drain grace exceeded; continuing exit", "grace", shutdownJoinGrace)
+	}
+	return modeErr
+}
+
+// runModes executes the selected probe/server mode until ctx is cancelled,
+// returning its terminal error. Extracted from run() so the metrics-server
+// death at the select above is comparable to (and can preempt) a mode exit.
+func runModes(
+	ctx context.Context,
+	mode string,
+	cfg prober.Config,
+	sourceForServer string,
+	allow *prober.Allowlist,
+	echoSecret string,
+	echoSecretOld string,
+) error {
 	switch mode {
 	case "server":
-		modeErr = prober.RunServer(p.ctx, *flListen, sourceForServer, allow, echoSecret, echoSecretOld)
+		return prober.RunServer(ctx, *flListen, sourceForServer, allow, echoSecret, echoSecretOld)
 	case "client":
-		modeErr = prober.RunClient(p.ctx, cfg)
+		return prober.RunClient(ctx, cfg)
 	case "both":
 		// Local WaitGroup: Add is sequenced before the goroutine starts
 		// and Wait runs in the same goroutine, so no Add/Wait race.
-		modeCtx, modeCancel := context.WithCancel(p.ctx)
+		modeCtx, modeCancel := context.WithCancel(ctx)
 		var wg sync.WaitGroup
 		var serverErr error
 		wg.Add(1)
@@ -918,24 +1239,14 @@ func (p *program) run() error {
 				modeCancel()
 			}
 		}()
-		modeErr = prober.RunClient(modeCtx, cfg)
+		clientErr := prober.RunClient(modeCtx, cfg)
 		modeCancel()
 		wg.Wait()
 		if serverErr != nil {
-			modeErr = serverErr
+			return serverErr
 		}
+		return clientErr
 	default:
-		modeErr = fmt.Errorf("unknown mode: %s", mode)
+		return fmt.Errorf("unknown mode: %s", mode)
 	}
-
-	// Drain the metrics server on the way out so an in-flight scrape
-	// finishes instead of being cut off by process exit. Best-effort:
-	// the agent's own metrics are in-memory and die with it regardless.
-	// pi-lens-ignore: go-context-background-handler
-	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	// pi-lens-ignore: go-ignored-call-result
-	_ = metricsSrv.Shutdown(shutCtx)
-	<-metricsDone
-	return modeErr
 }

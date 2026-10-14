@@ -1,0 +1,63 @@
+# Security
+
+- The server validates the magic header and accepts the header frame plus a
+  bounded payload extension (`header ≤ size ≤ header + 1400`); out-of-range
+  datagrams are dropped.
+- Reflection is 1:1, so the server is not an amplifier. Echo processing is
+  rate-limited to 2000 packets/s per IP and 10000 packets/s globally.
+- The allowlist is fail-closed (no `-allow`, no service); entries are IPs or
+  CIDRs.
+  - Plain IPs keep their series pre-resolved and are never evicted.
+  - CIDR-matched clients are capped at 1024 distinct IPs per process; further
+    new IPs are dropped as `client_overflow`, so spoofed source rotation cannot
+    grow the label space.
+  - A sweeper expires CIDR-matched clients idle past the 10-minute TTL.
+  - Eviction deletes that client's `link_server_probes_received_total` and
+    `link_server_clock_skew_seconds` series; a returning client re-creates them
+    at 0, so a `rate()` window across the return sees a counter reset.
+- Echoed timestamps are validated exactly (see
+  [Wire protocol](wire-protocol.md)); corruption and replays cannot fabricate
+  RTT samples.
+- With `-echo-secret`, the server drops probes whose timestamp is more than
+  ~30 seconds off its clock, so a capture cannot be replayed from a spoofed
+  source. Nodes need synchronized clocks (NTP).
+- `-hmac-coverage=full-frame` closes payload substitution: a tag over
+  header+payload rejects a tampered payload riding a captured tag.
+  - It does NOT close tuple replay: a captured frame re-sent from another
+    source within the freshness window still authenticates. The dup guard
+    allows one echo per (source, seq, ts).
+  - Sequence tracking is deliberately not attempted (client restarts, and
+    per-client memory a hostile fleet can pin). The freshness window is the
+    replay control.
+- The rotation runbook is tested with `header` coverage; `full-frame`
+  rotation works the same way, but the tests pin only the header path.
+- `-echo-secret` protects the link only when **both** ends set it. A server
+  without it accepts the client's 32-byte HMAC frame as a bounded payload probe
+  and echoes it, so the client reads a healthy link with no `hmac` drop reason
+  and no reflector authentication, leaving the allowlist the only control.
+  The server warns at startup when the secret is unset.
+- Rotate the secret without an outage:
+  1. Restart the SERVERS with `-echo-secret=<new>` plus `-echo-secret-old=<old>`
+     (or `LINK_PING_ECHO_SECRET` + `LINK_PING_ECHO_SECRET_OLD`), old secret
+     still set everywhere, so either secret is accepted.
+  2. Restart the clients with `-echo-secret=<new>`.
+  3. Remove `-echo-secret-old` from the servers. Frames failing both secrets
+     still count in `link_server_probes_dropped_total{reason="hmac"}`.
+  The agent refuses to start with `-echo-secret-old` set while `-echo-secret`
+  is empty: the old secret alone authenticates nothing, so a rotation deploy
+  that lost the new secret fails loudly.
+- Firewall-restrict internet-facing echo endpoints to known monitoring sites.
+- `/metrics` supports HTTP Basic Auth (`-metrics-user` / `-metrics-pass`) with
+  constant-time comparison over hashed credentials. Both must be set together;
+  the process refuses to start with only one.
+  - Usernames must not contain `:` (Basic Auth parses at the first colon), or
+    every request 401s.
+  - Prefer `LINK_PING_METRICS_USER` / `LINK_PING_METRICS_PASS` over flags:
+    flags are visible in `ps`.
+  - Basic Auth without TLS sends credentials as base64 and logs a warning; use
+    `-metrics-tls-cert` / `-metrics-tls-key` for HTTPS.
+- Mode-mismatched flags log a startup warning: server-only flags
+  (`-allow`, `-listen`, `-echo-secret-old`) in client mode, and
+  `-targets`/`-target` together (`-targets` wins).
+- The wire protocol carries no sensitive data (sequence numbers and timestamps
+  only) and has no TLS; firewall untrusted networks.

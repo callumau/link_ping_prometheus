@@ -17,9 +17,15 @@ link_ping_listen: ":4000"       # UDP echo listener (server/both modes)
 # for TCP 2112.
 link_ping_metrics_listen: "127.0.0.1:2112"
 # REQUIRED for server/both: comma-separated client IPs or CIDR
-# prefixes, e.g. "203.0.113.5,10.0.0.0/24".
+# prefixes, e.g. "203.0.113.5,10.0.0.0/24". Never spaces — a space
+# inside the value splits the rendered command line and silently
+# truncates the flag list (the playbook assert rejects it).
 link_ping_allow: ""
 # Appended verbatim to the CLI args, e.g. "-adaptive=false -dscp=46".
+# Multiple flags are fine (the play splits on whitespace between them),
+# but every whitespace-separated token must be one complete
+# -flag=value: a space INSIDE a value silently truncates the flag list,
+# and the playbook assert rejects tokens without a leading '-'.
 link_ping_extra_args: ""
 
 # Optional targets file (raw JSON content); when set it is written to

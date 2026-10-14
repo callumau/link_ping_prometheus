@@ -18,6 +18,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash"
 	"os"
 	"syscall"
 	"time"
@@ -71,8 +72,13 @@ var ReconnectInterval = 5 * time.Minute
 type Config struct {
 	// Source is the topology label applied to every metric series, e.g.
 	// the local datacenter or site name ("sydney-dc").
-	Source       string
-	Targets      []Target
+	Source  string
+	Targets []Target
+	// SkipSelf is the mesh-mode (-allow-from-targets) marker: the caller has
+	// already removed the target whose Name equals Source, and the reload
+	// path must apply that same removal so a hot reload cannot re-add the
+	// local site as a probe target.
+	SkipSelf     bool
 	Adaptive     bool
 	BaseInterval time.Duration
 	BaseTimeout  time.Duration
@@ -90,6 +96,14 @@ type Config struct {
 	// link_probes_corrupted_total (distinct from loss). Must be ≤
 	// MaxPayloadBytes so probes are never fragmented.
 	Payload int
+	// HmacCoverage selects which frame bytes the HMAC tag covers when
+	// EchoSecret is set: the 24-byte header only (default, byte-identical
+	// to the v0.7 wire format) or the header plus the pattern payload
+	// (HMACFullFrameCoverage), so a tampered payload — or a payload riding
+	// a captured tag — no longer authenticates. Only meaningful with
+	// EchoSecret AND Payload > 0: the two coverages produce byte-identical
+	// tags for zero-payload frames.
+	HmacCoverage HmacCoverage
 	// MTUSweep, when > 0, runs a periodic DF-bit sweep per target to
 	// discover the largest frame the path carries (link_path_mtu_bytes,
 	// /status path_mtu_bytes). 0 disables. Linux and Windows (IPv4 from
@@ -186,6 +200,15 @@ func (c Config) Validate() error {
 	if c.ReconnectInterval < 0 {
 		return fmt.Errorf("reconnect interval must be >= 0, got %v", c.ReconnectInterval)
 	}
+	if c.ReloadInterval < 0 {
+		// A negative -targets-reload-interval silently DISABLED hot reload
+		// (ticker construction is gated on > 0), reading to the operator
+		// as configured reloading that never fires — on a Windows service
+		// there is no SIGHUP fallback, so the targets file would never
+		// be re-read for the life of the process. Reject instead; 0 is the
+		// documented way to disable the timer.
+		return fmt.Errorf("targets reload interval must be >= 0, got %v", c.ReloadInterval)
+	}
 	if c.DSCP < 0 || c.DSCP > 63 {
 		return fmt.Errorf("dscp must be 0-63, got %d", c.DSCP)
 	}
@@ -255,17 +278,69 @@ func fillPayload(buf []byte, seq, ts uint64) {
 // magic+seq+timestamp. Used when EchoSecret is set to authenticate
 // probes and mitigate reflector spoofing (SEC22). Truncation keeps
 // payload at 32 bytes while retaining 64-bit forgery resistance.
-func computeHMAC(key string, seq, ts uint64) [8]byte {
-	mac := hmac.New(sha256.New, []byte(key))
-	mac.Write([]byte(MagicBytes))
+// probeMACer wraps ONE reusable crypto/hmac state. Every hot HMAC site
+// (client loop, reader, MTU sweep, server read loop) is single-goroutine,
+// so a Reset()-per-frame marshaler avoids the per-frame hmac struct +
+// sha256 digest + Sum(nil) slice (3 allocs / ~250B/frame - measured
+// dominant at the server's 10k/s global cap) and the two identical pad
+// block-compressions crypto/hmac re-runs fresh per frame. Tags are
+// byte-identical to the one-shot computeHMAC path (pinned by the
+// coverage tests), and scratch holds Sum's output so digesting
+// allocates nothing.
+type probeMACer struct {
+	h       hash.Hash
+	scratch [32]byte
+}
+
+// newProbeMACer builds a reusable HMAC-SHA256 state for secret.
+func newProbeMACer(secret string) *probeMACer {
+	return &probeMACer{h: hmac.New(sha256.New, []byte(secret))}
+}
+
+// digestHeader truncates the header HMAC (magic+seq+ts) to 8 bytes - the
+// v0.7 wire tag. Reset/Write/Sum on the same state next call.
+func (m *probeMACer) digestHeader(seq, ts uint64) [8]byte {
+	m.h.Reset()
+	m.h.Write([]byte(MagicBytes))
 	var tmp [16]byte
 	binary.LittleEndian.PutUint64(tmp[0:8], seq)
 	binary.LittleEndian.PutUint64(tmp[8:16], ts)
-	mac.Write(tmp[:])
-	sum := mac.Sum(nil)
+	m.h.Write(tmp[:])
 	var out [8]byte
-	copy(out[:], sum[:8])
+	copy(out[:], m.h.Sum(m.scratch[:0])[:8])
 	return out
+}
+
+// digestFrame truncates the full-frame HMAC (header + payload, tag slot
+// skipped) to 8 bytes - the frame must be at least PayloadSizeWithHMAC
+// bytes, exactly like computeHMACFullFrame.
+func (m *probeMACer) digestFrame(frame []byte) [8]byte {
+	m.h.Reset()
+	m.h.Write(frame[0:PayloadSize])
+	if len(frame) > PayloadSizeWithHMAC {
+		m.h.Write(frame[PayloadSizeWithHMAC:])
+	}
+	var out [8]byte
+	copy(out[:], m.h.Sum(m.scratch[:0])[:8])
+	return out
+}
+
+// verifyHeader reports whether tag matches the expected header tag.
+// Constant-time via hmac.Equal, like the one-shot path.
+func (m *probeMACer) verifyHeader(seq, ts uint64, tag []byte) bool {
+	want := m.digestHeader(seq, ts)
+	return hmac.Equal(want[:], tag)
+}
+
+// verifyFullFrame reports whether frame[24:32] matches the expected
+// full-frame tag. Constant-time via hmac.Equal.
+func (m *probeMACer) verifyFullFrame(frame []byte) bool {
+	want := m.digestFrame(frame)
+	return hmac.Equal(want[:], frame[24:32])
+}
+
+func computeHMAC(key string, seq, ts uint64) [8]byte {
+	return newProbeMACer(key).digestHeader(seq, ts)
 }
 
 // validHMAC reports whether the supplied 8-byte tag matches the
@@ -279,9 +354,85 @@ func validHMAC(key string, seq, ts uint64, tag []byte) bool {
 // validHMACAny reports whether the tag matches the primary secret or,
 // during a zero-downtime rotation, the previous secret. secretOld is
 // empty when no rotation is in progress. Constant-time per attempt.
+// macAny is the reusable-state twin of validHMACAny: nil entries are
+// skipped (no rotation / no secret). Constant-time per attempt.
+func macAny(cur, old *probeMACer, seq, ts uint64, tag []byte) bool {
+	if cur != nil && cur.verifyHeader(seq, ts, tag) {
+		return true
+	}
+	return old != nil && old.verifyHeader(seq, ts, tag)
+}
+
+// fullFrameAny mirrors macAny for the full-frame coverage fallback.
+func fullFrameAny(cur, old *probeMACer, frame []byte) bool {
+	if cur != nil && cur.verifyFullFrame(frame) {
+		return true
+	}
+	return old != nil && old.verifyFullFrame(frame)
+}
+
 func validHMACAny(secret, secretOld string, seq, ts uint64, tag []byte) bool {
 	if validHMAC(secret, seq, ts, tag) {
 		return true
 	}
 	return secretOld != "" && validHMAC(secretOld, seq, ts, tag)
+}
+
+// HmacCoverage selects which frame bytes the client's HMAC tag covers.
+type HmacCoverage int
+
+const (
+	// HMACHeaderCoverage tags only the 24-byte header (magic+seq+ts): the
+	// v0.7 behavior, the Go zero value, and the -hmac-coverage=header
+	// escape hatch for v0.7 peers; the wire bytes are unchanged.
+	HMACHeaderCoverage HmacCoverage = iota
+	// HMACFullFrameCoverage tags the header AND the pattern payload while
+	// skipping the 8-byte tag slot itself, closing the substitution gap
+	// where a payload tampered in flight — or a different payload riding a
+	// captured header tag — still authenticated.
+	HMACFullFrameCoverage
+)
+
+// ParseHMACCoverage maps the -hmac-coverage flag value onto the enum.
+func ParseHMACCoverage(s string) (HmacCoverage, error) {
+	switch s {
+	case "header":
+		return HMACHeaderCoverage, nil
+	case "full-frame":
+		return HMACFullFrameCoverage, nil
+	default:
+		return 0, fmt.Errorf("invalid -hmac-coverage %q: must be \"header\" or \"full-frame\"", s)
+	}
+}
+
+// computeHMACFullFrame returns the truncated HMAC-SHA256 (first 8 bytes)
+// over the header (frame[0:24]) followed by the payload (frame[32:]) —
+// the whole frame EXCEPT the 8-byte tag slot frame[24:32] that the tag
+// itself occupies. For a zero-payload frame (len == PayloadSizeWithHMAC)
+// the result is byte-identical to computeHMAC over the header, which is
+// what makes the coverage additive and forwards-compatible: an old
+// 32-byte frame IS a valid full-frame tag, and a server's header check
+// keeps accepting it. frame must be at least 24 bytes; every caller is
+// size-gated to at least PayloadSizeWithHMAC.
+func computeHMACFullFrame(key string, frame []byte) [8]byte {
+	return newProbeMACer(key).digestFrame(frame)
+}
+
+// validHMACFullFrame reports whether the frame's 8-byte tag slot matches
+// the expected full-frame HMAC under key. Constant-time via hmac.Equal.
+// frame must be at least PayloadSizeWithHMAC bytes; the server's size
+// gate and the client reader's expectedSize gate both guarantee it.
+func validHMACFullFrame(key string, frame []byte) bool {
+	expected := computeHMACFullFrame(key, frame)
+	return hmac.Equal(expected[:], frame[24:32])
+}
+
+// validHMACFullFrameAny mirrors validHMACAny for the full-frame
+// coverage: the tag must match the primary secret or, during a
+// zero-downtime rotation, the previous one. Constant-time per attempt.
+func validHMACFullFrameAny(secret, secretOld string, frame []byte) bool {
+	if validHMACFullFrame(secret, frame) {
+		return true
+	}
+	return secretOld != "" && validHMACFullFrame(secretOld, frame)
 }

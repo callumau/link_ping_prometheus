@@ -10,23 +10,36 @@ on:
 # write) and push the container image to GHCR (packages write).
 # id-token: write is required by .goreleaser.yaml: keyless signing
 # (sigstore/Fulcio) mints an OIDC token from the runner to prove the
-# signing identity is this workflow run. A named `permissions` block
+# signing identity is this workflow run, and by the attest-build-provenance
+# step below, which signs the SLSA provenance with a Sigstore cert minted
+# from the same token. attestations: write lets that step upload the
+# attestations to GitHub's attestation store. A named `permissions` block
 # sets every unlisted scope to none, so it must be listed explicitly.
 permissions:
   contents: write
   packages: write
   id-token: write
+  attestations: write
 
 # REQUIRED REPOSITORY SETTING (not verifiable from this file): restrict
 # `v*` tag creation in Settings > Rules > Rulesets to a release role.
 # This workflow's contents:write and id-token:write are only as
 # authorized as whatever may push those tags, so a tag push by an
 # untrusted account publishes signed-looking artifacts under this repo.
+# The job-level `github.repository ==` guard below is the second,
+# workflow-level layer: it stops a fork's or collaborator's `v*` tag
+# from ever running this job with the real repo's write permissions —
+# the ruleset remains the first line of defense for the primary repo.
 
 jobs:
   release:
     name: Release
     runs-on: ubuntu-latest
+    # Workflow-level guard (second layer on top of the tag-creation
+    # ruleset above): a fork or collaborator re-tag of `v*` in another
+    # repository must not run this job, which signs and publishes under
+    # the real repo's tokens.
+    if: github.repository == 'callumau/link_ping_prometheus'
     # Two tag pushes (e.g. a re-tagged release) must not publish at the
     # same time: they race on the same GitHub release and the same image
     # tags. Queue them instead of cancelling -- a half-finished publish
@@ -99,6 +112,23 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # v4.2.2 (SHA-pinned for supply-chain safety). SLSA build provenance
+      # for the release artifacts: every artifact listed in GoReleaser's
+      # dist/checksums.txt (the published tar.gz/zip archives and bare
+      # binaries) becomes a subject of an in-toto attestation uploaded to
+      # GitHub's attestation store, verifiable with `gh attestation verify`.
+      # Unlike the cosign signature, which only binds the checksums file to
+      # this workflow's signing identity, the provenance records which
+      # workflow run built each artifact, on what runner, from what source
+      # -- so an artifact produced outside this pipeline fails verification
+      # even with a valid signature over a swapped checksums file. The
+      # checksums file itself needs no attestation: its integrity is
+      # enforced by the keyless cosign signature it already carries.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # yamllint disable-line rule:line-length
+        with:
+          subject-checksums: dist/checksums.txt
 
       # Replace GoReleaser's auto body with a commit breakdown grouped by
       # Conventional Commit type, plus a link to the full changelog.

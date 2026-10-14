@@ -26,4 +26,12 @@ var peerUnreachableErrnos = []error{
 	windows.WSAECONNRESET,   // 10054 ICMP port unreachable / hard reset
 	windows.WSAEHOSTUNREACH, // 10065 a router replied host unreachable
 	windows.WSAENETUNREACH,  // 10051 a router replied net unreachable
+	// 10052 (MSDN: "the connection has been broken due to keep-alive activity
+	// detecting a failure while the operation was in progress") also surfaces
+	// on connected-UDP reads when the network answers an in-flight datagram
+	// with an ICMP time-exceeded / frag-needed error — a path condition, not
+	// a broken local socket. Without it a sustained ICMP time-expired
+	// condition exhausts the reader's bounded read-failure budget and forces
+	// needless re-dials instead of a plain probe timeout.
+	windows.WSAENETRESET,
 }

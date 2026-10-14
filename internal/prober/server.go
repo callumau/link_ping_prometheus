@@ -144,6 +144,35 @@ func ParseAllowlist(s string) (*Allowlist, error) {
 	return a, nil
 }
 
+// AllowEntriesFromTargets returns a comma-separated allowlist spec derived
+// from the target addresses (for -allow-from-targets). Every address must be
+// an IP literal: allowlisting a DNS name would need a resolution at
+// config-load time, and load-time validation deliberately never touches the
+// network (a reload must not depend on DNS). The result is meant to be
+// combined with any explicit -allow entries and passed to ParseAllowlist
+// once, so the CIDR, IPv4-mapped and size rules are applied in one place.
+func AllowEntriesFromTargets(targets []Target) (string, error) {
+	entries := make([]string, 0, len(targets))
+	for _, t := range targets {
+		host, _, err := net.SplitHostPort(t.Address)
+		if err != nil {
+			return "", fmt.Errorf("target %q: %w", t.Name, err)
+		}
+		addr, err := netip.ParseAddr(host)
+		if err != nil {
+			return "", fmt.Errorf("target %q address %q is not an IP literal (%w): -allow-from-targets cannot allowlist a DNS name (config load never resolves); use IP addresses in the mesh targets file, or list the host in -allow", t.Name, t.Address, err)
+		}
+		if addr.Zone() != "" {
+			// ParseAllowlist would reject this too, but its message speaks of
+			// allowlist entries, not of the target that produced one; name the
+			// target so the fix is obvious.
+			return "", fmt.Errorf("target %q address %q has an IPv6 scope zone: a datagram source never carries one, so it cannot be allowlisted; use a global address", t.Name, t.Address)
+		}
+		entries = append(entries, addr.String())
+	}
+	return strings.Join(entries, ","), nil
+}
+
 // Len reports the number of allowlist entries (exact IPs + prefixes).
 // Nil-safe: an absent allowlist is empty.
 func (a *Allowlist) Len() int {
@@ -191,15 +220,27 @@ func newRateLimiter(perIPCap, globalCap int) *rateLimiter {
 	return &rateLimiter{perIP: make(map[netip.Addr]int), perIPCap: perIPCap, globalCap: globalCap}
 }
 
+// rateMapReallocHint is the per-IP map size at which a window reset
+// reallocates instead of clearing in place: clear() keeps the bucket
+// array sized to the high-water mark forever, so one flood of rotating
+// fake IPs inside an allowed CIDR (secret-less mode; per-IP charge is
+// post-authentication) would pin its buckets for the server's lifetime.
+// Below the hint, in-place clear wins on per-second GC churn.
+const rateMapReallocHint = 1024
+
 // resetLocked rolls the fixed window forward when a second has elapsed.
 // Caller must hold r.mu.
 func (r *rateLimiter) resetLocked(now time.Time) {
 	if now.Sub(r.window) >= time.Second {
 		r.window = now
-		// clear in place (Go 1.21+) instead of reallocating: the window
-		// resets every second for the lifetime of the server, so reusing
-		// the map avoids per-second GC churn.
-		clear(r.perIP)
+		if len(r.perIP) > rateMapReallocHint {
+			r.perIP = make(map[netip.Addr]int, 64)
+		} else {
+			// clear in place (Go 1.21+) instead of reallocating: the
+			// window resets every second for the lifetime of the
+			// server, so reusing the map avoids per-second GC churn.
+			clear(r.perIP)
+		}
 		r.global = 0
 	}
 }
@@ -234,6 +275,86 @@ func (r *rateLimiter) chargeIP(ip netip.Addr) string {
 	}
 	r.perIP[ip]++
 	return ""
+}
+
+// skewReplayed reports whether an authenticated frame's timestamp skew
+// exceeds the ±maxReplayWindow replay window. Extracted from the read
+// loop so the boundary comparison is unit-pinnable: over a real socket
+// the exact ±30s edge is untestable (processing delay drifts the observed
+// skew in both directions between capture and compare), so the open/fair
+// and >=/< semantics of the edge can only be pinned here. Deliberately
+// strict > and < — a frame exactly at the window edge is a live probe.
+func skewReplayed(skew time.Duration) bool {
+	return skew > maxReplayWindow || skew < -maxReplayWindow
+}
+
+// FNV-1a 64-bit constants for the echo-loop guard's frame identity hash.
+const (
+	fnvOffset64 = 14695981039346656037
+	fnvPrime64  = 1099511628211
+)
+
+// dupRingSize bounds the echo-loop guard's memory: a fixed 8192-entry
+// FIFO ring of 64-bit frame identities plus a membership map, so the
+// guard costs well under 1MB no matter how fast dup frames arrive.
+const dupRingSize = 8192
+
+// echoDupGuard remembers the identities of recently echoed frames so the
+// responder can refuse to echo the same frame twice. Without it, one
+// spoofed datagram whose source is another link-ping server's listen
+// socket seeds an infinite echo bounce (each leg spending rate-limit
+// budget), and a source equal to this server's own address self-loops at
+// line rate; with -echo-secret the 30s replay window bounds that, without
+// one nothing does.
+//
+// Used only from the single echo-loop goroutine in ServePacketConn; no
+// locking.
+type echoDupGuard struct {
+	seen  map[uint64]struct{}
+	ring  [dupRingSize]uint64
+	next  int
+	count int
+}
+
+func newEchoDupGuard() *echoDupGuard {
+	return &echoDupGuard{seen: make(map[uint64]struct{}, dupRingSize)}
+}
+
+// record adds a key, FIFO-evicting the oldest entry once the ring is
+// full, so the guard tracks a bounded recent window and an old identity
+// becomes echoable again.
+func (g *echoDupGuard) record(key uint64) {
+	if g.count == dupRingSize {
+		delete(g.seen, g.ring[g.next])
+	} else {
+		g.count++
+	}
+	g.ring[g.next] = key
+	g.next = (g.next + 1) % dupRingSize
+	g.seen[key] = struct{}{}
+}
+
+// fnv1a64 continues the FNV-1a hash h over b.
+func fnv1a64(h uint64, b []byte) uint64 {
+	for _, c := range b {
+		h = (h ^ uint64(c)) * fnvPrime64
+	}
+	return h
+}
+
+// echoFrameKey derives the loop-guard identity of a frame: FNV-1a over
+// the source IP bytes, source port and the header's seq+ts fields
+// (frame[8:24]). The source address is part of the identity: two clients
+// that happen to send the same seq+ts are independent probes, and only a
+// repeat from the SAME source can be a bounce. Inline FNV keeps the
+// per-datagram path allocation-free.
+func echoFrameKey(ip netip.Addr, port int, frame []byte) uint64 {
+	ipb := ip.As16() // deterministic for both v4 (4-in-6) and v6
+	h := fnv1a64(fnvOffset64, ipb[:])
+	var pb [2]byte
+	binary.LittleEndian.PutUint16(pb[:], uint16(port))
+	h = fnv1a64(h, pb[:])
+	return fnv1a64(h, frame[8:24])
 }
 
 // RunServer starts a UDP echo responder on addr. served is the
@@ -283,9 +404,18 @@ func RunServer(ctx context.Context, addr string, source string, allowed *Allowli
 	}
 	slog.Info("Echo server listening (UDP)", "addr", addr)
 
+	// ctxWatcher closes the socket on cancellation and exits as soon as
+	// ServePacketConn returns, so RunServer leaves no goroutine behind on
+	// any return path (a read loop killed by an external pc.Close, a
+	// panic recovery, or a live ctx) — the socket close is idempotent.
+	serveDone := make(chan struct{})
+	defer close(serveDone)
 	go func() {
-		<-ctx.Done()
-		pc.Close()
+		select {
+		case <-ctx.Done():
+			pc.Close()
+		case <-serveDone:
+		}
 	}()
 
 	if err := ServePacketConn(ctx, pc, source, allowed, echoSecret, echoSecretOld...); err != nil {
@@ -307,7 +437,11 @@ func RunServer(ctx context.Context, addr string, source string, allowed *Allowli
 // from a non-allowlisted host costs no crypto and no metric work;
 // validation (size, magic, HMAC, replay window) then runs ahead of the
 // per-IP charge, so only frames that actually authenticate can spend a
-// client's per-IP budget. Blocks until ctx is cancelled or pc is closed.
+// client's per-IP budget, and the dup guard runs after the per-IP charge
+// but before any metric-handle resolution: a frame identical to one
+// recently echoed (same source, seq, timestamp — an echo loop or an
+// in-window replay) is dropped as dup and never allocates a series or a
+// MaxClientSeries slot. Blocks until ctx is cancelled or pc is closed.
 // A recovered panic is returned as an error so callers treat it as a
 // fatal failure, never a clean exit.
 // When echoSecret is non-empty, only HMAC-authenticated datagrams with a
@@ -325,6 +459,9 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 	}()
 	buf := make([]byte, MaxDatagramSize)
 	rl := newRateLimiter(MaxPktsPerIP, MaxPktsGlobal)
+	// Bounded echo-loop guard: the identity of every echoed frame is
+	// remembered for the last dupRingSize echoes.
+	guard := newEchoDupGuard()
 	var lastWriteLog time.Time
 	var lastReplayLog time.Time
 	// concurrent-read-failure state (see the read-error branch below).
@@ -333,12 +470,15 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 	// Pre-resolve the echo-failure counter once: a label lookup per write
 	// error would be pointless work on the hot path.
 	echoErrors := ServerEchoErrors.WithLabelValues(source)
+	// Half-configured-HMAC observability handle (see the increment site
+	// below): resolved once like echoErrors; the vec is keyed by {source} only.
+	unauthHMACFrames := ServerUnauthHMACFrames.WithLabelValues(source)
 
 	// Pre-resolve the fixed set of drop reasons once, so a dropped
 	// datagram (the flood case) costs no label-map hashing. If a new drop
 	// reason is added, add a field here and to the Help text in metrics.go.
 	drops := struct {
-		invalidAddr, allowlist, rateIP, rateGlobal, size, magic, clientOverflow, hmac, replay prometheus.Counter
+		invalidAddr, allowlist, rateIP, rateGlobal, size, magic, clientOverflow, hmac, replay, dup prometheus.Counter
 	}{
 		invalidAddr:    ServerProbesDropped.WithLabelValues(source, "invalid_addr"),
 		allowlist:      ServerProbesDropped.WithLabelValues(source, "allowlist"),
@@ -349,6 +489,7 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 		clientOverflow: ServerProbesDropped.WithLabelValues(source, "client_overflow"),
 		hmac:           ServerProbesDropped.WithLabelValues(source, "hmac"),
 		replay:         ServerProbesDropped.WithLabelValues(source, "replay"),
+		dup:            ServerProbesDropped.WithLabelValues(source, "dup"),
 	}
 
 	// Pre-resolve per-client metric handles for exact allowlist IPs once:
@@ -370,7 +511,17 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 		// pre-resolved exact-IP handles, which are never evicted.
 		lastSeen time.Time
 	}
-	handles := make(map[netip.Addr]clientHandles, allowed.Len())
+	handles := make(map[netip.Addr]clientHandles, len(allowed.exact))
+	// Reusable HMAC states for the read loop's verify chain (single
+	// goroutine, so one state per secret; crypto/hmac is not concurrent-
+	// safe). Built once instead of the previous 2-4 hmac.New per frame.
+	var curMAC, oldMAC *probeMACer
+	if echoSecret != "" {
+		curMAC = newProbeMACer(echoSecret)
+		if len(echoSecretOld) > 0 {
+			oldMAC = newProbeMACer(echoSecretOld[0])
+		}
+	}
 	for ip := range allowed.exact {
 		key := ip.String()
 		handles[ip] = clientHandles{
@@ -419,6 +570,7 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 			// above: spoofed sources inside an allowed CIDR could otherwise
 			// pin every slot and black out all other CIDR-matched clients
 			// (client_overflow) for as long as the flood lasts.
+			lastSweep = now
 			sweepExpired(now)
 		}
 		if len(dyn) >= MaxClientSeries {
@@ -468,6 +620,13 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 			}
 		}
 	}()
+
+	// Frame shape constants: constant for the loop's lifetime (they depend
+	// only on configuration captured above).
+	expectedSize := PayloadSize
+	if echoSecret != "" {
+		expectedSize = PayloadSizeWithHMAC
+	}
 
 	for {
 		n, raddr, err := pc.ReadFrom(buf)
@@ -539,10 +698,6 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 			continue
 		}
 
-		expectedSize := PayloadSize
-		if echoSecret != "" {
-			expectedSize = PayloadSizeWithHMAC
-		}
 		// Accept the header frame plus any bounded payload extension:
 		// clients can probe with a payload (MTU/data-path corruption
 		// detection) without coordinating server-side config. Reflection
@@ -556,6 +711,20 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 			drops.magic.Inc()
 			continue
 		}
+		// Half-configured-HMAC detection, purely observational: a server
+		// WITHOUT a secret accepts an HMAC-shaped frame — the bare 32-byte
+		// header, or 32B + payload, exactly the shapes this no-secret size
+		// gate above (expectedSize = PayloadSize = 24, n in [24, 24+
+		// MaxPayloadBytes]) admits — as an ordinary bounded payload probe and
+		// echoes it. Acceptance is deliberately unchanged, so the drop path
+		// stays silent for this pairing; the counter is what makes the
+		// mismatch (secret on clients, absent here) metric-visible. Note a
+		// secret-less 24-byte header plus an exactly-8-byte payload frame has
+		// the same shape — counted too, an ambiguity this frame size alone
+		// cannot resolve.
+		if echoSecret == "" && n >= PayloadSizeWithHMAC {
+			unauthHMACFrames.Inc()
+		}
 		// Authentication and the replay guard run BEFORE per-client handle
 		// resolution. resolve() allocates a {source,client} series pair and
 		// consumes one of the MaxClientSeries slots, so resolving first let
@@ -567,21 +736,34 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 		// series.
 		var skew time.Duration
 		if echoSecret != "" {
-			oldSecret := ""
-			if len(echoSecretOld) > 0 {
-				oldSecret = echoSecretOld[0]
-			}
 			seq := binary.LittleEndian.Uint64(buf[8:16])
 			ts := binary.LittleEndian.Uint64(buf[16:24])
-			if !validHMACAny(echoSecret, oldSecret, seq, ts, buf[24:32]) {
-				drops.hmac.Inc()
-				continue
+			// Payload frames are accepted under EITHER tag coverage: the
+			// header tag (v0.7 clients) or the full-frame tag over
+			// header+payload with the tag slot skipped (clients running
+			// -hmac-coverage=full-frame), so an upgraded client mixes freely
+			// with this server. Header-only is tried first — it matches bare
+			// 32-byte frames and old clients exactly — then full-frame. There
+			// is deliberately NO new drop reason: a drop is a drop, the two
+			// coverages fail together on a wrong secret, and splitting the
+			// reason would fragment the hmac/replay misconfig alerting in
+			// rules/link-monitor.yml for a distinction the operator cannot
+			// act on.
+			if !macAny(curMAC, oldMAC, seq, ts, buf[24:32]) {
+				// Bare 32-byte frames (n == expectedSize) skip the second
+				// attempt: the two coverages coincide byte-for-byte there
+				// (pinned by TestHMACCoverageZeroPayloadEquivalence), so the
+				// extra HMAC-SHA256 could never change the outcome.
+				if n == expectedSize || !fullFrameAny(curMAC, oldMAC, buf[:n]) {
+					drops.hmac.Inc()
+					continue
+				}
 			}
 			// Replay guard: an authenticated frame older or newer than
 			// the window is a capture-replay, not a live probe. Clocks
 			// between nodes must be approximately synchronized (NTP).
 			skew = time.Since(time.Unix(0, int64(ts)))
-			if skew > maxReplayWindow || skew < -maxReplayWindow {
+			if skewReplayed(skew) {
 				drops.replay.Inc()
 				// Throttled like the write-error warning: a captured frame
 				// replayed at the per-IP cap — or a client with a large clock
@@ -601,10 +783,39 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 			drops.rateIP.Inc()
 			continue
 		}
+		// Echo-loop guard: a frame identical to one recently echoed (same
+		// source, seq, timestamp) is a bounce off another responder (or an
+		// in-window replay), not a live probe — echoing it again would
+		// sustain the loop forever. Legit clients never repeat an identity:
+		// seq increments per successful write, ts is time.Now().UnixNano()
+		// per send, and the MTU sweep regenerates both on every attempt
+		// including its single retry. The check runs after the per-IP charge
+		// and BEFORE handle resolution, so a dup never allocates a series or
+		// a MaxClientSeries slot (and never sets the clock-skew gauge).
+		key := echoFrameKey(na, ua.Port, buf)
+		if _, dup := guard.seen[key]; dup {
+			drops.dup.Inc()
+			continue
+		}
+		// Record the identity IMMEDIATELY on acceptance, before the echo
+		// write (previously only after a successful write): the ring records
+		// per frame, so under a spoofed flood of near-identical identities
+		// the check→write→record window was wide enough for an attacker to
+		// slide a legitimate client's identity out of the 8192-slot ring
+		// faster than its echo could be re-checked — in secret-less mode
+		// this guard is the ONLY reflection-loop defense, so the window
+		// must not exist. The record call itself sits AFTER handle resolution,
+		// right before the echo write: recording a frame that resolve()
+		// rejects as client_overflow would ring-poison the source's own
+		// identity and dup-drop its legitimate retry once TTL frees a slot
+		// (seen in TestServer_DynamicClientEviction). A flood of
+		// near-identical identities from another source cannot land between
+		// this check and the record — the read loop is single-threaded, so
+		// only one frame is processed at a time.
 		// Resolve the per-client metric handles last: exact allowlist IPs hit
 		// the pre-resolved map with no lock, while prefix matches go through
 		// the capped dynamic map (H1 cardinality guard), and a frame dropped
-		// above for rate/HMAC/replay never allocates a series at all.
+		// above for rate/HMAC/replay/dup never allocates a series at all.
 		h, pre := handles[na]
 		if !pre {
 			res, resOK := resolve(na)
@@ -622,15 +833,25 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 		}
 
 		h.recv.Inc()
-		if nw, err := pc.WriteTo(buf[:n], raddr); err != nil && ctx.Err() == nil {
-			// A failed echo is our fault, not the network's: count it so the
-			// client's loss can be attributed correctly. Warn (throttled to
-			// once per minute, as client.go's dial loop does) rather than
-			// Debug-per-packet, which default verbosity would hide entirely.
-			echoErrors.Inc()
-			if lastWriteLog.IsZero() || time.Since(lastWriteLog) >= time.Minute {
-				slog.Warn("UDP echo write failed (further failures logged at most once per minute)", "addr", raddr, "bytes", nw, "err", err)
-				lastWriteLog = time.Now()
+		// Record the identity immediately BEFORE the echo write, not after
+		// a successful write: the check→record window must not include the
+		// write syscall, and — in secret-less mode, where this guard is the
+		// ONLY reflection-loop defense — a registered-but-unechoed identity
+		// (the local write failed) merely loses that one echoed frame, which
+		// the client already counts as ordinary loss; there is no loop to
+		// break because the frame did not reflect.
+		guard.record(key)
+		if nw, err := pc.WriteTo(buf[:n], raddr); err != nil {
+			if ctx.Err() == nil {
+				// A failed echo is our fault, not the network's: count it so the
+				// client's loss can be attributed correctly. Warn (throttled to
+				// once per minute, as client.go's dial loop does) rather than
+				// Debug-per-packet, which default verbosity would hide entirely.
+				echoErrors.Inc()
+				if lastWriteLog.IsZero() || time.Since(lastWriteLog) >= time.Minute {
+					slog.Warn("UDP echo write failed (further failures logged at most once per minute)", "addr", raddr, "bytes", nw, "err", err)
+					lastWriteLog = time.Now()
+				}
 			}
 		}
 	}

@@ -32,6 +32,13 @@ type TargetStatus struct {
 	// seconds since the last matched echo, -1 when none has arrived.
 	PathMTUBytes       int     `json:"path_mtu_bytes"`
 	LastEchoAgeSeconds float64 `json:"last_echo_age_seconds"`
+	// Straggler is set while this target's probe loop was replaced but
+	// failed to join within stragglerStopTimeout and is still winding
+	// down (or, for a permanently wedged loop, for as long as it lasts):
+	// the target is NOT being probed right now, so a /status consumer
+	// must not read the last emitted values as live. Without a visible
+	// flag, a wedged straggler looks exactly like a healthy idle target.
+	Straggler bool `json:"straggler"`
 }
 
 // StatusRegistry collects per-target live state from the probe loops.
@@ -56,7 +63,32 @@ func (r *StatusRegistry) Update(s TargetStatus) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// Preserve the straggler flag against a racing per-interval snapshot:
+	// markStraggler(true) can land between the wedged loop's emissions, and
+	// its last whole-struct Update would otherwise clear the flag — a
+	// permanently wedged loop never emits again, so /status would then read
+	// a straggler as healthy (the exact readout failure the flag exists to
+	// prevent). MarkStraggler(false) on release is the only legitimate
+	// clearer; a replacement loop's fresh snapshots arrive after release.
+	if prev, ok := r.targets[s.Name]; ok && prev.Straggler {
+		s.Straggler = true
+	}
 	r.targets[s.Name] = s
+}
+
+// MarkStraggler flips the Straggler flag on an existing snapshot.
+// Nil-receiver safe, like Update/Remove. The flag is cleared when the
+// straggler is released and its replacement loop emits its own snapshot.
+func (r *StatusRegistry) MarkStraggler(name string, straggler bool) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if s, ok := r.targets[name]; ok {
+		s.Straggler = straggler
+		r.targets[name] = s
+	}
 }
 
 // Remove drops a target's snapshot so a target deleted from the targets
@@ -126,12 +158,13 @@ type ProcessStatus struct {
 }
 
 // processStatusTTL bounds how often /status pays for runtime.ReadMemStats.
-// That call STOPS THE WORLD to produce consistent numbers, and /status (unlike
-// /metrics) has no concurrency cap and is reachable without credentials when
-// no metrics auth is configured — so a burst of requests would inject pauses
-// into a process whose whole purpose is measuring RTT, inflating its own
-// samples. One second keeps the readout fresh while bounding the cost to one
-// ReadMemStats per second regardless of request rate.
+// That call STOPS THE WORLD to produce consistent numbers, and /status is
+// reachable without credentials when no metrics auth is configured — so a
+// burst of requests would inject pauses into a process whose whole purpose
+// is measuring RTT, inflating its own samples. One second keeps the readout
+// fresh while bounding the cost to one ReadMemStats per second regardless of
+// request rate. (In-flight requests themselves are bounded by the same
+// 2-request concurrency cap /metrics uses — limitConcurrent in main.go.)
 const processStatusTTL = time.Second
 
 var (
@@ -170,6 +203,9 @@ func ReadProcessStatus() ProcessStatus {
 func (r *StatusRegistry) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		// Encode errors (client disconnecting mid-write) are not actionable
+		// here and would spam per-scrape; the endpoint's contract is a best-
+		// effort JSON snapshot. Explicitly discarded so the intent is visible.
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"targets": r.Snapshot(),
 			"process": ReadProcessStatus(),

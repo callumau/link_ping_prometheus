@@ -11,6 +11,7 @@ import (
 	"math"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -129,6 +130,23 @@ func targetByName(targets []Target, name string) (Target, bool) {
 	return Target{}, false
 }
 
+// FilterSelfTargets drops the target whose Name equals source, so one targets
+// file listing every site (including the local one) can be deployed unchanged
+// on every site of a mesh. The match is exact: target names are Prometheus
+// label values and are case-sensitive, so a case variant is a different series
+// and must not be dropped. The input slice is not modified.
+func FilterSelfTargets(targets []Target, source string) []Target {
+	kept := make([]Target, 0, len(targets))
+	for _, t := range targets {
+		if t.Name == source {
+			slog.Info("Skipping self target (mesh mode: one targets file for every site)", "name", t.Name)
+			continue
+		}
+		kept = append(kept, t)
+	}
+	return kept
+}
+
 // LoadTargets reads and validates a JSON file containing an array of
 // Target objects. Each target address is verified via ValidateTarget.
 // The file must be ≤ MaxTargetsFileSize (1 MB) and contain ≤ MaxTargetsCount
@@ -174,6 +192,14 @@ func LoadTargets(path string) ([]Target, error) {
 // misses this bound is recorded as a straggler and restarted (when the target
 // is still in the file) once it does exit.
 var stragglerStopTimeout = 5 * time.Second
+
+// stragglerReLogInterval re-asserts the stranded-target state at Warn
+// level: a permanently wedged probe loop (write with no deadline) leaves
+// its target silently unprobed for the process lifetime — one Error line
+// at mark time is invisible to log-frequency alerting, and nothing else
+// re-states the condition. A package var so tests can shorten it (the
+// stragglerStopTimeout/DynClientTTL precedent).
+var stragglerReLogInterval = time.Minute
 
 // RunClient starts probe loops for every target in cfg.Targets. Each
 // target is probed in its own goroutine. Blocks until ctx is cancelled.
@@ -283,7 +309,9 @@ func RunClient(ctx context.Context, cfg Config) error {
 	// target's absence can change while the old loop is still winding down:
 	// a removal that races the exit must not be missed (that left a ghost
 	// /status row and a frozen link_up series for the process lifetime).
+
 	markStraggler := func(name string, r running) {
+		cfg.Status.MarkStraggler(name, true)
 		stragglersMu.Lock()
 		stragglers[name] = r
 		stragglersMu.Unlock()
@@ -320,6 +348,10 @@ func RunClient(ctx context.Context, cfg Config) error {
 			delete(stragglers, name)
 		}
 		stragglersMu.Unlock()
+		// Clear the flag even for a name whose snapshot was already
+		// removed (purge path deletes the whole entry): keeping the
+		// /status row honest for the keep-case replacement matters.
+		cfg.Status.MarkStraggler(name, false)
 		if !ok {
 			return
 		}
@@ -450,6 +482,11 @@ func RunClient(ctx context.Context, cfg Config) error {
 			slog.Error("Targets reload failed; keeping previous targets", "path", cfg.TargetsPath, "err", err)
 			return
 		}
+		if cfg.SkipSelf {
+			// Mesh mode: the shared file lists every site including this one,
+			// and the reload must drop self exactly as the initial load did.
+			targets = FilterSelfTargets(targets, cfg.Source)
+		}
 		// The effective-window check needs the GLOBAL interval/timeout, so it
 		// cannot live in LoadTargets: reject a reload that would build an
 		// unbounded in-flight window rather than accept it and peg a core.
@@ -469,11 +506,62 @@ func RunClient(ctx context.Context, cfg Config) error {
 		apply(targets)
 	}
 
-	if cfg.ReloadSignal == nil && (cfg.ReloadInterval <= 0 || cfg.TargetsPath == "") {
-		// No reload path: original behavior — wait for every probe loop.
+	// drainLive waits for every live probe loop to exit, then gives any
+	// straggler one final bounded wait (stragglerStopTimeout). The
+	// per-loop cancels make every loop exit promptly; the bound exists
+	// for the pathological case (a wedged conn.Write with no deadline)
+	// where waiting forever would push the service Stop past the SCM
+	// deadline with no way out. Each probe loop joins its own MTU sweep
+	// before returning, so a sweep cannot outlive this drain by more
+	// than one sliced read arm (mtuReadArm).
+	drainLive := func() {
 		for _, r := range live {
 			<-r.done
 		}
+		stragglersMu.Lock()
+		dones := make([]chan struct{}, 0, len(stragglers))
+		for _, r := range stragglers {
+			dones = append(dones, r.done)
+		}
+		stragglersMu.Unlock()
+		if len(dones) == 0 {
+			return
+		}
+		t := time.NewTimer(stragglerStopTimeout)
+		defer t.Stop()
+		for _, d := range dones {
+			select {
+			case <-d:
+			case <-t.C:
+				return
+			}
+		}
+	}
+
+	// stragglerWarn re-states the stranded-target set at Warn level so a
+	// permanently wedged loop is visible to log alerting for the whole
+	// time the target stays unprobed (not just at mark time).
+	stragglerWarn := func() {
+		stragglersMu.Lock()
+		names := make([]string, 0, len(stragglers))
+		for name := range stragglers {
+			names = append(names, name)
+		}
+		stragglersMu.Unlock()
+		if len(names) == 0 {
+			return
+		}
+		slog.Warn("Probe targets stranded: loop did not exit in time; target is not being probed",
+			"targets", strings.Join(names, ","), "count", len(names))
+	}
+
+	stragglerReLog := time.NewTicker(stragglerReLogInterval)
+	defer stragglerReLog.Stop()
+
+	if cfg.ReloadSignal == nil && (cfg.ReloadInterval <= 0 || cfg.TargetsPath == "") {
+		// No reload path: original behavior — wait for every probe loop;
+		// stragglers get one bounded extra wait (drainLive).
+		drainLive()
 		return nil
 	}
 
@@ -486,14 +574,14 @@ func RunClient(ctx context.Context, cfg Config) error {
 	for {
 		select {
 		case <-ctx.Done():
-			for _, r := range live {
-				<-r.done
-			}
+			drainLive()
 			return nil
 		case <-cfg.ReloadSignal:
 			reload()
 		case <-reloadTick:
 			reload()
+		case <-stragglerReLog.C:
+			stragglerWarn()
 		case name := <-freed:
 			// A timed-out loop finally exited. Resolve it against the CURRENT
 			// desired set, then re-apply so a still-wanted target gets its
@@ -511,6 +599,7 @@ func RunClient(ctx context.Context, cfg Config) error {
 type targetMetrics struct {
 	sent      prometheus.Counter
 	sendErr   prometheus.Counter
+	throttled prometheus.Counter
 	corrupted prometheus.Counter
 	timedOut  prometheus.Counter
 	inflight  prometheus.Gauge
@@ -540,6 +629,7 @@ func newTargetMetrics(source string, t Target) targetMetrics {
 	return targetMetrics{
 		sent:               ProbesSent.WithLabelValues(source, t.Name, t.Address),
 		sendErr:            SendErrors.WithLabelValues(source, t.Name, t.Address),
+		throttled:          ProbesThrottled.WithLabelValues(source, t.Name, t.Address),
 		corrupted:          CorruptedProbes.WithLabelValues(source, t.Name, t.Address),
 		timedOut:           ProbesTimedOut.WithLabelValues(source, t.Name, t.Address),
 		inflight:           ProbesInflight.WithLabelValues(source, t.Name, t.Address),
@@ -607,6 +697,7 @@ func deleteTargetSeries(source string, t Target) {
 	labels := prometheus.Labels{"source": source, "target": t.Name, "address": t.Address}
 	ProbesSent.DeletePartialMatch(labels)
 	SendErrors.DeletePartialMatch(labels)
+	ProbesThrottled.DeletePartialMatch(labels)
 	CorruptedProbes.DeletePartialMatch(labels)
 	ProberInternalErrors.DeletePartialMatch(labels)
 	ProbesTimedOut.DeletePartialMatch(labels)
@@ -619,6 +710,55 @@ func deleteTargetSeries(source string, t Target) {
 	MTUProbesSent.DeletePartialMatch(labels)
 	MTUProbesLost.DeletePartialMatch(labels)
 	PathMTUBytes.DeletePartialMatch(labels)
+}
+
+// responseBufferCapacity computes respCh's buffer size for one probe
+// loop. A var-free function so tests can pin the sizing rule: the static
+// pair is clamped 100..maxPendingWindow, and -adaptive pins the channel
+// to maxPendingWindow because the applied RTO (floor max(200ms, 2*SRTT))
+// can legitimately hold the full window in flight.
+func responseBufferCapacity(cfg Config) int {
+	if cfg.Adaptive {
+		return maxPendingWindow
+	}
+	bufSize := 100
+	if cfg.BaseInterval > 0 {
+		n := int(cfg.BaseTimeout/cfg.BaseInterval) + 20
+		if n > bufSize {
+			bufSize = n
+		}
+		if bufSize > maxPendingWindow {
+			bufSize = maxPendingWindow
+		}
+	}
+	return bufSize
+}
+
+// sleepCtx sleeps d, returning false when ctx is cancelled first. Shared
+// by the three probeTarget retry pauses (dial failure, reader death,
+// panic restart), which were three copies of the same bounded timer
+// select.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	// pi-lens-ignore: waitgroup-done-scope
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+// stopDrain resets a timer and drains a possibly-queued tick so Reset
+// starts clean (Go's Reset contract), shared by three sites.
+func stopDrain(t *time.Timer) {
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
 }
 
 // maxConsecutiveWriteFails bounds how many successive local send errors
@@ -726,8 +866,26 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 	cfg = effectiveCfg
 	if cfg.MTUSweep > 0 {
 		// Own socket and counter namespace: MTU probing stays outside the
-		// main loss balance entirely.
-		go runMTUSweep(ctx, t, cfg, m, state, logger)
+		// main loss balance entirely. The sweep goroutine is TRACKED: the
+		// deferred join below keeps probeTarget from returning before the
+		// sweep has wound down, so stop()'s bounded join and the
+		// straggler/shutdown joins cover it too. With the sliced read
+		// arms in readEcho (mtuReadArm) the sweep exits within one arm
+		// (~500ms) of cancellation, so the join cannot stall a reload.
+		// Previously the sweep was fire-and-forget and could outlive its
+		// loop by a full applied RTO — duplicated DF probes and a stale
+		// link_path_mtu_bytes overwrite on a kept-series restart.
+		sweepDone := make(chan struct{})
+		go func() {
+			defer close(sweepDone)
+			runMTUSweep(ctx, t, cfg, m, state, logger)
+		}()
+		defer func() {
+			// Only reached while the loop is exiting for restart/shutdown;
+			// the sweep holds its own ctx copy and its reads are sliced,
+			// so this wait is bounded by mtuReadArm plus socket close.
+			<-sweepDone
+		}()
 	}
 	// Throttle dial-failure logging: first failure logs immediately, then
 	// at most once per minute (a DNS outage retries every second).
@@ -754,21 +912,11 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 			// cannot even open a socket (DNS outage, firewall). Carry the MTU
 			// and last-echo age too so /status agrees with the gauges instead
 			// of rendering 0/-1 unknowns while the agent keeps retrying.
-			lastEchoAge := -1.0
-			if !state.lastEcho.IsZero() {
-				lastEchoAge = time.Since(state.lastEcho).Seconds()
-			}
-			m.status.Update(TargetStatus{
-				Name:               t.Name,
-				Address:            t.Address,
-				ConsecutiveMisses:  state.consecutiveMisses,
-				RTOSeconds:         stats.CurrentRTO().Seconds(),
-				JitterSeconds:      state.jitter,
-				SRTTSeconds:        stats.SRTT().Seconds(),
-				LastSeq:            state.seq,
-				PathMTUBytes:       int(state.pathMTU.Load()),
-				LastEchoAgeSeconds: lastEchoAge,
-			})
+			// Zero socketStart so the snapshot renders age 0 (not-ready)
+			// for the whole retry pause, then reuse the single snapshot
+			// shape shared with the reader-dead and panic paths.
+			state.socketStart = time.Time{}
+			emitTargetStatus(m, state, stats, stats.CurrentRTO(), 0, 0)
 			// A DNS outage retries every second; log the first failure
 			// immediately, then at most once per minute so an Error-level
 			// message does not flood the log for the duration of the outage.
@@ -778,15 +926,8 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 				logger.Error("Failed to open UDP socket; retrying", "err", err)
 				lastDialLog = time.Now()
 			}
-			t := time.NewTimer(time.Second)
-			select {
-			// pi-lens-ignore: waitgroup-done-scope
-			case <-ctx.Done():
-				if !t.Stop() {
-					<-t.C
-				}
+			if !sleepCtx(ctx, time.Second) {
 				return
-			case <-t.C:
 			}
 			continue
 		}
@@ -828,15 +969,8 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 				logger.Error("UDP reader stopped; re-dialing socket")
 				lastDialLog = time.Now()
 			}
-			t := time.NewTimer(time.Second)
-			select {
-			// pi-lens-ignore: waitgroup-done-scope
-			case <-ctx.Done():
-				if !t.Stop() {
-					<-t.C
-				}
+			if !sleepCtx(ctx, time.Second) {
 				return
-			case <-t.C:
 			}
 			continue
 		}
@@ -897,26 +1031,35 @@ func runEchoLoop(
 ) (retErr error) {
 
 	type response struct {
-		seq       uint64
-		ts        uint64
-		recv      time.Time
+		seq uint64
+		ts  uint64
+		// recv is the receive time as UnixNano: int64 keeps the buffered
+		// entry compact, and respCh is sized to maxPendingWindow (1000)
+		// under -adaptive - at a 1000-target fleet every byte/entry is
+		// ~8KB of steady-state heap. Callers convert back with
+		// time.Unix(0, ...). recvQPC is the same instant on the
+		// high-resolution Windows counter (0 when unavailable); the wall
+		// clock alone is interrupt-time quantized there, which computed
+		// sub-quantum RTTs as exactly 0.
+		recv      int64
+		recvQPC   uint64
 		corrupted bool
 	}
 
 	// respCh buffers in-flight responses between the reader and the drain.
 	// Size scales with expected max inflight (timeout/interval) so aggressive
-	// intervals (e.g. 10ms/3s => 300) do not stall the reader. Clamped 100..1000.
-	bufSize := 100
-	if cfg.BaseInterval > 0 {
-		n := int(cfg.BaseTimeout/cfg.BaseInterval) + 20
-		if n > bufSize {
-			bufSize = n
-		}
-		if bufSize > 1000 {
-			bufSize = 1000
-		}
-	}
-	respCh := make(chan response, bufSize)
+	// intervals (e.g. 10ms/3s => 300) do not stall the reader. With
+	// -adaptive the applied timeout is the RFC 6298 RTO whose max(200ms,
+	// 2*SRTT) floor is unbounded above, so the STATIC pair under-counts:
+	// a healthy long-haul link can legitimately hold maxPendingWindow
+	// probes in flight, and a channel sized from the static pair then
+	// back-pressures the reader — parked in the send select, the kernel
+	// drops further echoes, which get swept as timed_out on a link that
+	// answered everything (fabricated loss on a healthy link). Under
+	// adaptive the channel is therefore sized to the same cap the send
+	// site enforces (maxPendingWindow); under a static pair the validated
+	// window always fits by construction.
+	respCh := make(chan response, responseBufferCapacity(cfg))
 
 	// done unblocks the reader when the loop exits via panic recovery:
 	// conn.Close() frees a reader blocked on the socket, but a reader
@@ -934,15 +1077,39 @@ func runEchoLoop(
 
 	go func() {
 		defer close(readerDone)
+		// Same panic contract as the echo loop below: a reader panic is
+		// per-event corruption, not a link condition. close(readerDone)
+		// still fires (deferred above), so the main loop re-dials via the
+		// errReaderDead path instead of probing into a void, and the
+		// failure is counted and logged at Error rather than vanishing.
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error("Panic in UDP reader; stopping reader", "panic", r)
+				m.internalPanic.Inc()
+			}
+		}()
 		// Read into a buffer larger than the payload so an oversized
 		// datagram is not silently truncated to PayloadSize by the kernel
 		// and mistaken for a valid probe (Read truncates to the buffer).
+		// Frame shape: constant for this socket's lifetime (depends only
+		// on configuration fixed at loop start).
+		expectedSize := PayloadSize
+		if cfg.EchoSecret != "" {
+			expectedSize = PayloadSizeWithHMAC
+		}
+		expectedSize += cfg.Payload
 		buf := make([]byte, MaxDatagramSize)
 		// Scratch for regenerating the expected payload pattern; reused
 		// across packets (single reader goroutine).
 		var payloadScratch []byte
 		if cfg.Payload > 0 {
 			payloadScratch = make([]byte, cfg.Payload)
+		}
+		// One reusable HMAC state for the reader goroutine (the send loop
+		// has its own; crypto/hmac state is not safe for concurrent use).
+		var rMac *probeMACer
+		if cfg.EchoSecret != "" {
+			rMac = newProbeMACer(cfg.EchoSecret)
 		}
 		deadlineFails := 0
 		// readFails bounds consecutive non-timeout Read errors: they can be
@@ -1000,11 +1167,6 @@ func runEchoLoop(
 				continue
 			}
 			readFails = 0
-			expectedSize := PayloadSize
-			if cfg.EchoSecret != "" {
-				expectedSize = PayloadSizeWithHMAC
-			}
-			expectedSize += cfg.Payload
 			if n != expectedSize {
 				continue
 			}
@@ -1015,11 +1177,29 @@ func runEchoLoop(
 			seq := binary.LittleEndian.Uint64(buf[8:16])
 			ts := binary.LittleEndian.Uint64(buf[16:24])
 			if cfg.EchoSecret != "" {
-				if !validHMAC(cfg.EchoSecret, seq, ts, buf[24:32]) {
+				// Verify under the coverage this client SENT with; no
+				// fallback is needed or safe: the server echoes buf[:n]
+				// unmodified (server.go WriteTo), so an echo can only carry
+				// the tag we wrote. A full-frame frame is either echoed
+				// intact (the dual-accept server) or never echoes at all —
+				// a v0.7 header-only server rejects it before echoing,
+				// which is exactly why the default stays 'header' for
+				// mixed fleets. Zero-payload frames are excluded from the
+				// full-frame check because the two coverages coincide
+				// byte-for-byte there (pinned by
+				// TestHMACCoverageZeroPayloadEquivalence), so the header
+				// check is the same check.
+				if cfg.HmacCoverage == HMACFullFrameCoverage && cfg.Payload > 0 {
+					if !rMac.verifyFullFrame(buf[:n]) {
+						continue
+					}
+				} else if !rMac.verifyHeader(seq, ts, buf[24:32]) {
 					continue
 				}
 			}
-			resp := response{seq: seq, ts: ts, recv: time.Now()}
+			recvNS := time.Now().UnixNano()
+			recvQPC, _ := qpcNow()
+			resp := response{seq: seq, ts: ts, recv: recvNS, recvQPC: recvQPC}
 			if cfg.Payload > 0 {
 				// Validate the echoed payload byte-for-byte against the
 				// pattern regenerated from the frame's own seq/ts.
@@ -1031,12 +1211,25 @@ func runEchoLoop(
 				resp.corrupted = !bytes.Equal(payloadScratch, buf[plOff:plOff+cfg.Payload])
 			}
 
+			// Push with PRIORITY over cancellation: this select must not
+			// gamble on the random case pick when both the channel and
+			// ctx.Done are ready - an echo already parsed (read from the
+			// wire) and then dropped here would be swept as a timeout at
+			// loop exit (fabricated loss on a probe the link answered).
+			// respCh is sized to the pending-window cap, so a non-blocking
+			// send has room on every realistic path; the blocking fallback
+			// exists only for the pathological full-channel case, where the
+			// done/ctx branches still bound the reader (MED-2 audit fix).
 			select {
 			case respCh <- resp:
-			case <-ctx.Done():
-				return
-			case <-done:
-				return
+			default:
+				select {
+				case respCh <- resp:
+				case <-ctx.Done():
+					return
+				case <-done:
+					return
+				}
 			}
 		}
 	}()
@@ -1046,17 +1239,34 @@ func runEchoLoop(
 	// warnedWriteDown makes the Error log fire once per failure streak
 	// (the drop itself is re-asserted on every failing tick).
 	warnedWriteDown := false
+	// warnedThrottle makes the pending-window throttle Warn fire once per
+	// sustained-throttle streak; reset on the next successful send.
+	warnedThrottle := false
 	payloadSize := PayloadSize
 	if cfg.EchoSecret != "" {
 		payloadSize = PayloadSizeWithHMAC
 	}
 	buf := make([]byte, payloadSize+cfg.Payload)
-	pending := make(map[uint64]time.Time)
+	// One reusable HMAC state for the send loop; the reader goroutine has
+	// its own (crypto/hmac state is not safe for concurrent use).
+	var mac *probeMACer
+	if cfg.EchoSecret != "" {
+		mac = newProbeMACer(cfg.EchoSecret)
+	}
 	pendingHighWater := 0
 	// started bounds the socket lifetime: once ReconnectInterval has
 	// elapsed and no probes are in flight, the loop returns errReconnect
 	// so the caller re-dials and re-resolves DNS.
 	started := time.Now()
+
+	// sentStamp carries the send-time markers for one in-flight probe:
+	// sentNS for the wire-timestamp echo check and coarse /status ages,
+	// qpc for the RTT delta when the high-resolution clock is available.
+	type sentStamp struct {
+		sentNS int64
+		qpc    uint64
+	}
+	pending := make(map[uint64]sentStamp)
 
 	// drainResponses consumes every response the reader has already buffered
 	// and matches them against pending. It is the single definition of the
@@ -1068,11 +1278,11 @@ func runEchoLoop(
 		for {
 			select {
 			case resp := <-respCh:
-				sentTime, ok := pending[resp.seq]
+				st, ok := pending[resp.seq]
 				if !ok {
 					continue
 				}
-				if resp.ts != uint64(sentTime.UnixNano()) {
+				if resp.ts != uint64(st.sentNS) {
 					// Echoed payload does not match what we sent:
 					// corruption, replay, or spoofing. Leave the probe
 					// pending so it is counted as a loss on timeout.
@@ -1095,11 +1305,21 @@ func runEchoLoop(
 						m.linkUp.Set(1)
 						state.linkUp = true
 					}
-					state.lastEcho = resp.recv
+					state.lastEcho = time.Unix(0, resp.recv)
 					continue
 				}
 
-				rttSec := resp.recv.Sub(sentTime).Seconds()
+				// RTT basis: prefer the high-resolution counter pair (send/recv q
+				// pc stamps) and fall back to the wall clock. Go's time.Now() on
+				// Windows is interrupt-time quantized (sub-quantum RTTs compute 0),
+				// which pinned SRTT to 0 and RTO to its floor for loopback/LAN-class
+				// links there; the counter pair restores ~100ns fidelity.
+				var rttSec float64
+				if st.qpc != 0 && resp.recvQPC != 0 {
+					rttSec = qpcSeconds(resp.recvQPC - st.qpc)
+				} else {
+					rttSec = float64(resp.recv-st.sentNS) / 1e9
+				}
 
 				// With a fixed (non-adaptive) timeout, a true RTT above the
 				// timeout makes every probe read as loss — indistinguishable
@@ -1148,7 +1368,7 @@ func runEchoLoop(
 					m.linkUp.Set(1)
 					state.linkUp = true
 				}
-				state.lastEcho = resp.recv
+				state.lastEcho = time.Unix(0, resp.recv)
 			default:
 				return
 			}
@@ -1156,6 +1376,23 @@ func runEchoLoop(
 	}
 
 	defer func() {
+		// Close the socket FIRST and give the reader one bounded join
+		// before any accounting: the reader can be parked in its send-select
+		// or mid-parse of an already-read datagram, and an echo it pushes in
+		// AFTER the non-blocking drain below would be charged as a timeout
+		// on a probe the link actually answered — fabricated loss. conn
+		// Close unblocks its Read (net.ErrClosed), readerDone closes when
+		// the goroutine exits on any path, and the bound keeps a wedged
+		// reader from stretching any join deadline (Stop's 20s, a reload's
+		// 5s stragglerStopTimeout). The join cost is paid once per loop exit,
+		// never per event. (Deliberately also fixes the panic-recovery drain
+		// below, which runs inside this same defer.)
+		// pi-lens-ignore: go-ignored-call-result
+		_ = conn.Close()
+		select {
+		case <-readerDone:
+		case <-time.After(mtuReadArm):
+		}
 		if r := recover(); r != nil {
 			logger.Error("Panic in echo loop; continuing", "panic", r)
 			retErr = fmt.Errorf("panic in echo loop: %v", r)
@@ -1164,9 +1401,21 @@ func runEchoLoop(
 			// fabricate loss. The remaining abandoned probes can never match
 			// on this socket, so they are counted as timed out to keep
 			// sent = rtt_count + timed_out + inflight balancing across the
-			// restart (same treatment as the reconnect flush).
+			// restart (same treatment as the reconnect flush). The flush is
+			// UNCONDITIONAL — a panicking loop is never a process shutdown
+			// (shutdown cancels the context; the loop returns normally), the
+			// supervisor restarts it, and its series stay exported — and it
+			// clears pending: the tail below would otherwise re-run its own
+			// accounting (a RunClient-managed restart exits with the root
+			// context still alive, so runClientShuttingDown is false and the
+			// tail re-adds) and every abandoned probe would be counted
+			// twice, over-reporting loss through the balance invariant.
 			drainResponses()
-			m.timedOut.Add(float64(len(pending)))
+			if n := len(pending); n > 0 {
+				m.timedOut.Add(float64(n))
+				m.inflight.Sub(float64(n))
+				pending = make(map[uint64]sentStamp)
+			}
 		}
 		// Probes still in flight die with the loop on cancellation. Whether
 		// they must also be counted as timed out depends on whether the
@@ -1206,7 +1455,7 @@ func runEchoLoop(
 		if n := len(pending); n > 0 {
 			m.timedOut.Add(float64(n))
 			m.inflight.Sub(float64(n))
-			pending = make(map[uint64]time.Time)
+			pending = make(map[uint64]sentStamp)
 		}
 	}
 
@@ -1238,12 +1487,7 @@ func runEchoLoop(
 
 		// Stop may race a firing timer; when Stop returns false the
 		// channel is drained so Reset starts clean.
-		if !intervalTimer.Stop() {
-			select {
-			case <-intervalTimer.C:
-			default:
-			}
-		}
+		stopDrain(intervalTimer)
 		delay := time.Until(next)
 		if delay < 0 {
 			// Fell behind (the loop's work exceeded the interval): skip the
@@ -1290,6 +1534,11 @@ func runEchoLoop(
 				state.linkUp = false
 			}
 			flushPending()
+			// The socket that just lost its reader can no longer deliver
+			// echoes: zero socketStart so the re-emit below — the snapshot
+			// /readyz is built on — reports socket_age_seconds=0 for the whole
+			// bounded re-dial pause instead of a stale age from a dead socket.
+			state.socketStart = time.Time{}
 			// Re-emit the snapshot so /status reflects the dropped link_up
 			// immediately rather than up to a full interval later.
 			emitTargetStatus(m, state, stats, timeout, writeFails, len(pending))
@@ -1300,11 +1549,11 @@ func runEchoLoop(
 
 		drainResponses()
 
-		now := time.Now()
+		nowNS := time.Now().UnixNano()
 		var timeoutOccurred bool
 		if len(pending) > 0 {
-			for s, sentTime := range pending {
-				if now.Sub(sentTime) > timeout {
+			for s, st := range pending {
+				if nowNS-st.sentNS > timeout.Nanoseconds() {
 					m.timedOut.Inc()
 					m.inflight.Dec()
 					delete(pending, s)
@@ -1322,7 +1571,7 @@ func runEchoLoop(
 		if len(pending) > pendingHighWater {
 			pendingHighWater = len(pending)
 		} else if len(pending) == 0 && pendingHighWater > 512 {
-			pending = make(map[uint64]time.Time)
+			pending = make(map[uint64]sentStamp)
 			pendingHighWater = 0
 		}
 
@@ -1358,6 +1607,31 @@ func runEchoLoop(
 			return errReconnect
 		}
 
+		// Pending-window send throttle: the static interval/timeout pair is
+		// validated at startup and reload (validatePendingWindow), but with
+		// -adaptive the applied timeout is the RFC 6298 RTO, whose floor
+		// max(200ms, 2*SRTT) is unbounded above — a large-SRTT link with a
+		// fast interval would otherwise grow `pending` past the cap and
+		// sweep all of it on every tick. When the window is at the cap, SKIP
+		// the send for this tick: no frame is built, nothing reaches the
+		// wire, and neither sent nor inflight moves — the balance invariant
+		// is untouched because the probe never existed (this is NOT a
+		// pending exit path). The skip is a measured probe-rate reduction,
+		// not loss; it is counted in link_probes_throttled_total, which
+		// stays outside the balance by design (like send errors).
+		if len(pending) >= maxPendingWindow {
+			m.throttled.Inc()
+			if !warnedThrottle {
+				// Bounded like the write-failure warning: once per
+				// sustained-throttle streak, Warn level (Debug is invisible
+				// at default verbosity). Reset on the next successful send.
+				warnedThrottle = true
+				logger.Warn("Pending window is full; skipping probe sends until probes resolve",
+					"pending", len(pending), "window", maxPendingWindow)
+			}
+			continue
+		}
+
 		// Reserve, but do not yet consume, the sequence number: a failed
 		// write never put the datagram on the wire, so burning its seq
 		// would look like a loss to the RFC 3550 gap check and spuriously
@@ -1367,20 +1641,32 @@ func runEchoLoop(
 		// Capture the send time here, NOT the `now` used for the timeout
 		// sweep: that timestamp predates the response drain, so using it as
 		// sentTime would inflate every RTT by the tick's drain/sweep cost.
-		sendTime := time.Now()
+		sendNS := time.Now().UnixNano()
+		sendQPC, _ := qpcNow()
 		seq := state.seq + 1
 		copy(buf[0:8], MagicBytes)
 		binary.LittleEndian.PutUint64(buf[8:16], seq)
-		ts := uint64(sendTime.UnixNano())
+		ts := uint64(sendNS)
 		binary.LittleEndian.PutUint64(buf[16:24], ts)
-		if cfg.EchoSecret != "" {
-			h := computeHMAC(cfg.EchoSecret, seq, ts)
-			copy(buf[24:32], h[:])
-		}
-		if cfg.Payload > 0 {
-			// Header end is payloadSize (24 or 32): fill the rest with the
-			// deterministic corruption-detection pattern.
+		if cfg.EchoSecret != "" && cfg.HmacCoverage == HMACFullFrameCoverage && cfg.Payload > 0 {
+			// Full-frame coverage: the tag covers header+payload, so the
+			// payload must be in buf BEFORE the tag is computed. The pattern
+			// still derives deterministically from (seq, ts) exactly as
+			// before; only the tag's INPUT changes, not the frame layout or
+			// the payload derivation.
 			fillPayload(buf[payloadSize:payloadSize+cfg.Payload], seq, ts)
+			h := mac.digestFrame(buf)
+			copy(buf[24:32], h[:])
+		} else {
+			if cfg.EchoSecret != "" {
+				h := mac.digestHeader(seq, ts)
+				copy(buf[24:32], h[:])
+			}
+			if cfg.Payload > 0 {
+				// Header end is payloadSize (24 or 32): fill the rest with the
+				// deterministic corruption-detection pattern.
+				fillPayload(buf[payloadSize:payloadSize+cfg.Payload], seq, ts)
+			}
 		}
 
 		// Send first, then register: registering in-flight only after a
@@ -1418,9 +1704,10 @@ func runEchoLoop(
 		}
 		writeFails = 0
 		warnedWriteDown = false
+		warnedThrottle = false
 		state.seq = seq
 
-		pending[state.seq] = sendTime
+		pending[state.seq] = sentStamp{sentNS: sendNS, qpc: sendQPC}
 		m.inflight.Inc()
 		m.sent.Inc()
 	}

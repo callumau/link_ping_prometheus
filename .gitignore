@@ -8,3 +8,6 @@ piolium/*
 .pi/
 dist/
 
+link_ping_prometheus.exe
+.venv-ansible/
+.venv-ansible/

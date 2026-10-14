@@ -39,6 +39,10 @@ var (
 		Name: "link_probes_send_errors_total",
 		Help: "Total probes that failed to send locally (UDP write errors). They never reach the wire, so they are not counted in link_probes_sent_total; a sustained rate means a local NIC/socket problem, not network loss.",
 	}, []string{"source", "target", "address"})
+	ProbesThrottled = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "link_probes_throttled_total",
+		Help: "Probes skipped because the pending window (the timeout/interval ratio) is full: the adaptive RTO floor (2*SRTT) can exceed the configured timeout and grow the in-flight set past its cap, so sends are skipped until probes resolve. A probe-rate reduction, NOT network loss — a throttled probe is never built or sent and is not counted in link_probes_sent_total.",
+	}, []string{"source", "target", "address"})
 	CorruptedProbes = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "link_probes_corrupted_total",
 		Help: "Probes whose echo came back with corrupted payload bytes (-payload mode only): magic, sequence and timestamp intact, data altered in flight. Data-path corruption, not loss — the round trip completed.",
@@ -53,7 +57,7 @@ var (
 	}, []string{"source", "target", "address"})
 	MTUProbesLost = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "link_mtu_probes_lost_total",
-		Help: "DF-set MTU probes with no echo, per attempt like link_mtu_probes_sent_total (a size that fails twice counts twice), so lost/sent stays a per-probe ratio. Rising lost with healthy main probes means fragmentation-requiring traffic is being blackholed (PMTUD failure) — the classic works-small-fails-big signature. Alert on the ratio, not on > 0: a single retried loss on a 1%-loss path moves this counter.",
+		Help: "DF-set MTU probes with no echo, per attempt like link_mtu_probes_sent_total (a size that fails twice counts twice), so lost/sent stays a per-probe ratio. A probe that never left the host (local UDP write error) is counted here too, unlike the main probes' send_errors counter — interpret rising lost alongside the main ratios before blaming the wire. Rising lost with healthy main probes means fragmentation-requiring traffic is being blackholed (PMTUD failure) — the classic works-small-fails-big signature. Alert on the ratio, not on > 0: a single retried loss on a 1%-loss path moves this counter.",
 	}, []string{"source", "target", "address"})
 	PathMTUBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "link_path_mtu_bytes",
@@ -106,12 +110,16 @@ var (
 	}, []string{"source"})
 	ServerProbesDropped = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "link_server_probes_dropped_total",
-		Help: "Total probes dropped by the server, labelled by source and reason (allowlist, rate_ip, rate_global, size, magic, hmac, replay, invalid_addr, client_overflow). Distinguishes misconfig (wrong secret, clock skew) and overload from true network loss.",
+		Help: "Total probes dropped by the server, labelled by source and reason (allowlist, rate_ip, rate_global, size, magic, hmac, replay, dup, invalid_addr, client_overflow). dup marks a frame identical to one recently echoed (same source, seq, timestamp) — replay or echo-loop guard; hmac/replay diagnose secret/NTP misconfig vs true loss; client_overflow means more distinct CIDR-allowlisted client IPs than the per-client series cap. Distinguishes misconfig (wrong secret, clock skew) and overload from true network loss.",
 	}, []string{"source", "reason"})
 	ServerClockSkew = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "link_server_clock_skew_seconds",
 		Help: "Last observed clock skew in seconds (server time minus client timestamp) for HMAC-authenticated probes. Positive means client is behind. Used to diagnose NTP drift causing replay drops.",
 	}, []string{"source", "client"})
+	ServerUnauthHMACFrames = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "link_server_unauth_hmac_frames_total",
+		Help: "HMAC-shaped frames (32-byte header, with or without the bounded payload extension) received while this server has NO -echo-secret configured. Such frames are accepted and echoed as ordinary bounded payload probes — acceptance is unchanged — so a half-configured pairing (secret on clients, absent on the server) exports no hmac drop reason and reads healthy; a rising rate means set -echo-secret on BOTH ends. Note: a secret-less probe with a 24-byte header plus exactly 8 bytes of payload has the same shape and is counted too.",
+	}, []string{"source"})
 	MetricsAuthFailures = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "link_metrics_auth_failures_total",
 		Help: "Rejected HTTP Basic auth attempts on /metrics and /status. A rising rate means a misconfigured scraper or credential scanning.",
@@ -129,11 +137,11 @@ var registerOnce sync.Once
 func InitMetrics() {
 	registerOnce.Do(func() {
 		prometheus.MustRegister(
-			ProbesSent, ProbesTimedOut, SendErrors, CorruptedProbes, ProbesInflight,
+			ProbesSent, ProbesTimedOut, SendErrors, ProbesThrottled, CorruptedProbes, ProbesInflight,
 			ProberInternalErrors,
 			MTUProbesSent, MTUProbesLost, PathMTUBytes,
 			RTTSeconds, JitterSeconds, LinkUp, RTOEstimate, SRTTSeconds,
-			ServerProbesReceived, ServerProbesDropped, ServerEchoErrors, ServerClockSkew,
+			ServerProbesReceived, ServerProbesDropped, ServerEchoErrors, ServerClockSkew, ServerUnauthHMACFrames,
 			MetricsAuthFailures, BuildInfo,
 		)
 	})
@@ -147,6 +155,7 @@ func SeedMetrics(source string, targets []Target) {
 		m := newTargetMetrics(source, t)
 		m.sent.Add(0)
 		m.sendErr.Add(0)
+		m.throttled.Add(0)
 		m.corrupted.Add(0)
 		m.mtuSent.Add(0)
 		m.mtuLost.Add(0)

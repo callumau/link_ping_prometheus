@@ -80,9 +80,18 @@ echo Parameters remain unchanged; swapping binary only.
 
 sc.exe stop "%SERVICE_NAME%" >nul 2>&1
 echo Waiting for service to stop...
+set "WAIT_STOP_COUNT=0"
 :wait_stop
 timeout /t 2 /nobreak >nul
-sc.exe query "%SERVICE_NAME%" | findstr /i "STOPPED" >nul || goto :wait_stop
+sc.exe query "%SERVICE_NAME%" 2>nul | findstr /i "STOPPED" >nul && goto :wait_done
+set /a WAIT_STOP_COUNT+=1
+if %WAIT_STOP_COUNT% GEQ 60 (
+    echo ERROR: service did not reach STOPPED within 120s - STOP_PENDING is stuck.
+    echo Run: taskkill /f /im link_ping_prometheus.exe   then rerun this script.
+    exit /b 1
+)
+goto :wait_stop
+:wait_done
 
 copy /y "%EXE_PATH%" "%INSTALLED_EXE%" >nul || (
     echo ERROR: failed to replace "%INSTALLED_EXE%" - service is STOPPED. Restore manually:
@@ -91,8 +100,14 @@ copy /y "%EXE_PATH%" "%INSTALLED_EXE%" >nul || (
 )
 
 echo === Starting updated service ===
-sc.exe start "%SERVICE_NAME%"
-sc.exe query "%SERVICE_NAME%" | findstr /i "STATE"
+sc.exe start "%SERVICE_NAME%" || (
+    echo ERROR: service failed to start after the upgrade - check the event log ^(Event 7000/7038; exit 1069 = service logon failed: a password-bearing account needs password=p via sc config^).
+    exit /b 1
+)
+timeout /t 3 /nobreak >nul
+set "WAIT_RUN_RESUME=finish_upgrade_start"
+goto :wait_running
+:finish_upgrade_start
 echo.
 echo Done. Verify version via metrics: link_ping_build_info{version=...}
 exit /b 0
@@ -121,6 +136,14 @@ goto :wiz_mode
 :wiz_metrics
 set "METRICS_ADDR="
 set /p "METRICS_ADDR=Metrics listen address [%DEF_METRICS%]: "
+REM Validate BEFORE any %VAR% expansion: the emptiness check itself expands
+REM the raw value, and a " in it would abort the batch at parse time.
+call :RejectQuoteAmp METRICS_ADDR
+if errorlevel 1 (
+    echo   ERROR: the address cannot contain a double-quote or ampersand -
+    echo   those characters cannot be delivered safely through quoting below.
+    goto :wiz_metrics
+)
 if "%METRICS_ADDR%"=="" set "METRICS_ADDR=%DEF_METRICS%"
 echo   NOTE: localhost binds are scrape-able only from this machine; use ":2112" to expose remotely (firewall-restrict it).
 
@@ -139,6 +162,13 @@ if /i "%TGT_CHOICE%"=="2" goto :wiz_single
 
 :wiz_targets_file
 set /p "TARGETS_FILE=Path to targets JSON file: "
+REM Validate BEFORE any %VAR% expansion (see the note at :wiz_metrics).
+call :RejectQuoteAmp TARGETS_FILE
+if errorlevel 1 (
+    echo   ERROR: the path cannot contain a double-quote or ampersand -
+    echo   those characters cannot be delivered safely through quoting below.
+    goto :wiz_targets_file
+)
 if "%TARGETS_FILE%"=="" (
     echo   REQUIRED: without a targets file nothing would be probed.
     goto :wiz_targets_file
@@ -156,11 +186,18 @@ goto :wiz_allow_ask
 
 :wiz_single
 set /p "SINGLE_TARGET=Single target address (host:port, e.g. 192.168.1.60:4000): "
+REM Validate BEFORE any %VAR% expansion (see the note at :wiz_metrics).
+call :RejectQuoteAmp SINGLE_TARGET
+if errorlevel 1 (
+    echo   ERROR: the address cannot contain a double-quote or ampersand -
+    echo   those characters cannot be delivered safely through quoting below.
+    goto :wiz_single
+)
 if "%SINGLE_TARGET%"=="" (
     echo   REQUIRED: without a target nothing would be probed.
     goto :wiz_single
 )
-echo %SINGLE_TARGET% | findstr /r /c:":" >nul || (
+echo "%SINGLE_TARGET%" | findstr /r /c:":" >nul || (
     echo   Missing port - use host:port form, e.g. 192.168.1.60:4000.
     goto :wiz_single
 )
@@ -174,6 +211,13 @@ set "ALLOW_LIST="
 echo Client IP allowlist - IPs of probers allowed to send probes TO this node.
 echo Fail-closed: the echo server REFUSES to start without at least one IP.
 set /p "ALLOW_LIST=Comma-separated IPs (REQUIRED): "
+REM Validate BEFORE any %VAR% expansion (see the note at :wiz_metrics).
+call :RejectQuoteAmp ALLOW_LIST
+if errorlevel 1 (
+    echo   ERROR: the allowlist cannot contain a double-quote or ampersand -
+    echo   those characters cannot be delivered safely through quoting below.
+    goto :wiz_allow
+)
 if "%ALLOW_LIST%"=="" (
     echo   REQUIRED: cannot be empty - see error above.
     goto :wiz_allow
@@ -182,22 +226,47 @@ if "%ALLOW_LIST%"=="" (
 :wiz_logdir
 set "LOG_DIR="
 set /p "LOG_DIR=Log directory [%DEF_LOG_DIR%]: "
+REM Validate BEFORE any %VAR% expansion (see the note at :wiz_metrics).
+call :RejectQuoteAmp LOG_DIR
+if errorlevel 1 (
+    echo   ERROR: the path cannot contain a double-quote or ampersand -
+    echo   those characters cannot be delivered safely through quoting below.
+    goto :wiz_logdir
+)
 if "%LOG_DIR%"=="" set "LOG_DIR=%DEF_LOG_DIR%"
+:: Same trailing-backslash rationale as TARGETS_FILE above: "C:\Logs\" would
+:: escape the closing quote in the quoted expansions below (icacls, the
+:: -log-file argument) and swallow the rest of the command line.
+if "%LOG_DIR:~-1%"=="\" set "LOG_DIR=%LOG_DIR:~0,-1%"
 
 :wiz_account
 set "SERVICE_ACCOUNT="
 echo Optional least-privilege service account (Enter = LocalSystem default^).
 set /p "SERVICE_ACCOUNT=e.g. NT AUTHORITY\LocalService or DOMAIN\svc-linkping$ [skip]: "
+REM Validate BEFORE any %VAR% expansion (see the note at :wiz_metrics).
+call :RejectQuoteAmp SERVICE_ACCOUNT
+if errorlevel 1 (
+    echo   ERROR: the account name cannot contain a double-quote or ampersand.
+    goto :wiz_account
+)
+REM Password-bearing accounts are NOT supported by this wizard: sc config obj=
+REM is set without password=, so such a service fails logon (1069) at start -
+REM the start below now reports that failure non-zero.
+REM Passwordless identities (LocalSystem/LocalService/NetworkService/gMSA)
+REM only.
 
 echo.
 echo === Summary ================================================================
 echo   Mode           : %RUN_MODE%
-if not "%TARGETS_FILE%"=="" echo   Targets file   : %TARGETS_FILE%
-if not "%SINGLE_TARGET%"=="" echo   Single target  : %SINGLE_TARGET%
-if not "%ALLOW_LIST%"==""   echo   Allow list     : %ALLOW_LIST%
-echo   Metrics address: %METRICS_ADDR%
-echo   Log directory  : %LOG_DIR%
-if "%SERVICE_ACCOUNT%"=="" (echo   Service account: LocalSystem ^(default^)) else (echo   Service account: %SERVICE_ACCOUNT%)
+REM Every user-derived value is quoted in these echoes: an unquoted expansion
+REM of a value containing & or " would execute or corrupt the line (a path
+REM like C:\R&D\targets.json would run "D\targets.json" as a command).
+if not "%TARGETS_FILE%"=="" echo   Targets file   : "%TARGETS_FILE%"
+if not "%SINGLE_TARGET%"=="" echo   Single target  : "%SINGLE_TARGET%"
+if not "%ALLOW_LIST%"==""   echo   Allow list     : "%ALLOW_LIST%"
+echo   Metrics address: "%METRICS_ADDR%"
+echo   Log directory  : "%LOG_DIR%"
+if "%SERVICE_ACCOUNT%"=="" (echo   Service account: LocalSystem ^(default^)) else (echo   Service account: "%SERVICE_ACCOUNT%")
 echo   Binary         : %INSTALLED_EXE%
 echo ============================================================================
 :wiz_confirm
@@ -235,10 +304,10 @@ icacls "%LOG_DIR%" /inheritance:r /grant "SYSTEM:(OI)(CI)F" "Administrators:(OI)
 :: allowlist written as "10.0.0.1, 10.0.0.2" and paths under Program Files,
 :: and an unquoted space splits the argument list -- Go's flag parser then
 :: stops at the stray token, -svc=install is never seen and this script waits
-:: forever on a foreground agent instead of installing the service. (-mode and
-:: -metrics are left bare: their values are validated literals with no sane
-:: space in them.)
-set "INSTALL_ARGS=-mode=%RUN_MODE% -metrics=%METRICS_ADDR%"
+:: forever on a foreground agent instead of installing the service.
+REM (-mode is a validated literal; -metrics is free-text user input and is
+REM quoted like the other space-capable values.)
+set "INSTALL_ARGS=-mode=%RUN_MODE% -metrics="%METRICS_ADDR%""
 if not "%TARGETS_FILE%"==""  set "INSTALL_ARGS=%INSTALL_ARGS% -targets="%TARGETS_FILE%""
 if not "%SINGLE_TARGET%"=="" set "INSTALL_ARGS=%INSTALL_ARGS% -target="%SINGLE_TARGET%""
 if not "%ALLOW_LIST%"==""    set "INSTALL_ARGS=%INSTALL_ARGS% -allow="%ALLOW_LIST%""
@@ -257,10 +326,22 @@ if errorlevel 1 (
 sc.exe failure "%SERVICE_NAME%" reset= 86400 actions= restart/5000/restart/30000/restart/60000 >nul || echo WARNING: could not set failure actions ^(SCM recovery from install remains active^).
 
 :: Per-service SID lets us ACL resources to NT SERVICE\%SERVICE_NAME% itself
-:: instead of broad groups - least privilege for file access.
-sc.exe sidtype "%SERVICE_NAME%" unrestricted >nul || echo WARNING: could not set service SID type.
+:: instead of broad groups - least privilege for file access. Both steps are
+:: FATAL, not warnings: the log dir grants write ONLY to SYSTEM (LocalSystem
+:: runs), Administrators, and this per-service SID - under LocalService/
+:: NetworkService/gMSA the SID is the account's ONLY write path, and a failed
+:: grant here means the agent's fail-closed log open exits 1 on every start
+:: while the SCM restart ladder loops forever with the install already
+:: reported successful.
+sc.exe sidtype "%SERVICE_NAME%" unrestricted >nul || (
+    echo ERROR: could not set the service SID type - the per-service NT SERVICE SID is this account's only log-dir write path under a non-LocalSystem account.
+    exit /b 1
+)
 
-icacls "%LOG_DIR%" /grant "NT SERVICE\%SERVICE_NAME%:(OI)(CI)M" >nul || echo WARNING: could not grant log-dir write access to the service SID.
+icacls "%LOG_DIR%" /grant "NT SERVICE\%SERVICE_NAME%:(OI)(CI)M" >nul || (
+    echo ERROR: could not grant log-dir write access to the service SID - the agent will fail-closed on its log open and the SCM restart ladder will loop.
+    exit /b 1
+)
 
 :: Optional dedicated account (LocalSystem is the default otherwise).
 if not "%SERVICE_ACCOUNT%"=="" (
@@ -280,16 +361,101 @@ echo.
 echo === Optional credential environment variables (Enter to skip) ===
 set "ENV_KEY=HKLM\SYSTEM\CurrentControlSet\Services\%SERVICE_NAME%\Environment"
 
+:wiz_muser
+set "MUser="
 set /p "MUser=Metrics basic-auth user: "
-if not "%MUser%"=="" reg add "%ENV_KEY%" /v LINK_PING_METRICS_USER /t REG_SZ /d "%MUser%" /f >nul
-
+call :RejectQuoteAmp MUser
+if errorlevel 1 (
+    echo   ERROR: the value cannot contain a double-quote or ampersand -
+    echo   those characters cannot be delivered safely through quoting below.
+    goto :wiz_muser
+)
+if "%MUser%"=="" goto :wiz_mpass
+:wiz_mpass
+set "MPass="
 set /p "MPass=Metrics basic-auth password: "
-if not "%MPass%"=="" reg add "%ENV_KEY%" /v LINK_PING_METRICS_PASS /t REG_SZ /d "%MPass%" /f >nul
-
+call :RejectQuoteAmp MPass
+if errorlevel 1 (
+    echo   ERROR: the value cannot contain a double-quote or ampersand -
+    echo   those characters cannot be delivered safely through quoting below.
+    goto :wiz_mpass
+)
+:: Pair rule mirrors resolveMetricsAuth in main.go: a half-pair (user
+:: without password or the reverse) makes the binary exit at startup and
+:: loops the SCM restart ladder, so refuse it at install time. Redirecting
+:: to :wiz_muser also lets the operator abandon metrics auth entirely:
+:: an empty username followed by an empty password stores neither.
+if "%MUser%"=="" if not "%MPass%"=="" (
+    echo   ERROR: password without a username is a half-pair - the binary
+    echo   requires BOTH metrics credentials or NEITHER. Starting over:
+    echo   press Enter at the username prompt to skip metrics auth.
+    goto :wiz_muser
+)
+if "%MUser%"=="" if "%MPass%"=="" goto :wiz_esecret
+if not "%MPass%"=="" goto :wiz_esecret
+echo   The password is required together with the username. Re-enter both:
+echo   press Enter at the username prompt to skip metrics auth.
+goto :wiz_muser
+:wiz_esecret
+set "ESecret="
 set /p "ESecret=Echo HMAC secret: "
-if not "%ESecret%"=="" reg add "%ENV_KEY%" /v LINK_PING_ECHO_SECRET /t REG_SZ /d "%ESecret%" /f >nul
-
+call :RejectQuoteAmp ESecret
+if errorlevel 1 (
+    echo   ERROR: the value cannot contain a double-quote or ampersand -
+    echo   those characters cannot be delivered safely through quoting below.
+    goto :wiz_esecret
+)
+if "%ESecret%"=="" goto :wiz_esecretold
+call :CheckSecretLength ESecret
+if not errorlevel 1 goto :wiz_esecretold
+REM Block-free error handling: the generation hint below contains parentheses,
+REM which must not sit inside a parenthesized if-block (a ")" at parse time
+REM would close the block early - the same class of hazard as a ")" in a
+REM user-typed password, which is why the ACL step below is also block-free).
+echo   ERROR: the echo HMAC secret must be at least 16 characters - it is
+echo   the key material for HMAC-SHA256 probe authentication, and a short
+echo   value is brute-forceable. Generate one with:
+echo     powershell -NoProfile -Command "-join ((48..57)+(97..122) | Get-Random -Count 32 | %% {[char]$_}^)"
+goto :wiz_esecret
+:wiz_esecretold
+set "ESecretOld="
 set /p "ESecretOld=Echo HMAC secret (previous, for rotation; Enter to skip): "
+call :RejectQuoteAmp ESecretOld
+if errorlevel 1 (
+    echo   ERROR: the value cannot contain a double-quote or ampersand -
+    echo   those characters cannot be delivered safely through quoting below.
+    goto :wiz_esecretold
+)
+if "%ESecretOld%"=="" goto :wiz_creds_done
+:: Rotation pair: the binary rejects a previous secret WITHOUT a current one
+:: (run()'s rotation guard) and the service would crash-loop the restart
+:: ladder, so refuse the half-pair at install time. Re-entering from
+:: :wiz_esecret lets the operator skip rotation entirely with Enter.
+if "%ESecret%"=="" if not "%ESecretOld%"=="" (
+    echo   ERROR: a previous secret without a current one is invalid - the
+    echo   binary's rotation guard refuses it and the service would exit at
+    echo   startup. Re-enter the current secret, or press Enter at both
+    echo   secret prompts to skip HMAC authentication.
+    goto :wiz_esecret
+)
+call :CheckSecretLength ESecretOld
+if errorlevel 1 (
+    echo   ERROR: the previous echo HMAC secret must also be at least 16 characters.
+    goto :wiz_esecretold
+)
+:wiz_creds_done
+:: A trailing backslash in a credential value would escape the closing
+:: quote of the quoted /d argument below at reg.exe's CommandLineToArgvW
+:: parse, silently mangling the stored secret while the install still
+:: reports success. Same rationale as the TARGETS_FILE/LOG_DIR strips
+:: above; a credential has no legitimate trailing backslash.
+if "%MUser:~-1%"=="\" set "MUser=%MUser:~0,-1%"
+if "%MPass:~-1%"=="\" set "MPass=%MPass:~0,-1%"
+if "%ESecret:~-1%"=="\" set "ESecret=%ESecret:~0,-1%"
+if "%ESecretOld:~-1%"=="\" set "ESecretOld=%ESecretOld:~0,-1%"
+if not "%MUser%"=="" reg add "%ENV_KEY%" /v LINK_PING_METRICS_USER /t REG_SZ /d "%MUser%" /f >nul
+if not "%MPass%"=="" reg add "%ENV_KEY%" /v LINK_PING_METRICS_PASS /t REG_SZ /d "%MPass%" /f >nul
+if not "%ESecret%"=="" reg add "%ENV_KEY%" /v LINK_PING_ECHO_SECRET /t REG_SZ /d "%ESecret%" /f >nul
 if not "%ESecretOld%"=="" reg add "%ENV_KEY%" /v LINK_PING_ECHO_SECRET_OLD /t REG_SZ /d "%ESecretOld%" /f >nul
 
 :: Restrict the credential key ------------------------------------------------
@@ -332,11 +498,67 @@ if not "%MUser%"=="" if not "%MPass%"=="" echo WARNING: metrics basic-auth crede
 :: Start and verify -------------------------------------------------------------
 echo.
 echo === Starting service ===
-sc.exe start "%SERVICE_NAME%"
+sc.exe start "%SERVICE_NAME%" || (
+    echo ERROR: service failed to start - check the event log ^(Event 7000/7038; exit 1069 = service logon failed: a password-bearing account needs password=p via sc config^).
+    exit /b 1
+)
 timeout /t 3 /nobreak >nul
-sc.exe query "%SERVICE_NAME%" | findstr /i "STATE"
-
+set "WAIT_RUN_RESUME=finish_fresh_start"
+goto :wait_running
+:finish_fresh_start
 echo.
 echo Done. Event Log source "%SERVICE_NAME%" (Application) carries lifecycle/fatal events.
-echo Logs: %LOG_DIR%\service.log
+echo Logs: "%LOG_DIR%\service.log"
 endlocal
+exit /b 0
+
+:: ============================================================================
+:: Subroutines
+:: ============================================================================
+
+:: RejectQuoteAmp VALUEVAR
+::   Sets errorlevel 1 when the named variable contains a double-quote or an
+::   ampersand. A " breaks every quoted expansion below (summary echoes,
+::   INSTALL_ARGS, reg add /d "..."), silently corrupting the install or the
+::   credential; a bare & executes as a command separator wherever quoting is
+::   lost (an unquoted echo of a path like C:\R&D\x runs "D\x" as a command).
+::   The check itself runs in PowerShell against the process environment so
+::   the raw value is NEVER expanded into a cmd command line - expanding a
+::   value to search it would itself be the injection this guard exists for.
+:wait_running
+:: Bounded RUNNING-state poll (SCM start can sit in START_PENDING well past
+:: 3s on a cold host - a single 3s check would false-fail): up to 30x2s, and
+:: an early STOPPED read reports the start failure immediately. Returns to
+:: the caller's resume label (WAIT_RUN_RESUME) on success; exits /b 1 on
+:: any failure so the operator sees the failed deploy instead of "Done.".
+echo Waiting for service to reach RUNNING state...
+set "WAIT_RUN_COUNT=0"
+:wait_run
+timeout /t 2 /nobreak >nul
+sc.exe query "%SERVICE_NAME%" 2>nul | findstr /i "RUNNING" >nul && goto :wait_run_done
+sc.exe query "%SERVICE_NAME%" 2>nul | findstr /i "STOPPED" >nul && goto :wait_run_fail
+set /a WAIT_RUN_COUNT+=1
+if %WAIT_RUN_COUNT% GEQ 30 goto :wait_run_fail
+goto :wait_run
+:wait_run_fail
+echo ERROR: service did not reach RUNNING within 60s - check the event log and run: sc.exe query %SERVICE_NAME%
+exit /b 1
+:wait_run_done
+sc.exe query "%SERVICE_NAME%" | findstr /i "STATE"
+goto %WAIT_RUN_RESUME%
+
+:RejectQuoteAmp
+REM The regex is written as \x22/\x26 escape sequences: a raw " or & inside
+REM the cmd-quoted -Command region would toggle cmd quoting and turn the &
+REM into a command separator (the exact hazard this guard exists for).
+powershell -NoProfile -Command "if ($env:%~1 -match '\x22|\x26') { exit 1 } else { exit 0 }" >nul 2>&1
+exit /b %errorlevel%
+
+:: CheckSecretLength VALUEVAR
+::   Sets errorlevel 1 when the named variable holds fewer than 16 characters.
+::   The echo HMAC secret is the key material for HMAC-SHA256 probe
+::   authentication; a short value is brute-forceable. PowerShell reads the
+::   value from the environment for the same no-expansion reason as above.
+:CheckSecretLength
+powershell -NoProfile -Command "if ($env:%~1.Length -lt 16) { exit 1 } else { exit 0 }" >nul 2>&1
+exit /b %errorlevel%

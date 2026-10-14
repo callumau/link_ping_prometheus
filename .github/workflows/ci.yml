@@ -29,7 +29,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
-          go-version: "1.27.1"
+          go-version: "1.27.2"
           # No action cache: a poisoned cache is a supply-chain vector,
           # and this project's deps are few enough to fetch per run.
           cache: false
@@ -45,6 +45,52 @@ jobs:
         run: |
           GOOS=windows go vet ./...
           GOOS=windows go build ./...
+
+      # The Ansible playbooks ship to fleet hosts but CI never parsed them, so
+      # a task naming a module that does not exist could sit here unnoticed —
+      # it did: playbook.yml used ansible.windows.win_script, which exists in
+      # no collection, so the Windows play's Environment-key ACL step (the one
+      # that stops every local user reading the HMAC secret) would have failed
+      # at run time. --syntax-check resolves module FQCNs, so the
+      # ansible.windows collection must be installed; ansible-core and the
+      # collection are version-pinned like govulncheck above. Nothing is
+      # contacted and no task runs: this parses the playbooks only.
+      - name: Validate Ansible playbooks
+        run: |
+          python3 -m venv .venv-ansible
+          .venv-ansible/bin/pip -q install 'ansible-core==2.17.6'
+          .venv-ansible/bin/ansible-galaxy collection install \
+            ansible.windows:3.8.0
+          for pb in deploy/ansible/playbook.yml deploy/ansible/mesh.yml; do
+            .venv-ansible/bin/ansible-playbook --syntax-check "$pb"
+          done
+
+      # The mesh config-pull scripts are shipped but never executed in CI, so
+      # they otherwise get zero machine checking. `sh -n` covers the POSIX
+      # script's structure; the PowerShell script is parsed by PowerShell's own
+      # parser below, which reports syntax errors without running a single
+      # statement (it never touches a deploy key or the network).
+      - name: Validate shell script syntax
+        run: sh -n deploy/mesh/pull-config.sh
+
+      - name: Validate PowerShell scripts
+        shell: pwsh
+        run: |
+          $bad = 0
+          $files = Get-ChildItem -Path deploy,installer -Recurse -Filter *.ps1
+          foreach ($s in $files) {
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              $s.FullName, [ref]$null, [ref]$errors)
+            foreach ($e in $errors) {
+              $f = $e.Extent.File
+              $n = $e.Extent.StartLineNumber
+              Write-Host "::error file=$f,line=$n::$($e.Message)"
+              $bad = 1
+            }
+          }
+          if ($bad -eq 0) { Write-Host "PowerShell scripts parsed cleanly" }
+          exit $bad
 
       # PromQL syntax + lint for the shipped rules. The Go suite only checks
       # metric-NAME coupling (TestRulesAndDashboardReferenceOnlyDefinedMetrics)
@@ -102,11 +148,44 @@ jobs:
       # the version in its own commit.
       - name: Govulncheck
         run: |
-          go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+          go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
           govulncheck ./...
 
       - name: Run Tests (race detector)
-        run: go test -race -v ./...
+        # LPP_E2E_LINUX=1 enables the Linux systemd lifecycle e2e
+        # (test/e2e; the runner user has passwordless sudo for systemctl).
+        env:
+          LPP_E2E_LINUX: "1"
+        run: go test -count=1 -race -v ./...
 
       - name: Build
         run: go build -v ./...
+
+  # Native Windows test job — the ubuntu job above only CROSS-compiles the
+  # windows-only files (GOOS=windows vet/build never executes them), so
+  # winsock errno classification, DF socket options and the service lifecycle
+  # previously shipped with zero execution coverage on their own platform.
+  # The generous -timeout is deliberate: the suite is sleep-timed and windows
+  # runners are slower/noisier than a local box (the suite runs ~90-120s
+  # locally, 2-3x under -race, and can take 10-20 min here); the existing
+  # skipIfRTTNearTimeout flake guards absorb runner noise — do NOT add
+  # continue-on-error, which would hide real failures.
+  test-windows:
+    name: Test (windows)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      # Same SHA pins as the ubuntu job (v7.0.1 checkout, v7.0.0 setup-go).
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: "1.27.2"
+          cache: false
+
+      - name: Run Tests (race detector)
+        run: go test -count=1 -race -timeout 30m -v ./...
