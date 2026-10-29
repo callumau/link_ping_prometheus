@@ -1603,6 +1603,10 @@ func runEchoLoop(
 			reconnectInterval = cfg.ReconnectInterval
 		}
 		if reconnectInterval != 0 && time.Since(started) >= reconnectInterval {
+			// Drain first, like the reader-dead and panic exits: an echo that
+			// already reached respCh answered a probe, and charging it as loss
+			// would fabricate wire loss on a healthy link.
+			drainResponses()
 			flushPending()
 			return errReconnect
 		}
