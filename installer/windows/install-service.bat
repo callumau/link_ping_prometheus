@@ -349,6 +349,14 @@ if not "%SERVICE_ACCOUNT%"=="" (
         echo ERROR: failed to set service account "%SERVICE_ACCOUNT%"
         exit /b 1
     )
+    rem The -svc=install run above opened service.log as the INSTALLING account
+    rem and gave it a protected DACL naming that account. Inheritance is off on
+    rem the file, so the log-dir grants above never reach it, and the new service
+    rem account cannot open it: the agent exits 1 at startup and the SCM restart
+    rem ladder loops. Delete it so the service recreates it under its own token
+    rem (the log dir is already writable by SYSTEM, Administrators and the
+    rem per-service SID).
+    del /f /q "%LOG_DIR%\service.log" >nul 2>&1
 )
 
 :: Credential environment variables (optional) ----------------------------------
