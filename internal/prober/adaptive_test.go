@@ -279,3 +279,49 @@ func TestAdaptiveStats_DynamicFloorMayExceedMaxRTO(t *testing.T) {
 		t.Errorf("applied RTO after backoff must still be the 2*SRTT floor (~4s), got %v", got)
 	}
 }
+
+// TestAdaptiveStats_SeedTimeoutIsNotClamped pins the fix for the silent
+// `-timeout` rewrite: under -adaptive (the default) CurrentRTO clamped the
+// seed stored by NewAdaptiveStats to DefaultMaxRTO, so `-timeout 10s` became
+// 3s on the very first tick. On a path whose real RTT exceeds 3s no probe can
+// then ever be answered inside the applied timeout, so SRTT never leaves 0,
+// the RTO never adapts, and the link reads 100% loss for the process lifetime
+// with no warning (the only relevant one fires when Adaptive is off). The
+// operator's configured timeout is the STARTING point and must survive; only
+// BACKOFF is capped.
+func TestAdaptiveStats_SeedTimeoutIsNotClamped(t *testing.T) {
+	stats := NewAdaptiveStats(10 * time.Second)
+	if got := stats.CurrentRTO(); got != 10*time.Second {
+		t.Fatalf("a configured -timeout of 10s must be applied as-is under adaptive, got %v", got)
+	}
+
+	// Backoff may never shrink the applied timeout below the seed either:
+	// a timeout spike must not drop a slow link's timeout under its own
+	// configured value (the ceiling is max(DefaultMaxRTO, seed)).
+	for range 10 {
+		stats.Backoff()
+		if got := stats.CurrentRTO(); got < 10*time.Second {
+			t.Fatalf("backoff on a 10s seed must never drop below 10s, got %v", got)
+		}
+		if got := stats.CurrentRTO(); got > 10*time.Second {
+			t.Fatalf("the 10s seed is also the backoff ceiling, got %v", got)
+		}
+	}
+	if stats.rto != 10.0 {
+		t.Errorf("backoff value must saturate at the seed 10s, got %f", stats.rto)
+	}
+}
+
+// TestAdaptiveStats_BackoffStillClampedAtMaxRTOForAShortSeed: the seed-aware
+// ceiling must not disable the clamp it exists to keep — a sub-DefaultMaxRTO
+// seed still saturates at DefaultMaxRTO under repeated timeouts, so a
+// sustained outage cannot inflate a LAN link's timeout without bound.
+func TestAdaptiveStats_BackoffStillClampedAtMaxRTOForAShortSeed(t *testing.T) {
+	stats := NewAdaptiveStats(time.Second)
+	for range 20 {
+		stats.Backoff()
+	}
+	if got := stats.CurrentRTO(); got != DefaultMaxRTO {
+		t.Errorf("1s seed must still clamp at DefaultMaxRTO %v after backoff, got %v", DefaultMaxRTO, got)
+	}
+}

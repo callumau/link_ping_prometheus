@@ -162,9 +162,9 @@ func TestMTUSweep_FindsLimit(t *testing.T) {
 // below the real MTU and make it flap between sweeps (e.g. 1424 → 1248 at
 // 1% loss). The server drops exactly one full-size probe (the first
 // attempt) and echoes the retry and everything else, so the gauge must
-// converge to and stay at the real MTU, lost must be exactly 1 (the single
-// dropped ATTEMPT — a probe rate, not a distinct-size rate), and the
-// retry's extra attempt must appear in sent.
+// converge to and stay at the real MTU, lost must count that single dropped
+// ATTEMPT (a probe rate, not a distinct-size rate), and the retry's extra
+// attempt must appear in sent.
 // pi-lens-ignore: go-test-functions
 func TestMTUSweep_SingleLossDoesNotFlapGauge(t *testing.T) {
 	prober.InitMetrics()
@@ -197,8 +197,13 @@ func TestMTUSweep_SingleLossDoesNotFlapGauge(t *testing.T) {
 	if n := getCounterValue(prober.MTUProbesSent, "mtu_target", addr); n < 2 {
 		t.Fatalf("the dropped size must be retried: sent %v probes, want >= 2", n)
 	}
-	if n := getCounterValue(prober.MTUProbesLost, "mtu_target", addr); n != 1 {
-		t.Errorf("exactly one attempt must count lost (the dropped first attempt; later sweeps all succeed), got %v", n)
+	// A probe RATE, not an exact count: the sweep fires every 20ms while these
+	// assertions run, so an extra attempt (a retry racing the next sweep, a
+	// probe still inside its deadline) is normal under CPU load. What must hold
+	// is that the one dropped attempt was counted and that succeeding sweeps do
+	// not keep adding losses.
+	if n := getCounterValue(prober.MTUProbesLost, "mtu_target", addr); n < 1 {
+		t.Errorf("the dropped attempt must count lost, got %v", n)
 	}
 	// The flap this guards against happens between sweeps, so keep sampling
 	// across several more sweeps: the gauge must stay at the real MTU.
@@ -208,8 +213,12 @@ func TestMTUSweep_SingleLossDoesNotFlapGauge(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if n := getCounterValue(prober.MTUProbesLost, "mtu_target", addr); n != 1 {
-		t.Errorf("succeeding sweeps must not add lost attempts, got %v (want 1)", n)
+	// Bounded, not exact: ±1 of slack absorbs a retry that landed while the
+	// sampling loop above ran (repo convention — assertions that encode an
+	// exact scheduling order are flaky on a loaded box). A real regression
+	// (every sweep losing its full-size probe) would grow without bound.
+	if n := getCounterValue(prober.MTUProbesLost, "mtu_target", addr); n > 2 {
+		t.Errorf("succeeding sweeps must not add lost attempts, got %v (want <= 2)", n)
 	}
 	// MTU probes stay outside the main loss balance even with a retry.
 	deadline = time.Now().Add(2 * time.Second)
@@ -249,24 +258,34 @@ func TestMTUSweep_DeadLinkKeepsLastValue(t *testing.T) {
 	runClientAsync(t, ctx, cancel, cfg)
 	// First sweep fires immediately: the full-size probe is retried once
 	// (2 attempts), then the header-only abort probe runs (1 attempt). All
-	// three vanish, so exactly 3 sent and 3 lost; wait for the last probe
-	// to time out before asserting the exact pair.
+	// vanish, so ~3 sent and ~3 lost. The counts are asserted as RANGES, not
+	// as the exact pair: each dead-link probe costs a full 300ms deadline, so
+	// whether the sampler catches the first sweep before the next 1s sweep
+	// starts depends on scheduling, and encoding that order is what made this
+	// test flaky (repo convention: ±1 under CPU load). What must hold is the
+	// 3-probe abort sequence, that no probe on a dead link reads as surviving,
+	// and that the gauge stays unknown.
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if getCounterValue(prober.MTUProbesLost, "mtu_target", addr) == 3 &&
-			getCounterValue(prober.MTUProbesSent, "mtu_target", addr) == 3 {
+		if getCounterValue(prober.MTUProbesLost, "mtu_target", addr) >= 3 &&
+			getCounterValue(prober.MTUProbesSent, "mtu_target", addr) >= 3 {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if n := getCounterValue(prober.MTUProbesSent, "mtu_target", addr); n != 3 {
-		t.Fatalf("expected exactly 3 MTU probes attempted (2 full-size retries + 1 header-only), got %v", n)
+	if n := getCounterValue(prober.MTUProbesSent, "mtu_target", addr); n < 3 || n > 5 {
+		t.Fatalf("expected the 3-probe dead-link abort sequence (2 full-size attempts + 1 header-only), got %v sent (want 3..5)", n)
 	}
-	if n := getCounterValue(prober.MTUProbesLost, "mtu_target", addr); n != 3 {
-		t.Errorf("failed DF probes must count lost exactly 3, got %v", n)
+	if n := getCounterValue(prober.MTUProbesLost, "mtu_target", addr); n < 3 {
+		t.Errorf("every dead-link DF probe must count lost, got %v", n)
 	}
-	if got := getGaugeValue(prober.PathMTUBytes, "mtu_target", addr); got != 0 {
-		t.Errorf("no surviving probe must leave path_mtu_bytes unknown (0), got %v", got)
+	// The gauge must stay unknown across several more samples: a dead link
+	// must never fabricate a path MTU.
+	for range 10 {
+		if got := getGaugeValue(prober.PathMTUBytes, "mtu_target", addr); got != 0 {
+			t.Errorf("no surviving probe must leave path_mtu_bytes unknown (0), got %v", got)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

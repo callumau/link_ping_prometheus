@@ -309,7 +309,15 @@ func sweepOnce(ctx context.Context, conn net.Conn, cfg Config, m targetMetrics, 
 	// attempt arriving during the retry still proves survival.
 	waitEcho := func(payload int, seqs ...uint64) bool {
 		if err := readEcho(ctx, conn, buf, headerSize+payload, seqs, sent, cfg.EchoSecret, cfg.HmacCoverage, time.Now().Add(deadline)); err != nil {
-			m.mtuLost.Inc()
+			// A cancelled read is not a lost probe: readEcho deliberately
+			// returns ctx.Err() so the sweep winds down promptly on
+			// reload/shutdown, and counting it here would fabricate a loss
+			// in link_mtu_probes_lost_total on every mid-sweep teardown — the
+			// ratio operators are told to alert on (lost/sent). Only a probe
+			// that genuinely got no echo inside its deadline counts.
+			if ctx.Err() == nil {
+				m.mtuLost.Inc()
+			}
 			return false
 		}
 		return true

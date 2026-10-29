@@ -11,6 +11,7 @@ import (
 	"math"
 	"net"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -152,13 +153,32 @@ func FilterSelfTargets(targets []Target, source string) []Target {
 // The file must be ≤ MaxTargetsFileSize (1 MB) and contain ≤ MaxTargetsCount
 // (1000) entries. Target names must be unique: they are Prometheus label
 // values, and duplicates would produce ambiguous metric series.
+//
+// The same trust checks hardenLogSink applies to the log sink apply here: the
+// targets file steers where probes go (a redirected address turns the monitor
+// into an oracle for another host) and can blank the set outright (the empty
+// array stops all probing). A symlink or a group/world-writable file therefore
+// lets any local user make that decision. Lstat, not Stat: following a symlink
+// is exactly what a local attacker would rely on.
 func LoadTargets(path string) ([]Target, error) {
-	info, err := os.Stat(path)
+	info, err := os.Lstat(path)
 	if err != nil {
 		return nil, fmt.Errorf("read targets file: %w", err)
 	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("refusing symlinked targets file %q: a symlink lets another local user repoint the probes; point -targets at the real file", path)
+	}
 	if info.Mode().IsDir() {
 		return nil, fmt.Errorf("targets path is a directory, not a file")
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0o022 != 0 {
+		// 0644/0604/0620 stay accepted (readable is not the risk — writing
+		// is); group- or world-WRITABLE is not. os.Stat always reports 0666
+		// on Windows, so the perm-bit check is meaningless there (the log
+		// sink's hardenLogSink makes the same exemption and relies on the
+		// file's DACL instead).
+		return nil, fmt.Errorf("targets file %q is group/world-writable (mode %04o): another local user could redirect or blank the probe set; fix with: chmod o-w,g-w %s (0600 is recommended)",
+			path, info.Mode().Perm(), path)
 	}
 	if info.Size() > MaxTargetsFileSize {
 		return nil, fmt.Errorf("targets file too large: %d bytes (max %d)", info.Size(), MaxTargetsFileSize)
@@ -229,6 +249,22 @@ func RunClient(ctx context.Context, cfg Config) error {
 	if effectiveReconnect != 0 && effectiveReconnect < cfg.BaseInterval {
 		slog.Warn("Reconnect interval < probe interval; reconnect will be delayed until next probe",
 			"reconnect_interval", effectiveReconnect, "interval", cfg.BaseInterval)
+	}
+	// Sub-second cadences are warned about, never rejected: -mtu-sweep below 1s
+	// means continuous DF sweeping (a restricted path costs
+	// ~2*log2(MaxPayloadBytes) probes per sweep), and
+	// -targets-reload-interval below 1s re-parses the whole JSON file and logs
+	// an unconditional Info line on every tick. Warn-only on purpose — tests
+	// and embedders set these through Config directly, so rejecting would
+	// break them, and neither is a correctness hazard.
+	if cfg.MTUSweep > 0 && cfg.MTUSweep < time.Second {
+		slog.Warn("MTU sweep interval below 1s; DF sweeping will run continuously",
+			"mtu_sweep", cfg.MTUSweep, "fix", "raise -mtu-sweep (e.g. 5m) unless you are testing")
+	}
+	if cfg.TargetsPath != "" && cfg.ReloadInterval > 0 && cfg.ReloadInterval < time.Second {
+		slog.Warn("Targets reload interval below 1s; the targets file will be re-read and logged every tick",
+			"targets_reload_interval", cfg.ReloadInterval, "path", cfg.TargetsPath,
+			"fix", "raise -targets-reload-interval (e.g. 30s)")
 	}
 	// Per-target interval/timeout warnings (0 means use global, already validated >0 when set).
 	for _, tg := range cfg.Targets {
@@ -507,35 +543,56 @@ func RunClient(ctx context.Context, cfg Config) error {
 	}
 
 	// drainLive waits for every live probe loop to exit, then gives any
-	// straggler one final bounded wait (stragglerStopTimeout). The
-	// per-loop cancels make every loop exit promptly; the bound exists
-	// for the pathological case (a wedged conn.Write with no deadline)
-	// where waiting forever would push the service Stop past the SCM
-	// deadline with no way out. Each probe loop joins its own MTU sweep
-	// before returning, so a sweep cannot outlive this drain by more
-	// than one sliced read arm (mtuReadArm).
+	// straggler one final bounded wait (stragglerStopTimeout). The BOUND on
+	// both joins matters: the per-loop cancels make every loop exit promptly
+	// in the normal case, but a wedged socket op (a UDP write with no
+	// deadline) would otherwise block shutdown forever — SIGTERM ignored, no
+	// log line saying why, until the process is killed. Each probe loop joins
+	// its own MTU sweep before returning, so a sweep cannot outlive this drain
+	// by more than one sliced read arm (mtuReadArm).
+	//
+	// One timer covers both joins: a single shutdown budget is what the
+	// service manager gives us anyway. Names are logged at Warn so a target
+	// that never joined is visible instead of silently abandoned.
+	type joinTarget struct {
+		name string
+		done chan struct{}
+	}
 	drainLive := func() {
-		for _, r := range live {
-			<-r.done
-		}
-		stragglersMu.Lock()
-		dones := make([]chan struct{}, 0, len(stragglers))
-		for _, r := range stragglers {
-			dones = append(dones, r.done)
-		}
-		stragglersMu.Unlock()
-		if len(dones) == 0 {
-			return
-		}
-		t := time.NewTimer(stragglerStopTimeout)
-		defer t.Stop()
-		for _, d := range dones {
-			select {
-			case <-d:
-			case <-t.C:
-				return
+		// Created here, not at RunClient scope: a timer started at startup
+		// would already have fired by drain time and abandon every loop
+		// instantly.
+		budget := time.NewTimer(stragglerStopTimeout)
+		defer budget.Stop()
+		joinBounded := func(kind string, targets []joinTarget) {
+			for i, jt := range targets {
+				select {
+				case <-jt.done:
+				case <-budget.C:
+					stuck := make([]string, 0, len(targets)-i)
+					for _, rest := range targets[i:] {
+						stuck = append(stuck, rest.name)
+					}
+					slog.Warn("Probe loop did not stop within the bound; abandoning it",
+						"loops", kind, "targets", strings.Join(stuck, ","), "timeout", stragglerStopTimeout)
+					return
+				}
 			}
 		}
+
+		liveJoins := make([]joinTarget, 0, len(live))
+		for name, r := range live {
+			liveJoins = append(liveJoins, joinTarget{name: name, done: r.done})
+		}
+		joinBounded("live", liveJoins)
+
+		stragglersMu.Lock()
+		stragglerJoins := make([]joinTarget, 0, len(stragglers))
+		for name, r := range stragglers {
+			stragglerJoins = append(stragglerJoins, joinTarget{name: name, done: r.done})
+		}
+		stragglersMu.Unlock()
+		joinBounded("straggler", stragglerJoins)
 	}
 
 	// stragglerWarn re-states the stranded-target set at Warn level so a
@@ -998,6 +1055,48 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 	}
 }
 
+// rttSeconds computes one RTT sample from a matched send/receive pair, and
+// reports ok=false when the instants are out of order. A negative sample must
+// never be published: link_rtt_seconds_sum is a Prometheus sum, so observing
+// one DECREASES it (rate() reads negative), and AdaptiveStats feeds the value
+// into SRTT/RTTVAR, collapsing the RTO floor to its minimum and fabricating
+// loss on a link that answered. Both instants come from time.Now() and
+// therefore carry the monotonic reading, so time.Time.Sub is immune to a wall
+// clock step — the UnixNano subtraction this replaces was not. QPC wins when
+// both sides carry a counter reading: Go's time.Now() is interrupt-time
+// quantized on Windows (sub-quantum RTTs compute as exactly 0 there, pinning
+// SRTT to 0 and the RTO to its floor), while the counter pair restores ~100ns
+// fidelity.
+func rttSeconds(sentAt, recvAt time.Time, sentQPC, recvQPC uint64) (float64, bool) {
+	if sentQPC != 0 && recvQPC != 0 && recvQPC >= sentQPC {
+		return qpcSeconds(recvQPC - sentQPC), true
+	}
+	delta := recvAt.Sub(sentAt)
+	if delta < 0 {
+		return 0, false
+	}
+	return delta.Seconds(), true
+}
+
+// probeExpired reports whether an in-flight probe has used up its timeout.
+// A sentAt in the FUTURE counts as EXPIRED, deliberately: that is exactly the
+// state a backwards clock step (VM snapshot restore, chrony/NTP step, manual
+// `date`) leaves behind, and a plain now.Sub(sentAt) > timeout test would then
+// never retire those entries. They would accumulate until maxPendingWindow
+// throttled every send — nothing probed while link_up stayed 1, the worst
+// failure mode for a monitor. Retiring them goes through the normal sweep
+// path, a legitimate pending exit (timed_out + inflight), so the
+// sent = rtt + timed_out + inflight balance is unaffected. The comparison is
+// strictly greater: a probe exactly at its timeout is retired by the next
+// tick, which is the documented loss deadline (the first probe tick AFTER the
+// RTO expires).
+func probeExpired(now, sentAt time.Time, timeout time.Duration) bool {
+	if now.Before(sentAt) {
+		return true
+	}
+	return now.Sub(sentAt) > timeout
+}
+
 // runEchoLoop is the core UDP probe loop for a single target.
 //
 // At each interval it:
@@ -1033,15 +1132,16 @@ func runEchoLoop(
 	type response struct {
 		seq uint64
 		ts  uint64
-		// recv is the receive time as UnixNano: int64 keeps the buffered
-		// entry compact, and respCh is sized to maxPendingWindow (1000)
-		// under -adaptive - at a 1000-target fleet every byte/entry is
-		// ~8KB of steady-state heap. Callers convert back with
-		// time.Unix(0, ...). recvQPC is the same instant on the
-		// high-resolution Windows counter (0 when unavailable); the wall
-		// clock alone is interrupt-time quantized there, which computed
-		// sub-quantum RTTs as exactly 0.
-		recv      int64
+		// recvAt is the receive instant as a time.Time, NOT UnixNano: the
+		// monotonic reading it carries is what makes the RTT subtraction
+		// immune to a wall-clock step (a `date`/NTP jump or a VM snapshot
+		// restore while a probe is in flight produced a NEGATIVE sample —
+		// link_rtt_seconds_sum went backwards and AdaptiveStats went
+		// negative, collapsing the RTO floor).
+		recvAt time.Time
+		// recvQPC is the same instant on the high-resolution Windows counter
+		// (0 when unavailable); the wall clock alone is interrupt-time
+		// quantized there, which computed sub-quantum RTTs as exactly 0.
 		recvQPC   uint64
 		corrupted bool
 	}
@@ -1167,6 +1267,13 @@ func runEchoLoop(
 				continue
 			}
 			readFails = 0
+			// Stamp the receive instant BEFORE any validation: the size,
+			// magic and (with -echo-secret) full-frame HMAC gates cost 1-3us
+			// of SHA-256, which is material on LAN RTTs and would bias every
+			// sample by that amount. Everything after this line is our own
+			// filtering, not time on the wire.
+			recvAt := time.Now()
+			recvQPC, _ := qpcNow()
 			if n != expectedSize {
 				continue
 			}
@@ -1197,9 +1304,7 @@ func runEchoLoop(
 					continue
 				}
 			}
-			recvNS := time.Now().UnixNano()
-			recvQPC, _ := qpcNow()
-			resp := response{seq: seq, ts: ts, recv: recvNS, recvQPC: recvQPC}
+			resp := response{seq: seq, ts: ts, recvAt: recvAt, recvQPC: recvQPC}
 			if cfg.Payload > 0 {
 				// Validate the echoed payload byte-for-byte against the
 				// pattern regenerated from the frame's own seq/ts.
@@ -1260,9 +1365,12 @@ func runEchoLoop(
 	started := time.Now()
 
 	// sentStamp carries the send-time markers for one in-flight probe:
-	// sentNS for the wire-timestamp echo check and coarse /status ages,
-	// qpc for the RTT delta when the high-resolution clock is available.
+	// sentAt is the instant the RTT and the timeout sweep use (it carries the
+	// monotonic reading, so a wall-clock step cannot move it), sentNS is the
+	// wire timestamp the echo must byte-equal, and qpc is the same instant on
+	// the Windows high-resolution counter.
 	type sentStamp struct {
+		sentAt time.Time
 		sentNS int64
 		qpc    uint64
 	}
@@ -1305,20 +1413,26 @@ func runEchoLoop(
 						m.linkUp.Set(1)
 						state.linkUp = true
 					}
-					state.lastEcho = time.Unix(0, resp.recv)
+					state.lastEcho = resp.recvAt
 					continue
 				}
 
-				// RTT basis: prefer the high-resolution counter pair (send/recv q
-				// pc stamps) and fall back to the wall clock. Go's time.Now() on
-				// Windows is interrupt-time quantized (sub-quantum RTTs compute 0),
-				// which pinned SRTT to 0 and RTO to its floor for loopback/LAN-class
-				// links there; the counter pair restores ~100ns fidelity.
-				var rttSec float64
-				if st.qpc != 0 && resp.recvQPC != 0 {
-					rttSec = qpcSeconds(resp.recvQPC - st.qpc)
-				} else {
-					rttSec = float64(resp.recv-st.sentNS) / 1e9
+				// RTT basis: the monotonic delta between the two instants (with the
+				// Windows counter pair preferred), never a subtraction of bare
+				// UnixNano values — that stripped the monotonic reading, so a
+				// wall-clock step while a probe was in flight produced a negative
+				// sample: link_rtt_seconds_sum decreased and AdaptiveStats went
+				// negative, collapsing the RTO floor.
+				rttSec, measurable := rttSeconds(st.sentAt, resp.recvAt, st.qpc, resp.recvQPC)
+				if !measurable {
+					// The echo claims to predate its own send (a clock step or a
+					// mismatched clock pair). Publishing the negative delta would
+					// corrupt the histogram sum and the estimator, so publish 0
+					// instead: the probe WAS answered, so charging it as loss
+					// would fabricate wire loss, and skipping the observation
+					// would break the sent = rtt_count + timed_out + inflight
+					// balance (link_rtt_seconds_count is the rtt bucket).
+					rttSec = 0
 				}
 
 				// With a fixed (non-adaptive) timeout, a true RTT above the
@@ -1368,7 +1482,7 @@ func runEchoLoop(
 					m.linkUp.Set(1)
 					state.linkUp = true
 				}
-				state.lastEcho = time.Unix(0, resp.recv)
+				state.lastEcho = resp.recvAt
 			default:
 				return
 			}
@@ -1549,11 +1663,11 @@ func runEchoLoop(
 
 		drainResponses()
 
-		nowNS := time.Now().UnixNano()
+		now := time.Now()
 		var timeoutOccurred bool
 		if len(pending) > 0 {
 			for s, st := range pending {
-				if nowNS-st.sentNS > timeout.Nanoseconds() {
+				if probeExpired(now, st.sentAt, timeout) {
 					m.timedOut.Inc()
 					m.inflight.Dec()
 					delete(pending, s)
@@ -1645,7 +1759,10 @@ func runEchoLoop(
 		// Capture the send time here, NOT the `now` used for the timeout
 		// sweep: that timestamp predates the response drain, so using it as
 		// sentTime would inflate every RTT by the tick's drain/sweep cost.
-		sendNS := time.Now().UnixNano()
+		// sentAt carries the monotonic reading (RTT + sweep math); sentNS is
+		// the wire nonce the echo must byte-equal.
+		sentAt := time.Now()
+		sendNS := sentAt.UnixNano()
 		sendQPC, _ := qpcNow()
 		seq := state.seq + 1
 		copy(buf[0:8], MagicBytes)
@@ -1677,6 +1794,12 @@ func runEchoLoop(
 		// successful write means a failed or panicking write can never
 		// orphan a gauge increment (every pending entry has exactly one
 		// matching inflight unit, so any exit-path flush balances).
+		// The write is deadline-bounded like the MTU sweep's probes (mtu.go):
+		// a UDP write can block when the local send buffer is saturated, and a
+		// wedged write would otherwise hang this loop — and therefore
+		// shutdown/reload — with no way out but SIGKILL.
+		// pi-lens-ignore: go-ignored-call-result
+		_ = conn.SetWriteDeadline(time.Now().Add(timeout))
 		if _, err := conn.Write(buf); err != nil {
 			writeFails++
 			m.sendErr.Inc()
@@ -1711,7 +1834,7 @@ func runEchoLoop(
 		warnedThrottle = false
 		state.seq = seq
 
-		pending[state.seq] = sentStamp{sentNS: sendNS, qpc: sendQPC}
+		pending[state.seq] = sentStamp{sentAt: sentAt, sentNS: sendNS, qpc: sendQPC}
 		m.inflight.Inc()
 		m.sent.Inc()
 	}

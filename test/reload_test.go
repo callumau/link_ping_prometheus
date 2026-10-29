@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -477,5 +478,218 @@ func TestReload_EmptyArrayStopsProbingAndPurges(t *testing.T) {
 	}
 	if got := capture.count("ALL probing stopped"); got != 1 {
 		t.Errorf("empty-array reload must warn exactly once that all probing stopped, got %d", got)
+	}
+}
+
+// TestRunClient_ReloadRejectsUnboundedWindow pins the reload-path
+// in-flight-window check (client.go's validatePendingWindow call inside
+// reload): a hand-edited targets file must not be able to introduce the
+// unbounded pending window Config.Validate rejects at startup. A per-target
+// interval of 1ms with a 2s timeout is a ~2000-deep window (> the 1000 cap),
+// so every tick would sweep 2000 map entries per target and peg a core.
+// The REJECTION must be loud and non-destructive: previous targets keep
+// probing, and the operator gets an Error naming the reason — a silently
+// accepted file is the failure mode (nothing to grep for, a pegged core).
+func TestRunClient_ReloadRejectsUnboundedWindow(t *testing.T) {
+	prober.InitMetrics()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// The capture must be installed before RunClient launches: the reload
+	// runs in the client goroutine.
+	capture := &logCapture{}
+	old := slog.Default()
+	slog.SetDefault(slog.New(capture))
+	defer slog.SetDefault(old)
+
+	var received atomic.Int64
+	addr := udpEcho(t, ctx, func(buf []byte, w func([]byte)) {
+		received.Add(1)
+		w(buf)
+	})
+
+	targetsFile := filepath.Join(t.TempDir(), "targets.json")
+	if err := os.WriteFile(targetsFile, []byte(`[{"name":"window_bomb","address":"`+addr+
+		`","interval":"1ms","timeout":"2s"}]`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	reg := prober.NewStatusRegistry()
+	hup := make(chan os.Signal, 1)
+	cfg := prober.Config{
+		Source:       testSource,
+		Targets:      []prober.Target{{Name: "window_keep", Address: addr}},
+		BaseInterval: 50 * time.Millisecond,
+		BaseTimeout:  time.Second,
+		TargetsPath:  targetsFile,
+		ReloadSignal: hup,
+		Status:       reg,
+	}
+	runClientAsync(t, ctx, cancel, cfg)
+
+	waitFor := func(cond func() bool, what string) {
+		t.Helper()
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if cond() {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		t.Fatalf("timeout waiting for: %s", what)
+	}
+	waitFor(func() bool { return getCounterValue(prober.ProbesSent, "window_keep", addr) >= 3 }, "initial target probed")
+
+	hup <- os.Interrupt
+	waitFor(func() bool { return capture.count("in-flight window too large") >= 1 }, "reload rejected for an unbounded window")
+
+	// The rejected set must not have started: no series (checked without
+	// touching the vec, which would re-create one) and no /status row.
+	if metricSeriesExists(t, "link_probes_sent_total", testSource, "window_bomb", addr) {
+		t.Error("a REJECTED reload must not start the offending target")
+	}
+	for _, s := range reg.Snapshot() {
+		if s.Name == "window_bomb" {
+			t.Errorf("a REJECTED reload must not add the offending target to /status: %+v", s)
+		}
+	}
+
+	// The previous set keeps probing: rejection is not a teardown.
+	before := getCounterValue(prober.ProbesSent, "window_keep", addr)
+	waitFor(func() bool { return getCounterValue(prober.ProbesSent, "window_keep", addr) > before+2 },
+		"previous target keeps probing after a rejected reload")
+	if !snapshotHasTarget(reg, "window_keep") {
+		t.Error("the previously running target must stay in /status after a rejected reload")
+	}
+}
+
+// TestRunClient_ReloadDropsSelfTarget pins the SkipSelf branch on the RELOAD
+// path (mesh mode): one targets file lists every site including the local one,
+// and dropping self only at startup would let a reload re-add the local site as
+// a probe target — silently measuring self and exporting a series that is
+// green by construction. Self is matched by exact, case-sensitive name ==
+// cfg.Source (FilterSelfTargets).
+func TestRunClient_ReloadDropsSelfTarget(t *testing.T) {
+	prober.InitMetrics()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	capture := &logCapture{}
+	old := slog.Default()
+	slog.SetDefault(slog.New(capture))
+	defer slog.SetDefault(old)
+
+	addrSelf := udpEcho(t, ctx, func(buf []byte, w func([]byte)) { w(buf) })
+	addrPeer := udpEcho(t, ctx, func(buf []byte, w func([]byte)) { w(buf) })
+
+	// The shared mesh file: this site (name == cfg.Source) plus a peer.
+	targetsFile := filepath.Join(t.TempDir(), "targets.json")
+	content := `[{"name":"` + testSource + `","address":"` + addrSelf + `"},{"name":"mesh_peer","address":"` + addrPeer + `"}]`
+	if err := os.WriteFile(targetsFile, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	reg := prober.NewStatusRegistry()
+	hup := make(chan os.Signal, 1)
+	cfg := prober.Config{
+		Source:       testSource,
+		Targets:      []prober.Target{{Name: "mesh_peer", Address: addrPeer}},
+		BaseInterval: 50 * time.Millisecond,
+		BaseTimeout:  time.Second,
+		TargetsPath:  targetsFile,
+		ReloadSignal: hup,
+		SkipSelf:     true,
+		Status:       reg,
+	}
+	runClientAsync(t, ctx, cancel, cfg)
+
+	waitFor := func(cond func() bool, what string) {
+		t.Helper()
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if cond() {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		t.Fatalf("timeout waiting for: %s", what)
+	}
+	waitFor(func() bool { return getCounterValue(prober.ProbesSent, "mesh_peer", addrPeer) >= 3 }, "peer target probed")
+
+	hup <- os.Interrupt
+	waitFor(func() bool { return capture.count("Skipping self target") >= 1 }, "self target skipped on reload")
+
+	// Non-vacuous: the peer from the SAME file really was applied.
+	if !metricSeriesExists(t, "link_probes_sent_total", testSource, "mesh_peer", addrPeer) {
+		t.Fatal("the reload must still apply the non-self targets from the file")
+	}
+	// The self target must have no series at all (never seeded, never
+	// probed) — non-mutating gather, since WithLabelValues would re-create it.
+	for _, family := range []string{"link_probes_sent_total", "link_up", "link_probes_inflight"} {
+		if metricSeriesExists(t, family, testSource, testSource, addrSelf) {
+			t.Errorf("a reload must not re-add the local site as a probe target (%s series exists)", family)
+		}
+	}
+	for _, s := range reg.Snapshot() {
+		if s.Name == testSource {
+			t.Errorf("self target must not appear in /status after a reload: %+v", s)
+		}
+	}
+
+	// And nothing may actually be probed at the local site.
+	peerBefore := getCounterValue(prober.ProbesSent, "mesh_peer", addrPeer)
+	waitFor(func() bool { return getCounterValue(prober.ProbesSent, "mesh_peer", addrPeer) > peerBefore+2 },
+		"the peer keeps probing (reload applied, self filtered)")
+}
+
+// TestLoadTargets_RefusesUntrustedFiles pins the trust checks on the targets
+// file: it steers where probes go (a repointed address turns the monitor into
+// an oracle for another host) and can blank the set outright (the empty array
+// stops all probing), so a symlink or a group/world-writable file lets any
+// local user make that decision. Readable-by-others is deliberately NOT
+// refused — writing is the risk, and 0644 is the common hand-deployed mode.
+func TestLoadTargets_RefusesUntrustedFiles(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "targets.json")
+	content := `[{"name":"trusted","address":"127.0.0.1:9999"}]`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := prober.LoadTargets(path); err != nil {
+		t.Fatalf("a 0644 targets file must be accepted (only group/world-WRITABLE is refused): %v", err)
+	}
+
+	if runtime.GOOS != "windows" {
+		// os.Stat always reports 0666 on Windows, so its perm bits carry no
+		// information and LoadTargets skips the check there (the same
+		// exemption hardenLogSink makes; the file's DACL is the control).
+		if err := os.Chmod(path, 0o666); err != nil {
+			t.Fatal(err)
+		}
+		_, err := prober.LoadTargets(path)
+		if err == nil {
+			t.Fatal("a group/world-writable targets file must be refused")
+		}
+		if !strings.Contains(err.Error(), "group/world-writable") {
+			t.Errorf("the refusal must name the condition and the fix, got: %v", err)
+		}
+	}
+
+	link := filepath.Join(dir, "targets-link.json")
+	if err := os.Symlink(path, link); err != nil {
+		t.Skipf("cannot create a symlink on this host (%v); the symlink refusal is untested here", err)
+	}
+	_, err := prober.LoadTargets(link)
+	if err == nil {
+		t.Fatal("a symlinked targets file must be refused (Lstat, not Stat)")
+	}
+	if !strings.Contains(err.Error(), "symlink") {
+		t.Errorf("the refusal must name the symlink, got: %v", err)
 	}
 }
