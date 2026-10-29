@@ -126,6 +126,13 @@ $exe = 'C:\Program Files\LinkPing\link_ping_prometheus.exe'
   -svc=install
 ```
 
+`-svc=install` validates the flags before it writes the SCM entry and refuses a
+config the agent would reject at startup (unknown `-mode`, `-echo-secret-old`
+without `-echo-secret`, a metrics auth/TLS pair that is half-set or will not
+load, server/both mode with an empty allowlist), so a failed install is the
+configuration talking, not the SCM. A missing `-targets-reload-interval` is
+only a warning — but on a service that file is then read once and never again.
+
 Two load-bearing warnings:
 
 - `-log-file` is required: stdout is discarded under the SCM. The agent

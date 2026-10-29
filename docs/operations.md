@@ -69,7 +69,11 @@ ratchet Go's heap high-water mark upward, which the runtime does not return
 while the agent is idle.
 
 `-mem-scavenge` (default `5m`, `0` disables) forces a scavenge so the
-high-water mark returns to the OS. It is skipped unless at least 4MB of
+high-water mark returns to the OS. Any other value below `100ms` is refused at
+startup: each tick is a stop-the-world `runtime.ReadMemStats` (plus a
+`debug.FreeOSMemory` above the releasable threshold), and in a process whose
+job is measuring RTT a sub-100ms interval turns the latency it exports into GC
+pauses. It is skipped unless at least 4MB of
 *releasable* heap is held (`HEAP_IDLE - HEAP_RELEASED`) — not total process
 memory — so an already-lean process pays nothing.
 

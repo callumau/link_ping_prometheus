@@ -9,8 +9,22 @@ flags are recorded at install time, except `-svc`, `-metrics-user`,
 is printed at install time).
 
 ```sh
-link_ping_prometheus.exe -mode=both -targets=targets.json -allow=192.0.2.11 -metrics=":2112" -log-file="C:\ProgramData\link_ping_prometheus\logs\service.log" -svc=install
+link_ping_prometheus.exe -mode=both -targets=targets.json -targets-reload-interval=30s -allow=192.0.2.11 -metrics=":2112" -log-file="C:\ProgramData\link_ping_prometheus\logs\service.log" -svc=install
 ```
+
+`-svc=install` validates the configuration before it writes the SCM entry, with
+the same checks a foreground run applies: an unknown `-mode`,
+`-echo-secret-old` without `-echo-secret`, half of the metrics auth or TLS
+pair, a TLS pair that will not load, or server/both mode with an empty
+allowlist fails the install and installs nothing. Those flags are replayed on
+every start, so an install that merely froze a broken command line used to
+succeed and then exit 1 on every start — a clean-looking install followed by an
+SCM restart every 5 seconds with no log to explain it.
+
+`-targets` without `-targets-reload-interval` installs with a warning: a
+service has no SIGHUP, so the file is read once at start and never re-read for
+the life of the process, and a peer edit stays invisible until someone restarts
+the service. Pass `-targets-reload-interval` (e.g. `30s`, as above).
 
 ## Built-in hardening (set at install)
 

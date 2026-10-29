@@ -110,7 +110,9 @@ at 3s; values beyond land in `+Inf`, which normally takes an echo outliving its
 own RTO by up to one probe interval.
 
 Two configurations make it routine: an SRTT above 1.5s (the applied timeout
-floors at 2×SRTT, above the 3s cap, on purpose) and a fixed `-timeout` above 3s.
+floors at 2×SRTT, above the 3s cap, on purpose) and `-timeout` above 3s — the
+configured seed raises the RTO ceiling, so it is honoured with the default
+`-adaptive` as well as with `-adaptive=false`.
 The native histogram (bucket factor 1.1) carries fine-grained data that
 Prometheus aggregates transparently when native-histogram support is enabled.
 

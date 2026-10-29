@@ -75,8 +75,36 @@
     flags are visible in `ps`.
   - Basic Auth without TLS sends credentials as base64 and logs a warning; use
     `-metrics-tls-cert` / `-metrics-tls-key` for HTTPS.
-- Mode-mismatched flags log a startup warning: server-only flags
-  (`-allow`, `-listen`, `-echo-secret-old`) in client mode, and
-  `-targets`/`-target` together (`-targets` wins).
+  - A metrics listener bound to a non-loopback address with no Basic auth logs
+    a startup warning: `/metrics` and `/status` publish the probe topology,
+    peer IPs and per-link RTT/loss, i.e. the network map itself, to anyone who
+    can reach the port. Bind `127.0.0.1`, or set `-metrics-user` /
+    `-metrics-pass` with `-metrics-tls-cert`/`-metrics-tls-key` (or
+    `-metrics-allow-insecure` to accept plaintext auth), or firewall the port
+    to the monitoring hosts. The warning is the entire control — the bind is
+    deliberately not refused, because a wildcard metrics port behind a
+    scraping-only firewall is a legitimate deployment.
+- `-svc=install` validates the configuration *before* it writes the SCM entry,
+  through the same checks `run()` applies: an unknown `-mode`,
+  `-echo-secret-old` without `-echo-secret`, half of the metrics auth or TLS
+  pair, an unloadable TLS pair, or server/both mode with an empty allowlist
+  exits non-zero and installs nothing. Those flags are replayed on every
+  service start, so freezing a rejected config would have meant a clean
+  install followed by an exit 1 every 5 seconds out of the SCM restart ladder,
+  with no log to say why when `-log-file` was unset.
+- `-targets` is trusted configuration, not inert data: the file steers where
+  probes go (a redirected address makes the monitor an oracle for another
+  host) and can blank the set outright (an empty array stops all probing).
+  `LoadTargets` therefore refuses a symlink — no follow, since following one
+  is exactly what a local attacker relies on — and a group/world-**writable**
+  file (`chmod o-w,g-w`; `0600` recommended, while `0644` stays accepted
+  because reading is not the risk, writing is). On Windows `Perm()` always
+  reports `0666`, so only the symlink check applies and the file's DACL is the
+  control.
+- Mode-mismatched flags log a startup warning: server-only flags (`-allow`,
+  `-allow-from-targets`, `-listen`, `-echo-secret-old`) in client mode,
+  client-probing flags (`-target`, `-targets`, `-interval`, `-timeout`, …) in
+  server-only mode — which is the DEFAULT, so a flag set and not honoured is
+  never silent — and `-targets`/`-target` together (`-targets` wins).
 - The wire protocol carries no sensitive data (sequence numbers and timestamps
   only) and has no TLS; firewall untrusted networks.

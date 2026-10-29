@@ -86,7 +86,7 @@ link_ping_prometheus -mode=<mode> [flags]
 | `-metrics-tls-key` | `""` | TLS private key file for `/metrics` (requires `-metrics-tls-cert`) |
 | `-metrics-allow-insecure` | `false` | Allow Basic Auth without TLS; plaintext auth is otherwise rejected |
 | `-metrics-gzip` | `false` | Gzip-compress `/metrics` when the scraper offers it |
-| `-mem-scavenge` | `5m` | Force a heap scavenge at this interval so unused heap returns to the OS (`0` disables) |
+| `-mem-scavenge` | `5m` | Force a heap scavenge at this interval so unused heap returns to the OS (`0` disables; `100ms` minimum) |
 | `-json-logs` | `false` | Log in JSON format |
 | `-log-file` | `""` | Append logs to this file too (required under the Windows service) |
 | `-log-file-max-mb` | `10` | Max log size in MB before rotation (`0` disables) |
@@ -99,6 +99,11 @@ link_ping_prometheus -mode=<mode> [flags]
 
 More detail:
 
+- `-mode` defaults to `server`, and a server only echoes: no target is loaded,
+  no `link_up` series is exported and `/readyz` answers 200 regardless. An
+  agent started with client-probing flags (`-target`, `-targets`, `-interval`,
+  `-timeout`, …) and no `-mode` logs one warning naming the flags it dropped —
+  a monitor that reads healthy while measuring nothing.
 - `-allow-from-targets`: one shared targets file serves a whole mesh:
   adding or renumbering a site is a one-line edit picked up by reload. Every
   address must be an IP literal, because config load never resolves; combines
@@ -122,7 +127,10 @@ More detail:
   `ps`.
 - `-metrics-gzip`: off by default: promhttp pools one gzip writer per CPU
   holding ~0.7MB of flate state — up to ~0.7MB x `GOMAXPROCS`.
-- `-mem-scavenge`: skipped unless at least 4MB of releasable heap is held
+- `-mem-scavenge`: below `100ms` is refused (exit 1), because every tick is a
+  stop-the-world `runtime.ReadMemStats` (plus a `debug.FreeOSMemory` once the
+  releasable threshold is met) in a process whose job is measuring RTT. Also
+  skipped unless at least 4MB of releasable heap is held
   (`HEAP_IDLE - HEAP_RELEASED`). Runtime tuning, including the 128MiB
   `GOMEMLIMIT` default, is in
   [operations and tuning](docs/operations.md#memory-and-runtime-tuning).
@@ -209,7 +217,7 @@ shortest outage you want to read as 100% loss.
 | `link_server_echo_errors_total` | Counter | Validated probes the server failed to echo (local UDP write error) |
 | `link_server_probes_dropped_total` | Counter | Probes dropped by the server, by `reason` (see Notes) |
 | `link_server_clock_skew_seconds` | Gauge | Last clock skew (server minus client timestamp) for HMAC probes; positive = client behind |
-| `link_server_unauth_hmac_frames_total` | Counter | HMAC-shaped frames received by a server with no `-echo-secret` (see Notes) |
+| `link_server_unauth_hmac_frames_total` | Counter | Bare 32-byte HMAC frames received by a server with no `-echo-secret` (see Notes) |
 | `link_metrics_auth_failures_total` | Counter | Rejected Basic auth attempts on `/metrics` and `/status` |
 | `link_ping_build_info` | Gauge | Build version, always 1 |
 
@@ -226,8 +234,10 @@ Notes:
 - A probe is retired at the first tick after its RTO: with `-interval` <=
   `-timeout` an echo up to one interval late counts as latency, not loss.
 - Samples above the 3s bucket edge land in `+Inf` whenever the applied RTO or
-  a fixed `-timeout` exceeds 3s, or an echo runs up to one interval late. The
-  cap bounds the backoff, not the floor.
+  `-timeout` exceeds 3s, or an echo runs up to one interval late. The 3s cap
+  bounds backoff growth, never the floor and never the configured seed:
+  `-timeout=10s` is honoured with `-adaptive` on (it raises the ceiling) as
+  well as off.
 - `link_mtu_probes_*` count per attempt (a failed size is retried once), so
   `sent` is a probe rate, not a rate of distinct sizes; never in the loss
   ratio or the balance.
@@ -249,10 +259,13 @@ Notes:
 - CIDR-matched client series are TTL-evicted when idle and restart at 0, so
   `rate()` across the return sees a counter reset. `client_overflow` means
   more CIDR-allowlisted IPs than the 1024-series cap.
-- `link_server_unauth_hmac_frames_total` counts 32-byte frames with or
-  without payload; a secret-less 24-byte header plus 8 bytes of payload has
-  the same shape. They are echoed either way, so it is the only signal of a
-  half-configured pairing.
+- `link_server_unauth_hmac_frames_total` counts only the bare 32-byte frame:
+  a secret-less 24-byte header plus exactly 8 payload bytes has the same
+  shape, while anything longer is byte-for-byte a legitimate `-payload` probe
+  and is deliberately not counted. Such frames are echoed either way, so on a
+  `-payload` deployment the counter (and `LinkMonitorReflectorUnauthenticated`)
+  cannot see a half-configured pairing and the allowlist is the only reflector
+  control — verify both ends by configuration, not by metrics.
 
 ## Prometheus and Grafana
 
