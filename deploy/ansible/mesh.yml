@@ -306,7 +306,7 @@
 
     - name: Install pull script
       ansible.builtin.copy:
-        src: ../../mesh/pull-config.sh
+        src: ../mesh/pull-config.sh
         dest: "{{ link_ping_pull_script }}"
         mode: "0755"
         owner: root
@@ -771,7 +771,7 @@
 
     - name: Install pull script
       ansible.windows.win_copy:
-        src: ../../mesh/pull-config.ps1
+        src: ../mesh/pull-config.ps1
         dest: "{{ link_ping_win_pull_script }}"
       when: link_ping_config_repo | length > 0
 
