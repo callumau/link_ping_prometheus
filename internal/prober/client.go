@@ -616,8 +616,18 @@ func RunClient(ctx context.Context, cfg Config) error {
 	defer stragglerReLog.Stop()
 
 	if cfg.ReloadSignal == nil && (cfg.ReloadInterval <= 0 || cfg.TargetsPath == "") {
-		// No reload path: original behavior — wait for every probe loop;
-		// stragglers get one bounded extra wait (drainLive).
+		// No reload path: block until shutdown, which is the only thing that
+		// ends a probe loop (probeTarget restarts itself on every internal
+		// failure, so a loop's done channel closes only on cancellation).
+		//
+		// Do NOT call drainLive() here: its join is deliberately BOUNDED
+		// (stragglerStopTimeout) so a wedged socket op cannot hang Stop, and
+		// using it as the steady-state wait made a plain client run return
+		// after five seconds — run() then took modeDone, shut the metrics
+		// server down and exited, i.e. every deployment without -targets died
+		// five seconds after start while looking healthy. Wait on ctx
+		// explicitly; the bounded drain belongs to shutdown.
+		<-ctx.Done()
 		drainLive()
 		return nil
 	}
