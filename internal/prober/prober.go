@@ -152,7 +152,19 @@ const maxPendingWindow = 1000
 // window would be unbounded (see maxPendingWindow). The error names the flags
 // so the operator knows what to change: the timeout is what must come down.
 func checkPendingWindow(interval, timeout time.Duration) error {
-	if interval <= 0 || timeout <= maxPendingWindow*interval {
+	// Non-positive values are Config.Validate's business (they fail there with
+	// their own errors); the window check passes them, as it always did.
+	if interval <= 0 || timeout <= 0 {
+		return nil
+	}
+	// Compare by division, never by maxPendingWindow*interval: that product
+	// overflows int64 once interval passes ~106 days (1000 × 292 years of
+	// nanoseconds), and a wrapped product is a nonsense bound — it rejected
+	// absurd-but-flag-supported intervals that were in fact fine. The
+	// quotient/remainder form is exactly equivalent to
+	// "timeout > maxPendingWindow*interval" without the overflow.
+	quotient, remainder := timeout/interval, timeout%interval
+	if quotient < maxPendingWindow || (quotient == maxPendingWindow && remainder == 0) {
 		return nil
 	}
 	return fmt.Errorf("probe timeout %v is more than %d probe intervals (%v): the in-flight window would hold ~%d probes per target, and every probe tick scans all of them; lower -timeout or raise -interval",

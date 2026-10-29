@@ -118,7 +118,7 @@ var (
 	}, []string{"source", "client"})
 	ServerUnauthHMACFrames = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "link_server_unauth_hmac_frames_total",
-		Help: "HMAC-shaped frames (32-byte header, with or without the bounded payload extension) received while this server has NO -echo-secret configured. Such frames are accepted and echoed as ordinary bounded payload probes — acceptance is unchanged — so a half-configured pairing (secret on clients, absent on the server) exports no hmac drop reason and reads healthy; a rising rate means set -echo-secret on BOTH ends. Note: a secret-less probe with a 24-byte header plus exactly 8 bytes of payload has the same shape and is counted too.",
+		Help: "Frames of exactly the bare 32-byte HMAC-header shape (32 bytes, valid magic) received while this server has NO -echo-secret configured — an authenticated client's probe, or a secret-less 24-byte header plus exactly 8 payload bytes. Such frames are accepted and echoed as ordinary bounded payload probes — acceptance is unchanged — so a half-configured pairing (secret on clients, absent on the server) exports no hmac drop reason and reads healthy; a rising rate means set -echo-secret on BOTH ends. Deliberately NOT counted: a 24-byte header plus MORE than 8 payload bytes, indistinguishable from a legitimate -payload probe, so on a -payload deployment this counter cannot see a half-configured fleet and the allowlist is the only reflector control.",
 	}, []string{"source"})
 	MetricsAuthFailures = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "link_metrics_auth_failures_total",

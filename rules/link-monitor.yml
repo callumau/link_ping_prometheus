@@ -314,23 +314,27 @@ groups:
 
       - alert: LinkMonitorReflectorUnauthenticated
         # Purely observational counter: the server WITHOUT -echo-secret
-        # still accepts and echoes HMAC-shaped (32-byte header) frames as
-        # ordinary bounded payload probes — acceptance is unchanged, so
-        # nothing drops, link_up stays 1, and no reason="hmac" drop is
+        # still accepts and echoes an HMAC-authenticated bare 32-byte frame
+        # as an ordinary bounded payload probe — acceptance is unchanged,
+        # so nothing drops, link_up stays 1, and no reason="hmac" drop is
         # ever recorded. This rate is the ONLY signal the half-configured
         # pairing (secret on clients, absent on the server) produces, and
         # while it holds the allowlist is the reflector's only control.
-        # CAVEAT: a secret-less 24-byte header plus an exactly-8-byte
-        # payload probe has the same shape — rule out that payload size
-        # before reconfiguring.
+        # CAVEATS: only the bare 32-byte frame is counted. A secret-less
+        # 24-byte header plus exactly 8 payload bytes has the same shape
+        # (rule out that payload size before reconfiguring), and a
+        # 24-byte header plus any OTHER payload length is deliberately NOT
+        # counted because it is indistinguishable from a legitimate
+        # -payload probe — so on a -payload deployment (payload > 8 bytes)
+        # this alert CANNOT see a half-configured fleet.
         expr: rate(link_server_unauth_hmac_frames_total[5m]) > 0
         for: 5m
         labels:
           severity: warning
         annotations:
           summary: >-
-            HMAC-shaped frames reaching {{ $labels.source }} which runs
-            without -echo-secret
+            Bare 32-byte HMAC-shaped frames reaching {{ $labels.source }}
+            which runs without -echo-secret
           description: >-
             A client is sending HMAC-authenticated (32-byte header) probes
             to this server, but the server runs without -echo-secret: the
@@ -338,7 +342,11 @@ groups:
             as ordinary bounded payload probes. The link reads healthy
             while reflector protection (SEC22) is silently absent — the
             allowlist is then the only control. Set -echo-secret on BOTH
-            ends (see the Wire Protocol section of the README).
+            ends (see the Wire Protocol section of the README). Only the
+            bare 32-byte frame is counted: a secret-less 24-byte header
+            plus exactly 8 payload bytes has the same shape, and any other
+            payload length is not counted at all, so a -payload deployment
+            gets no signal from this alert.
 
       - alert: MetricsAuthFailures
         expr: increase(link_metrics_auth_failures_total[10m]) >= 5

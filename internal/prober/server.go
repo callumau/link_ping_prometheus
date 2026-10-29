@@ -343,18 +343,18 @@ func fnv1a64(h uint64, b []byte) uint64 {
 }
 
 // echoFrameKey derives the loop-guard identity of a frame: FNV-1a over
-// the source IP bytes, source port and the header's seq+ts fields
-// (frame[8:24]). The source address is part of the identity: two clients
-// that happen to send the same seq+ts are independent probes, and only a
-// repeat from the SAME source can be a bounce. Inline FNV keeps the
-// per-datagram path allocation-free.
-func echoFrameKey(ip netip.Addr, port int, frame []byte) uint64 {
+// the source IP bytes and the header's seq+ts fields (frame[8:24]). The
+// source address is part of the identity: two clients that happen to send
+// the same seq+ts are independent probes, and only a repeat from the SAME
+// source can be a bounce. The source PORT is deliberately excluded: one
+// captured authenticated frame replayed at a victim's source IP from a
+// rotating source port would otherwise present a fresh identity per
+// replay, and each replay would spend the victim's per-IP budget until it
+// reads 100% loss (the manufactured-loss path this guard exists to
+// close). Inline FNV keeps the per-datagram path allocation-free.
+func echoFrameKey(ip netip.Addr, frame []byte) uint64 {
 	ipb := ip.As16() // deterministic for both v4 (4-in-6) and v6
-	h := fnv1a64(fnvOffset64, ipb[:])
-	var pb [2]byte
-	binary.LittleEndian.PutUint16(pb[:], uint16(port))
-	h = fnv1a64(h, pb[:])
-	return fnv1a64(h, frame[8:24])
+	return fnv1a64(fnv1a64(fnvOffset64, ipb[:]), frame[8:24])
 }
 
 // RunServer starts a UDP echo responder on addr. served is the
@@ -437,11 +437,12 @@ func RunServer(ctx context.Context, addr string, source string, allowed *Allowli
 // from a non-allowlisted host costs no crypto and no metric work;
 // validation (size, magic, HMAC, replay window) then runs ahead of the
 // per-IP charge, so only frames that actually authenticate can spend a
-// client's per-IP budget, and the dup guard runs after the per-IP charge
-// but before any metric-handle resolution: a frame identical to one
-// recently echoed (same source, seq, timestamp — an echo loop or an
-// in-window replay) is dropped as dup and never allocates a series or a
-// MaxClientSeries slot. Blocks until ctx is cancelled or pc is closed.
+// client's per-IP budget, and the dup guard runs ahead of the per-IP
+// charge but before any metric-handle resolution: a frame identical to
+// one recently echoed (same source, seq, timestamp — an echo loop or an
+// in-window replay) is dropped as dup, never spends a client's per-IP
+// budget, and never allocates a series or a MaxClientSeries slot. Blocks
+// until ctx is cancelled or pc is closed.
 // A recovered panic is returned as an error so callers treat it as a
 // fatal failure, never a clean exit.
 // When echoSecret is non-empty, only HMAC-authenticated datagrams with a
@@ -518,7 +519,14 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 	var curMAC, oldMAC *probeMACer
 	if echoSecret != "" {
 		curMAC = newProbeMACer(echoSecret)
-		if len(echoSecretOld) > 0 {
+		// The EMPTY old secret must be rejected here, not tolerated
+		// downstream: main passes the (usually empty) -echo-secret-old as a
+		// one-element variadic, and a zero-length key is a perfectly valid
+		// HMAC key — newProbeMACer("") would silently install a verifier for
+		// HMAC-SHA256(key ""), so any off-path host could tag its own frames
+		// and get them echoed (reflection, plus the victim's per-IP budget
+		// burned) while the server looks correctly configured.
+		if len(echoSecretOld) > 0 && echoSecretOld[0] != "" {
 			oldMAC = newProbeMACer(echoSecretOld[0])
 		}
 	}
@@ -712,17 +720,20 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 			continue
 		}
 		// Half-configured-HMAC detection, purely observational: a server
-		// WITHOUT a secret accepts an HMAC-shaped frame — the bare 32-byte
-		// header, or 32B + payload, exactly the shapes this no-secret size
-		// gate above (expectedSize = PayloadSize = 24, n in [24, 24+
-		// MaxPayloadBytes]) admits — as an ordinary bounded payload probe and
-		// echoes it. Acceptance is deliberately unchanged, so the drop path
-		// stays silent for this pairing; the counter is what makes the
-		// mismatch (secret on clients, absent here) metric-visible. Note a
-		// secret-less 24-byte header plus an exactly-8-byte payload frame has
-		// the same shape — counted too, an ambiguity this frame size alone
-		// cannot resolve.
-		if echoSecret == "" && n >= PayloadSizeWithHMAC {
+		// WITHOUT a secret accepts an authenticated client's 32-byte frame as
+		// an ordinary bounded payload probe and echoes it. Acceptance is
+		// deliberately unchanged, so the drop path stays silent for this
+		// pairing; this counter is what makes the mismatch (secret on clients,
+		// absent here) metric-visible. Only the BARE 32-byte frame is counted —
+		// the one unambiguous shape. A 32B+payload frame is byte-for-byte a
+		// secret-less 24-byte header plus 8+ payload bytes, i.e. exactly what a
+		// documented -payload deployment sends, so counting it left every such
+		// deployment permanently in LinkMonitorReflectorUnauthenticated; the
+		// price (stated in the Help text and in rules/link-monitor.yml) is that
+		// on a -payload deployment this alert cannot see a half-configured
+		// fleet and the allowlist is the only reflector control. A secret-less
+		// header plus exactly 8 payload bytes stays ambiguous and is counted.
+		if echoSecret == "" && n == PayloadSizeWithHMAC {
 			unauthHMACFrames.Inc()
 		}
 		// Authentication and the replay guard run BEFORE per-client handle
@@ -776,25 +787,28 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 				continue
 			}
 		}
-		// Per-IP budget is charged here, after authentication (or, with no
-		// secret, after size/magic), so only frames that authenticate can
-		// consume the source's allowance.
-		if reason := rl.chargeIP(na); reason != "" {
-			drops.rateIP.Inc()
-			continue
-		}
 		// Echo-loop guard: a frame identical to one recently echoed (same
 		// source, seq, timestamp) is a bounce off another responder (or an
 		// in-window replay), not a live probe — echoing it again would
 		// sustain the loop forever. Legit clients never repeat an identity:
 		// seq increments per successful write, ts is time.Now().UnixNano()
 		// per send, and the MTU sweep regenerates both on every attempt
-		// including its single retry. The check runs after the per-IP charge
-		// and BEFORE handle resolution, so a dup never allocates a series or
-		// a MaxClientSeries slot (and never sets the clock-skew gauge).
-		key := echoFrameKey(na, ua.Port, buf)
+		// including its single retry. The check runs BEFORE the per-IP charge
+		// (a replay must not spend the victim's allowance: one captured frame
+		// replayed at its source IP would otherwise fabricate 100% loss for
+		// the rest of the window) and BEFORE handle resolution, so a dup
+		// never allocates a series or a MaxClientSeries slot either.
+		key := echoFrameKey(na, buf)
 		if _, dup := guard.seen[key]; dup {
 			drops.dup.Inc()
+			continue
+		}
+		// Per-IP budget is charged here, after authentication (or, with no
+		// secret, after size/magic) and after the dup guard, so only frames
+		// that authenticate and are not replays can consume the source's
+		// allowance.
+		if reason := rl.chargeIP(na); reason != "" {
+			drops.rateIP.Inc()
 			continue
 		}
 		// Record the identity IMMEDIATELY on acceptance, before the echo

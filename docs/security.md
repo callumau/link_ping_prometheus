@@ -36,6 +36,25 @@
   and echoes it, so the client reads a healthy link with no `hmac` drop reason
   and no reflector authentication, leaving the allowlist the only control.
   The server warns at startup when the secret is unset.
+  - Observability of that half-configured fleet is now partial. Only the bare
+    32-byte frame increments `link_server_unauth_hmac_frames_total` (the shape
+    `LinkMonitorReflectorUnauthenticated` fires on). A secret-less 24-byte
+    header plus *any* payload has the same shape for every payload length
+    above 8 bytes, indistinguishable from a legitimate `-payload` probe, so it
+    is deliberately not counted: on a `-payload` deployment (payload > 8
+    bytes) that alert cannot see a half-configured fleet at all, and the
+    allowlist is then the only reflector control. Verify both ends by
+    configuration, not by metrics, whenever `-payload` is in use.
+- The wire tag is a deliberate 64-bit truncation of HMAC-SHA256, not a
+  full-length MAC: guessing it costs 2^64 forgery attempts, and only
+  allowlisted sources that survive the pre-authentication global rate charge
+  (10000 packets/s) can spend attempts at all. Raising the tag length would
+  change the frame size and break every deployed peer — do not.
+- `-echo-secret-old` is accepted only alongside a non-empty primary
+  `-echo-secret`. An empty old secret is ignored by the server rather than
+  installed as a verifier: a zero-length HMAC key is a *valid* key, so
+  honouring it would authenticate any frame an off-path attacker tags itself
+  (reflection, plus the victim's per-IP budget burned).
 - Rotate the secret without an outage:
   1. Restart the SERVERS with `-echo-secret=<new>` plus `-echo-secret-old=<old>`
      (or `LINK_PING_ECHO_SECRET` + `LINK_PING_ECHO_SECRET_OLD`), old secret

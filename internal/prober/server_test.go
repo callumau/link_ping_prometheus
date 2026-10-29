@@ -60,9 +60,10 @@ func TestEchoDupGuardRingEviction(t *testing.T) {
 }
 
 // TestEchoFrameKey: the identity must be a pure function of (source IP,
-// source port, seq, ts) and must distinguish every dimension the dup
-// guard relies on — a different source address, port, seq or timestamp
-// is a different probe, and only the exact repeat is a bounce.
+// seq, ts) and must distinguish every dimension the dup guard relies on —
+// a different source address, seq or timestamp is a different probe, and
+// only the exact repeat is a bounce. The source PORT is deliberately NOT
+// part of it: a rotating-port replay must not look like a fresh probe.
 func TestEchoFrameKey(t *testing.T) {
 	ip := netip.MustParseAddr("10.0.0.1")
 	frame := func(seq, ts uint64) []byte {
@@ -73,21 +74,18 @@ func TestEchoFrameKey(t *testing.T) {
 		return f
 	}
 	base := frame(7, uint64(time.Now().UnixNano()))
-	want := echoFrameKey(ip, 5000, base)
+	want := echoFrameKey(ip, base)
 
-	if got := echoFrameKey(ip, 5000, base); got != want {
+	if got := echoFrameKey(ip, base); got != want {
 		t.Error("identity must be deterministic for identical inputs")
 	}
-	if got := echoFrameKey(netip.MustParseAddr("10.0.0.2"), 5000, base); got == want {
+	if got := echoFrameKey(netip.MustParseAddr("10.0.0.2"), base); got == want {
 		t.Error("a different source IP must change the identity")
 	}
-	if got := echoFrameKey(ip, 5001, base); got == want {
-		t.Error("a different source port must change the identity")
-	}
-	if got := echoFrameKey(ip, 5000, frame(8, binary.LittleEndian.Uint64(base[16:24]))); got == want {
+	if got := echoFrameKey(ip, frame(8, binary.LittleEndian.Uint64(base[16:24]))); got == want {
 		t.Error("a different seq must change the identity")
 	}
-	if got := echoFrameKey(ip, 5000, frame(7, binary.LittleEndian.Uint64(base[16:24])+1)); got == want {
+	if got := echoFrameKey(ip, frame(7, binary.LittleEndian.Uint64(base[16:24])+1)); got == want {
 		t.Error("a different timestamp must change the identity")
 	}
 }

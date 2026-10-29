@@ -1828,7 +1828,7 @@ func TestServer_HMACSizeWindowAndDropReasons(t *testing.T) {
 // to seed an infinite echo bounce (each leg spending rate-limit budget),
 // and a source equal to the server's own address self-looped at line
 // rate. The dup guard drops a frame identical to one recently echoed
-// (same source IP+port, seq, timestamp) instead of echoing it again.
+// (same source IP, seq, timestamp) instead of echoing it again.
 // Table rows are sequential and share one server because the guard is
 // stateful, like TestServer_ReplayWindowEdges.
 func TestServer_DupGuardBreaksEchoLoop(t *testing.T) {
@@ -1843,8 +1843,9 @@ func TestServer_DupGuardBreaksEchoLoop(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s1.Close()
-	// Same allowlisted source IP, different port: the guard must key on
-	// the full source address, not just the IP.
+	// Same allowlisted source IP, different port: the identity deliberately
+	// ignores the source port, so one captured frame replayed from rotating
+	// ports (each Dial is a fresh port) is the same identity every time.
 	s2, err := net.Dial("udp", addr)
 	if err != nil {
 		t.Fatal(err)
@@ -1881,10 +1882,11 @@ func TestServer_DupGuardBreaksEchoLoop(t *testing.T) {
 		// Byte-identical re-send from the same socket: an echo-loop seed,
 		// never a live probe — dropped as dup, no echo.
 		{"identical frame from same socket is dropped as dup", s1, seeded, false},
-		// Same seq+ts from a DIFFERENT source socket is an independent
-		// probe: the identity includes the source address, so the guard
-		// must not suppress it.
-		{"same seq+ts from a different source socket echoes", s2, seeded, true},
+		// Same seq+ts from a DIFFERENT source socket is the same identity:
+		// the port is deliberately excluded, or a replay that rotates its
+		// source port would look like a fresh probe and spend the victim
+		// IP's per-IP budget on every attempt.
+		{"same seq+ts from a different source port is a dup", s2, seeded, false},
 		// The guard must not latch: a fresh frame from the dup-dropped
 		// socket is echoed normally.
 		{"fresh frame after dup still echoes", s1, frame(2), true},
@@ -1912,11 +1914,11 @@ func TestServer_DupGuardBreaksEchoLoop(t *testing.T) {
 	}
 
 	// A dup is a rejection, not an arrival: of the four frames above only
-	// the three echoed ones count as received. Reading ServerProbesReceived
+	// the two echoed ones count as received. Reading ServerProbesReceived
 	// before/after covers the whole table (WithLabelValues would re-create
 	// a missing series at 0, so baseline-first keeps this exact).
-	if got := getCounterValue(prober.ServerProbesReceived, "127.0.0.1"); got < 3 {
-		t.Errorf("dup drop must not count the frame as received; want >= 3 received total, got %v", got)
+	if got := getCounterValue(prober.ServerProbesReceived, "127.0.0.1"); got < 2 {
+		t.Errorf("dup drops must not count the frame as received; want >= 2 received total, got %v", got)
 	}
 }
 
@@ -1924,12 +1926,16 @@ func TestServer_DupGuardBreaksEchoLoop(t *testing.T) {
 // observability counter: a server WITHOUT -echo-secret accepts and echoes
 // an HMAC-shaped frame — the bare 32-byte header and the 32B+payload
 // shape alike, exactly as the size gate always did — because acceptance
-// is intentionally unchanged. The frames are counted in
-// link_server_unauth_hmac_frames_total, the only metric signal the
-// half-configured pairing (secret on clients, absent on the server)
-// produces, since the drop path stays silent. A server WITH the secret
-// must leave the counter untouched (its HMAC frames are authenticated,
-// not "unauth HMAC-shaped").
+// is intentionally unchanged. Only the BARE 32-byte frame is counted in
+// link_server_unauth_hmac_frames_total, the one unambiguous shape and the
+// only metric signal the half-configured pairing (secret on clients,
+// absent on the server) produces, since the drop path stays silent. A
+// 32B+payload frame is byte-for-byte a secret-less 24-byte header plus a
+// payload, i.e. what a documented -payload deployment sends, so counting
+// it kept every such deployment permanently alerting; it is deliberately
+// not counted (and the alert's Help/rules text says so). A server WITH
+// the secret must leave the counter untouched (its HMAC frames are
+// authenticated, not "unauth HMAC-shaped").
 func TestServer_UnauthHMACFrameCounter(t *testing.T) {
 	prober.InitMetrics()
 	ctx := t.Context()
@@ -1962,21 +1968,21 @@ func TestServer_UnauthHMACFrameCounter(t *testing.T) {
 		t.Fatalf("bare 32-byte frame must increment link_server_unauth_hmac_frames_total by 1, moved %v", got-before)
 	}
 
-	// 32B + payload shape (32+16 bytes): also echoed whole and counted.
-	withPayload := make([]byte, prober.PayloadSizeWithHMAC+16)
+	// 32B + payload shape (32+8 = 40 bytes): still echoed whole (acceptance
+	// unchanged) but NOT counted — it is indistinguishable from a legitimate
+	// -payload probe (24-byte header + 16 payload bytes).
+	withPayload := make([]byte, prober.PayloadSizeWithHMAC+8)
 	copy(withPayload[0:8], prober.MagicBytes)
 	binary.LittleEndian.PutUint64(withPayload[8:16], 1002)
 	binary.LittleEndian.PutUint64(withPayload[16:24], uint64(time.Now().UnixNano()))
-	// fillPayload over the payload region for realism — the server echoes
-	// it verbatim either way.
 	conn.Write(withPayload)
 	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	n, _ = conn.Read(make([]byte, 1500))
 	if n != len(withPayload) {
-		t.Fatalf("32B+payload HMAC-shaped frame must still be echoed, got %d bytes", n)
+		t.Fatalf("32B+payload frame must still be echoed, got %d bytes", n)
 	}
-	if got := getCounterValue(prober.ServerUnauthHMACFrames); got != before+2 {
-		t.Fatalf("32B+payload frame must increment the counter by 1 (total %v), got %v", before+2, got)
+	if got := getCounterValue(prober.ServerUnauthHMACFrames); got != before+1 {
+		t.Errorf("a 40-byte frame is not the bare 32-byte HMAC shape and must not count, counter moved to %v from %v", got, before+1)
 	}
 
 	// A plain 24-byte probe is not HMAC-shaped: echoed, counter unmoved.
@@ -1990,8 +1996,8 @@ func TestServer_UnauthHMACFrameCounter(t *testing.T) {
 	if n != prober.PayloadSize {
 		t.Fatalf("plain 24-byte probe must still be echoed, got %d bytes", n)
 	}
-	if got := getCounterValue(prober.ServerUnauthHMACFrames); got != before+2 {
-		t.Errorf("24-byte frame is not HMAC-shaped and must not count, counter moved to %v from %v", got, before+2)
+	if got := getCounterValue(prober.ServerUnauthHMACFrames); got != before+1 {
+		t.Errorf("24-byte frame is not HMAC-shaped and must not count, counter moved to %v from %v", got, before+1)
 	}
 
 	// Phase 2: server WITH a secret — its own HMAC frames authenticate, so
@@ -2008,7 +2014,7 @@ func TestServer_UnauthHMACFrameCounter(t *testing.T) {
 	if n, _ := conn2.Read(make([]byte, 1500)); n != prober.PayloadSizeWithHMAC {
 		t.Fatalf("authenticated frame must be echoed at a secret-configured server, got %d bytes", n)
 	}
-	if got := getCounterValue(prober.ServerUnauthHMACFrames); got != before+2 {
-		t.Errorf("authenticated HMAC frames must not increment the counter (want %v, got %v)", before+2, got)
+	if got := getCounterValue(prober.ServerUnauthHMACFrames); got != before+1 {
+		t.Errorf("authenticated HMAC frames must not increment the counter (want %v, got %v)", before+1, got)
 	}
 }
