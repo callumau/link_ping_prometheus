@@ -61,12 +61,21 @@ link_ping_allow: ""
 # Appended verbatim to the CLI args, e.g. "-payload=1400 -mtu-sweep=10m".
 # Multiple flags are fine, but every whitespace-separated token must be one
 # complete -flag=value: a space INSIDE a value silently truncates the flag
-# list, and the playbook assert rejects tokens without a leading '-'.
+# list, and the playbook assert rejects tokens without a leading '-'. It also
+# rejects -mode/-allow/-source/-metrics here: Go keeps the LAST value of a
+# repeated flag, so an override would silently win over the variable that
+# owns it (link_ping_mode / link_ping_allow / link_ping_site /
+# link_ping_metrics_listen).
 link_ping_extra_args: ""
 
 # Secrets - NEVER passed as CLI flags; delivered via the service
 # environment (EnvironmentFile on Linux, SCM Environment registry key on
-# Windows). Set the SAME value on every site. Encrypt with ansible-vault.
+# Windows). Encrypt with ansible-vault.
+# -echo-secret is STRONGLY RECOMMENDED and cannot be generated for you: a
+# mesh without it has ONLY the derived exact-IP allowlist as reflector
+# protection, so anyone who can spoof an allowlisted source can reflect
+# probes 1:1 (echoes are never larger than the probe, so a reflector, not an
+# amplifier). Set the SAME value on every site.
 link_ping_echo_secret: ""
 link_ping_echo_secret_old: ""   # only during a rotation, servers first
 link_ping_metrics_user: ""

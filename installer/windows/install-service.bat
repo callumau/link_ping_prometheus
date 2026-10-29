@@ -294,7 +294,11 @@ echo === Installing %SERVICE_NAME% from "%EXE_PATH%" ===
 
 :: Log directory with restrictive ACLs -----------------------------------------
 if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
-icacls "%LOG_DIR%" /inheritance:r /grant "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" >nul || (
+:: SIDs (*S-1-5-18 = SYSTEM, *S-1-5-32-544 = Administrators), never the
+:: account NAMES: "Administrators" is localized ("Administratoren" on German
+:: Windows) and icacls exits 1332 on an unresolvable name, aborting the
+:: install after the binary was copied.
+icacls "%LOG_DIR%" /inheritance:r /grant "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" >nul || (
     echo ERROR: failed to ACL "%LOG_DIR%"
     exit /b 1
 )
@@ -487,7 +491,9 @@ if not "%ESecretOld%"=="" reg add "%ENV_KEY%" /v LINK_PING_ECHO_SECRET_OLD /t RE
 :: one physical line on purpose - a ^ inside the quoted -Command is a literal
 :: caret, not a line join. An operator can paste the identical snippet to
 :: re-apply or audit the ACL by hand.
-powershell -NoProfile -Command "$k='HKLM:\SYSTEM\CurrentControlSet\Services\%SERVICE_NAME%\Environment'; if (-not (Test-Path $k)) { exit 0 }; $a=Get-Acl $k; $a.SetAccessRuleProtection($true,$false); foreach($n in 'SYSTEM','BUILTIN\Administrators'){ $a.AddAccessRule((New-Object System.Security.AccessControl.RegistrySystemAccessRule($n,'FullControl','ContainerInherit,ObjectInherit','None','Allow'))) }; Set-Acl -Path $k -AclObject $a; Write-Host 'Environment key ACL restricted to SYSTEM + BUILTIN\Administrators.'"
+:: The identities are SIDs (S-1-5-18 = SYSTEM, S-1-5-32-544 = Administrators):
+:: the names are localized on non-English Windows and would not resolve.
+powershell -NoProfile -Command "$k='HKLM:\SYSTEM\CurrentControlSet\Services\%SERVICE_NAME%\Environment'; if (-not (Test-Path $k)) { exit 0 }; $a=Get-Acl $k; $a.SetAccessRuleProtection($true,$false); foreach($n in 'S-1-5-18','S-1-5-32-544'){ $sid=(New-Object System.Security.Principal.SecurityIdentifier($n)); $a.AddAccessRule((New-Object System.Security.AccessControl.RegistrySystemAccessRule($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'))) }; Set-Acl -Path $k -AclObject $a; Write-Host 'Environment key ACL restricted to SYSTEM + BUILTIN\Administrators.'"
 :: Fail loud: a credential-bearing key left world-readable is exactly the
 :: exposure this step removes, so never continue past a failed ACL.
 if errorlevel 1 (

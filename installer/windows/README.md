@@ -129,14 +129,19 @@ snippet is exactly what a GPO-driven equivalent should apply, and it can be
 re-run by hand at any time to re-apply or audit the ACL:
 
 ```powershell
-powershell -NoProfile -Command "$k='HKLM:\SYSTEM\CurrentControlSet\Services\link_ping_prometheus\Environment'; $a=Get-Acl $k; $a.SetAccessRuleProtection($true,$false); foreach($n in 'SYSTEM','BUILTIN\Administrators'){ $a.AddAccessRule((New-Object System.Security.AccessControl.RegistrySystemAccessRule($n,'FullControl','ContainerInherit,ObjectInherit','None','Allow'))) }; Set-Acl -Path $k -AclObject $a"
+powershell -NoProfile -Command "$k='HKLM:\SYSTEM\CurrentControlSet\Services\link_ping_prometheus\Environment'; $a=Get-Acl $k; $a.SetAccessRuleProtection($true,$false); foreach($n in 'S-1-5-18','S-1-5-32-544'){ $sid=(New-Object System.Security.Principal.SecurityIdentifier($n)); $a.AddAccessRule((New-Object System.Security.AccessControl.RegistrySystemAccessRule($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'))) }; Set-Acl -Path $k -AclObject $a"
 ```
 
 `icacls` is the equivalent for sites that standardize on it:
 
 ```bat
-icacls "HKLM\SYSTEM\CurrentControlSet\Services\link_ping_prometheus\Environment" /inheritance:r /grant "SYSTEM:(F)" "Administrators:(F)"
+icacls "HKLM\SYSTEM\CurrentControlSet\Services\link_ping_prometheus\Environment" /inheritance:r /grant "*S-1-5-18:(F)" "*S-1-5-32-544:(F)"
 ```
+
+Both forms name the principals by SID (`S-1-5-18` = SYSTEM, `S-1-5-32-544` =
+Administrators) instead of by account name: the names are localized on
+non-English Windows ("Administratoren" on a German install) and would not
+resolve, so the ACL step would fail on a host that is otherwise fine.
 
 ## Security notes
 

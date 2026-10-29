@@ -201,8 +201,9 @@ or link_rtt_srtt_seconds{source="site04", target="site01"}
 
 `-echo-secret` (env `LINK_PING_ECHO_SECRET`) authenticates the probe with
 HMAC-SHA256 and grows the frame from 24 to 32 bytes. The example lists
-addresses only, so set it on every node. A half-configured pairing **still
-reads healthy**:
+addresses only, so set it on every node. A mesh with no `-echo-secret` has
+**only** the derived exact-IP allowlist as reflector protection, so a secret
+is strongly recommended. A half-configured pairing **still reads healthy**:
 
 - A server without it accepts the client's 32-byte HMAC frame as a payload
   probe and echoes it: the client sees a fine link, no `hmac` drop reason,
@@ -365,6 +366,16 @@ Wants=network-online.target
 Type=oneshot
 EnvironmentFile=/etc/link_ping_pull_config.env
 ExecStart=/usr/local/bin/link_ping_pull_config
+# Stays root (it writes the root-owned targets.json) but sandboxed. The three
+# ReadWritePaths are exactly what the script writes: the published targets
+# directory, /run/lock for its flock file (two ticks must not overlap), and
+# the git scratch checkout the hand-run in step 4 created -- all three must
+# exist before the unit starts, or ProtectSystem=strict leaves them read-only.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/etc/link_ping_prometheus /run/lock /var/lib/link_ping_pull_config
 EOF
 sudo tee /etc/systemd/system/link_ping_pull_config.timer >/dev/null <<'EOF'
 [Unit]
@@ -400,7 +411,7 @@ Copy-Item deploy\mesh\pull-config.ps1 `
 Copy-Item \\deploy\secrets\mesh-config-deploy-key `
   'C:\ProgramData\link_ping_prometheus\pull_config\deploy_key'
 icacls 'C:\ProgramData\link_ping_prometheus\pull_config\deploy_key' `
-  /inheritance:r /grant "SYSTEM:F" "Administrators:F"
+  /inheritance:r /grant "*S-1-5-18:F" "*S-1-5-32-544:F"
 
 # 3. known_hosts (verify the fingerprints first), then run once by hand.
 Copy-Item \\deploy\secrets\github_known_hosts `

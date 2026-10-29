@@ -52,6 +52,11 @@
     link_ping_pull_env: /etc/link_ping_pull_config.env
     link_ping_pull_script: /usr/local/bin/link_ping_pull_config
     link_ping_pull_work: /var/lib/link_ping_pull_config/repo
+    # Every path the pull oneshot legitimately writes, in one string: the
+    # published targets directory, /run/lock for its flock file, and the git
+    # scratch checkout. The generated unit's ReadWritePaths is exactly this.
+    link_ping_pull_rw_paths: >-
+      {{ link_ping_config_dest }} /run/lock {{ link_ping_pull_work | dirname }}
   tasks:
     # Pre-flight guardrail: -metrics is the management plane - /metrics AND
     # /status carry the whole probe topology (target addresses, packet
@@ -126,30 +131,57 @@
           never loads the targets file and cannot derive the allowlist.
         quiet: true
 
-    - name: Reject whitespace that would split the rendered flag list
+    - name: Reject flag values that would corrupt the rendered flag list
       # systemd word-splits the unquoted $OPTIONS expansion, so a space
       # inside a flag value silently truncates the flag list (the stray
       # remainder becomes a positional argument the flag parser ignores).
       # Between-flag spaces are fine; every whitespace-separated token in
       # link_ping_extra_args must therefore be one complete -flag=value.
+      # -source is rendered from link_ping_site_name, so a space in the site
+      # name truncates the flag list the same way.
+      #
+      # link_ping_extra_args is rendered AFTER the templated flags into that
+      # same $OPTIONS string, and Go's flag package keeps the LAST value, so
+      # a -metrics/-mode/-allow/-source token there would silently win over
+      # the variable it is supposed to come from (and over the metrics
+      # expose guardrail above, which only inspects
+      # link_ping_metrics_listen). All four are owned by variables in this
+      # play - -source included, because it is templated from
+      # link_ping_site_name and an override would desync the metric label
+      # from the self-skip and the derived allowlist. (playbook.yml rejects
+      # only three: it templates no -source.)
       vars:
         link_ping_bad_extra_args: >-
           {{ link_ping_extra_args.split()
              | reject('match', '^-\S+$') | list }}
+        link_ping_owned_extra_args: >-
+          {{ link_ping_extra_args.split()
+             | select('match', '^-(metrics|mode|allow|source)=') | list }}
       ansible.builtin.assert:
         that:
           - link_ping_allow is not search('\s')
           - link_ping_metrics_listen is not search('\s')
+          - link_ping_site_name is not search('\s')
           - link_ping_bad_extra_args | length == 0
+          - link_ping_owned_extra_args | length == 0
         fail_msg: >-
           Whitespace inside a flag value splits the rendered command line
           (systemd word-splits the unquoted $OPTIONS expansion), silently
-          truncating the flag list. Offending value(s):
+          truncating the flag list, and a flag templated from a variable
+          that is repeated in link_ping_extra_args is applied twice with
+          the LAST value winning. Offending value(s):
           link_ping_allow='{{ link_ping_allow }}',
           link_ping_metrics_listen='{{ link_ping_metrics_listen }}',
+          link_ping_site_name='{{ link_ping_site_name }}',
           link_ping_extra_args token(s) without a leading '-':
-          {{ link_ping_bad_extra_args }}. Separate multiple allowlist
-          entries with commas, never spaces.
+          {{ link_ping_bad_extra_args }},
+          link_ping_extra_args token(s) overriding a templated flag:
+          {{ link_ping_owned_extra_args }}. Separate multiple allowlist
+          entries with commas, never spaces; set -mode/-allow/-source/
+          -metrics with their own variables (link_ping_mode,
+          link_ping_allow, the inventory link_ping_site,
+          link_ping_metrics_listen); and keep link_ping_site to a
+          space-free name.
         quiet: true
 
     - name: Require this host's site to be in the shared peer list
@@ -192,6 +224,23 @@
           allowlist from it and config load never resolves DNS. Use the
           site's numeric address, or add the hostname's addresses to
           link_ping_allow.
+        quiet: true
+
+    - name: Refuse more mesh peers than the derived allowlist can hold
+      # -allow-from-targets feeds every peer address into the server
+      # allowlist, and ParseAllowlist rejects more than 256 entries - the
+      # binary exits at startup and Restart=on-failure crash-loops the
+      # service every 5s, on every site at once. Fail here instead.
+      ansible.builtin.assert:
+        that: link_ping_mesh_peers | length <= 256
+        fail_msg: >-
+          link_ping_mesh_peers has {{ link_ping_mesh_peers | length }}
+          entries. -allow-from-targets derives one allowlist entry per peer
+          address and the agent refuses more than 256 of them, so it would
+          exit at startup and Restart=on-failure would crash-loop every
+          site in the mesh. Split the fleet into regions (each with its own
+          peer list and firewall rules), or list broad site CIDRs in
+          link_ping_allow and disable link_ping_allow_from_targets.
         quiet: true
 
     - name: Require the pull settings when a config repo is configured
@@ -379,6 +428,19 @@
       when: link_ping_config_repo | length > 0
       notify: Reload link ping config pull
 
+    - name: Create the pull work directory
+      # Parent of the git scratch checkout. Created here so the oneshot unit
+      # below can bind-mount it (ReadWritePaths refuses a path that does not
+      # exist yet) and so the first clone has somewhere to mkdir into once
+      # the unit is sandboxed.
+      ansible.builtin.file:
+        path: "{{ link_ping_pull_work | dirname }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+      when: link_ping_config_repo | length > 0
+
     - name: Install pull oneshot service
       ansible.builtin.copy:
         content: |
@@ -391,6 +453,17 @@
           Type=oneshot
           EnvironmentFile={{ link_ping_pull_env }}
           ExecStart={{ link_ping_pull_script }}
+          # Stays root: it writes the root-owned targets.json and renames it
+          # into place. The sandbox bounds what a compromised pull can touch,
+          # so every path it legitimately writes is granted explicitly: the
+          # live config directory (published targets.json), the git work
+          # tree (link_ping_pull_work, whose parent the play creates), and
+          # /run/lock for the flock file that stops two ticks overlapping.
+          NoNewPrivileges=yes
+          PrivateTmp=yes
+          ProtectSystem=strict
+          ProtectHome=yes
+          ReadWritePaths={{ link_ping_pull_rw_paths }}
         dest: /etc/systemd/system/link_ping_pull_config.service
         mode: "0644"
       when: link_ping_config_repo | length > 0
@@ -537,28 +610,55 @@
           never loads the targets file and cannot derive the allowlist.
         quiet: true
 
-    - name: Reject whitespace that would split the rendered flag list
+    - name: Reject flag values that would corrupt the rendered flag list
       # The Windows service command line is rendered unquoted into one
       # win_shell invocation, so a space inside a flag value silently
       # truncates the flag list (the stray remainder becomes a positional
       # argument the flag parser ignores). Between-flag spaces are fine.
+      # -source is rendered from link_ping_site_name, so a space in the site
+      # name truncates the flag list the same way.
+      #
+      # link_ping_extra_args is rendered AFTER the templated flags into that
+      # same command line, and Go's flag package keeps the LAST value, so a
+      # -metrics/-mode/-allow/-source token there would silently win over
+      # the variable it is supposed to come from (and over the metrics
+      # expose guardrail above, which only inspects
+      # link_ping_metrics_listen). All four are owned by variables in this
+      # play - -source included, because it is templated from
+      # link_ping_site_name and an override would desync the metric label
+      # from the self-skip and the derived allowlist. (playbook.yml rejects
+      # only three: it templates no -source.)
       vars:
         link_ping_bad_extra_args: >-
           {{ link_ping_extra_args.split()
              | reject('match', '^-\S+$') | list }}
+        link_ping_owned_extra_args: >-
+          {{ link_ping_extra_args.split()
+             | select('match', '^-(metrics|mode|allow|source)=') | list }}
       ansible.builtin.assert:
         that:
           - link_ping_allow is not search('\s')
           - link_ping_metrics_listen is not search('\s')
+          - link_ping_site_name is not search('\s')
           - link_ping_bad_extra_args | length == 0
+          - link_ping_owned_extra_args | length == 0
         fail_msg: >-
           Whitespace inside a flag value splits the rendered command line,
-          silently truncating the flag list. Offending value(s):
+          silently truncating the flag list, and a flag templated from a
+          variable that is repeated in link_ping_extra_args is applied
+          twice with the LAST value winning. Offending value(s):
           link_ping_allow='{{ link_ping_allow }}',
           link_ping_metrics_listen='{{ link_ping_metrics_listen }}',
+          link_ping_site_name='{{ link_ping_site_name }}',
           link_ping_extra_args token(s) without a leading '-':
-          {{ link_ping_bad_extra_args }}. Separate multiple allowlist
-          entries with commas, never spaces.
+          {{ link_ping_bad_extra_args }},
+          link_ping_extra_args token(s) overriding a templated flag:
+          {{ link_ping_owned_extra_args }}. Separate multiple allowlist
+          entries with commas, never spaces; set -mode/-allow/-source/
+          -metrics with their own variables (link_ping_mode,
+          link_ping_allow, the inventory link_ping_site,
+          link_ping_metrics_listen); and keep link_ping_site to a
+          space-free name.
         quiet: true
 
     - name: Require this host's site to be in the shared peer list
@@ -591,6 +691,23 @@
           literal: {{ link_ping_mesh_bad_hosts }}. -allow-from-targets
           builds the allowlist from these addresses and config load never
           resolves DNS, so the binary refuses a name at startup.
+        quiet: true
+
+    - name: Refuse more mesh peers than the derived allowlist can hold
+      # -allow-from-targets feeds every peer address into the server
+      # allowlist, and ParseAllowlist rejects more than 256 entries - the
+      # binary exits at startup and the SCM restart ladder crash-loops the
+      # service every 5s, on every site at once. Fail here instead.
+      ansible.builtin.assert:
+        that: link_ping_mesh_peers | length <= 256
+        fail_msg: >-
+          link_ping_mesh_peers has {{ link_ping_mesh_peers | length }}
+          entries. -allow-from-targets derives one allowlist entry per peer
+          address and the agent refuses more than 256 of them, so it would
+          exit at startup and the SCM restart ladder would crash-loop every
+          site in the mesh. Split the fleet into regions (each with its own
+          peer list and firewall rules), or list broad site CIDRs in
+          link_ping_allow and disable link_ping_allow_from_targets.
         quiet: true
 
     - name: Require the pull settings when a config repo is configured
@@ -634,11 +751,13 @@
     - name: Restrict log directory ACLs
       # Same restriction as installer/windows/install-service.bat: drop the
       # inherited ACEs and keep SYSTEM/Administrators. The service runs as
-      # LocalSystem, so no per-service-SID grant is needed.
+      # LocalSystem, so no per-service-SID grant is needed. Principals are
+      # named by SID (*S-1-5-18, *S-1-5-32-544) because the account names are
+      # localized: icacls cannot resolve "Administrators" on a German host.
       ansible.windows.win_shell: >-
         icacls "{{ link_ping_win_log_dir }}"
         /inheritance:r
-        /grant "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F"
+        /grant "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F"
       changed_when: false
 
     - name: Query service state
@@ -725,13 +844,16 @@
           $k = '{{ svc_env_key }}'
           function New-AdminRule($n) {
               $type = 'System.Security.AccessControl.RegistrySystemAccessRule'
-              $argList = @($n, 'FullControl',
+              # SIDs, not names: 'SYSTEM'/'BUILTIN\Administrators' are
+              # localized on non-English Windows and would not resolve.
+              $sid = New-Object System.Security.Principal.SecurityIdentifier($n)
+              $argList = @($sid, 'FullControl',
                            'ContainerInherit,ObjectInherit', 'None', 'Allow')
               New-Object -TypeName $type -ArgumentList $argList
           }
           $a = Get-Acl $k
           $a.SetAccessRuleProtection($true, $false)
-          foreach ($n in 'SYSTEM', 'BUILTIN\Administrators') {
+          foreach ($n in 'S-1-5-18', 'S-1-5-32-544') {
               $a.AddAccessRule((New-AdminRule $n))
           }
           Set-Acl -Path $k -AclObject $a
@@ -769,6 +891,20 @@
         state: directory
       when: link_ping_config_repo | length > 0
 
+    - name: Restrict the pull directory ACLs
+      # The script, its key and known_hosts live here and a SYSTEM task runs
+      # the script from it every few minutes. ProgramData's default ACL lets
+      # Users create objects in a subdirectory it created, i.e. to plant or
+      # replace what SYSTEM executes; the log dir and the deploy key are
+      # already restricted the same way. SIDs, because the account names are
+      # localized.
+      ansible.windows.win_shell: >-
+        icacls "{{ link_ping_win_pull_dir }}"
+        /inheritance:r
+        /grant "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F"
+      when: link_ping_config_repo | length > 0
+      changed_when: false
+
     - name: Install pull script
       ansible.windows.win_copy:
         src: ../mesh/pull-config.ps1
@@ -795,11 +931,13 @@
 
     - name: Restrict the deploy key DACL
       # ssh (and the script) refuse a key any other local principal can
-      # read; drop the inherited ACEs and keep SYSTEM/Administrators.
+      # read; drop the inherited ACEs and keep SYSTEM/Administrators. SIDs
+      # again: the account names are localized and icacls cannot resolve
+      # them on a non-English host.
       ansible.windows.win_shell: >-
         icacls "{{ link_ping_config_key_path_win }}"
         /inheritance:r
-        /grant "SYSTEM:F" "Administrators:F"
+        /grant "*S-1-5-18:F" "*S-1-5-32-544:F"
       when:
         - link_ping_config_repo | length > 0
         - link_ping_config_key_src | length > 0

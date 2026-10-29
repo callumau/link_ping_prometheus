@@ -5,6 +5,11 @@ project_name: link_ping_prometheus
 builds:
   - env:
       - CGO_ENABLED=0
+    # -trimpath as in dev_build.sh: without it the published binaries embed the
+    # builder's absolute paths, so they are not reproducible and leak the build
+    # host's filesystem layout.
+    flags:
+      - -trimpath
     goos:
       - linux
       - windows

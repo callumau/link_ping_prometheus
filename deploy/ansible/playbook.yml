@@ -80,33 +80,54 @@
           deploy/ansible/README.md.
         quiet: true
 
-    - name: Reject whitespace that would split the rendered flag list
+    - name: Reject flag values that would corrupt the rendered flag list
       # systemd word-splits the unquoted $OPTIONS expansion, so a space
       # inside a flag value silently truncates the flag list (the stray
       # remainder becomes a positional argument the flag parser ignores) —
       # the hazard installer/windows/install-service.bat quotes against.
       # Between-flag spaces are fine; every whitespace-separated token in
       # link_ping_extra_args must therefore be one complete -flag=value.
+      #
+      # link_ping_extra_args is rendered AFTER the templated flags into that
+      # same $OPTIONS string, and Go's flag package keeps the LAST value, so
+      # a -metrics/-mode/-allow token there would silently win over the
+      # variable it is supposed to come from (and over the metrics expose
+      # guardrail above, which only inspects link_ping_metrics_listen). Those
+      # three flags are owned by their own variables here. -source is
+      # deliberately NOT rejected in this play: it templates no -source (the
+      # binary defaults it to the hostname), so link_ping_extra_args is the
+      # only way to set a site label. mesh.yml does reject it, because there
+      # -source is templated from link_ping_site_name.
       vars:
         link_ping_bad_extra_args: >-
           {{ link_ping_extra_args.split()
              | reject('match', '^-\S+$') | list }}
+        link_ping_owned_extra_args: >-
+          {{ link_ping_extra_args.split()
+             | select('match', '^-(metrics|mode|allow)=') | list }}
       ansible.builtin.assert:
         that:
           - link_ping_allow is not search('\s')
           - link_ping_metrics_listen is not search('\s')
           - link_ping_bad_extra_args | length == 0
+          - link_ping_owned_extra_args | length == 0
         fail_msg: >-
           Whitespace inside a flag value splits the rendered command line
           (systemd word-splits the unquoted $OPTIONS expansion), silently
-          truncating the flag list. Offending value(s):
+          truncating the flag list, and a flag templated from a variable
+          that is repeated in link_ping_extra_args is applied twice with
+          the LAST value winning. Offending value(s):
           link_ping_allow='{{ link_ping_allow }}',
           link_ping_metrics_listen='{{ link_ping_metrics_listen }}',
           link_ping_extra_args token(s) without a leading '-':
-          {{ link_ping_bad_extra_args }}. Fix in group_vars/all.yml:
+          {{ link_ping_bad_extra_args }},
+          link_ping_extra_args token(s) overriding a templated flag:
+          {{ link_ping_owned_extra_args }}. Fix in group_vars/all.yml:
           separate multiple allowlist entries with commas, never spaces,
-          and keep every -flag=value token in link_ping_extra_args free
-          of spaces. See deploy/ansible/README.md.
+          keep every -flag=value token in link_ping_extra_args free of
+          spaces, and set -mode/-allow/-metrics with their own variables
+          (link_ping_mode, link_ping_allow, link_ping_metrics_listen)
+          instead. See deploy/ansible/README.md.
         quiet: true
 
     - name: Create log directory
@@ -346,11 +367,13 @@
     - name: Restrict log directory ACLs
       # Same restriction as installer/windows/install-service.bat: drop the
       # inherited ACEs and keep SYSTEM/Administrators. The service runs as
-      # LocalSystem, so no per-service-SID grant is needed.
+      # LocalSystem, so no per-service-SID grant is needed. Principals are
+      # named by SID (*S-1-5-18, *S-1-5-32-544) because the account names are
+      # localized: icacls cannot resolve "Administrators" on a German host.
       ansible.windows.win_shell: >-
         icacls "{{ link_ping_win_log_dir }}"
         /inheritance:r
-        /grant "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F"
+        /grant "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F"
       changed_when: false
 
     - name: Query service state
@@ -436,13 +459,16 @@
           $k = '{{ svc_env_key }}'
           function New-AdminRule($n) {
               $type = 'System.Security.AccessControl.RegistrySystemAccessRule'
-              $argList = @($n, 'FullControl',
+              # SIDs, not names: 'SYSTEM'/'BUILTIN\Administrators' are
+              # localized on non-English Windows and would not resolve.
+              $sid = New-Object System.Security.Principal.SecurityIdentifier($n)
+              $argList = @($sid, 'FullControl',
                            'ContainerInherit,ObjectInherit', 'None', 'Allow')
               New-Object -TypeName $type -ArgumentList $argList
           }
           $a = Get-Acl $k
           $a.SetAccessRuleProtection($true, $false)
-          foreach ($n in 'SYSTEM', 'BUILTIN\Administrators') {
+          foreach ($n in 'S-1-5-18', 'S-1-5-32-544') {
               $a.AddAccessRule((New-AdminRule $n))
           }
           Set-Acl -Path $k -AclObject $a

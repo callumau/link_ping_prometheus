@@ -60,10 +60,26 @@ PrivateTmp=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
-RestrictAddressFamilies=AF_INET AF_INET6
+# AF_NETLINK is for IPv6 zone-name resolution only: an -allow/-target address
+# with a %zone (%eth0, %eth0.100) is resolved through net.InterfaceByName,
+# which is an RTM_GETLINK netlink query. Without it every zone-qualified target
+# fails to dial and reads as down. That lookup needs no new privilege (it is
+# reads, not CAP_NET_ADMIN), so the family is safe to allow.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK
+# The agent needs no capabilities at all: the DF bit and DSCP are unprivileged
+# socket options, and the echo port (4000) is unprivileged, so an empty
+# bounding set costs nothing.
+CapabilityBoundingSet=
+PrivateDevices=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
 RestrictSUIDSGID=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
+# 0077: anything the agent creates (its log file) starts private to its user,
+# and the binary's own 0600 enforcement then repairs nothing because there is
+# nothing to repair.
+UMask=0077
 LimitNOFILE=65536
 
 [Install]

@@ -57,7 +57,9 @@ directory, and an optional service account, then shows a summary.
    its own account, wherever `-log-file` points. The installer's ACL'd log
    **directory** is defense-in-depth; the manual recipe remains useful:
 
-   `icacls "<dir>" /inheritance:r /grant "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" "NT SERVICE\link_ping_prometheus:(OI)(CI)M"`
+   `icacls "<dir>" /inheritance:r /grant "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "NT SERVICE\link_ping_prometheus:(OI)(CI)M"`
+   (SIDs, not account names: `Administrators` is localized and icacls cannot
+   resolve it on a non-English host.)
 
    The restriction is re-applied every 5 minutes at runtime, repairing a
    rotation that recreates the live file under a wide directory DACL.

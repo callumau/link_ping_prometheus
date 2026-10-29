@@ -25,7 +25,10 @@ link_ping_allow: ""
 # Multiple flags are fine (the play splits on whitespace between them),
 # but every whitespace-separated token must be one complete
 # -flag=value: a space INSIDE a value silently truncates the flag list,
-# and the playbook assert rejects tokens without a leading '-'.
+# and the playbook assert rejects tokens without a leading '-'. It also
+# rejects -mode/-allow/-metrics here: Go keeps the LAST value of a repeated
+# flag, so an override would silently win over the variable that owns it
+# (use link_ping_mode / link_ping_allow / link_ping_metrics_listen).
 link_ping_extra_args: ""
 
 # Optional targets file (raw JSON content); when set it is written to

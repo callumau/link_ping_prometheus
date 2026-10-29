@@ -216,8 +216,8 @@ shortest outage you want to read as 100% loss.
 Percentiles and loss are not precomputed: `rate()` and `histogram_quantile()`
 derive them over any window (1m, 1h, 24h). `link_rtt_seconds` uses
 explicit buckets `{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 3.0}`
-s plus native histograms (`NativeHistogramBucketFactor` 1.1), alongside the
-library's `promhttp_metric_handler_requests_*` counters.
+seconds plus native histograms (`NativeHistogramBucketFactor` 1.1), alongside
+the library's `promhttp_metric_handler_requests_*` counters.
 
 Notes:
 
