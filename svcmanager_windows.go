@@ -31,8 +31,20 @@ import (
 // OS-neutral).
 type eventlogSinkAdapter struct{ log *eventlog.Log }
 
-func (a eventlogSinkAdapter) Info(msg string)  { a.log.Info(1, msg) }
-func (a eventlogSinkAdapter) Error(msg string) { a.log.Error(1, msg) }
+// Nil-tolerant on purpose: a nil log is the documented degraded mode (an
+// unregistered event-log source must not stop the agent from probing), and the
+// adapter is stored as a NON-nil interface, so a nil check on prg.svc can never
+// catch it.
+func (a eventlogSinkAdapter) Info(msg string) {
+	if a.log != nil {
+		a.log.Info(1, msg)
+	}
+}
+func (a eventlogSinkAdapter) Error(msg string) {
+	if a.log != nil {
+		a.log.Error(1, msg)
+	}
+}
 
 // platformRunService executes -svc=run. Under the SCM it drives the
 // svc.Run state machine; launched from a console (debugging) it falls
@@ -62,7 +74,9 @@ func platformRunService(prg *program) error {
 		// event log being unregistered (the installer registers it).
 		sysLog = nil
 	}
-	prg.svc = eventlogSinkAdapter{log: sysLog}
+	if sysLog != nil {
+		prg.svc = eventlogSinkAdapter{log: sysLog}
+	}
 	return svc.Run(serviceName, &scmRunner{prg: prg})
 }
 
