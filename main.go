@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -51,6 +52,14 @@ var version = "dev"
 // its stop-the-world-adjacent cost. An already-lean process must pay nothing.
 // It is a byte count, not a duration.
 const minScavengeUnreleased = 4 << 20
+
+// minScavengeInterval is the smallest accepted -mem-scavenge interval. Every
+// tick is a stop-the-world runtime.ReadMemStats plus, above the releasable
+// threshold, a debug.FreeOSMemory, in a process whose whole job is measuring
+// RTT — a 1ms interval turns the latency it exports into GC pauses. Rejected at
+// the flag boundary rather than clamped inside startHeapScavenger, so the
+// scavenger loop stays a pure primitive its own test drives directly.
+const minScavengeInterval = 100 * time.Millisecond
 
 // maxConcurrentScrapes bounds simultaneous /metrics gathers. A large fleet's
 // response is ~10-15MB of text and every concurrent scrape builds its own copy,
@@ -84,6 +93,16 @@ func releasableHeap(m runtime.MemStats) uint64 {
 // unreleased idle heap bytes.
 func shouldScavenge(m runtime.MemStats, minUnreleased uint64) bool {
 	return releasableHeap(m) >= minUnreleased
+}
+
+// validateScavengeInterval enforces the -mem-scavenge floor (see
+// minScavengeInterval). 0 keeps meaning "disabled"; only a nonzero interval
+// below the floor is refused.
+func validateScavengeInterval(every time.Duration) error {
+	if every <= 0 || every >= minScavengeInterval {
+		return nil
+	}
+	return fmt.Errorf("-mem-scavenge %v is too small: each scavenge is a stop-the-world runtime.ReadMemStats (plus debug.FreeOSMemory above the releasable threshold), so an interval this small would distort the RTT/loss this agent exists to measure; use 0 to disable or a value >= %v", every, minScavengeInterval)
 }
 
 // startHeapScavenger returns the unused heap high-water mark to the OS on a
@@ -147,7 +166,7 @@ var (
 	flPayload       = flag.Int("payload", 0, "Client: probe payload bytes beyond the 24/32-byte header (up to 1400), filled with a deterministic pattern and validated on echo; corruption is counted in link_probes_corrupted_total, distinct from loss")
 	flTargetsReload = flag.Duration("targets-reload-interval", 0, "Client: poll the -targets file at this interval and apply changes without a restart (0 disables; SIGHUP also reloads on Unix; Windows services need this flag to reload)")
 	flMTUSweep      = flag.Duration("mtu-sweep", time.Minute, "Client: periodically sweep DF-set probe sizes per target to find the largest frame the path carries (0 disables; Linux, or Windows with IPv4 on 2003+ / IPv6 on 1703+; results in link_path_mtu_bytes and /status; separate counters, never in the loss ratio)")
-	flMemScavenge   = flag.Duration("mem-scavenge", 5*time.Minute, "Process: force a heap scavenge at this interval so the unused heap high-water mark is returned to the OS (0 disables). Scrapes ratchet the heap high-water up and the runtime does not return it while the agent is otherwise idle; on Windows that reads as RSS/commit growth.")
+	flMemScavenge   = flag.Duration("mem-scavenge", 5*time.Minute, "Process: force a heap scavenge at this interval so the unused heap high-water mark is returned to the OS (0 disables; the interval must be at least 100ms, because each scavenge stops the world). Scrapes ratchet the heap high-water up and the runtime does not return it while the agent is otherwise idle; on Windows that reads as RSS/commit growth.")
 
 	flMetricsBasicAuthUser = flag.String("metrics-user", "", "Metrics: Basic auth username (empty disables auth; env LINK_PING_METRICS_USER)")
 	flMetricsBasicAuthPass = flag.String("metrics-pass", "", "Metrics: Basic auth password (env LINK_PING_METRICS_PASS; prefer env over CLI to avoid ps exposure)")
@@ -269,6 +288,10 @@ func main() {
 		fmt.Fprintln(os.Stderr, "log rotation flags must be >= 0")
 		os.Exit(1)
 	}
+	if err := validateScavengeInterval(*flMemScavenge); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 	if *flLogFile == "" {
 		dfltSize, errSize := flagDefaultInt("log-file-max-mb")
 		dfltBackups, errBackups := flagDefaultInt("log-file-max-backups")
@@ -284,7 +307,6 @@ func main() {
 			os.Exit(1)
 		}
 	}
-	svcTraceMarker("main-pre-logsetup")
 	logW := io.Writer(os.Stdout)
 	var logRepaired bool
 	if *flLogFile != "" {
@@ -349,6 +371,11 @@ func main() {
 		slog.Warn("Log file had wider permissions; repaired to 0600", "path", *flLogFile)
 	}
 
+	// Only after hardenLogSink and slog.SetDefault: emitted before them, the
+	// marker wrote through its own O_CREATE (which follows symlinks) into a
+	// path hardenLogSink would refuse, and bypassed the configured handler.
+	svcTraceMarker("main-post-logsetup")
+
 	svcTraceMarker("main-pre-svc")
 	if *flSvc != "" {
 		handleService(*flSvc, logSink)
@@ -403,6 +430,9 @@ func resolveEchoSecretOld() string {
 //     internal/prober/server.go), so it is ignored in client mode.
 //   - allow, allow-from-targets and listen gate the echo responder, so they
 //     are ignored in client mode.
+//   - the props of client probing (below) are inert in server-only mode, which
+//     is the DEFAULT: no target is loaded, no link_up series is exported, and
+//     /readyz answers 200 unconditionally.
 //   - with both -targets and -target set, buildConfig's else-if means -targets wins.
 func warnIgnoredFlags(mode string) {
 	if *flEchoSecretOld != "" && mode == "client" {
@@ -428,6 +458,51 @@ func warnIgnoredFlags(mode string) {
 	if *flHMACCoverage != flag.Lookup("hmac-coverage").DefValue && mode == "server" {
 		slog.Warn("-hmac-coverage set but ignored: tag coverage is a client-side choice; the echo server accepts both coverages whenever -echo-secret is set")
 	}
+	if mode == "server" {
+		// Mirrored direction: -mode defaults to server, so an agent started with
+		// client-probing flags and no -mode runs, exports ZERO link_up series
+		// and still answers /readyz 200 (server mode is ready by definition) —
+		// a monitor that looks healthy while measuring nothing. flag.Visit, not
+		// a value comparison, so the defaults (adaptive, 500ms, 1s, 1m sweep)
+		// of those flags never warn on a plain server run.
+		var set []string
+		for _, name := range setFlagNames() {
+			if slices.Contains(clientProbeFlags, name) {
+				set = append(set, "-"+name)
+			}
+		}
+		if len(set) > 0 {
+			slog.Warn(fmt.Sprintf("client-probing flags set but ignored (%s): -mode defaults to server, which probes no target, so no link_up series is exported and /readyz always reports ready; use -mode=client or -mode=both", strings.Join(set, ",")))
+		}
+	}
+}
+
+// clientProbeFlags are the flags with no effect outside client/both mode. Named
+// individually so the server-mode warning can say exactly which ones the
+// operator lost. -hmac-coverage is deliberately absent: it has its own warning
+// above (one cause, one line).
+var clientProbeFlags = []string{
+	"target",
+	"targets",
+	"adaptive",
+	"interval",
+	"timeout",
+	"reconnect-interval",
+	"payload",
+	"targets-reload-interval",
+	"mtu-sweep",
+	"dscp",
+}
+
+// setFlagNames reports the flags the operator actually set (flag.Visit reports
+// only those, so a default value never triggers an "ignored" warning). A var
+// because the process-wide FlagSet's "was set" bookkeeping cannot be undone: a
+// test that called flag.Set to exercise the warning would leak into every later
+// test in the binary.
+var setFlagNames = func() []string {
+	var names []string
+	flag.Visit(func(f *flag.Flag) { names = append(names, f.Name) })
+	return names
 }
 
 func sanitizeHostname(s string) string {
@@ -560,6 +635,110 @@ func resolveMetricsAuth() (string, string, error) {
 	return user, pass, nil
 }
 
+// startupFlags is the resolved form of the flags that must be validated before
+// anything is bound (run) or registered (install).
+type startupFlags struct {
+	echoSecret, echoSecretOld string
+	metricsUser, metricsPass  string
+	metricsCert, metricsKey   string
+}
+
+// checkStartupFlags runs the mode/auth/TLS checks that must fail BEFORE a port
+// is bound or an SCM entry is written. One helper, used by both run() and the
+// -svc=install path, so install can never freeze a command line that run() will
+// refuse: that mismatch produced an install that started cleanly and then
+// exited 1 every five seconds from the SCM OnFailure ladder, with no log at all
+// when -log-file was unset.
+func checkStartupFlags() (startupFlags, error) {
+	// A bad -mode should never open ports or start servers.
+	switch mode := *flMode; mode {
+	case "server", "client", "both":
+	default:
+		return startupFlags{}, fmt.Errorf("unknown mode: %s", mode)
+	}
+
+	// Rotation guard. ServePacketConn consults echoSecretOld only inside
+	// its `if echoSecret != ""` branch (internal/prober/server.go), so an
+	// old secret on its own authenticates NOTHING: with the primary secret
+	// empty the agent runs unauthenticated while an operator mid-rotation
+	// believes the rotation protection is active. Fail fast instead.
+	sf := startupFlags{echoSecret: resolveEchoSecret(), echoSecretOld: resolveEchoSecretOld()}
+	if sf.echoSecret == "" && sf.echoSecretOld != "" {
+		return startupFlags{}, errors.New("-echo-secret-old is set without -echo-secret: the old secret alone provides no authentication (it is only accepted alongside a primary secret), so the agent would run unauthenticated; set -echo-secret or clear -echo-secret-old")
+	}
+	// Runs here (not in run()) so the ignored-flag warnings also reach an
+	// operator at install time, when the persisted flags are still editable.
+	warnIgnoredFlags(*flMode)
+
+	user, pass, err := resolveMetricsAuth()
+	if err != nil {
+		return startupFlags{}, err
+	}
+	sf.metricsUser, sf.metricsPass = user, pass
+	sf.metricsCert, sf.metricsKey = *flMetricsTLSCert, *flMetricsTLSKey
+	if (sf.metricsCert == "") != (sf.metricsKey == "") {
+		return startupFlags{}, errors.New("-metrics-tls-cert and -metrics-tls-key must be set together")
+	}
+	if sf.metricsCert != "" {
+		// Validation only: the pair is loaded again by the listener, which
+		// seeds its reload cache with it.
+		// pi-lens-ignore: go-ignored-call-result
+		if _, err := tls.LoadX509KeyPair(sf.metricsCert, sf.metricsKey); err != nil {
+			return startupFlags{}, fmt.Errorf("metrics TLS: %w", err)
+		}
+	}
+	if user != "" && sf.metricsCert == "" && !*flMetricsAllowInsecure {
+		return startupFlags{}, errors.New("metrics basic auth requires TLS (-metrics-tls-cert/-key) or -metrics-allow-insecure to allow plaintext")
+	}
+	return sf, nil
+}
+
+// resolveAllowlist resolves the echo responder's fail-closed client allowlist:
+// -allow plus, in mesh mode, the peer list derived from the targets file. Shared
+// by run() and -svc=install so the two cannot accept different configurations.
+func resolveAllowlist(mode string, cfg prober.Config) (*prober.Allowlist, error) {
+	if mode == "client" {
+		// Client mode has no echo responder. -allow's value is never parsed here:
+		// parsing it made `-mode=client -allow=bogus` print the "-allow set but
+		// ignored" warning and then exit 1 on the unparsable entry.
+		return prober.ParseAllowlist("")
+	}
+	// The echo responder refuses to run without an explicit -allow list, so
+	// spoofed/unauthorised sources can neither reflect datagrams nor grow
+	// metric label cardinality. Mesh mode derives it from the targets file
+	// instead: every peer the agent probes is allowed to probe it back, and the
+	// self target was already dropped by buildConfig. -allow still contributes,
+	// so a mesh can also allow extra CIDRs explicitly.
+	allowSpec := *flAllow
+	if meshAllowFromTargets() {
+		if len(cfg.Targets) == 0 {
+			// Server-only mode never loads the targets file, and a file that
+			// lists only this site has no peers left after the self filter:
+			// name that instead of falling through to the generic
+			// "requires -allow" refusal, which hides why the flag had no
+			// effect.
+			return nil, errors.New("-allow-from-targets: no peers to derive an allowlist from (the targets file is empty or lists only this -source); run client/both with a mesh targets file, or pass -allow")
+		}
+		derived, err := prober.AllowEntriesFromTargets(cfg.Targets)
+		if err != nil {
+			return nil, err
+		}
+		if allowSpec == "" {
+			allowSpec = derived
+		} else {
+			allowSpec = derived + "," + allowSpec
+		}
+	}
+	allow, err := prober.ParseAllowlist(allowSpec)
+	if err != nil {
+		return nil, err
+	}
+	if (mode == "server" || mode == "both") && allow.Len() == 0 {
+		return nil, errors.New("server mode requires -allow (comma-separated client IP allowlist); fail-closed")
+	}
+	return allow, nil
+}
+
 // serviceConfig returns the base Windows/SCM service configuration.
 // Enterprise hardening baked in at install time:
 //   - OnFailure restart (5s delay): a crash or non-zero exit is restarted
@@ -636,6 +815,54 @@ func absolutizeFlagValue(name, value string) string {
 	return abs
 }
 
+// installServiceArgs validates the configuration -svc=install is about to
+// freeze into the SCM command line, then returns that command line. Validation
+// is not optional here: the flags are persisted and replayed on every service
+// start, so a config run() refuses — the DEFAULT -mode=server with no -allow,
+// say — installs "successfully" and then exits 1 on every start, which the SCM
+// OnFailure ladder turns into a restart every 5 seconds forever, with no log at
+// all when -log-file is unset. The checks are run()'s own, through the same
+// helpers, so install and run cannot drift.
+func installServiceArgs() ([]string, error) {
+	// Both results are validation-only here; run() consumes the values.
+	// pi-lens-ignore: go-ignored-call-result
+	if _, err := checkStartupFlags(); err != nil {
+		return nil, err
+	}
+	mode := *flMode
+	var cfg prober.Config
+	if mode != "server" {
+		var err error
+		if cfg, err = buildConfig(); err != nil {
+			return nil, err
+		}
+	}
+	// pi-lens-ignore: go-ignored-call-result
+	if _, err := resolveAllowlist(mode, cfg); err != nil {
+		return nil, err
+	}
+	if *flTargets != "" && *flTargetsReload == 0 {
+		// A Windows service has no SIGHUP, and -targets-reload-interval is the
+		// only other reload trigger: without it the targets file is read once at
+		// start and never again for the life of the process, so a peer edit
+		// stays invisible until someone restarts the service.
+		fmt.Println("WARNING: -targets is set but -targets-reload-interval is 0; a Windows service has no SIGHUP, so the targets file is read once at start and never re-read for the life of the process. Pass -targets-reload-interval (e.g. 1m) to pick up changes.")
+	}
+	// Build the SCM command line from the live flags at install time,
+	// excluding -svc itself and the credential flags (-metrics-
+	// user/-metrics-pass/-echo-secret/-echo-secret-old so credentials
+	// are never persisted; they are delivered via env vars).
+	var args []string
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name != "svc" && f.Name != "metrics-user" && f.Name != "metrics-pass" && f.Name != "echo-secret" && f.Name != "echo-secret-old" {
+			v := absolutizeFlagValue(f.Name, f.Value.String())
+			args = append(args, fmt.Sprintf("-%s=%s", f.Name, v))
+		}
+	})
+	args = append(args, "-svc=run")
+	return args, nil
+}
+
 // handleService manages the service lifecycle. Install/uninstall are
 // Windows-only (gated by svcActionSupported: Linux deploys use the static
 // systemd unit via the Ansible play, and the Linux renderers flagged by
@@ -653,18 +880,14 @@ func handleService(action string, logSink *countedWriter) {
 
 	switch action {
 	case "install":
-		// Build the SCM command line from the live flags at install
-		// time, excluding -svc itself and the credential flags (-metrics-
-		// user/-metrics-pass/-echo-secret/-echo-secret-old so credentials
-		// are never persisted; they are delivered via env vars).
-		var args []string
-		flag.Visit(func(f *flag.Flag) {
-			if f.Name != "svc" && f.Name != "metrics-user" && f.Name != "metrics-pass" && f.Name != "echo-secret" && f.Name != "echo-secret-old" {
-				v := absolutizeFlagValue(f.Name, f.Value.String())
-				args = append(args, fmt.Sprintf("-%s=%s", f.Name, v))
-			}
-		})
-		args = append(args, "-svc=run")
+		// Validate first: nothing below may reach the SCM for a config the
+		// runtime will refuse on every start (see installServiceArgs).
+		args, err := installServiceArgs()
+		if err != nil {
+			slog.Error("Service install refused: the persisted configuration would fail at startup", "err", err)
+			fmt.Fprintf(os.Stderr, "service install refused: %v\n", err)
+			os.Exit(1)
+		}
 		if err := platformInstallService(args); err != nil {
 			slog.Error("Service install failed", "err", err)
 			os.Exit(1)
@@ -866,20 +1089,19 @@ func metricsHandlerFor(g prometheus.Gatherer, gzip bool) http.Handler {
 	return promhttp.InstrumentMetricHandler(prometheus.DefaultRegisterer, h)
 }
 
-// svcTraceMarker appends a diagnostic line to the -log-file sink
-// (windows e2e triage aid under the SCM where stderr is dead). It is
-// best-effort by design: any error is ignored, never a run failure.
+// svcTraceMarker records a service-path diagnostic (windows e2e triage aid
+// under the SCM where stderr is dead). It emits through slog at Debug so the
+// configured handler owns the format: the previous raw "svc-trace[...]" line
+// written straight into -log-file broke -json-logs parsing (the file is then a
+// mix of JSON records and bare text) on every foreground run too. Only the
+// -svc paths emit at all; a plain foreground run has no service to trace. The
+// marker text is what the Windows e2e triage reads out of the log, so keep the
+// "svc-trace[...]" shape in the message.
 func svcTraceMarker(tag string) {
-	if *flLogFile == "" {
+	if *flSvc == "" {
 		return
 	}
-	// pi-lens-ignore: go-path-traversal
-	f, err := os.OpenFile(*flLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
-		return
-	}
-	defer f.Close() // pi-lens-ignore: go-ignored-call-result
-	fmt.Fprintf(f, "svc-trace[%s]\n", tag)
+	slog.Debug(fmt.Sprintf("svc-trace[%s]", tag))
 }
 
 // readyToProbe reports whether a running agent can actually do its job, i.e.
@@ -941,11 +1163,135 @@ func limitConcurrent(limit int, handler http.Handler) http.Handler {
 	})
 }
 
+// metricsCertReloader serves the metrics TLS pair from a cache that is re-read
+// when either file's (mtime, size) changes, so a renewed certificate takes
+// effect without a restart. ServeTLS otherwise loads the pair exactly once: on
+// 90-day certificates plus a service that is never restarted, that one-shot load
+// is a silent scrape blackout the day the cert expires — and under the SCM the
+// resulting handshake error is invisible (stderr is discarded). Set as
+// TLSConfig.GetCertificate, which crypto/tls consults for every handshake.
+type metricsCertReloader struct {
+	certPath, keyPath string
+
+	mu sync.Mutex
+	// cert is the pair currently served. Seeded at construction, so no
+	// handshake can ever observe an empty cache.
+	cert *tls.Certificate
+	// loaded is the fingerprint of the pair in cert; attempted is the last
+	// fingerprint a reload was tried for. Kept apart so a broken replacement is
+	// re-read (and re-logged) only when the files change again: a Warn per
+	// handshake would flood the very log the reload exists to make visible.
+	loaded, attempted certFingerprint
+	// statFailed latches the stat-error warning the same way.
+	statFailed bool
+}
+
+// certFingerprint identifies a certificate/key file pair by the metadata a
+// renewal changes. Hashing the contents would cost a full read on every
+// handshake; (mtime, size) is what rotators and `mv` in place actually touch.
+type certFingerprint struct {
+	certMod, keyMod   time.Time
+	certSize, keySize int64
+}
+
+func fingerprintCertPair(certPath, keyPath string) (certFingerprint, error) {
+	certInfo, err := os.Stat(certPath)
+	if err != nil {
+		return certFingerprint{}, err
+	}
+	keyInfo, err := os.Stat(keyPath)
+	if err != nil {
+		return certFingerprint{}, err
+	}
+	return certFingerprint{
+		certMod: certInfo.ModTime(), certSize: certInfo.Size(),
+		keyMod: keyInfo.ModTime(), keySize: keyInfo.Size(),
+	}, nil
+}
+
+// newMetricsCertReloader loads the pair once and seeds the cache with it — the
+// same load run() performs as startup validation. A pair that will not load is
+// a startup error, never a listener that serves nothing.
+func newMetricsCertReloader(certPath, keyPath string) (*metricsCertReloader, error) {
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		return nil, err
+	}
+	fp, err := fingerprintCertPair(certPath, keyPath)
+	if err != nil {
+		return nil, err
+	}
+	return &metricsCertReloader{certPath: certPath, keyPath: keyPath, cert: &cert, loaded: fp, attempted: fp}, nil
+}
+
+// GetCertificate implements tls.Config.GetCertificate.
+func (r *metricsCertReloader) GetCertificate(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	fp, err := fingerprintCertPair(r.certPath, r.keyPath)
+	if err != nil {
+		// Unstattable (a rename-in-progress, a rotated-away inode): keep serving
+		// the cached pair rather than failing every handshake on the way past.
+		if !r.statFailed {
+			r.statFailed = true
+			slog.Warn("Metrics TLS certificate files are not statable; keeping the previously loaded certificate",
+				"cert", r.certPath, "key", r.keyPath, "err", err)
+		}
+		return r.cert, nil
+	}
+	r.statFailed = false
+	if fp == r.loaded || fp == r.attempted {
+		return r.cert, nil
+	}
+	r.attempted = fp
+	cert, err := tls.LoadX509KeyPair(r.certPath, r.keyPath)
+	if err != nil {
+		// A half-written renewal or a key that does not match: keep the working
+		// cert and say so once. Failing the handshake instead would black out
+		// every scrape over a transient write.
+		slog.Warn("Metrics TLS certificate reload failed; keeping the previously loaded certificate",
+			"cert", r.certPath, "key", r.keyPath, "err", err)
+		return r.cert, nil
+	}
+	r.cert, r.loaded = &cert, fp
+	slog.Info("Metrics TLS certificate reloaded", "cert", r.certPath, "key", r.keyPath)
+	return r.cert, nil
+}
+
+// warnUnauthenticatedMetricsBind warns when the metrics listener came up on an
+// address reachable from off-host with no Basic auth. The flag help says the
+// default binds localhost only, but nothing at runtime says the operator just
+// widened it without credentials — and the payload is the probe topology, peer
+// IPs and per-link RTT/loss, i.e. the network map itself.
+func warnUnauthenticatedMetricsBind(addr net.Addr, user string) {
+	tcpAddr, ok := addr.(*net.TCPAddr)
+	if !ok || user != "" || tcpAddr.IP.IsLoopback() {
+		return
+	}
+	slog.Warn("Metrics endpoint is bound to a non-loopback address WITHOUT authentication: anyone who can reach it sees the probe topology, peer IPs and per-link RTT/loss",
+		"addr", tcpAddr.String(),
+		"fix", "bind 127.0.0.1, or set -metrics-user/-metrics-pass with -metrics-tls-cert/-metrics-tls-key (or -metrics-allow-insecure to accept plaintext auth)")
+}
+
 func (p *program) startMetricsServer(addr, user, pass, cert, key string, statusReg *prober.StatusRegistry, gzip bool, mode string) (*http.Server, <-chan struct{}, error) {
+	// Resolve the TLS pair BEFORE binding: a cert that cannot be loaded must
+	// abort startup without leaving a bound port behind it.
+	var tlsCfg *tls.Config
+	if cert != "" {
+		reloader, err := newMetricsCertReloader(cert, key)
+		if err != nil {
+			return nil, nil, fmt.Errorf("metrics TLS: %w", err)
+		}
+		// GetCertificate (not the Certificates slice) so every handshake can pick
+		// up a renewed pair. Constructing the reloader here is also the startup
+		// validation: a pair that will not load aborts the bind attempt.
+		tlsCfg = &tls.Config{MinVersion: tls.VersionTLS12, GetCertificate: reloader.GetCertificate}
+	}
 	metricsLn, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, nil, fmt.Errorf("metrics server: %w", err)
 	}
+	warnUnauthenticatedMetricsBind(metricsLn.Addr(), user)
 	mx := http.NewServeMux()
 	mx.Handle("/metrics", prober.MetricsAuth(user, pass, metricsHandler(gzip)))
 	healthzHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -971,6 +1317,13 @@ func (p *program) startMetricsServer(addr, user, pass, cert, key string, statusR
 	mx.Handle("/status", prober.MetricsAuth(user, pass, limitConcurrent(maxConcurrentScrapes, statusReg.Handler())))
 	metricsSrv := &http.Server{
 		Handler: mx,
+		// net/http reports its OWN failures (TLS handshake errors, accept
+		// errors, recovered handler panics) through the std log package to
+		// os.Stderr — and under the Windows service stderr is discarded, so a
+		// failing handshake or a panicking handler would leave no trace at all.
+		// Route them through slog so they land in -log-file / the event log
+		// with everything else.
+		ErrorLog: slog.NewLogLogger(slog.Default().Handler(), slog.LevelWarn),
 		// Addr is informational (Serve uses the already-bound listener) but
 		// lets tests and logs address the live server without guessing.
 		Addr:        metricsLn.Addr().String(),
@@ -986,18 +1339,27 @@ func (p *program) startMetricsServer(addr, user, pass, cert, key string, statusR
 		// connection open indefinitely.
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	if cert != "" {
-		metricsSrv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	if tlsCfg != nil {
+		metricsSrv.TLSConfig = tlsCfg
 	}
 	metricsDone := make(chan struct{})
 	go func() {
 		defer close(metricsDone)
 		slog.Info("Starting metrics server", "addr", addr, "tls", cert != "", "auth", user != "")
 		var serveErr error
-		if cert != "" {
-			serveErr = metricsSrv.ServeTLS(metricsLn, cert, key)
-		} else {
+		if tlsCfg == nil {
 			serveErr = metricsSrv.Serve(metricsLn)
+		} else {
+			// Empty cert/key paths on purpose: ServeTLS only skips its own
+			// tls.LoadX509KeyPair when the config already carries a certificate
+			// source, and it is the pair loaded into TLSConfig.Certificates that
+			// would freeze the renewal. crypto/tls consults GetCertificate only
+			// while that slice is empty (or the client sent SNI), so a scraper
+			// dialing an IP literal would otherwise keep being served the startup
+			// copy. ServeTLS (unlike a hand-rolled tls.NewListener) still owns the
+			// HTTP/2 ALPN setup. The reloader already loaded and validated the
+			// pair when it was constructed.
+			serveErr = metricsSrv.ServeTLS(metricsLn, "", "")
 		}
 		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
 			slog.Error("Metrics server error", "err", serveErr)
@@ -1015,39 +1377,13 @@ func (p *program) run() error {
 
 	// Fail fast on unknown mode BEFORE binding anything: a bad -mode
 	// should never open ports or start servers.
-	switch mode := *flMode; mode {
-	case "server", "client", "both":
-	default:
-		return fmt.Errorf("unknown mode: %s", mode)
-	}
-
-	// Rotation guard. ServePacketConn consults echoSecretOld only inside
-	// its `if echoSecret != ""` branch (internal/prober/server.go), so an
-	// old secret on its own authenticates NOTHING: with the primary secret
-	// empty the agent runs unauthenticated while an operator mid-rotation
-	// believes the rotation protection is active. Fail fast instead.
-	echoSecret, echoSecretOld := resolveEchoSecret(), resolveEchoSecretOld()
-	if echoSecret == "" && echoSecretOld != "" {
-		return errors.New("-echo-secret-old is set without -echo-secret: the old secret alone provides no authentication (it is only accepted alongside a primary secret), so the agent would run unauthenticated; set -echo-secret or clear -echo-secret-old")
-	}
-	warnIgnoredFlags(*flMode)
-
-	user, pass, err := resolveMetricsAuth()
+	sf, err := checkStartupFlags()
 	if err != nil {
 		return err
 	}
-	cert, key := *flMetricsTLSCert, *flMetricsTLSKey
-	if (cert == "") != (key == "") {
-		return errors.New("-metrics-tls-cert and -metrics-tls-key must be set together")
-	}
-	if cert != "" {
-		if _, err := tls.LoadX509KeyPair(cert, key); err != nil {
-			return fmt.Errorf("metrics TLS: %w", err)
-		}
-	}
-	if user != "" && cert == "" && !*flMetricsAllowInsecure {
-		return errors.New("metrics basic auth requires TLS (-metrics-tls-cert/-key) or -metrics-allow-insecure to allow plaintext")
-	} else if user != "" && cert == "" {
+	echoSecret, echoSecretOld := sf.echoSecret, sf.echoSecretOld
+	user, pass, cert, key := sf.metricsUser, sf.metricsPass, sf.metricsCert, sf.metricsKey
+	if user != "" && cert == "" {
 		slog.Warn("Metrics basic auth over plaintext HTTP: credentials are base64-only on the wire; consider -metrics-tls-cert/-metrics-tls-key")
 	}
 
@@ -1105,39 +1441,11 @@ func (p *program) run() error {
 		}
 	}
 
-	// Fail-closed client allowlist: the echo responder refuses to run
-	// without an explicit -allow list, so spoofed/unauthorised sources
-	// can neither reflect datagrams nor grow metric label cardinality.
-	// Mesh mode derives it from the targets file instead: every peer the
-	// agent probes is allowed to probe it back, and the self target was
-	// already dropped by buildConfig. -allow still contributes, so a mesh
-	// can also allow extra CIDRs explicitly.
-	allowSpec := *flAllow
-	if meshAllowFromTargets() {
-		if len(cfg.Targets) == 0 {
-			// Server-only mode never loads the targets file, and a file that
-			// lists only this site has no peers left after the self filter:
-			// name that instead of falling through to the generic
-			// "requires -allow" refusal, which hides why the flag had no
-			// effect.
-			return errors.New("-allow-from-targets: no peers to derive an allowlist from (the targets file is empty or lists only this -source); run client/both with a mesh targets file, or pass -allow")
-		}
-		derived, err := prober.AllowEntriesFromTargets(cfg.Targets)
-		if err != nil {
-			return err
-		}
-		if allowSpec == "" {
-			allowSpec = derived
-		} else {
-			allowSpec = derived + "," + allowSpec
-		}
-	}
-	allow, err := prober.ParseAllowlist(allowSpec)
+	// Fail-closed client allowlist, resolved by the same helper -svc=install
+	// validates against (see resolveAllowlist).
+	allow, err := resolveAllowlist(*flMode, cfg)
 	if err != nil {
 		return err
-	}
-	if mode := *flMode; (mode == "server" || mode == "both") && allow.Len() == 0 {
-		return errors.New("server mode requires -allow (comma-separated client IP allowlist); fail-closed")
 	}
 
 	// Bind the metrics listener before any probing starts so a bind

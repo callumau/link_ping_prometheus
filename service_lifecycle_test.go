@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -210,6 +211,30 @@ func TestWarnIgnoredFlags(t *testing.T) {
 			mode:      "client",
 			setup:     func() { *flAllowFromTargets = true },
 			wantWarns: []string{"-allow-from-targets set but ignored"},
+		},
+		{
+			// The mirrored direction: -mode defaults to server, so an agent started
+			// with client-probing flags and no -mode exports no link_up series at
+			// all while /readyz still answers 200. Drives the setFlagNames seam
+			// rather than flag.Set, whose process-wide "was set" bookkeeping
+			// cannot be undone for the tests that run after this one.
+			name: "client-probing flags set in server mode",
+			mode: "server",
+			setup: func() {
+				orig := setFlagNames
+				setFlagNames = func() []string { return []string{"interval", "target"} }
+				t.Cleanup(func() { setFlagNames = orig })
+			},
+			wantWarns: []string{"client-probing flags set but ignored", "-mode defaults to server", "-target", "-interval"},
+		},
+		{
+			name: "client-probing flags set in client mode are consumed",
+			mode: "client",
+			setup: func() {
+				orig := setFlagNames
+				setFlagNames = func() []string { return []string{"interval", "target"} }
+				t.Cleanup(func() { setFlagNames = orig })
+			},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -530,6 +555,104 @@ func TestProgramStopTimeoutReportsCleanStop(t *testing.T) {
 }
 
 // funcWriter adapts a function to io.Writer for sink tests.
+
+// TestInstallRejectsConfigThatCannotStart pins the -svc=install validation. The
+// flags are persisted into the SCM command line and replayed on every start, so
+// installing a config run() refuses — the DEFAULT -mode=server with no -allow —
+// used to "succeed" and then exit 1 every five seconds from the SCM OnFailure
+// ladder, with no log at all when -log-file was unset. The checks run before
+// platformInstallService, which is why this test needs no Windows: an install
+// path that reached the SCM hook here would fail with the Windows-only error
+// instead of the allowlist one.
+func TestInstallRejectsConfigThatCannotStart(t *testing.T) {
+	saveFlags(t)
+	t.Setenv("LINK_PING_METRICS_USER", "")
+	t.Setenv("LINK_PING_METRICS_PASS", "")
+	t.Setenv("LINK_PING_ECHO_SECRET", "")
+	t.Setenv("LINK_PING_ECHO_SECRET_OLD", "")
+
+	for _, tc := range []struct{ name, mode, wantErr string }{
+		{"server mode without an allowlist", "server", "server mode requires -allow"},
+		{"both mode without an allowlist", "both", "server mode requires -allow"},
+		{"unknown mode", "bogus", "unknown mode"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			saveFlags(t)
+			*flMode = tc.mode
+			*flAllow = ""
+			*flAllowFromTargets = false
+			*flTarget, *flTargets = "127.0.0.1:4000", ""
+			args, err := installServiceArgs()
+			if err == nil {
+				t.Fatalf("installServiceArgs accepted a configuration run() refuses; args=%v", args)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("error = %v, want it to name %q", err, tc.wantErr)
+			}
+			if args != nil {
+				t.Errorf("a refused install must not produce an SCM command line, got %v", args)
+			}
+		})
+	}
+
+	t.Run("a valid server install yields the SCM command line", func(t *testing.T) {
+		saveFlags(t)
+		*flMode = "server"
+		*flAllow = "127.0.0.1"
+		*flAllowFromTargets = false
+		*flTarget, *flTargets = "", ""
+		args, err := installServiceArgs()
+		if err != nil {
+			t.Fatalf("installServiceArgs refused a valid config: %v", err)
+		}
+		if len(args) == 0 || args[len(args)-1] != "-svc=run" {
+			t.Errorf("command line %v must end with -svc=run", args)
+		}
+	})
+
+	t.Run("warns when -targets cannot be reloaded under the SCM", func(t *testing.T) {
+		saveFlags(t)
+		path := filepath.Join(t.TempDir(), "targets.json")
+		// pi-lens-ignore: go-path-traversal
+		if err := os.WriteFile(path, []byte(`[{"name":"peer","address":"192.0.2.10:4000"}]`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		*flMode = "client"
+		*flTarget, *flTargets = "", path
+		*flTargetsReload = 0
+
+		out := captureStdout(t, func() {
+			if _, err := installServiceArgs(); err != nil {
+				t.Fatalf("installServiceArgs: %v", err)
+			}
+		})
+		if !strings.Contains(out, "no SIGHUP") {
+			t.Errorf("install with -targets but no reload interval must warn that a service never re-reads the file, stdout:\n%s", out)
+		}
+	})
+}
+
+// captureStdout runs fn with os.Stdout redirected to a pipe and returns what it
+// printed. installServiceArgs' install-time warnings use fmt.Println, not slog:
+// they are for the operator standing at the console running -svc=install.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	orig := os.Stdout
+	os.Stdout = w
+	defer func() { os.Stdout = orig }()
+	fn()
+	// pi-lens-ignore: go-ignored-call-result
+	_ = w.Close()
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read captured stdout: %v", err)
+	}
+	return string(out)
+}
 
 // TestSvcActionSupported pins the OS gate for the -svc lifecycle actions:
 // install/uninstall are Windows-only (the binary would otherwise run the

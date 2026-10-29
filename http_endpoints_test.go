@@ -1,8 +1,21 @@
 package main
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"log/slog"
+	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -325,3 +338,253 @@ func TestStatusEndpointIsGatedLikeMetrics(t *testing.T) {
 // would validate PromQL syntax, but not this, and the repo's suite needs nothing
 // beyond go test.
 // pi-lens-ignore: go-test-functions
+
+// TestMetricsServerErrorLogReachesSlog pins two coupled facts: the metrics
+// server has an ErrorLog at all, and net/http's own failures (TLS handshake
+// errors, accept errors, recovered handler panics) reach slog instead of the
+// std log package's os.Stderr — which is DISCARDED under the Windows service, so
+// a handshake that fails on a fleet node left no trace anywhere. The producer is
+// a real failing handshake (plaintext on the TLS port), not a synthetic logf
+// call, so the wiring into net/http is what is exercised.
+func TestMetricsServerErrorLogReachesSlog(t *testing.T) {
+	prober.InitMetrics()
+	dir := t.TempDir()
+	certPath, keyPath := filepath.Join(dir, "cert.crt"), filepath.Join(dir, "cert.key")
+	writeTestCert(t, certPath, keyPath, "metrics-server", 1)
+	logs := captureLogs(t)
+
+	p := &program{}
+	srv, done, err := p.startMetricsServer("127.0.0.1:0", "", "", certPath, keyPath, prober.NewStatusRegistry(), false, "server")
+	if err != nil {
+		t.Fatalf("startMetricsServer: %v", err)
+	}
+	t.Cleanup(func() {
+		// pi-lens-ignore: go-ignored-call-result
+		_ = srv.Close()
+		<-done
+	})
+	if srv.ErrorLog == nil {
+		t.Fatal("metricsSrv.ErrorLog is nil: net/http would write its failures to os.Stderr, which the SCM discards")
+	}
+
+	conn, err := net.Dial("tcp", srv.Addr)
+	if err != nil {
+		t.Fatalf("dial %s: %v", srv.Addr, err)
+	}
+	// Plaintext bytes on a TLS port fail the handshake inside net/http, which
+	// reports it through srv.ErrorLog.
+	// pi-lens-ignore: go-ignored-call-result
+	_, _ = conn.Write([]byte("GET /metrics HTTP/1.1\r\nHost: metrics\r\n\r\n"))
+	// pi-lens-ignore: go-ignored-call-result
+	_ = conn.Close()
+
+	waitForLog(t, logs, "TLS handshake error")
+}
+
+// TestMetricsServerCertReloadWithoutRestart pins the hot reload: a renewed
+// certificate pair must be served by the NEXT handshake, with no restart. A
+// 90-day certificate on a service that is never restarted otherwise becomes a
+// silent scrape blackout on expiry. The two certificates differ in CN length on
+// purpose, so the (mtime, size) fingerprint the reloader keys on changes even on
+// a filesystem with coarse timestamps.
+func TestMetricsServerCertReloadWithoutRestart(t *testing.T) {
+	prober.InitMetrics()
+	dir := t.TempDir()
+	certPath, keyPath := filepath.Join(dir, "cert.crt"), filepath.Join(dir, "cert.key")
+	writeTestCert(t, certPath, keyPath, "cert-one", 101)
+
+	p := &program{}
+	srv, done, err := p.startMetricsServer("127.0.0.1:0", "", "", certPath, keyPath, prober.NewStatusRegistry(), false, "server")
+	if err != nil {
+		t.Fatalf("startMetricsServer: %v", err)
+	}
+	t.Cleanup(func() {
+		// pi-lens-ignore: go-ignored-call-result
+		_ = srv.Close()
+		<-done
+	})
+	if got := servedCert(t, srv.Addr); got.SerialNumber.Int64() != 101 || got.Subject.CommonName != "cert-one" {
+		t.Fatalf("startup certificate = serial %d cn %q, want 101/cert-one", got.SerialNumber.Int64(), got.Subject.CommonName)
+	}
+
+	writeTestCert(t, certPath, keyPath, "cert-two-renewed-longer", 202)
+
+	got := servedCert(t, srv.Addr)
+	if got.SerialNumber.Int64() != 202 || got.Subject.CommonName != "cert-two-renewed-longer" {
+		t.Errorf("after renewal the handshake served serial %d cn %q, want 202/cert-two-renewed-longer (no restart, no reload)",
+			got.SerialNumber.Int64(), got.Subject.CommonName)
+	}
+}
+
+// TestMetricsServerCertReloadFailureKeepsPrevious pins the degraded path: an
+// unreadable or half-written replacement must NOT break scraping. The previously
+// loaded certificate keeps being served, and the failure is reported exactly
+// once for that file pair — a Warn per handshake would flood the log the reload
+// exists to make visible, and failing the handshake would black out /metrics for
+// the duration of a transient write.
+func TestMetricsServerCertReloadFailureKeepsPrevious(t *testing.T) {
+	prober.InitMetrics()
+	dir := t.TempDir()
+	certPath, keyPath := filepath.Join(dir, "cert.crt"), filepath.Join(dir, "cert.key")
+	writeTestCert(t, certPath, keyPath, "cert-one", 101)
+	logs := captureLogs(t)
+
+	p := &program{}
+	srv, done, err := p.startMetricsServer("127.0.0.1:0", "", "", certPath, keyPath, prober.NewStatusRegistry(), false, "server")
+	if err != nil {
+		t.Fatalf("startMetricsServer: %v", err)
+	}
+	t.Cleanup(func() {
+		// pi-lens-ignore: go-ignored-call-result
+		_ = srv.Close()
+		<-done
+	})
+
+	// pi-lens-ignore: go-path-traversal (t.TempDir)
+	if err := os.WriteFile(certPath, []byte("not a certificate\n"), 0o600); err != nil {
+		t.Fatalf("replace certificate with garbage: %v", err)
+	}
+	for range 2 {
+		if got := servedCert(t, srv.Addr); got.SerialNumber.Int64() != 101 {
+			t.Fatalf("a failed reload must keep serving the previous certificate, got serial %d", got.SerialNumber.Int64())
+		}
+	}
+	if n := countLogs(logs, "keeping the previously loaded certificate", 300*time.Millisecond); n != 1 {
+		t.Errorf("a failed reload logged %d times for one file pair, want exactly 1", n)
+	}
+}
+
+// TestWarnUnauthenticatedMetricsBind pins the exposure warning: the listener
+// defaults to localhost, so widening -metrics without credentials is otherwise a
+// silent decision to publish the probe topology, peer IPs and per-link RTT/loss
+// to every host that can reach the port.
+func TestWarnUnauthenticatedMetricsBind(t *testing.T) {
+	for _, tc := range []struct {
+		name, addr, user string
+		wantWarn         bool
+	}{
+		{"loopback without auth", "127.0.0.1:2112", "", false},
+		{"loopback v6 without auth", "[::1]:2112", "", false},
+		{"wildcard v4 without auth", "0.0.0.0:2112", "", true},
+		{"wildcard v6 without auth", "[::]:2112", "", true},
+		{"routable without auth", "192.0.2.5:2112", "", true},
+		{"wildcard with auth", "0.0.0.0:2112", "alice", false},
+		{"routable with auth", "192.0.2.5:2112", "alice", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tcpAddr, err := net.ResolveTCPAddr("tcp", tc.addr)
+			if err != nil {
+				t.Fatalf("resolve %q: %v", tc.addr, err)
+			}
+			buf := captureWarns(t)
+			warnUnauthenticatedMetricsBind(tcpAddr, tc.user)
+			got := strings.Contains(buf.String(), "WITHOUT authentication")
+			if got != tc.wantWarn {
+				t.Errorf("warnUnauthenticatedMetricsBind(%s, user=%q) warned = %v, want %v (log: %s)",
+					tc.addr, tc.user, got, tc.wantWarn, buf.String())
+			}
+		})
+	}
+}
+
+// writeTestCert generates a self-signed server certificate for cn and writes the
+// pair to certPath/keyPath. Certificates are generated rather than checked in:
+// the reloader keys on (mtime, size), so the test has to control exactly when
+// the bytes on disk are replaced.
+func writeTestCert(t *testing.T, certPath, keyPath, cn string, serial int64) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(serial),
+		Subject:               pkix.Name{CommonName: cn},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create certificate: %v", err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatalf("marshal private key: %v", err)
+	}
+	// pi-lens-ignore: go-path-traversal (t.TempDir)
+	if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatalf("write certificate: %v", err)
+	}
+	// pi-lens-ignore: go-path-traversal (t.TempDir)
+	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
+		t.Fatalf("write key: %v", err)
+	}
+}
+
+// servedCert dials addr and returns the certificate the server presented. No
+// ServerName is set (the client dials an IP literal), which is the scrape shape
+// crypto/tls serves only through GetCertificate.
+func servedCert(t *testing.T, addr string) *x509.Certificate {
+	t.Helper()
+	// pi-lens-ignore: go-insecure-skip-verify (self-signed test certificate)
+	conn, err := tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true})
+	if err != nil {
+		t.Fatalf("TLS dial %s: %v", addr, err)
+	}
+	defer conn.Close()
+	certs := conn.ConnectionState().PeerCertificates
+	if len(certs) == 0 {
+		t.Fatalf("no peer certificate from %s", addr)
+	}
+	return certs[0]
+}
+
+// captureLogs installs a channel-backed slog handler for the test and returns
+// the channel. A bytes.Buffer would be written by the serve/handshake goroutines
+// while the test reads it, which is a data race — and the traffic here is
+// produced by another goroutine by construction.
+func captureLogs(t *testing.T) <-chan string {
+	t.Helper()
+	prev := slog.Default()
+	ch := make(chan string, 128)
+	slog.SetDefault(slog.New(chanHandler{ch: ch}))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return ch
+}
+
+// waitForLog drains ch until a record whose message contains want arrives.
+func waitForLog(t *testing.T, ch <-chan string, want string) {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case msg := <-ch:
+			if strings.Contains(msg, want) {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("no log record containing %q within 5s", want)
+		}
+	}
+}
+
+// countLogs counts records whose message contains want, draining ch for window.
+// The caller has already provoked them; the window only bounds the wait.
+func countLogs(ch <-chan string, want string, window time.Duration) int {
+	deadline := time.After(window)
+	n := 0
+	for {
+		select {
+		case msg := <-ch:
+			if strings.Contains(msg, want) {
+				n++
+			}
+		case <-deadline:
+			return n
+		}
+	}
+}

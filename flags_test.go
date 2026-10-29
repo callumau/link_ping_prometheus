@@ -1,11 +1,15 @@
 package main
 
 import (
+	"flag"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
+
+	"link_ping_prometheus/internal/prober"
 )
 
 // pi-lens-ignore: go-test-functions
@@ -321,6 +325,80 @@ func TestAbsolutizeFlagValue(t *testing.T) {
 // nothing is exactly the failure mode an orchestrator must be able to see.
 // socket_age_seconds is set only after a successful dial, so it is the signal
 // the gate reads.
+
+// TestResolveAllowlist pins the allowlist's mode split. Client mode has no echo
+// responder, so -allow must never be parsed there: parsing it made
+// `-mode=client -allow=bogus` print the "-allow set but ignored" warning and
+// then exit 1 on the unparsable entry. Server/both keep the fail-closed rule.
+func TestResolveAllowlist(t *testing.T) {
+	saveFlags(t)
+
+	tests := []struct {
+		name    string
+		mode    string
+		allow   string
+		wantLen int
+		wantErr string
+	}{
+		{"client mode ignores an unparsable -allow", "client", "bogus", 0, ""},
+		{"client mode ignores even a valid -allow", "client", "127.0.0.1", 0, ""},
+		{"server mode requires -allow", "server", "", 0, "requires -allow"},
+		{"both mode requires -allow", "both", "", 0, "requires -allow"},
+		{"server mode rejects an unparsable -allow", "server", "bogus", 0, "invalid"},
+		{"server mode accepts a valid -allow", "server", "127.0.0.1,10.0.0.0/8", 2, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			saveFlags(t)
+			*flAllowFromTargets = false
+			*flAllow = tc.allow
+			allow, err := resolveAllowlist(tc.mode, prober.Config{})
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("resolveAllowlist(%s, %q) = %v, %v; want error containing %q", tc.mode, tc.allow, allow, err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveAllowlist(%s, %q): %v", tc.mode, tc.allow, err)
+			}
+			if allow.Len() != tc.wantLen {
+				t.Errorf("resolveAllowlist(%s, %q) len = %d, want %d", tc.mode, tc.allow, allow.Len(), tc.wantLen)
+			}
+		})
+	}
+}
+
+// TestValidateScavengeInterval pins the -mem-scavenge floor: each tick is a
+// stop-the-world runtime.ReadMemStats (plus debug.FreeOSMemory above the
+// releasable threshold), so a sub-100ms interval would distort the RTT this
+// agent exists to measure. 0 keeps meaning "disabled".
+func TestValidateScavengeInterval(t *testing.T) {
+	for _, tc := range []struct {
+		every   time.Duration
+		wantErr bool
+	}{
+		{0, false},
+		{-time.Second, false},
+		{time.Millisecond, true},
+		{minScavengeInterval - time.Millisecond, true},
+		{minScavengeInterval, false},
+		{5 * time.Minute, false},
+	} {
+		err := validateScavengeInterval(tc.every)
+		if tc.wantErr && err == nil {
+			t.Errorf("validateScavengeInterval(%v) accepted a sub-floor interval", tc.every)
+		}
+		if !tc.wantErr && err != nil {
+			t.Errorf("validateScavengeInterval(%v) = %v, want nil", tc.every, err)
+		}
+	}
+	// The flag Help is user-facing doc for a tunable, so it must name the floor
+	// the code enforces (help/code drift has happened in this repo).
+	if f := flag.Lookup("mem-scavenge"); f == nil || !strings.Contains(f.Usage, minScavengeInterval.String()) {
+		t.Errorf("mem-scavenge flag help must state the %v floor: %v", minScavengeInterval, f)
+	}
+}
 
 // TestBuildConfigMeshSelfSkip pins the mesh contract: with -allow-from-targets
 // one targets file lists every site including the local one, so the client set
