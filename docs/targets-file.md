@@ -6,8 +6,8 @@ per-target `interval`/`timeout` override the global `-interval`/`-timeout`
 
 ```json
 [
-  {"name": "server1", "address": "192.168.1.10:4000"},
-  {"name": "server2", "address": "192.168.1.11:4000", "interval": "200ms", "timeout": "800ms"}
+  {"name": "server1", "address": "192.0.2.10:4000"},
+  {"name": "server2", "address": "192.0.2.11:4000", "interval": "200ms", "timeout": "800ms"}
 ]
 ```
 

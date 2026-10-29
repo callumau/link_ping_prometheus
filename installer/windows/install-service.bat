@@ -185,7 +185,7 @@ if not exist "%TARGETS_FILE%" (
 goto :wiz_allow_ask
 
 :wiz_single
-set /p "SINGLE_TARGET=Single target address (host:port, e.g. 192.168.1.60:4000): "
+set /p "SINGLE_TARGET=Single target address (host:port, e.g. 192.0.2.10:4000): "
 REM Validate BEFORE any %VAR% expansion (see the note at :wiz_metrics).
 call :RejectQuoteAmp SINGLE_TARGET
 if errorlevel 1 (
@@ -198,7 +198,7 @@ if "%SINGLE_TARGET%"=="" (
     goto :wiz_single
 )
 echo "%SINGLE_TARGET%" | findstr /r /c:":" >nul || (
-    echo   Missing port - use host:port form, e.g. 192.168.1.60:4000.
+    echo   Missing port - use host:port form, e.g. 192.0.2.10:4000.
     goto :wiz_single
 )
 

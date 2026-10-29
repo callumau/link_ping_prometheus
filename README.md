@@ -141,7 +141,7 @@ More detail:
 Client:
 
 ```sh
-./link_ping_prometheus -mode=client -target="192.168.1.71:4000" -metrics=":2112"
+./link_ping_prometheus -mode=client -target="192.0.2.10:4000" -metrics=":2112"
 ```
 
 Client, multiple targets:
@@ -153,13 +153,13 @@ Client, multiple targets:
 Server:
 
 ```sh
-./link_ping_prometheus -mode=server -listen=":4000" -allow=192.168.1.71 -metrics=":2112"
+./link_ping_prometheus -mode=server -listen=":4000" -allow=192.0.2.11 -metrics=":2112"
 ```
 
 Both:
 
 ```sh
-./link_ping_prometheus -mode=both -targets=targets.json -allow=192.168.1.71 -metrics=":2112"
+./link_ping_prometheus -mode=both -targets=targets.json -allow=192.0.2.11 -metrics=":2112"
 ```
 
 ### Targets file

@@ -9,5 +9,13 @@ piolium/*
 dist/
 
 link_ping_prometheus.exe
+
+# live per-host target list; the format is documented in docs/targets-file.md
+targets.json
+
+# local-only dev deploy helper (site data lives outside the repo, in
+# ~/.config/lpp/dev.env; credentials come from 1Password at run time)
+dev_push.sh
+
 .venv-ansible/
 .venv-ansible/

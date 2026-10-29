@@ -9,7 +9,7 @@ flags are recorded at install time, except `-svc`, `-metrics-user`,
 is printed at install time).
 
 ```sh
-link_ping_prometheus.exe -mode=both -targets=targets.json -allow=192.168.1.71 -metrics=":2112" -log-file="C:\ProgramData\link_ping_prometheus\logs\service.log" -svc=install
+link_ping_prometheus.exe -mode=both -targets=targets.json -allow=192.0.2.11 -metrics=":2112" -log-file="C:\ProgramData\link_ping_prometheus\logs\service.log" -svc=install
 ```
 
 ## Built-in hardening (set at install)
