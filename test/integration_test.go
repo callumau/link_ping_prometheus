@@ -34,7 +34,13 @@ func TestMultiTargetProbing(t *testing.T) {
 	time.Sleep(time.Second)
 
 	for _, tg := range targets {
-		verifyCounter(t, prober.ProbesSent, tg.Name, tg.Address)
+		// ~20 probes are expected in 1s at a 50ms interval; requiring 5
+		// keeps the old stress test's floor (a regression that stalls most
+		// targets cannot pass on one lucky send) while the RTT assertion
+		// proves the echoes actually returned.
+		if sent := getCounterValue(prober.ProbesSent, tg.Name, tg.Address); sent < 5 {
+			t.Errorf("target %s sent %v probes, want >= 5 (cpu load?)", tg.Name, sent)
+		}
 		verifyHistogramCount(t, prober.RTTSeconds, tg.Name, tg.Address)
 	}
 }
