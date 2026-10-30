@@ -3,7 +3,7 @@
 # Install:
 #   cp installer/linux/link_ping_prometheus.service /etc/systemd/system/
 #   # CLI flags go in OPTIONS inside /etc/link_ping_prometheus.env, e.g.:
-#   #   OPTIONS="-mode=both -listen=:4000 -allow=203.0.113.5 -metrics=:2112"
+#   #   OPTIONS="-mode=both -listen=:4000 -allow=203.0.113.5 -metrics=127.0.0.1:2112"
 #   # Secrets (LINK_PING_METRICS_USER/LINK_PING_METRICS_PASS,
 #   # LINK_PING_ECHO_SECRET) go in the same file, never in service args.
 #   #   LINK_PING_ECHO_SECRET=...

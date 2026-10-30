@@ -31,10 +31,10 @@ half-configured fleet reads healthy unauthenticated.
 
 ```sh
 # Node A - echo server
-./link_ping_prometheus -mode=server -listen=":4000" -allow=192.0.2.11 -metrics=":2112"
+./link_ping_prometheus -mode=server -listen=":4000" -allow=192.0.2.11 -metrics="127.0.0.1:2112"
 
 # Node B - probe Node A, tagging every series with the local site
-./link_ping_prometheus -mode=client -target="192.0.2.10:4000" -source="site-b" -metrics=":2112"
+./link_ping_prometheus -mode=client -target="192.0.2.10:4000" -source="site-b" -metrics="127.0.0.1:2112"
 ```
 
 Then scrape both `/metrics` endpoints and open the
@@ -149,25 +149,25 @@ More detail:
 Client:
 
 ```sh
-./link_ping_prometheus -mode=client -target="192.0.2.10:4000" -metrics=":2112"
+./link_ping_prometheus -mode=client -target="192.0.2.10:4000" -metrics="127.0.0.1:2112"
 ```
 
 Client, multiple targets:
 
 ```sh
-./link_ping_prometheus -mode=client -targets=targets.json -metrics=":2112"
+./link_ping_prometheus -mode=client -targets=targets.json -metrics="127.0.0.1:2112"
 ```
 
 Server:
 
 ```sh
-./link_ping_prometheus -mode=server -listen=":4000" -allow=192.0.2.11 -metrics=":2112"
+./link_ping_prometheus -mode=server -listen=":4000" -allow=192.0.2.11 -metrics="127.0.0.1:2112"
 ```
 
 Both:
 
 ```sh
-./link_ping_prometheus -mode=both -targets=targets.json -allow=192.0.2.11 -metrics=":2112"
+./link_ping_prometheus -mode=both -targets=targets.json -allow=192.0.2.11 -metrics="127.0.0.1:2112"
 ```
 
 ### Targets file

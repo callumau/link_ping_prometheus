@@ -46,6 +46,14 @@ jobs:
           GOOS=windows go vet ./...
           GOOS=windows go build ./...
 
+      # Darwin binaries are shipped by .goreleaser.yaml but the CI never
+      # compiled them. This job already cross-compiles Windows; add the
+      # compile+vet parity check so an OS-tagged file cannot rot unnoticed.
+      - name: Vet and build (darwin)
+        run: |
+          GOOS=darwin go vet ./...
+          GOOS=darwin go build ./...
+
       # The Ansible playbooks ship to fleet hosts but CI never parsed them, so
       # a task naming a module that does not exist could sit here unnoticed —
       # it did: playbook.yml used ansible.windows.win_script, which exists in

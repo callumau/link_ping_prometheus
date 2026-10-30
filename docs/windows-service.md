@@ -9,7 +9,7 @@ flags are recorded at install time, except `-svc`, `-metrics-user`,
 is printed at install time).
 
 ```sh
-link_ping_prometheus.exe -mode=both -targets=targets.json -targets-reload-interval=30s -allow=192.0.2.11 -metrics=":2112" -log-file="C:\ProgramData\link_ping_prometheus\logs\service.log" -svc=install
+link_ping_prometheus.exe -mode=both -targets=targets.json -targets-reload-interval=30s -allow=192.0.2.11 -metrics="127.0.0.1:2112" -log-file="C:\ProgramData\link_ping_prometheus\logs\service.log" -svc=install
 ```
 
 `-svc=install` validates the configuration before it writes the SCM entry, with
