@@ -818,7 +818,8 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 }
 
 // stopDrain resets a timer and drains a possibly-queued tick so Reset
-// starts clean (Go's Reset contract), shared by three sites.
+// starts clean (Go's Reset contract), used by the probe ticker and the MTU
+// sweep timer.
 func stopDrain(t *time.Timer) {
 	if !t.Stop() {
 		select {
@@ -1052,15 +1053,8 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 		// lives inside runEchoLoop, which just exited, so without this /status
 		// would keep reporting link_up:true through the restart pause.
 		emitTargetStatus(m, state, stats, stats.CurrentRTO(), 0, 0)
-		t := time.NewTimer(time.Second)
-		select {
-		// pi-lens-ignore: waitgroup-done-scope
-		case <-ctx.Done():
-			if !t.Stop() {
-				<-t.C
-			}
+		if !sleepCtx(ctx, time.Second) {
 			return
-		case <-t.C:
 		}
 	}
 }

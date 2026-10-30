@@ -115,6 +115,12 @@ func TestSeedMetrics(t *testing.T) {
 	want := []string{
 		"link_probes_sent_total",
 		"link_probes_timed_out_total",
+		"link_probes_send_errors_total",
+		"link_probes_throttled_total",
+		"link_probes_corrupted_total",
+		"link_mtu_probes_sent_total",
+		"link_mtu_probes_lost_total",
+		"link_path_mtu_bytes",
 		"link_probes_inflight",
 		"link_up",
 		"link_rto_seconds",

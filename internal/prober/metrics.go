@@ -148,24 +148,16 @@ func InitMetrics() {
 }
 
 // SeedMetrics initialises every metric series for each target so they all
-// surface in /metrics output even before the first event. source is the
-// topology label applied to every series (e.g. the local datacenter).
+// surface in /metrics output even before the first event. Resolving a
+// target's handles via newTargetMetrics creates the series; no explicit
+// zero write is needed. source is the topology label applied to every
+// series (e.g. the local datacenter).
 func SeedMetrics(source string, targets []Target) {
 	for _, t := range targets {
-		m := newTargetMetrics(source, t)
-		m.sent.Add(0)
-		m.sendErr.Add(0)
-		m.throttled.Add(0)
-		m.corrupted.Add(0)
-		m.mtuSent.Add(0)
-		m.mtuLost.Add(0)
-		m.pathMTU.Set(0)
-		m.timedOut.Add(0)
-		m.inflight.Set(0)
-		m.linkUp.Set(0)
-		m.rto.Set(0)
-		m.srtt.Set(0)
-		m.jitter.Set(0)
+		// Resolving the handles creates the series. The explicit Add(0)/
+		// Set(0) writes this used to carry were no-ops and a fourth place
+		// to edit whenever a client metric is added.
+		_ = newTargetMetrics(source, t)
 	}
 }
 
