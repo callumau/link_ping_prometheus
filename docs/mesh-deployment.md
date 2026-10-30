@@ -540,11 +540,11 @@ that use payload probing.
 
 ### Series
 
-Each target exports one series set under `{source, target, address}`: 13
+Each target exports one series set under `{source, target, address}`: 17
 series pre-created by `SeedMetrics` (sent, timed_out, inflight, send_errors,
 throttled, corrupted, link_up, rto, srtt, jitter, path MTU, MTU sent, MTU
-lost) plus the RTT histogram's bucket/`_sum`/`_count` lines.
-`link_prober_internal_errors_total` appears only after a prober fault. A
+lost, the three `link_prober_internal_errors_total` reasons, the RTT
+histogram, and its bucket/`_sum`/`_count` lines). A
 10-site mesh probes 10 × 9 = **90 directional links** — 90 series sets
 across the fleet, 9 per agent: small, with the heap soft-capped at 128MiB
 and per-target handles resolved once (see [operations and
