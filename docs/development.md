@@ -45,7 +45,12 @@ page.
 ## Code Structure
 
 ```text
-main.go                     — CLI wrapper, flag parsing, service lifecycle
+main.go                     — CLI entry, flags, main(), run/runModes
+config.go                   — startup checks, buildConfig, source/allowlist resolution, ignored-flag warnings
+metrics_server.go           — /metrics, /readyz, TLS cert reload, scrape concurrency cap
+service.go                  — Windows SCM lifecycle, install args, service runner
+scavenger.go                — heap scavenger and its validation
+logsink.go                  — log sink write-failure watcher and event-log bridge
 main_test.go                — lifecycle race, auth/TLS flag validation tests
 main_metrics_test.go        — /metrics body decoding (gzip on/off)
 internal/prober/

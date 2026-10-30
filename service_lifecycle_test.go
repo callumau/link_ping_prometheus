@@ -59,13 +59,28 @@ func TestServiceConfigHardening(t *testing.T) {
 // documented "skip an already-lean process" guard never fired.
 // pi-lens-ignore: go-test-functions
 
-// TestRunRejectsEchoSecretOldWithoutPrimary pins the rotation guard (F4):
-// -echo-secret-old without a primary -echo-secret silently disables ALL wire
-// auth — internal/prober/server.go consults the old secret only inside its
-// `if echoSecret != ""` branch, so an operator mid-rotation whose new secret
-// deploy failed would run unauthenticated believing rotation protection is
-// active. The guard must fail the run BEFORE any bind.
-func TestRunRejectsEchoSecretOldWithoutPrimary(t *testing.T) {
+// TestRunRejectsInvalidConfiguration folds the four startup-refusal tests into
+// one table. Every row must fail run() BEFORE anything is bound, and the error
+// must name the guard that fired — a generic failure would hide which startup
+// invariant broke. The rows cover:
+//
+//   - the F4 rotation guard: -echo-secret-old without a primary -echo-secret
+//     silently disables ALL wire auth — internal/prober/server.go consults the
+//     old secret only inside its `if echoSecret != ""` branch, so an operator
+//     mid-rotation whose new secret deploy failed would run unauthenticated
+//     believing rotation protection is active;
+//   - -allow-from-targets diagnostics: server-only mode never loads the targets
+//     file, and a file whose only entry is the local site has no peers left
+//     after the self filter. Both must name that reason rather than falling
+//     through to the generic "requires -allow" refusal, which would hide why
+//     the flag had no effect. A DNS-name target is refused before any bind,
+//     because the derived allowlist cannot be built without a resolution and
+//     config load deliberately never touches the network;
+//   - unknown -mode refused before any bind, so a typo cannot open ports or
+//     start servers;
+//   - flag combinations that can only fail later: a TLS certificate without
+//     its key, Basic auth without a password, and an unparseable target.
+func TestRunRejectsInvalidConfiguration(t *testing.T) {
 	saveFlags(t)
 	t.Setenv("LINK_PING_METRICS_USER", "")
 	t.Setenv("LINK_PING_METRICS_PASS", "")
@@ -73,58 +88,197 @@ func TestRunRejectsEchoSecretOldWithoutPrimary(t *testing.T) {
 	t.Setenv("LINK_PING_ECHO_SECRET_OLD", "")
 
 	for _, tc := range []struct {
-		name    string
-		secret  string
-		old     string
-		wantErr bool
+		name string
+		// setup mutates the flags (and nothing else) for one row.
+		setup func()
+		// targetsBody, when non-empty, is written to a temp targets file and
+		// assigned to -targets after setup.
+		targetsBody string
+		// envOldSecret sets LINK_PING_ECHO_SECRET_OLD for the env-provenance
+		// rotation case.
+		envOldSecret string
+		// wantErrContains is the message fragment the run() error must name.
+		wantErrContains string
+		// wantErrNotContains proves a guard was passed: the failure must come
+		// from a later check, not from this message.
+		wantErrNotContains string
 	}{
-		{"old secret without primary", "", "x", true},
-		{"old secret with primary", "s", "x", false},
-		{"no secrets", "", "", false},
-		{"primary only", "s", "", false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			saveFlags(t)
-			*flEchoSecret = tc.secret
-			*flEchoSecretOld = tc.old
+		{
 			// Deterministic late failure PAST the guard: an invalid target
 			// fails buildConfig, which runs after the rotation guard, so an
 			// error that does not mention the old secret proves the guard
 			// let the run proceed without binding anything.
-			*flMode = "client"
-			*flTarget = "not a target"
+			name: "old secret without primary",
+			setup: func() {
+				*flMode = "client"
+				*flTarget = "not a target"
+				*flEchoSecret = ""
+				*flEchoSecretOld = "x"
+			},
+			wantErrContains: "old secret alone provides no authentication",
+		},
+		{
+			name: "old secret with primary",
+			setup: func() {
+				*flMode = "client"
+				*flTarget = "not a target"
+				*flEchoSecret = "s"
+				*flEchoSecretOld = "x"
+			},
+			wantErrContains:    "invalid target address",
+			wantErrNotContains: "echo-secret-old",
+		},
+		{
+			name: "no secrets",
+			setup: func() {
+				*flMode = "client"
+				*flTarget = "not a target"
+				*flEchoSecret = ""
+				*flEchoSecretOld = ""
+			},
+			wantErrContains:    "invalid target address",
+			wantErrNotContains: "echo-secret-old",
+		},
+		{
+			name: "primary only",
+			setup: func() {
+				*flMode = "client"
+				*flTarget = "not a target"
+				*flEchoSecret = "s"
+				*flEchoSecretOld = ""
+			},
+			wantErrContains:    "invalid target address",
+			wantErrNotContains: "echo-secret-old",
+		},
+		{
+			// Env-only variant: LINK_PING_ECHO_SECRET_OLD set while the primary
+			// is absent. resolveEchoSecret cannot distinguish a present-but-empty
+			// env var from unset (both read "") — acceptable for the primary;
+			// the guard must still catch the dangerous combination regardless of
+			// provenance.
+			name: "old secret via env only",
+			setup: func() {
+				*flMode = "server"
+				*flTarget = ""
+				*flEchoSecret = ""
+				*flEchoSecretOld = ""
+			},
+			envOldSecret:    "x",
+			wantErrContains: "old secret alone provides no authentication",
+		},
+		{
+			name: "allow-from-targets in server mode has no targets file to derive from",
+			setup: func() {
+				*flMode = "server"
+				*flAllowFromTargets = true
+				*flAllow = ""
+				*flSource = ""
+			},
+			wantErrContains: "no peers to derive",
+		},
+		{
+			name: "allow-from-targets with a self-only file has no peers left",
+			setup: func() {
+				*flMode = "both"
+				*flAllowFromTargets = true
+				*flAllow = ""
+				*flSource = "syd"
+			},
+			targetsBody:     `[{"name":"syd","address":"192.0.2.10:4000"}]`,
+			wantErrContains: "no peers to derive",
+		},
+		{
+			name: "allow-from-targets refuses a DNS-name target",
+			setup: func() {
+				*flMode = "both"
+				*flAllowFromTargets = true
+				*flAllow = ""
+				*flSource = "syd"
+			},
+			targetsBody:     `[{"name":"syd","address":"192.0.2.10:4000"},{"name":"fra","address":"peer.example.com:4000"}]`,
+			wantErrContains: "not an IP literal",
+		},
+		{
+			name: "unknown mode before bind",
+			setup: func() {
+				*flMode = "bogus"
+			},
+			wantErrContains: "unknown mode",
+		},
+		{
+			name: "tls cert without key",
+			setup: func() {
+				*flMetricsTLSCert = "cert.pem"
+			},
+			wantErrContains: "-metrics-tls-cert and -metrics-tls-key must be set together",
+		},
+		{
+			name: "metrics user without password",
+			setup: func() {
+				*flMetricsBasicAuthUser = "u"
+			},
+			wantErrContains: "metrics basic auth requires both username and password",
+		},
+		{
+			name: "client mode with invalid target",
+			setup: func() {
+				*flMode = "client"
+				*flTarget = "not an address"
+			},
+			wantErrContains: "invalid target address",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			saveFlags(t)
+			// Deterministic baseline: an earlier row (or an earlier test that
+			// leaked through saveFlags' snapshot-at-entry restore) must not
+			// change which guard fires first.
+			*flMode = "server"
+			*flListen = "127.0.0.1:0"
+			*flMetrics = "127.0.0.1:0"
+			*flAllow = ""
+			*flAllowFromTargets = false
+			*flTarget = ""
+			*flTargets = ""
+			*flSource = ""
+			*flEchoSecret = ""
+			*flEchoSecretOld = ""
+			*flMetricsBasicAuthUser = ""
+			*flMetricsBasicAuthPass = ""
+			*flMetricsTLSCert = ""
+			*flMetricsTLSKey = ""
+			*flMetricsAllowInsecure = false
+			t.Setenv("LINK_PING_METRICS_USER", "")
+			t.Setenv("LINK_PING_METRICS_PASS", "")
+			t.Setenv("LINK_PING_ECHO_SECRET", "")
+			t.Setenv("LINK_PING_ECHO_SECRET_OLD", "")
+			if tc.envOldSecret != "" {
+				t.Setenv("LINK_PING_ECHO_SECRET_OLD", tc.envOldSecret)
+			}
+			tc.setup()
+			if tc.targetsBody != "" {
+				path := filepath.Join(t.TempDir(), "targets.json")
+				// pi-lens-ignore: go-path-traversal
+				if err := os.WriteFile(path, []byte(tc.targetsBody), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				*flTargets = path
+			}
 
 			// pi-lens-ignore: go-context-background-handler
 			prg := &program{ctx: context.Background()}
 			err := prg.run()
 			if err == nil {
-				t.Fatal("expected run() to fail (rotation guard or invalid target sentinel)")
+				t.Fatalf("expected run() to fail (startup guard or post-guard sentinel), got nil")
 			}
-			if tc.wantErr && !strings.Contains(err.Error(), "old secret alone provides no authentication") {
-				t.Errorf("error should name the old-secret-only problem, got: %v", err)
+			if !strings.Contains(err.Error(), tc.wantErrContains) {
+				t.Fatalf("want error containing %q, got %v", tc.wantErrContains, err)
 			}
-			if !tc.wantErr && strings.Contains(err.Error(), "echo-secret-old") {
-				t.Errorf("valid secret pair must pass the rotation guard, got: %v", err)
+			if tc.wantErrNotContains != "" && strings.Contains(err.Error(), tc.wantErrNotContains) {
+				t.Errorf("valid configuration must pass the earlier guard, but error mentions %q: %v", tc.wantErrNotContains, err)
 			}
 		})
 	}
-
-	// Env-only variant: LINK_PING_ECHO_SECRET_OLD set while the primary is
-	// absent. resolveEchoSecret cannot distinguish a present-but-empty env
-	// var from unset (both read "") — acceptable for the primary; the guard
-	// must still catch the dangerous combination regardless of provenance.
-	t.Run("old secret via env only", func(t *testing.T) {
-		saveFlags(t)
-		*flEchoSecret = ""
-		*flEchoSecretOld = ""
-		t.Setenv("LINK_PING_ECHO_SECRET_OLD", "x")
-		// pi-lens-ignore: go-context-background-handler
-		prg := &program{ctx: context.Background()}
-		err := prg.run()
-		if err == nil || !strings.Contains(err.Error(), "old secret alone provides no authentication") {
-			t.Errorf("env-sourced old secret without primary must fail the guard, got: %v", err)
-		}
-	})
 }
 
 // TestResolveMetricsAuthRejectsColonInUser pins the Basic-auth username
@@ -162,6 +316,10 @@ func TestWarnIgnoredFlags(t *testing.T) {
 				*flAllow = "127.0.0.1"
 				*flListen = "127.0.0.1:4100"
 				*flEchoSecretOld = "old"
+				// -listen's warning keys off flagWasSet, whose process-wide
+				// bookkeeping cannot be reset; drive the same seam the other
+				// set-flag cases use. The per-subtest reset restores it.
+				setFlagNames = func() []string { return []string{"listen"} }
 			},
 			wantWarns: []string{"-allow", "-listen", "-echo-secret-old"},
 		},
@@ -221,9 +379,7 @@ func TestWarnIgnoredFlags(t *testing.T) {
 			name: "client-probing flags set in server mode",
 			mode: "server",
 			setup: func() {
-				orig := setFlagNames
 				setFlagNames = func() []string { return []string{"interval", "target"} }
-				t.Cleanup(func() { setFlagNames = orig })
 			},
 			wantWarns: []string{"client-probing flags set but ignored", "-mode defaults to server", "-target", "-interval"},
 		},
@@ -231,14 +387,15 @@ func TestWarnIgnoredFlags(t *testing.T) {
 			name: "client-probing flags set in client mode are consumed",
 			mode: "client",
 			setup: func() {
-				orig := setFlagNames
 				setFlagNames = func() []string { return []string{"interval", "target"} }
-				t.Cleanup(func() { setFlagNames = orig })
 			},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			saveFlags(t)
+			orig := setFlagNames
+			t.Cleanup(func() { setFlagNames = orig })
+			setFlagNames = func() []string { return nil }
 			*flMode = tc.mode
 			tc.setup()
 			buf := captureWarns(t)
@@ -253,99 +410,6 @@ func TestWarnIgnoredFlags(t *testing.T) {
 				t.Errorf("expected no warnings, log:\n%s", log)
 			}
 		})
-	}
-}
-
-// TestRunRejectsAllowFromTargetsWithoutPeers pins the startup diagnostics for
-// -allow-from-targets. Server-only mode never loads the targets file, and a
-// file whose only entry is the local site has no peers left after the self
-// filter; both must name that reason rather than falling through to the
-// generic "requires -allow" refusal, which would hide why the flag had no
-// effect. A DNS-name target is refused before any bind, because the derived
-// allowlist cannot be built without a resolution and config load deliberately
-// never touches the network.
-// pi-lens-ignore: go-test-functions
-func TestRunRejectsAllowFromTargetsWithoutPeers(t *testing.T) {
-	saveFlags(t)
-	t.Setenv("LINK_PING_METRICS_USER", "")
-	t.Setenv("LINK_PING_METRICS_PASS", "")
-
-	writeTargets := func(t *testing.T, body string) string {
-		t.Helper()
-		path := filepath.Join(t.TempDir(), "targets.json")
-		// pi-lens-ignore: go-path-traversal
-		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		return path
-	}
-
-	for _, tc := range []struct {
-		name    string
-		mode    string
-		targets string
-		source  string
-		wantErr string
-	}{
-		{
-			name:    "server mode has no targets file to derive from",
-			mode:    "server",
-			wantErr: "no peers to derive",
-		},
-		{
-			name:    "a self-only file has no peers left",
-			mode:    "both",
-			targets: `[{"name":"syd","address":"192.0.2.10:4000"}]`,
-			source:  "syd",
-			wantErr: "no peers to derive",
-		},
-		{
-			name:    "a DNS-name target cannot be allowlisted",
-			mode:    "both",
-			targets: `[{"name":"syd","address":"192.0.2.10:4000"},{"name":"fra","address":"peer.example.com:4000"}]`,
-			source:  "syd",
-			wantErr: "not an IP literal",
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			saveFlags(t)
-			*flMode = tc.mode
-			*flListen = "127.0.0.1:0"
-			*flMetrics = "127.0.0.1:0"
-			*flAllow = ""
-			*flTargets = ""
-			*flSource = tc.source
-			*flAllowFromTargets = true
-			if tc.targets != "" {
-				*flTargets = writeTargets(t, tc.targets)
-			}
-			// pi-lens-ignore: go-context-background-handler
-			prg := &program{ctx: context.Background()}
-			err := prg.run()
-			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
-				t.Fatalf("want error containing %q, got %v", tc.wantErr, err)
-			}
-		})
-	}
-}
-
-// pi-lens-ignore: go-test-functions
-
-func TestRunRejectsUnknownModeBeforeBind(t *testing.T) {
-	saveFlags(t)
-	t.Setenv("LINK_PING_METRICS_USER", "")
-	t.Setenv("LINK_PING_METRICS_PASS", "")
-
-	*flMode = "bogus"
-	*flMetrics = "127.0.0.1:0"
-	// pi-lens-ignore: go-context-background-handler
-	prg := &program{ctx: context.Background()}
-	err := prg.run()
-	if err == nil {
-		t.Fatal("expected error for unknown mode")
-	}
-	if !strings.Contains(err.Error(), "unknown mode") {
-		t.Errorf("error should name the mode problem, got: %v", err)
 	}
 }
 
@@ -439,46 +503,6 @@ func TestRun_MetricsServerDeathIsFatal(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("run() did not observe the dead metrics server within 5s")
 	}
-}
-
-// pi-lens-ignore: go-test-functions
-
-// pi-lens-ignore: go-test-functions
-func TestRunRejectsBadFlagCombos(t *testing.T) {
-	saveFlags(t)
-	t.Setenv("LINK_PING_METRICS_USER", "")
-	t.Setenv("LINK_PING_METRICS_PASS", "")
-
-	t.Run("tls cert without key", func(t *testing.T) {
-		saveFlags(t)
-		*flMetricsTLSCert = "cert.pem"
-		// pi-lens-ignore: go-context-background-handler
-		prg := &program{ctx: context.Background()}
-		if err := prg.run(); err == nil {
-			t.Error("expected error for cert without key")
-		}
-	})
-
-	t.Run("metrics user without password", func(t *testing.T) {
-		saveFlags(t)
-		*flMetricsBasicAuthUser = "u"
-		// pi-lens-ignore: go-context-background-handler
-		prg := &program{ctx: context.Background()}
-		if err := prg.run(); err == nil {
-			t.Error("expected error for user without password")
-		}
-	})
-
-	t.Run("client mode with invalid target", func(t *testing.T) {
-		saveFlags(t)
-		*flMode = "client"
-		*flTarget = "not an address"
-		// pi-lens-ignore: go-context-background-handler
-		prg := &program{ctx: context.Background()}
-		if err := prg.run(); err == nil {
-			t.Error("expected error for invalid target in client mode")
-		}
-	})
 }
 
 // TestProgramStartStopBothMode exercises the service Start/Stop lifecycle

@@ -118,22 +118,51 @@ func TestResolveMetricsAuthRejectsColonInUser(t *testing.T) {
 // where the flags are actually consumed.
 
 // pi-lens-ignore: go-test-functions
-func TestFlagDefaultInt(t *testing.T) {
-	// Pins the helper against the current flag defaults so the
-	// "rotation flags require -log-file" guard keeps working.
-	for name, want := range map[string]int{
-		"log-file-max-mb":      *flLogMaxSize,
-		"log-file-max-backups": *flLogMaxBackups,
-		"log-file-max-age":     *flLogMaxAge,
+// TestFlagWasSet pins the single "was this flag explicitly set" primitive.
+// The process-wide FlagSet's "was set" bookkeeping cannot be undone, so the
+// test drives the setFlagNames seam rather than flag.Set.
+func TestFlagWasSet(t *testing.T) {
+	orig := setFlagNames
+	t.Cleanup(func() { setFlagNames = orig })
+	setFlagNames = func() []string { return []string{"listen", "hmac-coverage"} }
+
+	if !flagWasSet("listen") || !flagWasSet("hmac-coverage") {
+		t.Error("an explicitly set flag must report true")
+	}
+	if flagWasSet("interval") {
+		t.Error("an unset flag must report false")
+	}
+}
+
+// TestValidateLogRotationFlags pins the rotation guard: a rotation flag
+// without -log-file is a startup error, and explicitly passing a default
+// value counts as set (the old DefValue comparison silently accepted it).
+func TestValidateLogRotationFlags(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		logFile string
+		set     []string
+		wantErr bool
+	}{
+		{"no rotation flags", "", nil, false},
+		{"rotation flag with log-file", "agent.log", []string{"log-file-max-mb"}, false},
+		{"size without log-file", "", []string{"log-file-max-mb"}, true},
+		{"backups without log-file", "", []string{"log-file-max-backups"}, true},
+		{"age without log-file", "", []string{"log-file-max-age"}, true},
+		{"explicit default size without log-file", "", []string{"log-file-max-mb"}, true},
 	} {
-		got, err := flagDefaultInt(name)
-		if err != nil {
-			t.Errorf("flagDefaultInt(%s): %v", name, err)
-			continue
-		}
-		if got != want {
-			t.Errorf("flagDefaultInt(%s) = %d, want %d", name, got, want)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			saveFlags(t)
+			*flLogFile = tc.logFile
+			orig := setFlagNames
+			t.Cleanup(func() { setFlagNames = orig })
+			setFlagNames = func() []string { return tc.set }
+
+			err := validateLogRotationFlags()
+			if got := err != nil; got != tc.wantErr {
+				t.Errorf("validateLogRotationFlags() error = %v, wantErr %v", err, tc.wantErr)
+			}
+		})
 	}
 }
 
