@@ -377,7 +377,7 @@ func TestMetricsServerCertReloadWithoutRestart(t *testing.T) {
 // a pure "already tried" memo would serve the expired certificate forever.
 func TestMetricsServerCertReloadFailureKeepsPrevious(t *testing.T) {
 	origCooldown := certReloadRetryCooldown
-	certReloadRetryCooldown = time.Second
+	certReloadRetryCooldown = 200 * time.Millisecond
 	t.Cleanup(func() { certReloadRetryCooldown = origCooldown })
 
 	prober.InitMetrics()

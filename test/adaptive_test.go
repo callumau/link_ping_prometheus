@@ -47,10 +47,12 @@ func TestAdaptive_RespondsToJitter(t *testing.T) {
 	rtoLow := getGaugeValue(prober.RTOEstimate, "adaptive_jitter", addr)
 
 	// Link jumps to 150ms: the dynamic floor (2*SRTT) must lift the RTO
-	// to ~300ms plus the RTTVAR term.
+	// to ~300ms plus the RTTVAR term. 1.5s is ~7 probes at the 200ms
+	// interval: enough samples for the floor to rise above the settled
+	// 200ms value, which is all the assertions below need.
 	delay.Store(int64(150 * time.Millisecond))
 	// pi-lens-ignore: go-time-sleep-test
-	time.Sleep(3 * time.Second)
+	time.Sleep(1500 * time.Millisecond)
 	rtoHigh := getGaugeValue(prober.RTOEstimate, "adaptive_jitter", addr)
 
 	t.Logf("RTO Low: %v, RTO High: %v", rtoLow, rtoHigh)

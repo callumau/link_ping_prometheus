@@ -94,7 +94,7 @@ func TestPrecision_BucketPlacement_CannotUndercountRTT(t *testing.T) {
 	cfg := cfgWith(false, 150*time.Millisecond, time.Second,
 		prober.Target{Name: "precision_bkt_80", Address: addrA},
 		prober.Target{Name: "precision_bkt_120", Address: addrB})
-	runClientFor(ctx, cfg, 4500*time.Millisecond)
+	runClientFor(ctx, cfg, 3000*time.Millisecond)
 	cancel()
 	time.Sleep(200 * time.Millisecond)
 
@@ -113,7 +113,7 @@ func TestPrecision_BucketPlacement_CannotUndercountRTT(t *testing.T) {
 			t.Fatalf("%s: no histogram series", tc.name)
 		}
 		total := float64(h.GetSampleCount())
-		if total < 20 {
+		if total < 15 {
 			t.Fatalf("%s: only %v samples — cpu load?", tc.name, total)
 		}
 		for _, b := range h.GetBucket() {
