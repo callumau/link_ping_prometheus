@@ -27,10 +27,6 @@ func platformStopService() error {
 	return exec.Command("launchctl", "stop", launchdLabel).Run()
 }
 
-// removeEventLogSource exists only on the Windows manager; darwin has no
-// event-log source to remove.
-func removeEventLogSource(name string) {}
-
 // platformInstallService / platformUninstallService are unreachable on
 // darwin (svcActionSupported refuses install/uninstall off-Windows);
 // defined so the portable dispatcher compiles.

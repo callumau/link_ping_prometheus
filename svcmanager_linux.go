@@ -26,10 +26,6 @@ func platformStopService() error {
 	return exec.Command("systemctl", "stop", serviceName).Run()
 }
 
-// removeEventLogSource exists only on the Windows manager; unix has no
-// event-log source to remove.
-func removeEventLogSource(name string) {}
-
 // platformInstallService / platformUninstallService are unreachable on
 // linux (svcActionSupported refuses install/uninstall off-Windows);
 // defined so the portable dispatcher compiles.

@@ -2,7 +2,6 @@ package e2e
 
 import (
 	"encoding/json"
-	"net/http"
 	"os"
 	"os/exec"
 	"runtime"
@@ -140,13 +139,6 @@ func funcPort2Status(port int) string {
 func http2Body(t *testing.T, port int) string {
 	t.Helper()
 	_, body := httpGetIf(t, "http://127.0.0.1:"+itoa(port)+"/metrics")
-	return body
-}
-
-// httpBodyURL fetches an arbitrary binary endpoint body.
-func httpBodyURL(t *testing.T, url string) string {
-	t.Helper()
-	_, body := httpGetIf(t, url)
 	return body
 }
 
@@ -383,22 +375,6 @@ func itoa(i int) string {
 		b[pos] = '-'
 	}
 	return string(b[pos:])
-}
-
-// clientTimeout is the shared HTTP client for the e2e surfaces.
-var clientTimeout = &clientWithTimeout{timeout: 3 * time.Second}
-
-type clientWithTimeout struct {
-	timeout time.Duration
-}
-
-func (c *clientWithTimeout) Get(url string) (*http.Response, error) {
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
-	}
-	// pi-lens-ignore: go-context-background-handler
-	return (&http.Client{Timeout: c.timeout}).Do(req)
 }
 
 var _ = os.Getenv // referenced by the service tests which set/read env

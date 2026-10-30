@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"os"
 	"time"
-	"unsafe"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
@@ -263,20 +262,6 @@ func platformStopService() error {
 		if err != nil {
 			return fmt.Errorf("poll service status: %w", err)
 		}
-	}
-	return nil
-}
-
-// setServiceSIDType writes SERVICE_CONFIG_SERVICE_SID_INFO; svc/mgr does
-// not expose it, so ChangeServiceConfig2W is summoned directly.
-func setServiceSIDType(s *mgr.Service, sidType uint32) error {
-	type serviceSidInfo struct {
-		dwServiceSidType uint32
-	}
-	info := serviceSidInfo{dwServiceSidType: uint32(sidType)}
-	const serviceConfigServiceSidInfo = 12
-	if err := windows.ChangeServiceConfig2(s.Handle, serviceConfigServiceSidInfo, (*byte)(unsafe.Pointer(&info))); err != nil {
-		return err
 	}
 	return nil
 }

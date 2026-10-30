@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -29,8 +28,6 @@ import (
 
 var (
 	binPath string
-	binOnce sync.Once
-	binErr  error
 )
 
 // TestMain builds the release binary once for the whole suite so the
@@ -66,11 +63,6 @@ type binProc struct {
 	buf    *syncBuffer
 }
 
-// compileLogRegex wraps the log-pattern regexes used by waitLog.
-func compileLogRegex(re string) *regexp.Regexp {
-	return regexp.MustCompile(re)
-}
-
 // waitMetricGTE polls the /metrics exposition until the named series
 // reaches a value >= min (positive-condition polling; series exist at 0
 // from first scrape so a substring wait is never enough).
@@ -90,8 +82,8 @@ func waitMetricGTE(t *testing.T, url, name string, min float64, timeout time.Dur
 	return 0
 }
 
-// startBin launches the binary with args. Output is race-buffered; use
-// proc.log() in asserts. Cleanup kills the process (SIGTERM on unix via
+// startBin launches the binary with args. Output is race-buffered; read
+// proc.buf.String() in asserts. Cleanup kills the process (SIGTERM on unix via
 // cancel-friendly process kill; Windows uses Process.Kill, which is
 // what a service-control test leaves behind anyway).
 func startBin(t *testing.T, args ...string) *binProc {
@@ -111,24 +103,6 @@ func startBin(t *testing.T, args ...string) *binProc {
 	})
 	return &binProc{cmd: cmd, ctx: ctx, cancel: cancel, buf: buf}
 }
-
-// waitLog polls the captured output until the regex matches, returning
-// the first match (used to scrape ephemeral listen ports from logs).
-func (b *binProc) waitLog(t *testing.T, re string, timeout time.Duration) string {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	rxre := compileLogRegex(re)
-	for time.Now().Before(deadline) {
-		if m := rxre.FindStringSubmatch(b.buf.String()); m != nil {
-			return m[len(m)-1]
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	t.Fatalf("log pattern %q not found within %v; output:\n%s", re, timeout, b.buf.String())
-	return ""
-}
-
-func (b *binProc) log() string { return b.buf.String() }
 
 // syncBuffer is an io.Writer safe for the exec pipes' concurrent writes.
 type syncBuffer struct {
@@ -213,11 +187,6 @@ func metricValue(body, line string) float64 {
 	return 0
 }
 
-// metricGauge returns the metric by exact name present check.
-func metricPresent(body, name string) bool {
-	return strings.Contains(body, name)
-}
-
 // writeTargetsFile writes a targets JSON file with names/addresses.
 func writeTargetsFile(t *testing.T, dir string, targets map[string]string) string {
 	t.Helper()
@@ -237,16 +206,4 @@ func writeTargetsFile(t *testing.T, dir string, targets map[string]string) strin
 		t.Fatalf("write targets: %v", err)
 	}
 	return p
-}
-
-// procWaitExit waits for process exit and returns error (nil on 0).
-func (b *binProc) waitExit(timeout time.Duration) error {
-	done := make(chan error, 1)
-	go func() { done <- b.cmd.Wait() }()
-	select {
-	case err := <-done:
-		return err
-	case <-time.After(timeout):
-		return fmt.Errorf("process still running after %v", timeout)
-	}
 }

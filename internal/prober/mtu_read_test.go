@@ -36,7 +36,7 @@ func (c *scriptedReadConn) SetDeadline(time.Time) error      { return nil }
 func (c *scriptedReadConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *scriptedReadConn) SetWriteDeadline(time.Time) error { return nil }
 
-// dfFrame builds a well-formed echo frame of the given total size with the
+// dfFrameFull builds a well-formed echo frame of the given total size with the
 // given seq and ts, appending tag when non-nil (HMAC frames are 8 bytes
 // longer; callers pass size accordingly).
 func dfFrameFull(seq, ts uint64, size int, tag []byte) []byte {
@@ -48,11 +48,6 @@ func dfFrameFull(seq, ts uint64, size int, tag []byte) []byte {
 		copy(b[24:32], tag)
 	}
 	return b
-}
-
-// dfFrame builds a ts-zero echo frame of the given total size.
-func dfFrame(seq uint64, size int) []byte {
-	return dfFrameFull(seq, 0, size, nil)
 }
 
 // TestReadEcho_SkipsForeignAndOtherSizedDatagrams pins the matching rule that
