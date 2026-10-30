@@ -34,34 +34,58 @@ func mustAllow(s string) *prober.Allowlist {
 // all dial from the loopback IP, so it is the sole permitted prober.
 var testAllow = mustAllow("127.0.0.1")
 
-// startServer starts ServePacketConn on an ephemeral loopback port with
-// the standard test allowlist, returning the port address. The socket is
-// closed on ctx cancel; t.Cleanup waits for the echo loop to return so a
-// leaked server goroutine cannot race a later test writing the shared
-// rate-limit cap variables.
-func startServer(t *testing.T, ctx context.Context) string {
-	t.Helper()
-	pc := listenUDP(t, ctx)
-	done := make(chan struct{})
-	go func() {
-		prober.ServePacketConn(ctx, pc, testSource, testAllow, "")
-		close(done)
-	}()
-	t.Cleanup(func() { <-done })
-	return pc.LocalAddr().String()
+// serverOpts selects the ServePacketConn parameters a test needs. The zero
+// value uses the standard test allowlist and no secret; old is variadic
+// because main always passes the rotation secret as a one-element variadic
+// (empty included).
+type serverOpts struct {
+	allow  *prober.Allowlist
+	secret string
+	old    []string
 }
 
-// startServerDone is startServer with a channel that is closed when
-// ServePacketConn returns, for tests that assert shutdown behavior.
-func startServerDone(t *testing.T, ctx context.Context) (string, <-chan struct{}) {
+// startServerOpts starts ServePacketConn on an ephemeral loopback port and
+// returns its address plus a channel closed when the echo loop exits. The
+// caller owns the join (a defer or t.Cleanup) so tests that assert shutdown
+// ordering keep it; a leaked server goroutine would race a later test
+// writing the shared rate-limit/cap vars.
+func startServerOpts(t *testing.T, ctx context.Context, o serverOpts) (string, chan struct{}) {
 	t.Helper()
+	if o.allow == nil {
+		o.allow = testAllow
+	}
 	pc := listenUDP(t, ctx)
 	done := make(chan struct{})
 	go func() {
-		prober.ServePacketConn(ctx, pc, testSource, testAllow, "")
+		prober.ServePacketConn(ctx, pc, testSource, o.allow, o.secret, o.old...)
 		close(done)
 	}()
 	return pc.LocalAddr().String(), done
+}
+
+// startServer starts ServePacketConn with the standard test allowlist, no
+// secret, and joins the echo loop at test end.
+func startServer(t *testing.T, ctx context.Context) string {
+	t.Helper()
+	addr, done := startServerOpts(t, ctx, serverOpts{})
+	t.Cleanup(func() { <-done })
+	return addr
+}
+
+// startServerDone is startServer with the exit channel exposed, for tests
+// that assert shutdown behavior and own the cancel themselves.
+func startServerDone(t *testing.T, ctx context.Context) (string, chan struct{}) {
+	t.Helper()
+	return startServerOpts(t, ctx, serverOpts{})
+}
+
+// startHMACServer starts ServePacketConn with echo authentication enabled
+// and joins the echo loop at test end.
+func startHMACServer(t *testing.T, ctx context.Context, secret string) string {
+	t.Helper()
+	addr, done := startServerOpts(t, ctx, serverOpts{secret: secret})
+	t.Cleanup(func() { <-done })
+	return addr
 }
 
 // dialProbe opens a UDP conn to addr and builds one valid probe frame.
@@ -397,21 +421,6 @@ func buildHMACFrame(secret string, seq, ts uint64) []byte {
 	return frame
 }
 
-// startHMACServer starts ServePacketConn with echo authentication
-// enabled, returning its port address. Closed on ctx cancel; like
-// startServer, t.Cleanup joins the goroutine before the next test runs.
-func startHMACServer(t *testing.T, ctx context.Context, secret string) string {
-	t.Helper()
-	pc := listenUDP(t, ctx)
-	done := make(chan struct{})
-	go func() {
-		prober.ServePacketConn(ctx, pc, testSource, testAllow, secret)
-		close(done)
-	}()
-	t.Cleanup(func() { <-done })
-	return pc.LocalAddr().String()
-}
-
 // TestServer_HMACAuth: the SEC22 echo-authentication path must accept
 // only valid, fresh 32-byte frames from allowed sources — good tags are
 // echoed; bad tags, wrong sizes, and stale/replayed timestamps are all
@@ -487,14 +496,8 @@ func TestServer_HMACRotation(t *testing.T) {
 	const newSecret = "test-secret-new"
 	const oldSecret = "test-secret"
 
-	pc := listenUDP(t, ctx)
-	done := make(chan struct{})
-	go func() {
-		prober.ServePacketConn(ctx, pc, testSource, testAllow, newSecret, oldSecret)
-		close(done)
-	}()
+	addr, done := startServerOpts(t, ctx, serverOpts{secret: newSecret, old: []string{oldSecret}})
 	t.Cleanup(func() { <-done })
-	addr := pc.LocalAddr().String()
 
 	conn, err := net.Dial("udp", addr)
 	if err != nil {
@@ -522,14 +525,9 @@ func TestServer_HMACRotation(t *testing.T) {
 
 	// Without the rotation secret configured, an old-secret frame is a
 	// plain hmac drop again.
-	pc2 := listenUDP(t, ctx)
-	done2 := make(chan struct{})
-	go func() {
-		prober.ServePacketConn(ctx, pc2, testSource, testAllow, newSecret)
-		close(done2)
-	}()
+	addr2, done2 := startServerOpts(t, ctx, serverOpts{secret: newSecret})
 	t.Cleanup(func() { <-done2 })
-	conn2, err := net.Dial("udp", pc2.LocalAddr().String())
+	conn2, err := net.Dial("udp", addr2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -606,13 +604,7 @@ func TestServer_GlobalRateLimitStarvesExcess(t *testing.T) {
 		prober.MaxPktsPerIP, prober.MaxPktsGlobal = oldIP, oldGlobal
 	}()
 
-	pc := listenUDP(t, ctx)
-	allowed := mustAllow("127.0.0.1,127.0.0.2")
-	go func() {
-		prober.ServePacketConn(ctx, pc, testSource, allowed, "")
-		close(done)
-	}()
-	addr := pc.LocalAddr().String()
+	addr, done := startServerOpts(t, ctx, serverOpts{allow: mustAllow("127.0.0.1,127.0.0.2")})
 
 	echoCount := func(conn net.Conn, sends int) int {
 		t.Helper()
@@ -730,14 +722,8 @@ func TestServer_UnlistedValidHMACStillDropped(t *testing.T) {
 	ctx := t.Context()
 
 	const secret = "order-secret"
-	pc := listenUDP(t, ctx)
-	done := make(chan struct{})
-	go func() {
-		prober.ServePacketConn(ctx, pc, testSource, testAllow, secret) // allowlist: 127.0.0.1 only
-		close(done)
-	}()
+	addr, done := startServerOpts(t, ctx, serverOpts{secret: secret})
 	t.Cleanup(func() { <-done }) // join before global rate-cap vars are restored
-	addr := pc.LocalAddr().String()
 
 	dst, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
@@ -915,13 +901,7 @@ func TestServer_CIDRAllowlist(t *testing.T) {
 		<-done
 	}()
 
-	pc := listenUDP(t, ctx)
-	allowed := mustAllow("127.0.0.2/32")
-	go func() {
-		prober.ServePacketConn(ctx, pc, testSource, allowed, "")
-		close(done)
-	}()
-	addr := pc.LocalAddr().String()
+	addr, done := startServerOpts(t, ctx, serverOpts{allow: mustAllow("127.0.0.2/32")})
 
 	in := dialFrom(t, addr, net.IPv4(127, 0, 0, 2))
 	defer in.Close()
@@ -953,13 +933,7 @@ func TestServer_ClientSeriesOverflow(t *testing.T) {
 		<-done
 	}()
 
-	pc := listenUDP(t, ctx)
-	allowed := mustAllow("127.0.0.0/8")
-	go func() {
-		prober.ServePacketConn(ctx, pc, testSource, allowed, "")
-		close(done)
-	}()
-	addr := pc.LocalAddr().String()
+	addr, done := startServerOpts(t, ctx, serverOpts{allow: mustAllow("127.0.0.0/8")})
 
 	var conns []net.Conn
 	defer func() {
@@ -1013,13 +987,7 @@ func TestServer_UnauthenticatedSourceCannotSpendSeriesSlot(t *testing.T) {
 	}()
 
 	const secret = "resolve-after-auth"
-	pc := listenUDP(t, ctx)
-	allowed := mustAllow("127.0.0.0/8") // CIDR entry -> the dynamic resolve path
-	go func() {
-		prober.ServePacketConn(ctx, pc, testSource, allowed, secret)
-		close(done)
-	}()
-	addr := pc.LocalAddr().String()
+	addr, done := startServerOpts(t, ctx, serverOpts{allow: mustAllow("127.0.0.0/8"), secret: secret})
 
 	// Correct size, magic and fresh timestamp — only the tag is wrong, so the
 	// frame reaches the authentication step and nothing else.
@@ -1097,14 +1065,9 @@ func TestAllowlist_IPv4Mapped(t *testing.T) {
 		cancel()
 		<-done
 	}()
-	pc := listenUDP(t, ctx)
-	allowed := mustAllow("::ffff:127.0.0.1")
-	go func() {
-		prober.ServePacketConn(ctx, pc, testSource, allowed, "")
-		close(done)
-	}()
+	addr, done := startServerOpts(t, ctx, serverOpts{allow: mustAllow("::ffff:127.0.0.1")})
 
-	conn, probe := dialProbe(t, pc.LocalAddr().String())
+	conn, probe := dialProbe(t, addr)
 	defer conn.Close()
 	conn.Write(probe)
 	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
@@ -1134,13 +1097,7 @@ func TestServer_RateLimit_JunkDoesNotSpendPerIPBudget(t *testing.T) {
 	}()
 
 	const secret = "rate-order-secret"
-	pc := listenUDP(t, ctx)
-	allowed := mustAllow("127.0.0.1")
-	go func() {
-		prober.ServePacketConn(ctx, pc, testSource, allowed, secret)
-		close(done)
-	}()
-	addr := pc.LocalAddr().String()
+	addr, done := startServerOpts(t, ctx, serverOpts{allow: mustAllow("127.0.0.1"), secret: secret})
 
 	conn, err := net.Dial("udp", addr)
 	if err != nil {
@@ -1197,13 +1154,7 @@ func TestServer_RateLimit_GlobalChargeBoundsCrypto(t *testing.T) {
 	}()
 
 	const secret = "rate-order-secret"
-	pc := listenUDP(t, ctx)
-	allowed := mustAllow("127.0.0.1")
-	go func() {
-		prober.ServePacketConn(ctx, pc, testSource, allowed, secret)
-		close(done)
-	}()
-	addr := pc.LocalAddr().String()
+	addr, done := startServerOpts(t, ctx, serverOpts{allow: mustAllow("127.0.0.1"), secret: secret})
 
 	conn, err := net.Dial("udp", addr)
 	if err != nil {
@@ -1256,13 +1207,7 @@ func TestServer_RateLimit_ReplayDoesNotSpendPerIPBudget(t *testing.T) {
 	}()
 
 	const secret = "replay-order-secret"
-	pc := listenUDP(t, ctx)
-	allowed := mustAllow("127.0.0.1")
-	go func() {
-		prober.ServePacketConn(ctx, pc, testSource, allowed, secret)
-		close(done)
-	}()
-	addr := pc.LocalAddr().String()
+	addr, done := startServerOpts(t, ctx, serverOpts{allow: mustAllow("127.0.0.1"), secret: secret})
 
 	conn, err := net.Dial("udp", addr)
 	if err != nil {
@@ -1453,13 +1398,7 @@ func TestServer_DynamicClientEviction(t *testing.T) {
 		prober.MaxClientSeries, prober.DynClientTTL = oldCap, oldTTL
 	}()
 
-	pc := listenUDP(t, ctx)
-	allowed := mustAllow("127.0.0.0/8") // CIDR entry -> clients take the dynamic path
-	go func() {
-		prober.ServePacketConn(ctx, pc, testSource, allowed, "")
-		close(done)
-	}()
-	addr := pc.LocalAddr().String()
+	addr, done := startServerOpts(t, ctx, serverOpts{allow: mustAllow("127.0.0.0/8")})
 
 	// Dial all three first so the window between the last admitted probe and
 	// the overflow probe stays far below DynClientTTL.
@@ -1532,13 +1471,7 @@ func TestServer_DynamicClientSeriesExpiresBelowCap(t *testing.T) {
 		prober.DynClientTTL = oldTTL
 	}()
 
-	pc := listenUDP(t, ctx)
-	allowed := mustAllow("127.0.0.0/8") // CIDR entry -> clients take the dynamic path
-	go func() {
-		prober.ServePacketConn(ctx, pc, testSource, allowed, "")
-		close(done)
-	}()
-	addr := pc.LocalAddr().String()
+	addr, done := startServerOpts(t, ctx, serverOpts{allow: mustAllow("127.0.0.0/8")})
 
 	c2 := dialFrom(t, addr, net.IPv4(127, 0, 0, 2))
 	defer c2.Close()
@@ -1699,14 +1632,9 @@ func TestServer_ExactClientSeriesNeverEvicted(t *testing.T) {
 		<-done
 	}()
 
-	pc := listenUDP(t, ctx)
-	allowed := mustAllow("127.0.0.1") // exact entry -> pre-resolved handle
-	go func() {
-		prober.ServePacketConn(ctx, pc, testSource, allowed, "")
-		close(done)
-	}()
+	addr, done := startServerOpts(t, ctx, serverOpts{allow: mustAllow("127.0.0.1")})
 
-	conn, probe := dialProbe(t, pc.LocalAddr().String())
+	conn, probe := dialProbe(t, addr)
 	defer conn.Close()
 
 	conn.Write(probe)
@@ -1756,15 +1684,8 @@ func TestServer_HMACSizeWindowAndDropReasons(t *testing.T) {
 	defer cancel()
 
 	const secret = "size-window-secret"
-	pc := listenUDP(t, ctx)
-	allowed := mustAllow("127.0.0.1")
-	done := make(chan struct{})
-	go func() {
-		prober.ServePacketConn(ctx, pc, testSource, allowed, secret)
-		close(done)
-	}()
+	addr, done := startServerOpts(t, ctx, serverOpts{allow: mustAllow("127.0.0.1"), secret: secret})
 	t.Cleanup(func() { <-done })
-	addr := pc.LocalAddr().String()
 
 	conn, err := net.Dial("udp", addr)
 	if err != nil {
