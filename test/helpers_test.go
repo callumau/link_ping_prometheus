@@ -74,14 +74,6 @@ func getHistogramCount(vec *prometheus.HistogramVec, targetName, address string)
 	return float64(h.GetSampleCount())
 }
 
-func verifyCounter(t *testing.T, vec *prometheus.CounterVec, targetName, address string) {
-	t.Helper()
-	val := getCounterValue(vec, targetName, address)
-	if val <= 0 {
-		t.Errorf("expected metric value > 0 for target %s (addr %s), got %v", targetName, address, val)
-	}
-}
-
 func verifyHistogramCount(t *testing.T, vec *prometheus.HistogramVec, targetName, address string) {
 	t.Helper()
 	val := getHistogramCount(vec, targetName, address)
