@@ -554,6 +554,22 @@ func effectiveSource() string {
 	return sanitized
 }
 
+// resolveSource returns the effective source label (the -source flag or the
+// sanitized hostname) and validates it. One spelling for buildConfig, the
+// server-only run path and -svc=install: a source that fails
+// ValidateTargetName must be refused by every caller, never persisted into a
+// service command line that then exits 1 on each SCM start.
+func resolveSource() (string, error) {
+	source := *flSource
+	if source == "" {
+		source = effectiveSource()
+	}
+	if err := prober.ValidateTargetName(source); err != nil {
+		return "", fmt.Errorf("invalid -source: %w", err)
+	}
+	return source, nil
+}
+
 // buildConfig resolves CLI flags into a prober.Config. It handles single
 // (-target) and multi-target (-targets) modes. Failures are returned as
 // errors so the caller can abort before any server starts.
@@ -571,12 +587,9 @@ func buildConfig() (prober.Config, error) {
 		}
 		targets = []prober.Target{{Name: "default", Address: *flTarget}}
 	}
-	source := *flSource
-	if source == "" {
-		source = effectiveSource()
-	}
-	if err := prober.ValidateTargetName(source); err != nil {
-		return prober.Config{}, fmt.Errorf("invalid source: %w", err)
+	source, err := resolveSource()
+	if err != nil {
+		return prober.Config{}, err
 	}
 	// Mesh mode (-allow-from-targets) deploys ONE targets file on every
 	// site, listing all of them including the local one. Drop the self entry
@@ -599,12 +612,24 @@ func buildConfig() (prober.Config, error) {
 		DSCP:              *flDSCP,
 		Payload:           *flPayload,
 		MTUSweep:          *flMTUSweep,
+		TargetsPath:       *flTargets,
+		ReloadInterval:    *flTargetsReload,
 	}
 	coverage, err := prober.ParseHMACCoverage(*flHMACCoverage)
 	if err != nil {
 		return prober.Config{}, err
 	}
 	cfg.HmacCoverage = coverage
+	// Validate the whole config here so -svc=install and run() cannot accept
+	// different configurations: both reach RunClient through this builder.
+	// A self-only mesh file is diagnosed by resolveAllowlist with a more
+	// specific message ("no peers to derive an allowlist from"), so leave
+	// the empty target set to it rather than preempting with "no targets".
+	if !(skipSelf && len(targets) == 0) {
+		if err := cfg.Validate(); err != nil {
+			return prober.Config{}, err
+		}
+	}
 	return cfg, nil
 }
 
@@ -837,17 +862,14 @@ func installServiceArgs() ([]string, error) {
 			return nil, err
 		}
 	}
-	// run() validates the resolved source in EVERY mode, but buildConfig is the
-	// only caller of ValidateTargetName on this path and it is skipped for
-	// server-only mode: -svc=install -mode=server -source="Sydney DC" used to
-	// install and then exit 1 on every SCM start. Validate it here whatever the
-	// mode.
-	source := *flSource
-	if source == "" {
-		source = effectiveSource()
-	}
-	if err := prober.ValidateTargetName(source); err != nil {
-		return nil, fmt.Errorf("invalid -source: %w", err)
+	// buildConfig validates the resolved source in client/both mode; server
+	// mode never calls it, so validate the flag here too. -svc=install
+	// -mode=server -source="Sydney DC" used to install and then exit 1 on
+	// every SCM start. Validate it here whatever the mode.
+	if cfg.Source == "" {
+		if _, err := resolveSource(); err != nil {
+			return nil, err
+		}
 	}
 	// The bind addresses are the same crash loop when malformed (the persisted
 	// flag can never bind), so resolve them here too. Resolution only — a bind
@@ -1454,30 +1476,21 @@ func (p *program) run() error {
 	// -targets-reload-interval). Signals coalesce: every delivery just
 	// re-reads and re-validates the file, which is idempotent.
 	if *flTargets != "" {
-		cfg.TargetsPath = *flTargets
-		cfg.ReloadInterval = *flTargetsReload
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGHUP)
 		defer signal.Stop(sigCh)
 		cfg.ReloadSignal = sigCh
 	}
 
-	// Resolve source for server metrics; defaults to hostname and is validated.
-	// For client/both modes cfg.Source already holds the effective source (via buildConfig).
-	// For server-only mode we resolve it here.
-	sourceForServer := *flSource
+	// Resolve source for server metrics. buildConfig already validated it in
+	// client/both mode (and set cfg.Source); server-only mode skips
+	// buildConfig, so resolve and validate it here through the same helper.
+	sourceForServer := cfg.Source
 	if sourceForServer == "" {
-		if cfg.Source != "" {
-			sourceForServer = cfg.Source
-		} else {
-			sourceForServer = effectiveSource()
-			if err := prober.ValidateTargetName(sourceForServer); err != nil {
-				return fmt.Errorf("invalid source: %w", err)
-			}
-		}
-	} else {
-		if err := prober.ValidateTargetName(sourceForServer); err != nil {
-			return fmt.Errorf("invalid source: %w", err)
+		var err error
+		sourceForServer, err = resolveSource()
+		if err != nil {
+			return err
 		}
 	}
 

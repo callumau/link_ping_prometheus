@@ -632,6 +632,46 @@ func TestInstallRejectsConfigThatCannotStart(t *testing.T) {
 	})
 }
 
+// TestInstallRejectsInvalidConfigFields pins the config.Validate parity hole:
+// -svc=install validated the flags, source, addresses and allowlist but not
+// the whole Config, so a persisted -interval/-payload/-dscp/-reconnect value
+// that RunClient rejects installed "successfully" and then exited 1 on every
+// SCM start (the 5s restart ladder, with no log when -log-file is unset).
+func TestInstallRejectsInvalidConfigFields(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		setup   func()
+		wantErr string
+	}{
+		{"sub-millisecond interval", func() { *flBaseInterval = time.Microsecond }, "at least 1ms"},
+		{"payload over the cap", func() { *flPayload = prober.MaxPayloadBytes + 1 }, "payload must be 0-"},
+		{"dscp out of range", func() { *flDSCP = 64 }, "dscp must be 0-63"},
+		{"reconnect below interval", func() {
+			*flBaseInterval = time.Second
+			*flReconnectInterval = 100 * time.Millisecond
+		}, "reconnect interval"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			saveFlags(t)
+			*flMode = "client"
+			*flAllow = ""
+			*flAllowFromTargets = false
+			*flTarget, *flTargets = "127.0.0.1:4000", ""
+			tc.setup()
+			args, err := installServiceArgs()
+			if err == nil {
+				t.Fatalf("installServiceArgs accepted a config run() refuses; args=%v", args)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("error = %v, want it to name %q", err, tc.wantErr)
+			}
+			if args != nil {
+				t.Errorf("a refused install must not produce an SCM command line, got %v", args)
+			}
+		})
+	}
+}
+
 // TestInstallRejectsUnstartableSourceAndAddresses covers the two holes left in
 // the -svc=install guard: server-only mode skipped buildConfig (the only caller
 // of prober.ValidateTargetName there) while run() validates the resolved source

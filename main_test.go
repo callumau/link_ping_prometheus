@@ -39,6 +39,8 @@ func saveFlags(t *testing.T) {
 	oldAllow, oldAllowFromTargets, oldSource := *flAllow, *flAllowFromTargets, *flSource
 	oldAdaptive := *flAdaptive
 	oldInterval, oldTimeout := *flBaseInterval, *flBaseTimeout
+	oldReconnect, oldPayload, oldDSCP := *flReconnectInterval, *flPayload, *flDSCP
+	oldTargetsReload, oldMTUSweep := *flTargetsReload, *flMTUSweep
 	oldLogFile, oldJSONLogs := *flLogFile, *flJSONLogs
 	oldLogMaxSize, oldLogMaxBackups, oldLogMaxAge := *flLogMaxSize, *flLogMaxBackups, *flLogMaxAge
 	oldAllowInsecure := *flMetricsAllowInsecure
@@ -52,6 +54,8 @@ func saveFlags(t *testing.T) {
 		*flAllowFromTargets = oldAllowFromTargets
 		*flAdaptive = oldAdaptive
 		*flBaseInterval, *flBaseTimeout = oldInterval, oldTimeout
+		*flReconnectInterval, *flPayload, *flDSCP = oldReconnect, oldPayload, oldDSCP
+		*flTargetsReload, *flMTUSweep = oldTargetsReload, oldMTUSweep
 		*flLogFile, *flJSONLogs = oldLogFile, oldJSONLogs
 		*flLogMaxSize, *flLogMaxBackups, *flLogMaxAge = oldLogMaxSize, oldLogMaxBackups, oldLogMaxAge
 		*flMetricsAllowInsecure = oldAllowInsecure
