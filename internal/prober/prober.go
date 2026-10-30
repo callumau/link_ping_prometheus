@@ -237,6 +237,11 @@ func (c Config) Validate() error {
 	if c.MTUSweep < 0 {
 		return fmt.Errorf("mtu sweep interval must be >= 0, got %v", c.MTUSweep)
 	}
+	if c.HmacCoverage != HMACHeaderCoverage && c.HmacCoverage != HMACFullFrameCoverage {
+		// An out-of-range value used to behave silently as header-only: the
+		// operator asked for payload coverage and got the v0.7 check.
+		return fmt.Errorf("hmac coverage must be header or full-frame, got %d", c.HmacCoverage)
+	}
 	if c.ReconnectInterval != 0 && c.ReconnectInterval < c.BaseInterval {
 		return fmt.Errorf("reconnect interval %v must be >= probe interval %v", c.ReconnectInterval, c.BaseInterval)
 	}
@@ -299,6 +304,14 @@ func fillPayload(buf []byte, seq, ts uint64) {
 	}
 }
 
+// tagsPayload reports whether the tag must cover the payload: full-frame
+// coverage with at least one payload byte. With no payload the two coverages
+// produce byte-identical tags, so the header tag is the same tag. One
+// spelling of the condition for the send and read paths.
+func tagsPayload(coverage HmacCoverage, payload int) bool {
+	return coverage == HMACFullFrameCoverage && payload > 0
+}
+
 // buildProbeFrame writes one probe frame into buf: magic, sequence number,
 // wire timestamp, the optional deterministic payload, and — when mac is
 // non-nil — the 8-byte tag under coverage. The header size is derived from
@@ -322,7 +335,7 @@ func buildProbeFrame(buf []byte, seq, ts uint64, payload int, mac *probeMACer, c
 		return
 	}
 	var tag [8]byte
-	if coverage == HMACFullFrameCoverage && payload > 0 {
+	if tagsPayload(coverage, payload) {
 		tag = mac.digestFrame(buf[:headerSize+payload])
 	} else {
 		tag = mac.digestHeader(seq, ts)

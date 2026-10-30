@@ -1304,7 +1304,7 @@ func runEchoLoop(
 				// coverages coincide byte-for-byte there (pinned by
 				// TestHMACCoverageZeroPayloadEquivalence), so the header
 				// check is the same check.
-				if cfg.HmacCoverage == HMACFullFrameCoverage && cfg.Payload > 0 {
+				if tagsPayload(cfg.HmacCoverage, cfg.Payload) {
 					if !rMac.verifyFullFrame(buf[:n]) {
 						continue
 					}

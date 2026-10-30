@@ -126,6 +126,33 @@ func TestConfigValidate_MinProbeInterval(t *testing.T) {
 	}
 }
 
+// TestConfigValidate_HmacCoverage rejects an out-of-range coverage instead of
+// letting it behave silently as header-only (the operator asked for payload
+// coverage and got the v0.7 check).
+func TestConfigValidate_HmacCoverage(t *testing.T) {
+	base := Config{
+		Targets:      []Target{{Name: "t", Address: "127.0.0.1:4000"}},
+		BaseInterval: time.Second,
+		BaseTimeout:  time.Second,
+	}
+	for _, tc := range []struct {
+		name     string
+		coverage HmacCoverage
+		wantErr  bool
+	}{
+		{"header", HMACHeaderCoverage, false},
+		{"full-frame", HMACFullFrameCoverage, false},
+		{"out of range", HmacCoverage(7), true},
+	} {
+		cfg := base
+		cfg.HmacCoverage = tc.coverage
+		err := cfg.Validate()
+		if got := err != nil; got != tc.wantErr {
+			t.Errorf("%s: Validate() error = %v, wantErr %v", tc.name, err, tc.wantErr)
+		}
+	}
+}
+
 // TestLoadTargets_MinProbeInterval pins the same floor on the targets.json
 // path: LoadTargets re-validates through validateTargets, so a hot-reload
 // with a sub-millisecond interval is rejected and keeps the previous set

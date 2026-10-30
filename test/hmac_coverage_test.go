@@ -34,21 +34,16 @@ func hmacFullFrameTag(secret string, frame []byte) [8]byte {
 	return out
 }
 
-// buildPayloadFrame assembles a 32-byte header + payloadLen pattern bytes;
-// fillPayload is reimplemented too (xorshift64*, keyed by seq/ts) so the
-// test's tampering acts on frame bytes alone.
+// buildPayloadFrame assembles a 32-byte header + payloadLen pattern bytes.
+// The payload pattern comes from payloadPattern, the same independent
+// reimplementation the corruption test uses, so the xorshift spec has one
+// test-side copy instead of two that can drift.
 func buildPayloadFrame(seq, ts uint64, payloadLen int) []byte {
 	f := make([]byte, prober.PayloadSizeWithHMAC+payloadLen)
 	copy(f[0:8], prober.MagicBytes)
 	binary.LittleEndian.PutUint64(f[8:16], seq)
 	binary.LittleEndian.PutUint64(f[16:24], ts)
-	x := seq*0x9E3779B97F4A7C15 ^ ts
-	for i := prober.PayloadSizeWithHMAC; i < len(f); i++ {
-		x ^= x << 13
-		x ^= x >> 7
-		x ^= x << 17
-		f[i] = byte(x >> 24)
-	}
+	payloadPattern(f[prober.PayloadSizeWithHMAC:], seq, ts)
 	return f
 }
 
