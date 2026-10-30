@@ -299,6 +299,37 @@ func fillPayload(buf []byte, seq, ts uint64) {
 	}
 }
 
+// buildProbeFrame writes one probe frame into buf: magic, sequence number,
+// wire timestamp, the optional deterministic payload, and — when mac is
+// non-nil — the 8-byte tag under coverage. The header size is derived from
+// mac so a caller cannot pair a 24-byte header with a tag slot; payload is
+// the number of pattern bytes after the header. buf must have room for
+// headerSize+payload. This is the single spelling of the wire layout, shared
+// by the main prober and the MTU sweep: two spellings could tag differently
+// on a full-frame deployment and silently stop authenticating.
+func buildProbeFrame(buf []byte, seq, ts uint64, payload int, mac *probeMACer, coverage HmacCoverage) {
+	headerSize := PayloadSize
+	if mac != nil {
+		headerSize = PayloadSizeWithHMAC
+	}
+	copy(buf[0:8], MagicBytes)
+	binary.LittleEndian.PutUint64(buf[8:16], seq)
+	binary.LittleEndian.PutUint64(buf[16:24], ts)
+	if payload > 0 {
+		fillPayload(buf[headerSize:headerSize+payload], seq, ts)
+	}
+	if mac == nil {
+		return
+	}
+	var tag [8]byte
+	if coverage == HMACFullFrameCoverage && payload > 0 {
+		tag = mac.digestFrame(buf[:headerSize+payload])
+	} else {
+		tag = mac.digestHeader(seq, ts)
+	}
+	copy(buf[24:32], tag[:])
+}
+
 // probeMACer wraps ONE reusable crypto/hmac state. Every hot HMAC site
 // (client loop, reader, MTU sweep, server read loop) is single-goroutine,
 // so a Reset()-per-frame marshaler avoids the per-frame hmac struct +

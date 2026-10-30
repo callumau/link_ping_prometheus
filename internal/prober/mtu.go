@@ -264,28 +264,9 @@ func sweepOnce(ctx context.Context, conn net.Conn, cfg Config, m targetMetrics, 
 		}
 		seq++
 		ts := uint64(time.Now().UnixNano())
-		copy(buf[0:8], MagicBytes)
-		binary.LittleEndian.PutUint64(buf[8:16], seq)
-		binary.LittleEndian.PutUint64(buf[16:24], ts)
-		if cfg.EchoSecret != "" && cfg.HmacCoverage == HMACFullFrameCoverage && payload > 0 {
-			// Full-frame coverage: the tag covers header+payload, so the
-			// payload must be in buf BEFORE the tag is computed. Same
-			// deterministic (seq, ts) pattern as before; only the tag's
-			// INPUT changes.
-			fillPayload(buf[headerSize:headerSize+payload], seq, ts)
-			h := mac.digestFrame(buf[:headerSize+payload])
-			copy(buf[24:32], h[:])
-		} else {
-			if cfg.EchoSecret != "" {
-				h := mac.digestHeader(seq, ts)
-				copy(buf[24:32], h[:])
-			}
-			if payload > 0 {
-				// Pattern fill: keep the probe indistinguishable from real
-				// opaque traffic for middleboxes (dedup/compression).
-				fillPayload(buf[headerSize:headerSize+payload], seq, ts)
-			}
-		}
+		// One spelling of the wire layout, shared with the main prober:
+		// see buildProbeFrame.
+		buildProbeFrame(buf, seq, ts, payload, mac, cfg.HmacCoverage)
 		m.mtuSent.Inc()
 		// Bounded write, like every other socket-op in the sweep: a UDP
 		// send can block when the local send buffer is saturated (peer

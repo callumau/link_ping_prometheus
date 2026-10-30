@@ -1779,30 +1779,10 @@ func runEchoLoop(
 		sendNS := sentAt.UnixNano()
 		sendQPC, _ := qpcNow()
 		seq := state.seq + 1
-		copy(buf[0:8], MagicBytes)
-		binary.LittleEndian.PutUint64(buf[8:16], seq)
 		ts := uint64(sendNS)
-		binary.LittleEndian.PutUint64(buf[16:24], ts)
-		if cfg.EchoSecret != "" && cfg.HmacCoverage == HMACFullFrameCoverage && cfg.Payload > 0 {
-			// Full-frame coverage: the tag covers header+payload, so the
-			// payload must be in buf BEFORE the tag is computed. The pattern
-			// still derives deterministically from (seq, ts) exactly as
-			// before; only the tag's INPUT changes, not the frame layout or
-			// the payload derivation.
-			fillPayload(buf[payloadSize:payloadSize+cfg.Payload], seq, ts)
-			h := mac.digestFrame(buf)
-			copy(buf[24:32], h[:])
-		} else {
-			if cfg.EchoSecret != "" {
-				h := mac.digestHeader(seq, ts)
-				copy(buf[24:32], h[:])
-			}
-			if cfg.Payload > 0 {
-				// Header end is payloadSize (24 or 32): fill the rest with the
-				// deterministic corruption-detection pattern.
-				fillPayload(buf[payloadSize:payloadSize+cfg.Payload], seq, ts)
-			}
-		}
+		// One spelling of the wire layout, shared with the MTU sweep:
+		// see buildProbeFrame.
+		buildProbeFrame(buf, seq, ts, cfg.Payload, mac, cfg.HmacCoverage)
 
 		// Send first, then register: registering in-flight only after a
 		// successful write means a failed or panicking write can never
