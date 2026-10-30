@@ -2,7 +2,6 @@ package prober
 
 import (
 	"context"
-	"encoding/binary"
 	"net"
 	"testing"
 	"time"
@@ -80,23 +79,15 @@ func oldSecretSend(t *testing.T, conn net.Conn, frame []byte) int {
 // oldSecretHeaderFrame is a bare 32-byte frame carrying the header tag (the
 // v0.7 coverage) computed under key.
 func oldSecretHeaderFrame(seq, ts uint64, key string) []byte {
-	f := make([]byte, PayloadSizeWithHMAC)
-	copy(f[0:8], MagicBytes)
-	binary.LittleEndian.PutUint64(f[8:16], seq)
-	binary.LittleEndian.PutUint64(f[16:24], ts)
 	tag := headerTag(key, seq, ts)
-	copy(f[24:32], tag[:])
-	return f
+	return buildFrame(PayloadSizeWithHMAC, seq, ts, 0, tag[:])
 }
 
 // oldSecretFullFrame is a 32-byte header plus payload frame carrying the
 // full-frame tag under key — the shape a -hmac-coverage=full-frame client
 // emits, i.e. the frame whose tag slot a captured-tag forgery would occupy.
 func oldSecretFullFrame(seq, ts uint64, key string, payloadLen int) []byte {
-	f := make([]byte, PayloadSizeWithHMAC+payloadLen)
-	copy(f[0:8], MagicBytes)
-	binary.LittleEndian.PutUint64(f[8:16], seq)
-	binary.LittleEndian.PutUint64(f[16:24], ts)
+	f := buildFrame(PayloadSizeWithHMAC, seq, ts, payloadLen, nil)
 	for i := PayloadSizeWithHMAC; i < len(f); i++ {
 		f[i] = byte(i * 31)
 	}

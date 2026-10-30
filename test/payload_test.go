@@ -61,15 +61,11 @@ func TestPayload_HealthyEcho(t *testing.T) {
 	cfg.Payload = 64
 
 	runClientAsync(t, ctx, cancel, cfg)
-	deadline := time.Now().Add(3 * time.Second)
 	var rttCount float64
-	for time.Now().Before(deadline) {
+	pollUntil(t, 3*time.Second, 20*time.Millisecond, func() bool {
 		rttCount = getHistogramCount(prober.RTTSeconds, targetName, addr)
-		if rttCount >= 5 {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+		return rttCount >= 5
+	})
 	if rttCount < 5 {
 		t.Fatalf("expected >=5 RTT samples with payload probes, got %v", rttCount)
 	}
@@ -123,15 +119,11 @@ func TestPayload_CorruptionCountedSeparately(t *testing.T) {
 	startTimedOut := getCounterValue(prober.ProbesTimedOut, targetName, addr)
 
 	runClientAsync(t, ctx, cancel, cfg)
-	deadline := time.Now().Add(3 * time.Second)
 	var corrupted float64
-	for time.Now().Before(deadline) {
+	pollUntil(t, 3*time.Second, 20*time.Millisecond, func() bool {
 		corrupted = getCounterValue(prober.CorruptedProbes, targetName, addr) - startCorrupted
-		if corrupted >= 5 {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+		return corrupted >= 5
+	})
 	if corrupted < 5 {
 		t.Fatalf("expected >=5 corrupted echoes, got %v", corrupted)
 	}

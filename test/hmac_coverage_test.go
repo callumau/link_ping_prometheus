@@ -39,10 +39,7 @@ func hmacFullFrameTag(secret string, frame []byte) [8]byte {
 // reimplementation the corruption test uses, so the xorshift spec has one
 // test-side copy instead of two that can drift.
 func buildPayloadFrame(seq, ts uint64, payloadLen int) []byte {
-	f := make([]byte, prober.PayloadSizeWithHMAC+payloadLen)
-	copy(f[0:8], prober.MagicBytes)
-	binary.LittleEndian.PutUint64(f[8:16], seq)
-	binary.LittleEndian.PutUint64(f[16:24], ts)
+	f := buildFrame(prober.PayloadSizeWithHMAC, seq, ts, payloadLen, nil)
 	payloadPattern(f[prober.PayloadSizeWithHMAC:], seq, ts)
 	return f
 }
@@ -127,10 +124,9 @@ func TestServer_HMACCoverageDualAccept(t *testing.T) {
 			// coverages attempted).
 			dropped := !tc.wantEcho
 			if dropped {
-				deadline := time.Now().Add(2 * time.Second)
-				for getCounterValue(prober.ServerProbesDropped, "hmac") == before && time.Now().Before(deadline) {
-					time.Sleep(10 * time.Millisecond)
-				}
+				pollUntil(t, 2*time.Second, 10*time.Millisecond, func() bool {
+					return getCounterValue(prober.ServerProbesDropped, "hmac") != before
+				})
 			}
 			if got := getCounterValue(prober.ServerProbesDropped, "hmac") - before; dropped != (got > 0) {
 				t.Errorf("hmac drop counter delta %v but wantEcho=%v (drop reason mis-routed)", got, tc.wantEcho)

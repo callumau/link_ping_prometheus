@@ -1,7 +1,6 @@
 package prober
 
 import (
-	"encoding/binary"
 	"testing"
 	"time"
 )
@@ -16,13 +15,7 @@ import (
 // bytes in the tag slot; payload is filled with the deterministic
 // (seq, ts) pattern. len(tag) must be 8 or nil.
 func hmacCoverageFrame(seq, ts uint64, payload int, tag []byte) []byte {
-	f := make([]byte, PayloadSizeWithHMAC+payload)
-	copy(f[0:8], MagicBytes)
-	binary.LittleEndian.PutUint64(f[8:16], seq)
-	binary.LittleEndian.PutUint64(f[16:24], ts)
-	if tag != nil {
-		copy(f[24:32], tag)
-	}
+	f := buildFrame(PayloadSizeWithHMAC, seq, ts, payload, tag)
 	if payload > 0 {
 		fillPayload(f[PayloadSizeWithHMAC:], seq, ts)
 	}

@@ -2,7 +2,6 @@ package prober
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"net"
 	"os"
@@ -40,14 +39,7 @@ func (c *scriptedReadConn) SetWriteDeadline(time.Time) error { return nil }
 // given seq and ts, appending tag when non-nil (HMAC frames are 8 bytes
 // longer; callers pass size accordingly).
 func dfFrameFull(seq, ts uint64, size int, tag []byte) []byte {
-	b := make([]byte, size)
-	copy(b[0:8], MagicBytes)
-	binary.LittleEndian.PutUint64(b[8:16], seq)
-	binary.LittleEndian.PutUint64(b[16:24], ts)
-	if tag != nil {
-		copy(b[24:32], tag)
-	}
-	return b
+	return buildFrame(PayloadSize, seq, ts, size-PayloadSize, tag)
 }
 
 // TestReadEcho_SkipsForeignAndOtherSizedDatagrams pins the matching rule that

@@ -95,9 +95,7 @@ func dialProbe(t *testing.T, addr string) (net.Conn, []byte) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	probe := make([]byte, prober.PayloadSize)
-	copy(probe[0:8], prober.MagicBytes)
-	return conn, probe
+	return conn, buildFrame(prober.PayloadSize, 0, 0, 0, nil)
 }
 
 // TestGarbageData_Server: a peer that answers probes with garbage (wrong
@@ -168,8 +166,7 @@ func TestServer_EnforceSizeAndHeader(t *testing.T) {
 	// MaxPayloadBytes) is an arbitrary-payload reflector attempt: no
 	// echo. Bounded extensions (header ≤ size ≤ header+1400) are echoed
 	// whole — covered in TestServer_BoundedPayloadSizeRange.
-	oversized := make([]byte, prober.PayloadSize+prober.MaxPayloadBytes+1)
-	copy(oversized[0:8], prober.MagicBytes)
+	oversized := buildFrame(prober.PayloadSize, 0, 0, prober.MaxPayloadBytes+1, nil)
 	conn.Write(oversized)
 	conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
 	if n, _ := conn.Read(reply); n != 0 {
@@ -177,8 +174,7 @@ func TestServer_EnforceSizeAndHeader(t *testing.T) {
 	}
 
 	// Valid 24-byte probe: echoed.
-	probe := make([]byte, prober.PayloadSize)
-	copy(probe[0:8], prober.MagicBytes)
+	probe := buildFrame(prober.PayloadSize, 0, 0, 0, nil)
 	conn.Write(probe)
 	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	if n, err := conn.Read(reply); err != nil || n != prober.PayloadSize {
@@ -267,8 +263,7 @@ func TestServer_ProbeCounterIgnoresInvalid(t *testing.T) {
 	defer conn.Close()
 
 	// Valid probe -> counted + echoed.
-	probe := make([]byte, prober.PayloadSize)
-	copy(probe[0:8], prober.MagicBytes)
+	probe := buildFrame(prober.PayloadSize, 0, 0, 0, nil)
 	conn.Write(probe)
 	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	if n, err := conn.Read(make([]byte, prober.PayloadSize)); err != nil || n != prober.PayloadSize {
@@ -360,8 +355,7 @@ func TestServer_AllowlistDropsUnlisted(t *testing.T) {
 	}
 	defer conn.Close()
 
-	probe := make([]byte, prober.PayloadSize)
-	copy(probe[0:8], prober.MagicBytes)
+	probe := buildFrame(prober.PayloadSize, 0, 0, 0, nil)
 	conn.Write(probe)
 	conn.SetReadDeadline(time.Now().Add(400 * time.Millisecond))
 	if n, _ := conn.Read(make([]byte, prober.PayloadSize)); n != 0 {
@@ -412,13 +406,8 @@ func hmacTag(secret string, seq, ts uint64) [8]byte {
 
 // buildHMACFrame builds one 32-byte probe frame with an authentic tag.
 func buildHMACFrame(secret string, seq, ts uint64) []byte {
-	frame := make([]byte, prober.PayloadSizeWithHMAC)
-	copy(frame[0:8], prober.MagicBytes)
-	binary.LittleEndian.PutUint64(frame[8:16], seq)
-	binary.LittleEndian.PutUint64(frame[16:24], ts)
 	tag := hmacTag(secret, seq, ts)
-	copy(frame[24:32], tag[:])
-	return frame
+	return buildFrame(prober.PayloadSizeWithHMAC, seq, ts, 0, tag[:])
 }
 
 // TestServer_HMACAuth: the SEC22 echo-authentication path must accept
@@ -445,8 +434,7 @@ func TestServer_HMACAuth(t *testing.T) {
 	stale := uint64(time.Now().Add(-61 * time.Second).UnixNano())
 	future := uint64(time.Now().Add(61 * time.Second).UnixNano())
 
-	badMagic24 := make([]byte, prober.PayloadSize)
-	copy(badMagic24[0:8], prober.MagicBytes) // right magic, wrong size for an HMAC server
+	badMagic24 := buildFrame(prober.PayloadSize, 0, 0, 0, nil) // right magic, wrong size for an HMAC server
 
 	flipped := buildHMACFrame(secret, 2, now)
 	flipped[30] ^= 0xFF // corrupt one tag byte
@@ -606,8 +594,7 @@ func TestServer_GlobalRateLimitStarvesExcess(t *testing.T) {
 
 	echoCount := func(conn net.Conn, sends int) int {
 		t.Helper()
-		probe := make([]byte, prober.PayloadSize)
-		copy(probe[0:8], prober.MagicBytes)
+		probe := buildFrame(prober.PayloadSize, 0, 0, 0, nil)
 		got := 0
 		for i := range sends {
 			// Fresh frame per send: a live client never repeats an identity.
@@ -786,8 +773,7 @@ func TestServer_MalformedFramesKeepServing(t *testing.T) {
 	}
 
 	// Oversized: larger than the server's read buffer.
-	oversized := make([]byte, prober.MaxDatagramSize+500)
-	copy(oversized[0:8], prober.MagicBytes)
+	oversized := buildFrame(prober.PayloadSize, 0, 0, prober.MaxDatagramSize+500-prober.PayloadSize, nil)
 	conn.Write(oversized)
 	conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
 	if n, _ := conn.Read(reply); n != 0 {
@@ -994,10 +980,9 @@ func TestServer_UnauthenticatedSourceCannotSpendSeriesSlot(t *testing.T) {
 	bad.Write(frame)
 
 	// The counter is moved only after the frame reached authentication.
-	deadline := time.Now().Add(2 * time.Second)
-	for getCounterValue(prober.ServerProbesDropped, "hmac") == before && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
+	pollUntil(t, 2*time.Second, 10*time.Millisecond, func() bool {
+		return getCounterValue(prober.ServerProbesDropped, "hmac") != before
+	})
 	if getCounterValue(prober.ServerProbesDropped, "hmac") == before {
 		t.Fatal("the unauthenticated frame was never processed (cpu load?)")
 	}
@@ -1255,11 +1240,9 @@ func TestServer_WarnsWhenEchoSecretUnset(t *testing.T) {
 		// The listening Info record is the sync point: the startup warning
 		// is emitted before it, so by the time the server accepts probes
 		// the warning has fired (or is lost).
-		deadline := time.Now().Add(2 * time.Second)
-		for time.Now().Before(deadline) && capture.find("Echo server listening") == "" {
-			// pi-lens-ignore: go-time-sleep-test
-			time.Sleep(10 * time.Millisecond)
-		}
+		pollUntil(t, 2*time.Second, 10*time.Millisecond, func() bool {
+			return capture.find("Echo server listening") != ""
+		})
 	})
 	if got := capture.count("set -echo-secret on BOTH ends"); got != 1 {
 		t.Errorf("server must warn exactly once at startup when -echo-secret is unset, got %d warnings", got)
@@ -1507,8 +1490,7 @@ func TestServer_BoundedPayloadSizeRange(t *testing.T) {
 	defer conn.Close()
 
 	// Header + payload extension: echoed whole.
-	withPayload := make([]byte, prober.PayloadSize+64)
-	copy(withPayload[0:8], prober.MagicBytes)
+	withPayload := buildFrame(prober.PayloadSize, 0, 0, 64, nil)
 	conn.Write(withPayload)
 	conn.SetReadDeadline(time.Now().Add(400 * time.Millisecond))
 	if n, _ := conn.Read(make([]byte, 1500)); n != len(withPayload) {
@@ -1516,8 +1498,7 @@ func TestServer_BoundedPayloadSizeRange(t *testing.T) {
 	}
 
 	// Oversized: dropped as an arbitrary-payload reflector attempt.
-	oversized := make([]byte, prober.PayloadSize+prober.MaxPayloadBytes+10)
-	copy(oversized[0:8], prober.MagicBytes)
+	oversized := buildFrame(prober.PayloadSize, 0, 0, prober.MaxPayloadBytes+10, nil)
 	conn.Write(oversized)
 	conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
 	if n, _ := conn.Read(make([]byte, 1500)); n != 0 {
@@ -1563,10 +1544,9 @@ func TestServer_EchoWriteErrorsCounted(t *testing.T) {
 		t.Errorf("a failed echo must not deliver bytes back, got %d", n)
 	}
 
-	deadline := time.Now().Add(2 * time.Second)
-	for getCounterValue(prober.ServerEchoErrors) == before && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
+	pollUntil(t, 2*time.Second, 10*time.Millisecond, func() bool {
+		return getCounterValue(prober.ServerEchoErrors) != before
+	})
 	if got := getCounterValue(prober.ServerEchoErrors) - before; got < 1 {
 		t.Errorf("a probe the server could not echo must be counted in link_server_echo_errors_total, got %v", got)
 	}
@@ -1691,10 +1671,9 @@ func TestServer_HMACSizeWindowAndDropReasons(t *testing.T) {
 		if n := send(frame); n != 0 {
 			t.Errorf("%s frame must not be echoed, got %d bytes back", reason, n)
 		}
-		deadline := time.Now().Add(2 * time.Second)
-		for getCounterValue(prober.ServerProbesDropped, reason) < before+1 && time.Now().Before(deadline) {
-			time.Sleep(5 * time.Millisecond)
-		}
+		pollUntil(t, 2*time.Second, 5*time.Millisecond, func() bool {
+			return getCounterValue(prober.ServerProbesDropped, reason) >= before+1
+		})
 		if got := getCounterValue(prober.ServerProbesDropped, reason); got < before+1 {
 			t.Errorf("expected a %q drop, counter stayed at %v", reason, got-before)
 		}
@@ -1753,11 +1732,7 @@ func TestServer_DupGuardBreaksEchoLoop(t *testing.T) {
 	defer s2.Close()
 
 	frame := func(seq uint64) []byte {
-		f := make([]byte, prober.PayloadSize)
-		copy(f[0:8], prober.MagicBytes)
-		binary.LittleEndian.PutUint64(f[8:16], seq)
-		binary.LittleEndian.PutUint64(f[16:24], uint64(time.Now().UnixNano()))
-		return f
+		return buildFrame(prober.PayloadSize, seq, uint64(time.Now().UnixNano()), 0, nil)
 	}
 	// Built ONCE and reused by both the echo row and the dup row: a real
 	// bounce re-sends the byte-identical datagram, and regenerating it
@@ -1802,10 +1777,9 @@ func TestServer_DupGuardBreaksEchoLoop(t *testing.T) {
 				if n != 0 {
 					t.Fatalf("dup frame must not be echoed, got %d bytes back", n)
 				}
-				deadline := time.Now().Add(2 * time.Second)
-				for dupDrops() < before+1 && time.Now().Before(deadline) {
-					time.Sleep(5 * time.Millisecond)
-				}
+				pollUntil(t, 2*time.Second, 5*time.Millisecond, func() bool {
+					return dupDrops() >= before+1
+				})
 				if got := dupDrops() - before; got != 1 {
 					t.Errorf("expected exactly one dup drop, counter moved %v", got)
 				}
@@ -1854,10 +1828,7 @@ func TestServer_UnauthHMACFrameCounter(t *testing.T) {
 
 	// Bare 32-byte HMAC frame: magic + seq + ts + 8 arbitrary bytes
 	// (the tag bytes, unverified by a secret-less server). Echoed whole.
-	bare := make([]byte, prober.PayloadSizeWithHMAC)
-	copy(bare[0:8], prober.MagicBytes)
-	binary.LittleEndian.PutUint64(bare[8:16], 1001)
-	binary.LittleEndian.PutUint64(bare[16:24], uint64(time.Now().UnixNano()))
+	bare := buildFrame(prober.PayloadSizeWithHMAC, 1001, uint64(time.Now().UnixNano()), 0, nil)
 	conn.Write(bare)
 	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	n, _ := conn.Read(make([]byte, 1500))
@@ -1871,10 +1842,7 @@ func TestServer_UnauthHMACFrameCounter(t *testing.T) {
 	// 32B + payload shape (32+8 = 40 bytes): still echoed whole (acceptance
 	// unchanged) but NOT counted — it is indistinguishable from a legitimate
 	// -payload probe (24-byte header + 16 payload bytes).
-	withPayload := make([]byte, prober.PayloadSizeWithHMAC+8)
-	copy(withPayload[0:8], prober.MagicBytes)
-	binary.LittleEndian.PutUint64(withPayload[8:16], 1002)
-	binary.LittleEndian.PutUint64(withPayload[16:24], uint64(time.Now().UnixNano()))
+	withPayload := buildFrame(prober.PayloadSizeWithHMAC, 1002, uint64(time.Now().UnixNano()), 8, nil)
 	conn.Write(withPayload)
 	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	n, _ = conn.Read(make([]byte, 1500))
@@ -1886,10 +1854,7 @@ func TestServer_UnauthHMACFrameCounter(t *testing.T) {
 	}
 
 	// A plain 24-byte probe is not HMAC-shaped: echoed, counter unmoved.
-	plain := make([]byte, prober.PayloadSize)
-	copy(plain[0:8], prober.MagicBytes)
-	binary.LittleEndian.PutUint64(plain[8:16], 1003)
-	binary.LittleEndian.PutUint64(plain[16:24], uint64(time.Now().UnixNano()))
+	plain := buildFrame(prober.PayloadSize, 1003, uint64(time.Now().UnixNano()), 0, nil)
 	conn.Write(plain)
 	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	n, _ = conn.Read(make([]byte, 1500))

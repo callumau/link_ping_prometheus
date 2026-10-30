@@ -2,6 +2,7 @@ package prober_test
 
 import (
 	"context"
+	"encoding/binary"
 	"log/slog"
 	"net"
 	"strings"
@@ -80,6 +81,42 @@ func verifyHistogramCount(t *testing.T, vec *prometheus.HistogramVec, targetName
 	if val <= 0 {
 		t.Errorf("expected histogram sample count > 0 for target %s (addr %s), got %v", targetName, address, val)
 	}
+}
+
+// buildFrame assembles one wire probe frame: magic, little-endian sequence,
+// little-endian unix-ns timestamp, an optional 8-byte tag at offset 24, and
+// payloadLen zero-filled payload bytes. headerSize is prober.PayloadSize or
+// prober.PayloadSizeWithHMAC; a payload-bearing header frame passes the
+// former and puts the tag in the first 8 payload bytes. Callers supply the tag
+// and fill the payload themselves: tag computation and payload patterns stay
+// independent of the prober package on purpose.
+func buildFrame(headerSize int, seq, ts uint64, payloadLen int, tag []byte) []byte {
+	f := make([]byte, headerSize+payloadLen)
+	copy(f[0:8], prober.MagicBytes)
+	binary.LittleEndian.PutUint64(f[8:16], seq)
+	binary.LittleEndian.PutUint64(f[16:24], ts)
+	if tag != nil {
+		copy(f[24:32], tag)
+	}
+	return f
+}
+
+// pollUntil evaluates cond every sleep until it reports true or timeout
+// elapses, returning the final result. It is the shared spelling of the
+// time-first wait loops in this package; condition side effects (recording the
+// last observed value) are preserved because cond is not called after the
+// deadline has passed.
+func pollUntil(t *testing.T, timeout, sleep time.Duration, cond func() bool) bool {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return true
+		}
+		// pi-lens-ignore: go-time-sleep-test
+		time.Sleep(sleep)
+	}
+	return false
 }
 
 // listenUDP opens a loopback UDP socket that is closed when ctx is
@@ -214,8 +251,7 @@ func dialFrom(t *testing.T, addr string, ip net.IP) net.Conn {
 // full-size echo came back within 300ms.
 func echoOnce(t *testing.T, conn net.Conn) bool {
 	t.Helper()
-	probe := make([]byte, prober.PayloadSize)
-	copy(probe[0:8], prober.MagicBytes)
+	probe := buildFrame(prober.PayloadSize, 0, 0, 0, nil)
 	conn.Write(probe)
 	conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
 	n, _ := conn.Read(make([]byte, prober.PayloadSize))
