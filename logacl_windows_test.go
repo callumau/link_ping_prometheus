@@ -4,17 +4,154 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"golang.org/x/sys/windows"
 )
 
+// TestLogACLSDDL pins the single source of truth for the restricted log
+// DACL. The token-user ACE is spliced in only for accounts the static
+// SYSTEM/Administrators ACEs do not already cover: a LocalSystem process
+// (the default for -svc) would otherwise build SY+BA+SY, which Windows
+// canonicalizes on apply to SY+BA, so every 5-minute recheck would see a
+// mismatch and re-apply/Warn forever.
+func TestLogACLSDDL(t *testing.T) {
+	const (
+		normalUserSID = "S-1-5-21-1111111111-2222222222-3333333333-1001"
+		staticSDDL    = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
+		wantMask      = windows.ACCESS_MASK(windows.STANDARD_RIGHTS_REQUIRED | windows.SYNCHRONIZE | 0x1ff) // SDDL "FA"
+		wantFlags     = byte(windows.OBJECT_INHERIT_ACE | windows.CONTAINER_INHERIT_ACE)
+	)
+
+	tests := []struct {
+		name    string
+		userSID string
+		want    []string
+	}{
+		{"SYSTEM is already a static trustee", logACLSystemSID, []string{logACLSystemSID, logACLAdministratorsSID}},
+		{"Administrators is already a static trustee", logACLAdministratorsSID, []string{logACLSystemSID, logACLAdministratorsSID}},
+		{"ordinary user gets its own ACE", normalUserSID, []string{logACLSystemSID, logACLAdministratorsSID, normalUserSID}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sd, err := windows.SecurityDescriptorFromString(logACLSDDL(tt.userSID))
+			if err != nil {
+				t.Fatalf("build descriptor for %s: %v", tt.userSID, err)
+			}
+			protected, aces, err := logDACLTable(sd)
+			if err != nil {
+				t.Fatalf("summarize descriptor for %s: %v", tt.userSID, err)
+			}
+			if !protected {
+				t.Errorf("DACL for %s is not protected from parent inheritance", tt.userSID)
+			}
+			if len(aces) != len(tt.want) {
+				t.Fatalf("ACE count for %s = %d, want %d (%+v)", tt.userSID, len(aces), len(tt.want), aces)
+			}
+			counts := make(map[string]int, len(aces))
+			for _, a := range aces {
+				counts[a.sid]++
+				if a.mask != wantMask {
+					t.Errorf("ACE %s mask = %#x, want FA (%#x)", a.sid, a.mask, wantMask)
+				}
+				if a.flags&wantFlags != wantFlags {
+					t.Errorf("ACE %s flags = %#x, want OICI (%#x)", a.sid, a.flags, wantFlags)
+				}
+			}
+			for _, sid := range tt.want {
+				if counts[sid] != 1 {
+					t.Errorf("trustee %s appears %d times in %q, want exactly once", sid, counts[sid], logACLSDDL(tt.userSID))
+				}
+			}
+			for sid, n := range counts {
+				if n > 1 {
+					t.Errorf("duplicate trustee %s (%d ACEs) in %q", sid, n, logACLSDDL(tt.userSID))
+				}
+			}
+		})
+	}
+
+	// Pin the exact static shape separately: protection bit, FA masks and
+	// object+container inheritance are the security properties the builder
+	// must not lose while deduplicating.
+	if got := logACLSDDL(logACLSystemSID); got != staticSDDL {
+		t.Errorf("SYSTEM SDDL = %q, want %q", got, staticSDDL)
+	}
+	if got := logACLSDDL(logACLAdministratorsSID); got != staticSDDL {
+		t.Errorf("Administrators SDDL = %q, want %q", got, staticSDDL)
+	}
+	if got, want := logACLSDDL(normalUserSID), staticSDDL+"(A;OICI;FA;;;"+normalUserSID+")"; got != want {
+		t.Errorf("ordinary-user SDDL = %q, want %q", got, want)
+	}
+}
+
+// TestLogACLSDDL_SystemFixedPoint pins the convergence property the
+// duplicate-SYSTEM ACE broke: a DACL built for LocalSystem, applied through
+// the same security layer SetNamedSecurityInfo uses, must read back as the
+// same table sameLogDACL compares against. Before the dedupe the builder
+// wanted SY+BA+SY, Windows stored SY+BA, and the recheck re-applied forever.
+func TestLogACLSDDL_SystemFixedPoint(t *testing.T) {
+	sd, err := windows.SecurityDescriptorFromString(logACLSDDL(logACLSystemSID))
+	if err != nil {
+		t.Fatalf("build SYSTEM descriptor: %v", err)
+	}
+	wantProtected, wantAces, err := logDACLTable(sd)
+	if err != nil {
+		t.Fatalf("summarize SYSTEM descriptor: %v", err)
+	}
+	dacl, _, err := sd.DACL()
+	if err != nil {
+		t.Fatalf("extract SYSTEM ACL: %v", err)
+	}
+
+	// Apply to a throwaway file and read it back THROUGH THE SAME HANDLE:
+	// the granted READ_CONTROL/WRITE_DAC/DELETE survive the DACL change, so
+	// this works even when the test account is neither SYSTEM nor an
+	// administrator. FILE_FLAG_DELETE_ON_CLOSE removes the file when the
+	// handle closes, so TempDir cleanup never touches a file whose DACL
+	// excludes the test account.
+	path := filepath.Join(t.TempDir(), "system.log")
+	name, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		t.Fatalf("convert path: %v", err)
+	}
+	h, err := windows.CreateFile(name,
+		windows.READ_CONTROL|windows.WRITE_DAC|windows.DELETE,
+		0, nil, windows.CREATE_ALWAYS,
+		windows.FILE_ATTRIBUTE_NORMAL|windows.FILE_FLAG_DELETE_ON_CLOSE, 0)
+	if err != nil {
+		t.Fatalf("create temp file: %v", err)
+	}
+	defer windows.CloseHandle(h)
+
+	if err := windows.SetSecurityInfo(h, windows.SE_FILE_OBJECT,
+		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
+		nil, nil, dacl, nil); err != nil {
+		t.Fatalf("apply SYSTEM DACL: %v", err)
+	}
+	cur, err := windows.GetSecurityInfo(h, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+	if err != nil {
+		t.Fatalf("read back applied DACL: %v", err)
+	}
+	curProtected, curAces, err := logDACLTable(cur)
+	if err != nil {
+		t.Fatalf("summarize applied DACL: %v", err)
+	}
+	if !wantProtected || !curProtected {
+		t.Fatalf("protection bit: want=%v applied=%v", wantProtected, curProtected)
+	}
+	if !sameLogDACL(wantAces, curAces) {
+		t.Errorf("SYSTEM-built DACL is not a sameLogDACL fixed point: want %+v, applied %+v", wantAces, curAces)
+	}
+}
+
 // testLogTokenUserSID returns the SID of the account the test process runs
-// as, i.e. the trustee of the third ACE in the restricted log DACL, in raw
-// SID-string form (name-resolution free).
+// as, i.e. the trustee of the token-user ACE (absent when the token user is
+// already SYSTEM or Administrators), in raw SID-string form
+// (name-resolution free).
 func testLogTokenUserSID(t *testing.T) string {
 	t.Helper()
 	user, err := windows.GetCurrentProcessToken().GetTokenUser()
@@ -28,7 +165,9 @@ func testLogTokenUserSID(t *testing.T) string {
 // protected set from logacl_windows.go: protected from parent inheritance,
 // and every ACE a full-access (FA) allow entry with object+container
 // inheritance for exactly one of SYSTEM (S-1-5-18), Administrators
-// (S-1-5-32-544) and the process token user — no other trustee.
+// (S-1-5-32-544) and the process token user — no other trustee and no
+// duplicate trustee (the builder dedupes the token user when it is already
+// a static trustee; Windows would merge the duplicate on apply anyway).
 //
 // Previously this helper tokenized the RENDERED SDDL string; that is
 // environment-dependent (observed on the windows-latest CI runner: the
@@ -66,6 +205,9 @@ func verifyLogDACLRestricted(t *testing.T, path string) {
 	}
 	if len(trustees) == 0 {
 		t.Fatalf("no ACEs found on %q", path)
+	}
+	if len(aces) != len(trustees) {
+		t.Errorf("log DACL has %d ACEs but %d distinct trustees (duplicate trustee)", len(aces), len(trustees))
 	}
 	for sid := range want {
 		if !trustees[sid] {
@@ -220,7 +362,7 @@ func isLogDACLRestricted(t *testing.T, path string) bool {
 	if err != nil {
 		return false
 	}
-	want, err := windows.SecurityDescriptorFromString(fmt.Sprintf(logACLSDDLTemplate, user.User.Sid.String()))
+	want, err := windows.SecurityDescriptorFromString(logACLSDDL(user.User.Sid.String()))
 	if err != nil {
 		return false
 	}
@@ -235,7 +377,7 @@ func isLogDACLRestricted(t *testing.T, path string) bool {
 	return wantProtected && curProtected && sameLogDACL(wantAces, curAces)
 }
 
-// dumpLogDACLTables logs the template-derived DACL table and the file's
+// dumpLogDACLTables logs the builder-derived DACL table and the file's
 // live table to the test log, so a non-converging comparison can be
 // diagnosed from a runner log directly.
 func dumpLogDACLTables(t *testing.T, path string) {
@@ -243,7 +385,7 @@ func dumpLogDACLTables(t *testing.T, path string) {
 	user, err := windows.GetCurrentProcessToken().GetTokenUser()
 	if err != nil {
 		t.Logf("want: token user read error: %v", err)
-	} else if wsd, werr := windows.SecurityDescriptorFromString(fmt.Sprintf(logACLSDDLTemplate, user.User.Sid.String())); werr == nil {
+	} else if wsd, werr := windows.SecurityDescriptorFromString(logACLSDDL(user.User.Sid.String())); werr == nil {
 		if wp, wa, wterr := logDACLTable(wsd); wterr == nil {
 			t.Logf("want: protected=%v aces=%+v", wp, wa)
 		} else {

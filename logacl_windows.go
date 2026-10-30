@@ -125,14 +125,29 @@ func reapplyLogDACL(path string) error {
 	if path == "" {
 		return nil
 	}
+	// Open with FILE_SHARE_DELETE so lumberjack's rotation can rename the
+	// live file while this short-lived recheck handle is open. os.OpenFile
+	// omits that share bit on Windows: a rename racing the recheck then
+	// fails with "process cannot access the file because it is being used
+	// by another process" (observed as a flaky rotation test, and a real
+	// window in which a rotation cannot complete). The handle needs only
+	// GENERIC_WRITE (which includes READ_CONTROL for GetSecurityInfo); the
+	// replacement itself goes through SetNamedSecurityInfo by name.
 	// pi-lens-ignore: go-path-traversal
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+	name, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return fmt.Errorf("log DACL recheck: path %q: %w", path, err)
+	}
+	h, err := windows.CreateFile(name, windows.GENERIC_WRITE,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		nil, windows.OPEN_EXISTING, windows.FILE_ATTRIBUTE_NORMAL, 0)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
 		return fmt.Errorf("log DACL recheck: open %q: %w", path, err)
 	}
+	f := os.NewFile(uintptr(h), path)
 	defer f.Close()
 	changed, err := restrictLogDACL(f)
 	if err != nil {
@@ -166,8 +181,16 @@ func startLogDACLRecheck(ctx context.Context, path string) {
 	}()
 }
 
-// logACLSDDLTemplate is the DACL applied to the log sink, with the current
-// process token's user SID spliced in at the %s slot:
+// Static restricted-set ACEs and the raw SIDs they name. The builder
+// compares the token user against raw SIDs because windows.SID.String()
+// returns raw-SID form, never an SDDL alias.
+const (
+	logACLSystemSID         = "S-1-5-18"     // SYSTEM ("SY")
+	logACLAdministratorsSID = "S-1-5-32-544" // builtin Administrators ("BA")
+	logACLStaticACEs        = "(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
+)
+
+// logACLSDDL builds the DACL applied to the log sink:
 //
 //	"SY"  SYSTEM                 full control
 //	"BA"  builtin Administrators full control
@@ -176,11 +199,26 @@ func startLogDACLRecheck(ctx context.Context, path string) {
 //	      because a manually installed agent may run as LocalSystem,
 //	      LocalService, NetworkService or an operator account
 //
+// The token-user ACE is added ONLY when that SID is not already one of the
+// static trustees. That dedupe is load-bearing, not cosmetic: LocalSystem
+// (S-1-5-18) is the default service account, and an SDDL carrying a second
+// S-1-5-18 ACE is not a converged state. The security layer canonicalizes
+// an applied DACL by merging duplicate-trustee ACEs, so the live file reads
+// back as SY+BA while a naive builder keeps expecting SY+BA+SY. The
+// multiset comparison in sameLogDACL then fails forever, and the periodic
+// recheck re-applies the DACL and logs a Warning on every tick.
+//
 // File-all-access ("FA") with object+container inheritance keeps every entry
 // self-contained, and the "P" flag protects the DACL from parent-directory
 // inheritance, so wherever -log-file happens to point, its wide directory
 // entries cannot re-leak the file.
-const logACLSDDLTemplate = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;%s)"
+func logACLSDDL(userSID string) string {
+	sddl := "D:P" + logACLStaticACEs
+	if userSID != logACLSystemSID && userSID != logACLAdministratorsSID {
+		sddl += "(A;OICI;FA;;;" + userSID + ")"
+	}
+	return sddl
+}
 
 // restrictLogDACL enforces log confidentiality on Windows, where the POSIX
 // mode-bit repair in hardenLogSink is a no-op: os.OpenFile's 0600 mode has no
@@ -205,7 +243,7 @@ func restrictLogDACL(f *os.File) (changed bool, err error) {
 	if err != nil {
 		return false, fmt.Errorf("log DACL: read token user: %w", err)
 	}
-	want, err := windows.SecurityDescriptorFromString(fmt.Sprintf(logACLSDDLTemplate, user.User.Sid.String()))
+	want, err := windows.SecurityDescriptorFromString(logACLSDDL(user.User.Sid.String()))
 	if err != nil {
 		return false, fmt.Errorf("log DACL: build restricted descriptor: %w", err)
 	}
