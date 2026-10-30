@@ -27,10 +27,7 @@ func runMTUSweep(ctx context.Context, t Target, cfg Config, m targetMetrics, sta
 	// is populated on startup instead of after the first full interval.
 	timer := time.NewTimer(0)
 	defer timer.Stop()
-	headerSize := PayloadSize
-	if cfg.EchoSecret != "" {
-		headerSize = PayloadSizeWithHMAC
-	}
+	headerSize := probeHeaderSize(cfg.EchoSecret)
 	var warnedDF bool
 	var warnedDSCP bool
 	for {
@@ -73,7 +70,7 @@ func runMTUSweep(ctx context.Context, t Target, cfg Config, m targetMetrics, sta
 				}
 			}
 		}
-		largest, ok := sweepOnce(ctx, conn, cfg, m, state, headerSize)
+		largest, ok := sweepOnce(ctx, conn, cfg, m, state)
 		conn.Close()
 		if ok {
 			// Report the full probe frame size (header + payload);
@@ -229,6 +226,17 @@ func readEcho(ctx context.Context, conn net.Conn, buf []byte, size int, seqs []u
 // value the main UDP reader uses as its periodic ctx checkpoint.
 const mtuReadArm = 500 * time.Millisecond
 
+// probeHeaderSize is the frame header length: 32 bytes when an HMAC tag is
+// present, 24 otherwise. One spelling for the sweep's buffer/write length
+// and the path-MTU frame size; buildProbeFrame derives the same value from
+// its MACer, which is created under the identical condition.
+func probeHeaderSize(echoSecret string) int {
+	if echoSecret != "" {
+		return PayloadSizeWithHMAC
+	}
+	return PayloadSize
+}
+
 // sweepOnce binary-searches [0, MaxPayloadBytes] for the largest payload
 // that echoes back on the DF socket. A failed size is retried once
 // before it counts as "does not survive": a single dropped probe on a
@@ -240,8 +248,9 @@ const mtuReadArm = 500 * time.Millisecond
 // header-only probe aborts, leaving the gauge at its last known value).
 // Each failed probe costs one probe deadline of wait, so a sweep is
 // milliseconds on healthy links.
-func sweepOnce(ctx context.Context, conn net.Conn, cfg Config, m targetMetrics, state *probeLoopState, headerSize int) (int, bool) {
+func sweepOnce(ctx context.Context, conn net.Conn, cfg Config, m targetMetrics, state *probeLoopState) (int, bool) {
 	deadline := mtuDeadline(cfg, state)
+	headerSize := probeHeaderSize(cfg.EchoSecret)
 	buf := make([]byte, headerSize+MaxPayloadBytes)
 	var seq uint64
 	// One reusable HMAC state for the sweep's own goroutine.

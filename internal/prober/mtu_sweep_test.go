@@ -49,7 +49,7 @@ func TestMTUSweep_CancelledProbeIsNotLost(t *testing.T) {
 	state := &probeLoopState{}
 	cfg := Config{BaseTimeout: time.Second}
 
-	largest, ok := sweepOnce(ctx, conn, cfg, m, state, PayloadSize)
+	largest, ok := sweepOnce(ctx, conn, cfg, m, state)
 	if ok {
 		t.Fatalf("a cancelled sweep must not report success, got largest=%d", largest)
 	}
