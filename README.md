@@ -89,9 +89,9 @@ link_ping_prometheus -mode=<mode> [flags]
 | `-mem-scavenge` | `5m` | Force a heap scavenge at this interval so unused heap returns to the OS (`0` disables; `100ms` minimum) |
 | `-json-logs` | `false` | Log in JSON format |
 | `-log-file` | `""` | Append logs to this file too (required under the Windows service) |
-| `-log-file-max-mb` | `10` | Max log size in MB before rotation (`0` disables) |
-| `-log-file-max-backups` | `5` | Max rotated files to keep (`0` keeps all — pair with `-log-file-max-age`) |
-| `-log-file-max-age` | `28` | Max days to keep rotated files |
+| `-log-file-max-mb` | `10` | Max log size in MB before rotation (`0` disables; requires `-log-file`) |
+| `-log-file-max-backups` | `5` | Max rotated files to keep (`0` keeps all — pair with `-log-file-max-age`; requires `-log-file`) |
+| `-log-file-max-age` | `28` | Max days to keep rotated files (requires `-log-file`) |
 | `-svc` | `""` | Windows service action: `install`, `uninstall`, `start`, `stop`, `run` |
 | `-echo-secret` | `""` | HMAC probe secret (env `LINK_PING_ECHO_SECRET`); set on both ends; frame grows to 32 bytes |
 | `-echo-secret-old` | `""` | Server: previous HMAC secret accepted during a rotation (env `LINK_PING_ECHO_SECRET_OLD`); error without `-echo-secret` |

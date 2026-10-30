@@ -51,8 +51,8 @@ var (
 	flJSONLogs         = flag.Bool("json-logs", false, "Log in JSON format")
 	flLogFile          = flag.String("log-file", "", "Log: append logs to this file in addition to stdout (stdout is discarded under the Windows service)")
 	flLogMaxSize       = flag.Int("log-file-max-mb", 10, "Log: max size in MB before rotation (0 disables rotation; requires -log-file)")
-	flLogMaxBackups    = flag.Int("log-file-max-backups", 5, "Log: max rotated files to keep")
-	flLogMaxAge        = flag.Int("log-file-max-age", 28, "Log: max days to keep rotated files")
+	flLogMaxBackups    = flag.Int("log-file-max-backups", 5, "Log: max rotated files to keep (requires -log-file)")
+	flLogMaxAge        = flag.Int("log-file-max-age", 28, "Log: max days to keep rotated files (requires -log-file)")
 
 	flAdaptive          = flag.Bool("adaptive", true, "Client: Use adaptive timeout based on link quality (RFC 6298)")
 	flBaseInterval      = flag.Duration("interval", 500*time.Millisecond, "Client: Probe interval")
