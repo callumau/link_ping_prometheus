@@ -632,6 +632,43 @@ func TestInstallRejectsConfigThatCannotStart(t *testing.T) {
 	})
 }
 
+// TestInstallRejectsUnstartableSourceAndAddresses covers the two holes left in
+// the -svc=install guard: server-only mode skipped buildConfig (the only caller
+// of prober.ValidateTargetName there) while run() validates the resolved source
+// in every mode, and nothing ever parsed the persisted bind addresses. Both
+// freeze a config that can only exit 1 on every SCM start — with no log at all
+// when -log-file is unset — so the install must refuse and name the flag. The
+// checks run before platformInstallService, which is why this needs no Windows.
+func TestInstallRejectsUnstartableSourceAndAddresses(t *testing.T) {
+	for _, tc := range []struct{ name, source, metrics, listen, wantErr string }{
+		{"server mode with an invalid -source", "Sydney DC", "127.0.0.1:0", "127.0.0.1:0", "-source"},
+		{"malformed -metrics address", "", "127.0.0.1:not-a-port", "127.0.0.1:0", "-metrics"},
+		{"malformed -listen address", "", "127.0.0.1:0", "127.0.0.1:not-a-port", "-listen"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			saveFlags(t)
+			*flMode = "server"
+			*flAllow = "127.0.0.1"
+			*flAllowFromTargets = false
+			*flTarget, *flTargets = "", ""
+			*flSource = tc.source
+			*flMetrics = tc.metrics
+			*flListen = tc.listen
+
+			args, err := installServiceArgs()
+			if err == nil {
+				t.Fatalf("installServiceArgs accepted a configuration run() refuses; args=%v", args)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("error = %v, want it to name %q", err, tc.wantErr)
+			}
+			if args != nil {
+				t.Errorf("a refused install must not produce an SCM command line, got %v", args)
+			}
+		})
+	}
+}
+
 // captureStdout runs fn with os.Stdout redirected to a pipe and returns what it
 // printed. installServiceArgs' install-time warnings use fmt.Println, not slog:
 // they are for the operator standing at the console running -svc=install.

@@ -133,10 +133,13 @@ type Config struct {
 	ReloadInterval time.Duration
 }
 
-// minProbeInterval is the smallest accepted probe interval. Below it the
-// in-flight set grows to ~RTO/interval entries and every tick sweeps
-// O(len(pending)) timeouts, pegging a core — and the loss ratio becomes
-// meaningless. Rejected at config load with an error naming the flag.
+// minProbeInterval is the smallest accepted probe interval, and the smallest
+// accepted probe timeout. Below it the in-flight set grows to ~RTO/interval
+// entries and every tick sweeps O(len(pending)) timeouts, pegging a core — and
+// the loss ratio becomes meaningless. The same floor on the timeout is a
+// correctness bound, not a cost one: a sub-millisecond timeout expires before
+// any echo can return over a real link, so every probe reads as loss (fabricated
+// 100% loss). Rejected at config load with an error naming the flag.
 const minProbeInterval = time.Millisecond
 
 // maxPendingWindow caps the effective timeout/interval ratio, i.e. how many
@@ -209,6 +212,9 @@ func (c Config) Validate() error {
 	if c.BaseTimeout <= 0 {
 		return fmt.Errorf("probe timeout must be positive, got %v", c.BaseTimeout)
 	}
+	if c.BaseTimeout < minProbeInterval {
+		return fmt.Errorf("probe timeout (-timeout) must be at least %v, got %v", minProbeInterval, c.BaseTimeout)
+	}
 	if c.ReconnectInterval < 0 {
 		return fmt.Errorf("reconnect interval must be >= 0, got %v", c.ReconnectInterval)
 	}
@@ -260,6 +266,12 @@ func validateTargets(targets []Target) error {
 		}
 		if t.Timeout < 0 {
 			return fmt.Errorf("target %q: timeout must be >= 0, got %v", t.Name, t.Timeout)
+		}
+		if t.Timeout != 0 && t.Timeout < minProbeInterval {
+			// A per-target override bypasses the global floor otherwise: a
+			// sub-millisecond timeout timeouts every probe and reads as 100%
+			// loss on the link it was supposed to measure.
+			return fmt.Errorf("target %q: timeout must be at least %v, got %v", t.Name, minProbeInterval, t.Timeout)
 		}
 		if _, dup := seen[t.Name]; dup {
 			return fmt.Errorf("duplicate target name %q: metric labels would be ambiguous", t.Name)

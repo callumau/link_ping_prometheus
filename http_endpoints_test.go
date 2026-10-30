@@ -418,16 +418,38 @@ func TestMetricsServerCertReloadWithoutRestart(t *testing.T) {
 
 // TestMetricsServerCertReloadFailureKeepsPrevious pins the degraded path: an
 // unreadable or half-written replacement must NOT break scraping. The previously
-// loaded certificate keeps being served, and the failure is reported exactly
-// once for that file pair — a Warn per handshake would flood the log the reload
+// loaded certificate keeps being served, the failure is reported exactly once
+// for that file pair — a Warn per handshake would flood the log the reload
 // exists to make visible, and failing the handshake would black out /metrics for
-// the duration of a transient write.
+// the duration of a transient write — AND the pair is retried after
+// certReloadRetryCooldown. The retry is what makes an in-place repair
+// observable: the repair below restores the finished bytes under the broken
+// pair's own mtime and size, so the (mtime, size) fingerprint never changes and
+// a pure "already tried" memo would serve the expired certificate forever.
 func TestMetricsServerCertReloadFailureKeepsPrevious(t *testing.T) {
+	origCooldown := certReloadRetryCooldown
+	certReloadRetryCooldown = time.Second
+	t.Cleanup(func() { certReloadRetryCooldown = origCooldown })
+
 	prober.InitMetrics()
 	dir := t.TempDir()
 	certPath, keyPath := filepath.Join(dir, "cert.crt"), filepath.Join(dir, "cert.key")
 	writeTestCert(t, certPath, keyPath, "cert-one", 101)
 	logs := captureLogs(t)
+
+	// The renewal is generated up front so the broken replacement written
+	// later can carry exactly its byte counts: the repair writes these bytes
+	// back under the broken pair's mtime, leaving the fingerprint untouched.
+	renewedCertPath, renewedKeyPath := filepath.Join(dir, "renewed.crt"), filepath.Join(dir, "renewed.key")
+	writeTestCert(t, renewedCertPath, renewedKeyPath, "cert-two-renewed-longer", 202)
+	renewedCert, err := os.ReadFile(renewedCertPath)
+	if err != nil {
+		t.Fatalf("read renewed certificate: %v", err)
+	}
+	renewedKey, err := os.ReadFile(renewedKeyPath)
+	if err != nil {
+		t.Fatalf("read renewed key: %v", err)
+	}
 
 	p := &program{}
 	srv, done, err := p.startMetricsServer("127.0.0.1:0", "", "", certPath, keyPath, prober.NewStatusRegistry(), false, "server")
@@ -440,17 +462,74 @@ func TestMetricsServerCertReloadFailureKeepsPrevious(t *testing.T) {
 		<-done
 	})
 
+	// A half-written renewal: no PEM data at all, but the same sizes as the
+	// finished pair. The (mtime, size) it lands on is the fingerprint the
+	// failed load is recorded under.
 	// pi-lens-ignore: go-path-traversal (t.TempDir)
-	if err := os.WriteFile(certPath, []byte("not a certificate\n"), 0o600); err != nil {
+	if err := os.WriteFile(certPath, []byte(strings.Repeat("x", len(renewedCert))), 0o600); err != nil {
 		t.Fatalf("replace certificate with garbage: %v", err)
 	}
-	for range 2 {
-		if got := servedCert(t, srv.Addr); got.SerialNumber.Int64() != 101 {
-			t.Fatalf("a failed reload must keep serving the previous certificate, got serial %d", got.SerialNumber.Int64())
-		}
+	// pi-lens-ignore: go-path-traversal (t.TempDir)
+	if err := os.WriteFile(keyPath, []byte(strings.Repeat("x", len(renewedKey))), 0o600); err != nil {
+		t.Fatalf("replace key with garbage: %v", err)
+	}
+	brokenCertInfo, err := os.Stat(certPath)
+	if err != nil {
+		t.Fatalf("stat broken certificate: %v", err)
+	}
+	brokenKeyInfo, err := os.Stat(keyPath)
+	if err != nil {
+		t.Fatalf("stat broken key: %v", err)
+	}
+	if got := servedCert(t, srv.Addr); got.SerialNumber.Int64() != 101 {
+		t.Fatalf("a failed reload must keep serving the previous certificate, got serial %d", got.SerialNumber.Int64())
+	}
+
+	// Repair in place without touching (mtime, size): put the finished bytes
+	// back and restore the timestamps the broken pair was recorded under.
+	// pi-lens-ignore: go-path-traversal (t.TempDir)
+	if err := os.WriteFile(certPath, renewedCert, 0o600); err != nil {
+		t.Fatalf("restore certificate: %v", err)
+	}
+	// pi-lens-ignore: go-path-traversal (t.TempDir)
+	if err := os.WriteFile(keyPath, renewedKey, 0o600); err != nil {
+		t.Fatalf("restore key: %v", err)
+	}
+	// pi-lens-ignore: go-path-traversal (t.TempDir)
+	if err := os.Chtimes(certPath, brokenCertInfo.ModTime(), brokenCertInfo.ModTime()); err != nil {
+		t.Fatalf("restore certificate mtime: %v", err)
+	}
+	// pi-lens-ignore: go-path-traversal (t.TempDir)
+	if err := os.Chtimes(keyPath, brokenKeyInfo.ModTime(), brokenKeyInfo.ModTime()); err != nil {
+		t.Fatalf("restore key mtime: %v", err)
+	}
+	if repaired, err := os.Stat(certPath); err != nil {
+		t.Fatalf("stat repaired certificate: %v", err)
+	} else if repaired.Size() != brokenCertInfo.Size() || !repaired.ModTime().Equal(brokenCertInfo.ModTime()) {
+		t.Fatalf("the in-place repair changed the fingerprint (size %d->%d, mtime %v->%v): it no longer exercises the cooldown retry",
+			brokenCertInfo.Size(), repaired.Size(), brokenCertInfo.ModTime(), repaired.ModTime())
+	}
+
+	// Still inside the cooldown: the repaired pair must not be re-read yet, so
+	// a broken renewal does not cost a file read (and a Warn) per handshake.
+	if got := servedCert(t, srv.Addr); got.SerialNumber.Int64() != 101 {
+		t.Errorf("within the retry cooldown the handshake served serial %d, want the cached 101", got.SerialNumber.Int64())
 	}
 	if n := countLogs(logs, "keeping the previously loaded certificate", 300*time.Millisecond); n != 1 {
 		t.Errorf("a failed reload logged %d times for one file pair, want exactly 1", n)
+	}
+
+	// Past the cooldown the unchanged fingerprint is retried, so the repaired
+	// pair takes effect with no restart and no (mtime, size) change.
+	// pi-lens-ignore: go-time-sleep-test
+	time.Sleep(certReloadRetryCooldown)
+	got := servedCert(t, srv.Addr)
+	if got.SerialNumber.Int64() != 202 || got.Subject.CommonName != "cert-two-renewed-longer" {
+		t.Errorf("after the retry cooldown the handshake served serial %d cn %q, want 202/cert-two-renewed-longer",
+			got.SerialNumber.Int64(), got.Subject.CommonName)
+	}
+	if n := countLogs(logs, "reloaded", 300*time.Millisecond); n != 1 {
+		t.Errorf("the repaired pair was reloaded %d times, want exactly 1", n)
 	}
 }
 

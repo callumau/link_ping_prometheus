@@ -55,10 +55,12 @@ func TestValidateTarget_IPishHosts(t *testing.T) {
 	}
 }
 
-// TestConfigValidate_MinProbeInterval pins the 1ms probe-interval floor.
-// Below it the in-flight set grows to ~RTO/interval entries and every tick
-// sweeps O(len(pending)) timeouts, pegging a core; the error must name the
-// offending flag so the operator knows what to change.
+// TestConfigValidate_MinProbeInterval pins the 1ms floor on the probe interval
+// AND on the probe timeout. Below the interval floor the in-flight set grows to
+// ~RTO/interval entries and every tick sweeps O(len(pending)) timeouts, pegging
+// a core; below the timeout floor every probe expires before an echo can return
+// over a real link, so the link reads as 100% loss that never happened. Both
+// errors must name the offending flag so the operator knows what to change.
 // pi-lens-ignore: go-test-functions
 func TestConfigValidate_MinProbeInterval(t *testing.T) {
 	cases := []struct {
@@ -85,6 +87,26 @@ func TestConfigValidate_MinProbeInterval(t *testing.T) {
 		{
 			"per-target exactly at floor accepted",
 			Config{Targets: []Target{{Name: "t", Address: "127.0.0.1:4000", Interval: time.Millisecond}}, BaseInterval: time.Second, BaseTimeout: time.Second},
+			false, "",
+		},
+		{
+			"global timeout below floor rejected",
+			Config{Targets: []Target{{Name: "t", Address: "127.0.0.1:4000"}}, BaseInterval: time.Second, BaseTimeout: 500 * time.Microsecond},
+			true, "-timeout",
+		},
+		{
+			"global timeout exactly at floor accepted",
+			Config{Targets: []Target{{Name: "t", Address: "127.0.0.1:4000"}}, BaseInterval: time.Second, BaseTimeout: time.Millisecond},
+			false, "",
+		},
+		{
+			"per-target timeout below floor rejected",
+			Config{Targets: []Target{{Name: "t", Address: "127.0.0.1:4000", Timeout: 500 * time.Microsecond}}, BaseInterval: time.Second, BaseTimeout: time.Second},
+			true, `target "t"`,
+		},
+		{
+			"per-target timeout exactly at floor accepted",
+			Config{Targets: []Target{{Name: "t", Address: "127.0.0.1:4000", Timeout: time.Millisecond}}, BaseInterval: time.Second, BaseTimeout: time.Second},
 			false, "",
 		},
 	}
@@ -115,7 +137,9 @@ func TestLoadTargets_MinProbeInterval(t *testing.T) {
 		wantErr bool
 	}{
 		{"sub-ms interval rejected", `[{"name":"a","address":"127.0.0.1:4000","interval":"500us"}]`, true},
+		{"sub-ms timeout rejected", `[{"name":"a","address":"127.0.0.1:4000","timeout":"500us"}]`, true},
 		{"1ms interval accepted", `[{"name":"a","address":"127.0.0.1:4000","interval":"1ms"}]`, false},
+		{"1ms timeout accepted", `[{"name":"a","address":"127.0.0.1:4000","timeout":"1ms"}]`, false},
 		{"omitted interval accepted", `[{"name":"a","address":"127.0.0.1:4000"}]`, false},
 	}
 	for _, tc := range cases {

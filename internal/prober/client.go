@@ -1089,17 +1089,21 @@ func rttSeconds(sentAt, recvAt time.Time, sentQPC, recvQPC uint64) (float64, boo
 }
 
 // probeExpired reports whether an in-flight probe has used up its timeout.
-// A sentAt in the FUTURE counts as EXPIRED, deliberately: that is exactly the
-// state a backwards clock step (VM snapshot restore, chrony/NTP step, manual
-// `date`) leaves behind, and a plain now.Sub(sentAt) > timeout test would then
-// never retire those entries. They would accumulate until maxPendingWindow
-// throttled every send — nothing probed while link_up stayed 1, the worst
-// failure mode for a monitor. Retiring them goes through the normal sweep
-// path, a legitimate pending exit (timed_out + inflight), so the
-// sent = rtt + timed_out + inflight balance is unaffected. The comparison is
-// strictly greater: a probe exactly at its timeout is retired by the next
-// tick, which is the documented loss deadline (the first probe tick AFTER the
-// RTO expires).
+// A sentAt in the FUTURE counts as EXPIRED. Both instants are time.Time carrying
+// the monotonic reading, so a wall clock step (VM snapshot restore, chrony/NTP
+// step, manual `date`) can no longer move sentAt or now — this check is
+// defensive, not the load-bearing guard it was for the old UnixNano arithmetic.
+// It stays because the failure it prevents is catastrophic: entries stuck in
+// the future never retire, they accumulate until maxPendingWindow throttles
+// every send, and nothing is probed while link_up stays 1 — the worst failure
+// mode for a monitor. If it ever DOES fire, the observable effect is a single
+// tick that sweeps the whole pending set: link_probes_timed_out_total jumps by
+// N, consecutiveMisses can cross LinkUpMissThreshold (one interval of
+// link_up=0) and the loss ratio reads elevated for one window. The balance
+// stays exact because the sweep is a normal pending exit (timed_out + inflight).
+// The comparison is strictly greater: a probe exactly at its timeout is retired
+// by the next tick, which is the documented loss deadline (the first probe tick
+// AFTER the RTO expires).
 func probeExpired(now, sentAt time.Time, timeout time.Duration) bool {
 	if now.Before(sentAt) {
 		return true
@@ -1300,10 +1304,10 @@ func runEchoLoop(
 				// the tag we wrote. A full-frame frame is either echoed
 				// intact (the dual-accept server) or never echoes at all —
 				// a v0.7 header-only server rejects it before echoing,
-				// which is exactly why the default stays 'header' for
-				// mixed fleets. Zero-payload frames are excluded from the
-				// full-frame check because the two coverages coincide
-				// byte-for-byte there (pinned by
+				// which is why -hmac-coverage=header remains the documented
+				// escape hatch for a v0.7 peer. Zero-payload frames are
+				// excluded from the full-frame check because the two
+				// coverages coincide byte-for-byte there (pinned by
 				// TestHMACCoverageZeroPayloadEquivalence), so the header
 				// check is the same check.
 				if cfg.HmacCoverage == HMACFullFrameCoverage && cfg.Payload > 0 {

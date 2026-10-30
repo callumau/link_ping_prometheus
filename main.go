@@ -837,6 +837,29 @@ func installServiceArgs() ([]string, error) {
 			return nil, err
 		}
 	}
+	// run() validates the resolved source in EVERY mode, but buildConfig is the
+	// only caller of ValidateTargetName on this path and it is skipped for
+	// server-only mode: -svc=install -mode=server -source="Sydney DC" used to
+	// install and then exit 1 on every SCM start. Validate it here whatever the
+	// mode.
+	source := *flSource
+	if source == "" {
+		source = effectiveSource()
+	}
+	if err := prober.ValidateTargetName(source); err != nil {
+		return nil, fmt.Errorf("invalid -source: %w", err)
+	}
+	// The bind addresses are the same crash loop when malformed (the persisted
+	// flag can never bind), so resolve them here too. Resolution only — a bind
+	// failure is the runtime's business.
+	if _, err := net.ResolveTCPAddr("tcp", *flMetrics); err != nil {
+		return nil, fmt.Errorf("invalid -metrics address: %w", err)
+	}
+	if mode == "server" || mode == "both" {
+		if _, err := net.ResolveUDPAddr("udp", *flListen); err != nil {
+			return nil, fmt.Errorf("invalid -listen address: %w", err)
+		}
+	}
 	// pi-lens-ignore: go-ignored-call-result
 	if _, err := resolveAllowlist(mode, cfg); err != nil {
 		return nil, err
@@ -1163,6 +1186,18 @@ func limitConcurrent(limit int, handler http.Handler) http.Handler {
 	})
 }
 
+// certReloadRetryCooldown is how long a fingerprint whose load FAILED is
+// skipped before the pair is read again. The retry is what makes an in-place
+// repair observable: a pair fixed without touching (mtime, size) — a
+// chmod-only fix, a same-size rewrite that preserves the timestamp — keeps the
+// fingerprint the failed attempt was recorded under, so a pure memo would serve
+// the expired certificate until the files changed again, i.e. exactly the
+// silent scrape blackout the reloader exists to prevent. The cooldown keeps the
+// other side of that tradeoff: a genuinely broken renewal costs one file read
+// (and at most one Warn) per cooldown, not one per handshake. A var so tests
+// can lower it.
+var certReloadRetryCooldown = 30 * time.Second
+
 // metricsCertReloader serves the metrics TLS pair from a cache that is re-read
 // when either file's (mtime, size) changes, so a renewed certificate takes
 // effect without a restart. ServeTLS otherwise loads the pair exactly once: on
@@ -1177,11 +1212,13 @@ type metricsCertReloader struct {
 	// cert is the pair currently served. Seeded at construction, so no
 	// handshake can ever observe an empty cache.
 	cert *tls.Certificate
-	// loaded is the fingerprint of the pair in cert; attempted is the last
-	// fingerprint a reload was tried for. Kept apart so a broken replacement is
-	// re-read (and re-logged) only when the files change again: a Warn per
-	// handshake would flood the very log the reload exists to make visible.
+	// loaded is the fingerprint of the pair in cert; attempted/attemptedAt are
+	// the last fingerprint a reload was tried for and when. Kept apart so a
+	// failed load is retried only after certReloadRetryCooldown rather than on
+	// every handshake, which would flood the very log the reload exists to make
+	// visible (see certReloadRetryCooldown for why the retry matters at all).
 	loaded, attempted certFingerprint
+	attemptedAt       time.Time
 	// statFailed latches the stat-error warning the same way.
 	statFailed bool
 }
@@ -1240,10 +1277,13 @@ func (r *metricsCertReloader) GetCertificate(*tls.ClientHelloInfo) (*tls.Certifi
 		return r.cert, nil
 	}
 	r.statFailed = false
-	if fp == r.loaded || fp == r.attempted {
+	if fp == r.loaded {
 		return r.cert, nil
 	}
-	r.attempted = fp
+	if fp == r.attempted && time.Since(r.attemptedAt) < certReloadRetryCooldown {
+		return r.cert, nil
+	}
+	r.attempted, r.attemptedAt = fp, time.Now()
 	cert, err := tls.LoadX509KeyPair(r.certPath, r.keyPath)
 	if err != nil {
 		// A half-written renewal or a key that does not match: keep the working
