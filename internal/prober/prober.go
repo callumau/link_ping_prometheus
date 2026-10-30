@@ -316,10 +316,11 @@ func tagsPayload(coverage HmacCoverage, payload int) bool {
 // wire timestamp, the optional deterministic payload, and — when mac is
 // non-nil — the 8-byte tag under coverage. The header size is derived from
 // mac so a caller cannot pair a 24-byte header with a tag slot; payload is
-// the number of pattern bytes after the header. buf must have room for
-// headerSize+payload. This is the single spelling of the wire layout, shared
-// by the main prober and the MTU sweep: two spellings could tag differently
-// on a full-frame deployment and silently stop authenticating.
+// the number of pattern bytes after the header. buf must have room for the
+// header plus payload (24+payload without a tag, 32+payload with one). This
+// is the single spelling of the wire layout, shared by the main prober and
+// the MTU sweep: two spellings could tag differently on a full-frame
+// deployment and silently stop authenticating.
 func buildProbeFrame(buf []byte, seq, ts uint64, payload int, mac *probeMACer, coverage HmacCoverage) {
 	headerSize := PayloadSize
 	if mac != nil {
@@ -348,8 +349,8 @@ func buildProbeFrame(buf []byte, seq, ts uint64, payload int, mac *probeMACer, c
 // so a Reset()-per-frame marshaler avoids the per-frame hmac struct +
 // sha256 digest + Sum(nil) slice (3 allocs / ~250B/frame - measured
 // dominant at the server's 10k/s global cap) and the two identical pad
-// block-compressions crypto/hmac re-runs fresh per frame. Reset-then-digest
-// yields the same tag as a fresh state (pinned by the coverage tests), and
+// block-compressions crypto/hmac re-runs fresh per frame. Tag bytes do not
+// depend on prior use of the state (the round-trip tests exercise reuse), and
 // scratch holds Sum's output so digesting allocates nothing.
 type probeMACer struct {
 	h       hash.Hash
