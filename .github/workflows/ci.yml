@@ -196,4 +196,10 @@ jobs:
           cache: false
 
       - name: Run Tests (race detector)
+        # LPP_E2E_WINDOWS_INSTALL=1 runs the CI-safe install/config/uninstall
+        # half of the Windows service e2e. LPP_E2E_WINDOWS is deliberately NOT
+        # set: the SCM start/stop lifecycle dies pre-dispatch under LocalSystem
+        # (1053) on hosted runners and stays manual (see docs/development.md).
+        env:
+          LPP_E2E_WINDOWS_INSTALL: "1"
         run: go test -count=1 -race -timeout 30m -v ./...

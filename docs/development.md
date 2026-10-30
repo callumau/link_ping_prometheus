@@ -38,6 +38,12 @@ Both suites run in CI. The Windows-only behavioral tests (winsock errno
 classification, DF socket options, log-DACL hardening) execute natively in the
 `test-windows` job.
 
+The Windows service **install/config/uninstall** e2e also runs there
+(`LPP_E2E_WINDOWS_INSTALL=1`). The full SCM **start/stop** lifecycle and the
+credential env-delivery e2e stay manual (`LPP_E2E_WINDOWS=1`): on hosted Windows
+runners the SCM-started process dies before dispatch (1053), and its failure
+surface is only debuggable on an interactive host.
+
 Release binaries for Linux, macOS, and Windows are on the
 [Latest Release](https://github.com/callumau/link_ping_prometheus/releases/latest)
 page.

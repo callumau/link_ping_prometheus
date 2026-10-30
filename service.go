@@ -341,18 +341,20 @@ func (p *program) Stop(_ eventlogSink) error {
 }
 
 // svcTraceMarker records a service-path diagnostic (windows e2e triage aid
-// under the SCM where stderr is dead). It emits through slog at Debug so the
-// configured handler owns the format: the previous raw "svc-trace[...]" line
-// written straight into -log-file broke -json-logs parsing (the file is then a
-// mix of JSON records and bare text) on every foreground run too. Only the
-// -svc paths emit at all; a plain foreground run has no service to trace. The
-// marker text is what the Windows e2e triage reads out of the log, so keep the
+// under the SCM where stderr is dead). It emits through slog at Info: the
+// handler is fixed at LevelInfo, so Debug markers were invisible in the
+// service log the e2e dumps on failure. The configured handler still owns the
+// format: the previous raw "svc-trace[...]" line written straight into
+// -log-file broke -json-logs parsing (the file is then a mix of JSON records
+// and bare text) on every foreground run too. Only the -svc paths emit at
+// all; a plain foreground run has no service to trace. The marker text is
+// what the Windows e2e triage reads out of the log, so keep the
 // "svc-trace[...]" shape in the message.
 func svcTraceMarker(tag string) {
 	if *flSvc == "" {
 		return
 	}
-	slog.Debug(fmt.Sprintf("svc-trace[%s]", tag))
+	slog.Info(fmt.Sprintf("svc-trace[%s]", tag))
 }
 
 // readyToProbe reports whether a running agent can actually do its job, i.e.

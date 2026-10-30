@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -32,8 +31,14 @@ func svcHasAdmin(t *testing.T) bool {
 }
 
 func TestE2EWindowsServiceLifecycle(t *testing.T) {
-	if os.Getenv("LPP_E2E_WINDOWS") != "1" {
-		t.Skip("set LPP_E2E_WINDOWS=1 to run the Windows SCM lifecycle e2e; on a CI runner the SCM-start process dies pre-dispatch under LocalSystem (1053) and its failure surface is only locally debuggable — see docs/development.md")
+	// Install/config/uninstall is CI-safe and runs with
+	// LPP_E2E_WINDOWS_INSTALL=1. The SCM start/stop half stays behind the
+	// manual gate: on hosted runners the SCM-started process dies
+	// pre-dispatch under LocalSystem (1053) and is only debuggable on an
+	// interactive host (see docs/development.md).
+	full := os.Getenv("LPP_E2E_WINDOWS") == "1"
+	if !full && os.Getenv("LPP_E2E_WINDOWS_INSTALL") != "1" {
+		t.Skip("set LPP_E2E_WINDOWS_INSTALL=1 for the install/config/uninstall e2e (CI), or LPP_E2E_WINDOWS=1 for the full SCM start/stop lifecycle (manual)")
 	}
 	if !svcHasAdmin(t) {
 		t.Skip("SCM manager connect needs elevation; runner lacks it")
@@ -84,6 +89,14 @@ func TestE2EWindowsServiceLifecycle(t *testing.T) {
 	}
 	if len(cfg.Dependencies) < 2 {
 		t.Errorf("dependencies not recorded: %v (want Tcpip + W32Time)", cfg.Dependencies)
+	}
+
+	// CI runs only the install half. Assert the teardown here so the CI run
+	// still covers install -> SCM config -> uninstall.
+	if !full {
+		t.Log("LPP_E2E_WINDOWS unset: verified install/config/uninstall; SCM start/stop is manual-only")
+		uninstallSvc(t, m, svcName)
+		return
 	}
 
 	// start (through our own -svc=start path) and wait RUNNING. On failure
@@ -159,12 +172,18 @@ func TestE2EWindowsServiceLifecycle(t *testing.T) {
 	}
 
 	// uninstall removes the service entirely.
-	if out, err = exec.Command(binPath, "-svc=uninstall").CombinedOutput(); err != nil {
+	uninstallSvc(t, m, svcName)
+}
+
+// uninstallSvc removes the installed service and fails the test if the SCM
+// still reports it. Shared by the CI install-only path and the full
+// lifecycle path so both assert the same teardown.
+func uninstallSvc(t *testing.T, m *mgr.Mgr, name string) {
+	t.Helper()
+	if out, err := exec.Command(binPath, "-svc=uninstall").CombinedOutput(); err != nil {
 		t.Fatalf("-svc=uninstall failed: %v\noutput: %.400s", err, out)
 	}
-	if _, err := m.OpenService(svcName); err == nil {
+	if _, err := m.OpenService(name); err == nil {
 		t.Errorf("service still present after -svc=uninstall")
 	}
-	_ = strings.TrimSpace("")
-	_ = os.Getenv("LPP_E2E_WINDOWS_SVC")
 }
