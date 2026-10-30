@@ -152,10 +152,10 @@ func TestReadEcho_SkipsForeignAndOtherSizedDatagrams(t *testing.T) {
 }
 
 // TestReadEcho_VerifiesHMACTag pins the sweep-side echo authentication when
-// -echo-secret is set: the echoed tag must match computeHMAC over the
+// -echo-secret is set: the echoed tag must match digestHeader over the
 // (sequence, echoed-timestamp) pair the sweep actually sent, compared
 // constant-time, and a frame without the tag is skipped by the size gate.
-// Mirrors the main reader's acceptance (client.go validHMAC) so an
+// Mirrors the main reader's acceptance (client.go verifyHeader) so an
 // off-path injector cannot steer the binary search.
 func TestReadEcho_VerifiesHMACTag(t *testing.T) {
 	const secret = "audit-secret"
@@ -163,7 +163,7 @@ func TestReadEcho_VerifiesHMACTag(t *testing.T) {
 	const wantSize = PayloadSizeWithHMAC // 32: header + tag
 	wantTS := uint64(1727000000987654321)
 	deadline := time.Now().Add(time.Second)
-	goodTag := computeHMAC(secret, wantSeq, wantTS)
+	goodTag := headerTag(secret, wantSeq, wantTS)
 	sent := map[uint64]uint64{wantSeq: wantTS}
 
 	cases := []struct {
@@ -202,7 +202,7 @@ func TestReadEcho_VerifiesHMACTag(t *testing.T) {
 		{
 			"a tag forged for a different timestamp is skipped",
 			func() [][]byte {
-				forged := computeHMAC(secret, wantSeq, wantTS+1)
+				forged := headerTag(secret, wantSeq, wantTS+1)
 				return [][]byte{dfFrameFull(wantSeq, wantTS, wantSize, forged[:])}
 			}(),
 			true,
@@ -229,7 +229,7 @@ func TestReadEcho_VerifiesHMACTag(t *testing.T) {
 	// ITS OWN timestamp/tag arriving during attempt 2 proves survival.
 	s1TS, s2TS := wantTS, wantTS+5
 	both := map[uint64]uint64{41: s1TS, 42: s2TS}
-	tag1 := computeHMAC(secret, 41, s1TS)
+	tag1 := headerTag(secret, 41, s1TS)
 	conn2 := &scriptedReadConn{frames: [][]byte{dfFrameFull(41, s1TS, wantSize, tag1[:])}}
 	if err := readEcho(context.Background(), conn2, make([]byte, MaxDatagramSize), wantSize, []uint64{41, 42}, both, secret, HMACHeaderCoverage, deadline); err != nil {
 		t.Errorf("an echo of either attempt's (seq, ts) pair must be accepted, got %v", err)
@@ -256,7 +256,7 @@ func TestReadEcho_VerifiesHMACFullFrameTag(t *testing.T) {
 	build := func(tamper bool) []byte {
 		b := dfFrameFull(wantSeq, wantTS, wantSize, nil)
 		fillPayload(b[PayloadSizeWithHMAC:], wantSeq, wantTS)
-		h := computeHMACFullFrame(secret, b)
+		h := frameTag(secret, b)
 		copy(b[24:32], h[:])
 		if tamper {
 			b[PayloadSizeWithHMAC] ^= 0xFF

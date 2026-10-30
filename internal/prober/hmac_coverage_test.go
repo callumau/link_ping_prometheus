@@ -30,8 +30,8 @@ func hmacCoverageFrame(seq, ts uint64, payload int, tag []byte) []byte {
 }
 
 // TestHMACCoverageZeroPayloadEquivalence pins the keystone invariant:
-// computeHMACFullFrame over a zero-payload 32-byte frame is
-// byte-identical to computeHMAC over the header. That identity is why the
+// the full-frame digest over a zero-payload 32-byte frame is
+// byte-identical to the header digest. That identity is why the
 // server can keep its header-only check for bare 32-byte frames (the
 // second coverage attempt could never change the outcome) and why
 // empty-payload frames behave identically under both coverages — an old
@@ -42,10 +42,10 @@ func TestHMACCoverageZeroPayloadEquivalence(t *testing.T) {
 	ts := uint64(time.Now().UnixNano())
 	for _, key := range keys {
 		for _, seq := range []uint64{0, 1, 42, ^uint64(0)} {
-			headerTag := computeHMAC(key, seq, ts)
-			frame := hmacCoverageFrame(seq, ts, 0, headerTag[:])
-			if got := computeHMACFullFrame(key, frame); got != headerTag {
-				t.Errorf("computeHMACFullFrame over a zero-payload frame must equal computeHMAC (key %q, seq %d)", key, seq)
+			wantHeader := headerTag(key, seq, ts)
+			frame := hmacCoverageFrame(seq, ts, 0, wantHeader[:])
+			if got := frameTag(key, frame); got != wantHeader {
+				t.Errorf("frameTag over a zero-payload frame must equal headerTag (key %q, seq %d)", key, seq)
 			}
 		}
 	}
@@ -62,10 +62,10 @@ func TestValidHMACFullFrame(t *testing.T) {
 	ts := uint64(1727000000123456789)
 
 	frame := hmacCoverageFrame(seq, ts, payload, nil)
-	tag := computeHMACFullFrame(secret, frame)
+	tag := frameTag(secret, frame)
 	copy(frame[24:32], tag[:])
 
-	if !validHMACFullFrame(secret, frame) {
+	if !newProbeMACer(secret).verifyFullFrame(frame) {
 		t.Error("a correctly full-frame-tagged payload frame must authenticate")
 	}
 	// Same (seq, ts, tag), different payload bytes: must NOT authenticate.
@@ -73,16 +73,16 @@ func TestValidHMACFullFrame(t *testing.T) {
 	copy(tampered, frame)
 	tampered[PayloadSizeWithHMAC] ^= 0xFF
 	tampered[len(tampered)-1] ^= 0x01
-	if validHMACFullFrame(secret, tampered) {
+	if newProbeMACer(secret).verifyFullFrame(tampered) {
 		t.Error("a tampered payload riding the captured tag must NOT authenticate under full-frame coverage")
 	}
 	// Wrong secret rejected.
-	if validHMACFullFrame("different-secret", frame) {
+	if newProbeMACer("different-secret").verifyFullFrame(frame) {
 		t.Error("a full-frame tag must not verify under a different secret")
 	}
 	// The header check (v0.7 path) still fails for this frame: a
 	// full-frame tag is not a header tag when a payload exists.
-	if validHMAC(secret, seq, ts, frame[24:32]) {
+	if newProbeMACer(secret).verifyHeader(seq, ts, frame[24:32]) {
 		t.Error("a full-frame tag must not authenticate under the header-only check")
 	}
 }
@@ -97,13 +97,13 @@ func TestValidHMACHeaderPathUnchangedForOldFrames(t *testing.T) {
 	for _, seq := range []uint64{1, 99} {
 		for _, payload := range []int{0, 64} {
 			frame := hmacCoverageFrame(seq, ts, payload, nil)
-			tag := computeHMAC(secret, seq, ts)
+			tag := headerTag(secret, seq, ts)
 			copy(frame[24:32], tag[:])
-			if !validHMAC(secret, seq, ts, frame[24:32]) {
-				t.Errorf("the v0.7 header-tag frame (seq %d, payload %d) must still authenticate via validHMAC", seq, payload)
+			if !newProbeMACer(secret).verifyHeader(seq, ts, frame[24:32]) {
+				t.Errorf("the v0.7 header-tag frame (seq %d, payload %d) must still authenticate via verifyHeader", seq, payload)
 			}
-			if !validHMACAny(secret, "stale-rotation-secret", seq, ts, frame[24:32]) {
-				t.Errorf("validHMACAny must accept the primary secret's header tag (seq %d, payload %d)", seq, payload)
+			if !macAny(macerOrNil(secret), macerOrNil("stale-rotation-secret"), seq, ts, frame[24:32]) {
+				t.Errorf("macAny must accept the primary secret's header tag (seq %d, payload %d)", seq, payload)
 			}
 		}
 	}
@@ -119,24 +119,24 @@ func TestValidHMACFullFrameAny(t *testing.T) {
 
 	for _, secretOf := range []string{secret, secretOld} {
 		frame := hmacCoverageFrame(11, ts, 32, nil)
-		tag := computeHMACFullFrame(secretOf, frame)
+		tag := frameTag(secretOf, frame)
 		copy(frame[24:32], tag[:])
-		if !validHMACFullFrameAny(secret, secretOld, frame) {
-			t.Errorf("validHMACFullFrameAny must accept a %s-tagged frame during rotation", secretOf)
+		if !fullFrameAny(macerOrNil(secret), macerOrNil(secretOld), frame) {
+			t.Errorf("fullFrameAny must accept a %s-tagged frame during rotation", secretOf)
 		}
 	}
 	// An unknown secret still fails both attempts.
 	frame := hmacCoverageFrame(12, ts, 32, nil)
-	tag := computeHMACFullFrame("unknown", frame)
+	tag := frameTag("unknown", frame)
 	copy(frame[24:32], tag[:])
-	if validHMACFullFrameAny(secret, secretOld, frame) {
-		t.Error("validHMACFullFrameAny must reject a tag from an unknown secret")
+	if fullFrameAny(macerOrNil(secret), macerOrNil(secretOld), frame) {
+		t.Error("fullFrameAny must reject a tag from an unknown secret")
 	}
 	// No rotation in progress: only the primary secret is consulted.
 	frame2 := hmacCoverageFrame(13, ts, 32, nil)
-	tagOld := computeHMACFullFrame(secretOld, frame2)
+	tagOld := frameTag(secretOld, frame2)
 	copy(frame2[24:32], tagOld[:])
-	if validHMACFullFrameAny(secret, "", frame2) {
+	if fullFrameAny(macerOrNil(secret), macerOrNil(""), frame2) {
 		t.Error("with no rotation, the old secret's tag must be rejected")
 	}
 }

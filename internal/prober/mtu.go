@@ -112,10 +112,10 @@ func mtuDeadline(cfg Config, state *probeLoopState) time.Duration {
 // (sent maps seq -> ts), and — when the sweep runs with -echo-secret — whose
 // tag authenticates under the coverage the sweep sent with: coverage selects
 // between the header tag (v0.7 layout) and the full-frame tag over
-// header+payload with the tag slot skipped (computeHMACFullFrame; for the
+// header+payload with the tag slot skipped (digestFrame; for the
 // header-only probe the two coverages coincide byte-for-byte, so the header
-// check is the same check), compared constant-time (validHMAC /
-// validHMACFullFrame). The main reader applies the same identity checks to
+// check is the same check), compared constant-time (verifyHeader /
+// verifyFullFrame). The main reader applies the same identity checks to
 // its responses; without them a peer able to inject into the connected DF
 // socket could fabricate an echo for the currently probed size (sequence
 // numbers are deterministic) and steer the binary search.

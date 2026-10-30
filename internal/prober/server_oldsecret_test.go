@@ -84,7 +84,7 @@ func oldSecretHeaderFrame(seq, ts uint64, key string) []byte {
 	copy(f[0:8], MagicBytes)
 	binary.LittleEndian.PutUint64(f[8:16], seq)
 	binary.LittleEndian.PutUint64(f[16:24], ts)
-	tag := computeHMAC(key, seq, ts)
+	tag := headerTag(key, seq, ts)
 	copy(f[24:32], tag[:])
 	return f
 }
@@ -100,7 +100,7 @@ func oldSecretFullFrame(seq, ts uint64, key string, payloadLen int) []byte {
 	for i := PayloadSizeWithHMAC; i < len(f); i++ {
 		f[i] = byte(i * 31)
 	}
-	tag := computeHMACFullFrame(key, f)
+	tag := frameTag(key, f)
 	copy(f[24:32], tag[:])
 	return f
 }
