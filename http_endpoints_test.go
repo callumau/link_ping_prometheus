@@ -189,17 +189,6 @@ func TestConcurrencyCapReturns503(t *testing.T) {
 	}
 }
 
-// blockingStatusHandler parks every request until release is closed, making
-// the /status concurrency cap deterministic (the same pattern as
-// blockingGatherer for /metrics). After release is closed, later requests
-// complete immediately, so the test can verify slots are reusable afterward.
-
-// TestStatusHandler_CapReleasesOnPanic pins that a panicking request still
-// frees its semaphore slot: the cap wraps arbitrary handlers and a leaked
-// slot would eventually 503 every /status request forever. The wrapper lets
-// the panic propagate to net/http's server-side recovery, so the test
-// mirrors that by recovering it itself. The inner handler panics exactly
-// once, so the request after the panic also proves the freed slot serves.
 // TestStatusHandler_CapReleasesOnPanic pins that a panicking request still
 // frees its semaphore slot: the cap wraps arbitrary handlers and a leaked
 // slot would eventually 503 every /status request forever. The wrapper lets

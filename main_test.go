@@ -78,13 +78,6 @@ func captureWarns(t *testing.T) *bytes.Buffer {
 	return &buf
 }
 
-// TestRunRejectsEchoSecretOldWithoutPrimary pins the rotation guard (F4):
-// -echo-secret-old without a primary -echo-secret silently disables ALL wire
-// auth — internal/prober/server.go consults the old secret only inside its
-// `if echoSecret != ""` branch, so an operator mid-rotation whose new secret
-// deploy failed would run unauthenticated believing rotation protection is
-// active. The guard must fail the run BEFORE any bind.
-
 // blockingGatherer parks every Gather until release is closed, making the
 // MaxRequestsInFlight cap deterministic: without the park, the cap could only
 // be tested by racing real gathers against each other.

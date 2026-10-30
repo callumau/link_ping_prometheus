@@ -597,14 +597,12 @@ func TestServer_GlobalRateLimitStarvesExcess(t *testing.T) {
 	prober.MaxPktsPerIP, prober.MaxPktsGlobal = 100, 4
 
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
+	addr, done := startServerOpts(t, ctx, serverOpts{allow: mustAllow("127.0.0.1,127.0.0.2")})
 	defer func() {
 		cancel()
 		<-done // server must have exited before the shared caps are restored
 		prober.MaxPktsPerIP, prober.MaxPktsGlobal = oldIP, oldGlobal
 	}()
-
-	addr, done := startServerOpts(t, ctx, serverOpts{allow: mustAllow("127.0.0.1,127.0.0.2")})
 
 	echoCount := func(conn net.Conn, sends int) int {
 		t.Helper()
@@ -895,13 +893,11 @@ func TestServer_CIDRAllowlist(t *testing.T) {
 	prober.InitMetrics()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
+	addr, done := startServerOpts(t, ctx, serverOpts{allow: mustAllow("127.0.0.2/32")})
 	defer func() {
 		cancel()
 		<-done
 	}()
-
-	addr, done := startServerOpts(t, ctx, serverOpts{allow: mustAllow("127.0.0.2/32")})
 
 	in := dialFrom(t, addr, net.IPv4(127, 0, 0, 2))
 	defer in.Close()
@@ -927,13 +923,11 @@ func TestServer_ClientSeriesOverflow(t *testing.T) {
 	defer func() { prober.MaxClientSeries = old }()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
+	addr, done := startServerOpts(t, ctx, serverOpts{allow: mustAllow("127.0.0.0/8")})
 	defer func() {
 		cancel()
 		<-done
 	}()
-
-	addr, done := startServerOpts(t, ctx, serverOpts{allow: mustAllow("127.0.0.0/8")})
 
 	var conns []net.Conn
 	defer func() {
@@ -978,16 +972,14 @@ func TestServer_UnauthenticatedSourceCannotSpendSeriesSlot(t *testing.T) {
 	defer func() { prober.MaxClientSeries = old }()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
 	// Restore MaxClientSeries only after the server has returned: it reads
 	// the var from its own goroutine (race detector).
+	const secret = "resolve-after-auth"
+	addr, done := startServerOpts(t, ctx, serverOpts{allow: mustAllow("127.0.0.0/8"), secret: secret})
 	defer func() {
 		cancel()
 		<-done
 	}()
-
-	const secret = "resolve-after-auth"
-	addr, done := startServerOpts(t, ctx, serverOpts{allow: mustAllow("127.0.0.0/8"), secret: secret})
 
 	// Correct size, magic and fresh timestamp — only the tag is wrong, so the
 	// frame reaches the authentication step and nothing else.
@@ -1060,12 +1052,11 @@ func TestAllowlist_IPv4Mapped(t *testing.T) {
 	// that silently admitted nothing before the Unmap fix.
 	prober.InitMetrics()
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
+	addr, done := startServerOpts(t, ctx, serverOpts{allow: mustAllow("::ffff:127.0.0.1")})
 	defer func() {
 		cancel()
 		<-done
 	}()
-	addr, done := startServerOpts(t, ctx, serverOpts{allow: mustAllow("::ffff:127.0.0.1")})
 
 	conn, probe := dialProbe(t, addr)
 	defer conn.Close()
@@ -1089,15 +1080,13 @@ func TestServer_RateLimit_JunkDoesNotSpendPerIPBudget(t *testing.T) {
 	prober.MaxPktsPerIP = 1 // a single authenticated frame exhausts the budget
 
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
+	const secret = "rate-order-secret"
+	addr, done := startServerOpts(t, ctx, serverOpts{allow: mustAllow("127.0.0.1"), secret: secret})
 	defer func() {
 		cancel()
 		<-done // join before restoring the shared cap vars
 		prober.MaxPktsPerIP, prober.MaxPktsGlobal = oldIP, oldGlobal
 	}()
-
-	const secret = "rate-order-secret"
-	addr, done := startServerOpts(t, ctx, serverOpts{allow: mustAllow("127.0.0.1"), secret: secret})
 
 	conn, err := net.Dial("udp", addr)
 	if err != nil {
@@ -1146,15 +1135,13 @@ func TestServer_RateLimit_GlobalChargeBoundsCrypto(t *testing.T) {
 	prober.MaxPktsGlobal = 3
 
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
+	const secret = "rate-order-secret"
+	addr, done := startServerOpts(t, ctx, serverOpts{allow: mustAllow("127.0.0.1"), secret: secret})
 	defer func() {
 		cancel()
 		<-done // join before restoring the shared cap vars
 		prober.MaxPktsPerIP, prober.MaxPktsGlobal = oldIP, oldGlobal
 	}()
-
-	const secret = "rate-order-secret"
-	addr, done := startServerOpts(t, ctx, serverOpts{allow: mustAllow("127.0.0.1"), secret: secret})
 
 	conn, err := net.Dial("udp", addr)
 	if err != nil {
@@ -1199,15 +1186,13 @@ func TestServer_RateLimit_ReplayDoesNotSpendPerIPBudget(t *testing.T) {
 	prober.MaxPktsPerIP = 1 // one authenticated frame exhausts the budget
 
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
+	const secret = "replay-order-secret"
+	addr, done := startServerOpts(t, ctx, serverOpts{allow: mustAllow("127.0.0.1"), secret: secret})
 	defer func() {
 		cancel()
 		<-done // join before restoring the shared cap vars
 		prober.MaxPktsPerIP, prober.MaxPktsGlobal = oldIP, oldGlobal
 	}()
-
-	const secret = "replay-order-secret"
-	addr, done := startServerOpts(t, ctx, serverOpts{allow: mustAllow("127.0.0.1"), secret: secret})
 
 	conn, err := net.Dial("udp", addr)
 	if err != nil {
@@ -1391,14 +1376,12 @@ func TestServer_DynamicClientEviction(t *testing.T) {
 	prober.MaxClientSeries, prober.DynClientTTL = 2, 500*time.Millisecond
 
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
+	addr, done := startServerOpts(t, ctx, serverOpts{allow: mustAllow("127.0.0.0/8")})
 	defer func() {
 		cancel()
 		<-done // join before restoring the shared vars
 		prober.MaxClientSeries, prober.DynClientTTL = oldCap, oldTTL
 	}()
-
-	addr, done := startServerOpts(t, ctx, serverOpts{allow: mustAllow("127.0.0.0/8")})
 
 	// Dial all three first so the window between the last admitted probe and
 	// the overflow probe stays far below DynClientTTL.
@@ -1464,14 +1447,12 @@ func TestServer_DynamicClientSeriesExpiresBelowCap(t *testing.T) {
 	prober.DynClientTTL = 200 * time.Millisecond
 
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
+	addr, done := startServerOpts(t, ctx, serverOpts{allow: mustAllow("127.0.0.0/8")})
 	defer func() {
 		cancel()
 		<-done // join before restoring the shared var
 		prober.DynClientTTL = oldTTL
 	}()
-
-	addr, done := startServerOpts(t, ctx, serverOpts{allow: mustAllow("127.0.0.0/8")})
 
 	c2 := dialFrom(t, addr, net.IPv4(127, 0, 0, 2))
 	defer c2.Close()
@@ -1625,14 +1606,12 @@ func TestServer_ExactClientSeriesNeverEvicted(t *testing.T) {
 	defer func() { prober.DynClientTTL = oldTTL }()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
 	// Join the server BEFORE restoring the var above (defer order).
+	addr, done := startServerOpts(t, ctx, serverOpts{allow: mustAllow("127.0.0.1")})
 	defer func() {
 		cancel()
 		<-done
 	}()
-
-	addr, done := startServerOpts(t, ctx, serverOpts{allow: mustAllow("127.0.0.1")})
 
 	conn, probe := dialProbe(t, addr)
 	defer conn.Close()
