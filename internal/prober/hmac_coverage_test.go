@@ -139,6 +139,14 @@ func TestValidHMACFullFrameAny(t *testing.T) {
 	if fullFrameAny(macerOrNil(secret), macerOrNil(""), frame2) {
 		t.Error("with no rotation, the old secret's tag must be rejected")
 	}
+	// The empty old secret must not install a verifier: a zero-length HMAC
+	// key is a valid key, so a frame tagged under "" would otherwise pass.
+	frameEmpty := hmacCoverageFrame(14, ts, 32, nil)
+	tagEmpty := frameTag("", frameEmpty)
+	copy(frameEmpty[24:32], tagEmpty[:])
+	if fullFrameAny(macerOrNil(secret), macerOrNil(""), frameEmpty) {
+		t.Error("the empty old secret must not be installed as a verifier")
+	}
 }
 
 // TestParseHMACCoverage pins the flag grammar: the two documented values
