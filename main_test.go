@@ -102,13 +102,6 @@ func (g *blockingGatherer) Gather() ([]*dto.MetricFamily, error) {
 	return nil, nil
 }
 
-// TestMetricsHandler_ConcurrencyCapReturns503: /metrics must serve at most
-// maxConcurrentScrapes gathers at once (a large fleet's response is ~10-15MB
-// of text and every concurrent scrape builds its own copy against
-// GOMEMLIMIT). Excess scrapes get a 503, which Prometheus retries; without
-// this an unbounded scrape storm multiplies the agent's own heap and can make
-// the monitor report ITSELF down. The rejected request must not reach Gather.
-
 // blockingStatusHandler parks every request until release is closed, making
 // the /status concurrency cap deterministic (the same pattern as
 // blockingGatherer for /metrics). After release is closed, later requests
@@ -125,13 +118,6 @@ func (h *blockingStatusHandler) ServeHTTP(w http.ResponseWriter, r *http.Request
 	}
 	<-h.release
 }
-
-// TestStatusHandler_CapReleasesOnPanic pins that a panicking request still
-// frees its semaphore slot: the cap wraps arbitrary handlers and a leaked
-// slot would eventually 503 every /status request forever. The wrapper lets
-// the panic propagate to net/http's server-side recovery, so the test
-// mirrors that by recovering it itself. The inner handler panics exactly
-// once, so the request after the panic also proves the freed slot serves.
 
 // funcWriter adapts a function to io.Writer for sink tests.
 type funcWriter func([]byte) (int, error)

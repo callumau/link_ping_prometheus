@@ -2,6 +2,7 @@ package prober
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -153,6 +154,18 @@ func TestConfigValidate_HmacCoverage(t *testing.T) {
 	}
 }
 
+// writeTempTargets writes body to a fresh 0600 targets file under the test's
+// temporary directory and returns its path. LoadTargets refuses group/world
+// writable files, so 0600 matters.
+func writeTempTargets(t *testing.T, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "targets.json")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 // TestLoadTargets_MinProbeInterval pins the same floor on the targets.json
 // path: LoadTargets re-validates through validateTargets, so a hot-reload
 // with a sub-millisecond interval is rejected and keeps the previous set
@@ -171,18 +184,7 @@ func TestLoadTargets_MinProbeInterval(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			f, err := os.CreateTemp("", "targets-mininterval-*.json")
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer os.Remove(f.Name())
-			if _, err := f.WriteString(tc.body); err != nil {
-				t.Fatal(err)
-			}
-			if err := f.Close(); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := LoadTargets(f.Name()); (err != nil) != tc.wantErr {
+			if _, err := LoadTargets(writeTempTargets(t, tc.body)); (err != nil) != tc.wantErr {
 				t.Errorf("LoadTargets error = %v, wantErr %v", err, tc.wantErr)
 			}
 		})

@@ -89,149 +89,103 @@ func TestStartMetricsServerTimeouts(t *testing.T) {
 	}
 }
 
-// TestMetricsHandler_ConcurrencyCapReturns503: /metrics must serve at most
-// maxConcurrentScrapes gathers at once (a large fleet's response is ~10-15MB
-// of text and every concurrent scrape builds its own copy against
-// GOMEMLIMIT). Excess scrapes get a 503, which Prometheus retries; without
-// this an unbounded scrape storm multiplies the agent's own heap and can make
-// the monitor report ITSELF down. The rejected request must not reach Gather.
-func TestMetricsHandler_ConcurrencyCapReturns503(t *testing.T) {
-	prober.InitMetrics()
-	g := &blockingGatherer{entered: make(chan struct{}, 8), release: make(chan struct{})}
-	h := metricsHandlerFor(g, false)
+// TestConcurrencyCapReturns503 pins both wirings of the scrape cap: /metrics
+// applies it inside metricsHandlerFor, /status wraps limitConcurrent around
+// the status handler. Excess requests get 503 and must never reach the inner
+// handler; after the burst every slot must be reusable.
+func TestConcurrencyCapReturns503(t *testing.T) {
+	cases := []struct {
+		name      string
+		path      string
+		postBurst int
+		handler   func(entered, release chan struct{}) http.Handler
+	}{
+		{
+			name: "/metrics", path: "/metrics", postBurst: 1,
+			handler: func(entered, release chan struct{}) http.Handler {
+				return metricsHandlerFor(&blockingGatherer{entered: entered, release: release}, false)
+			},
+		},
+		{
+			name: "/status", path: "/status", postBurst: 10,
+			handler: func(entered, release chan struct{}) http.Handler {
+				return limitConcurrent(maxConcurrentScrapes, &blockingStatusHandler{entered: entered, release: release})
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			prober.InitMetrics()
+			entered := make(chan struct{}, 8)
+			release := make(chan struct{})
+			h := tc.handler(entered, release)
 
-	recs := make([]*httptest.ResponseRecorder, maxConcurrentScrapes)
-	done := make([]chan struct{}, len(recs))
-	for i := range recs {
-		recs[i] = httptest.NewRecorder()
-		done[i] = make(chan struct{})
-		go func(i int) {
-			defer close(done[i])
-			h.ServeHTTP(recs[i], httptest.NewRequest(http.MethodGet, "/metrics", nil))
-		}(i)
-	}
-	for range maxConcurrentScrapes {
-		select {
-		case <-g.entered:
-		case <-time.After(5 * time.Second):
-			t.Fatal("scrapes never reached the gatherer (cap not applied?)")
-		}
-	}
+			recs := make([]*httptest.ResponseRecorder, maxConcurrentScrapes)
+			done := make([]chan struct{}, len(recs))
+			for i := range recs {
+				recs[i] = httptest.NewRecorder()
+				done[i] = make(chan struct{})
+				go func(i int) {
+					defer close(done[i])
+					h.ServeHTTP(recs[i], httptest.NewRequest(http.MethodGet, tc.path, nil))
+				}(i)
+			}
+			for range maxConcurrentScrapes {
+				select {
+				case <-entered:
+				case <-time.After(5 * time.Second):
+					t.Fatal("requests never reached the inner handler (cap not applied?)")
+				}
+			}
 
-	// The next scrape arrives while both slots are held: 503, no gather.
-	// Served from a goroutine with a bound so a regression that removes the cap
-	// fails fast instead of hanging until the package timeout: if the cap is
-	// gone, the third request parks inside Gather and announces itself on
-	// g.entered (whose buffer this test drained above).
-	type result struct {
-		code int
-	}
-	third := make(chan result, 1)
-	go func() {
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
-		third <- result{code: rec.Code}
-	}()
-	select {
-	case got := <-third:
-		if got.code != http.StatusServiceUnavailable {
-			t.Errorf("a scrape beyond the %d-scrape cap must get 503, got %d", maxConcurrentScrapes, got.code)
-		}
-	case <-g.entered:
-		t.Error("the concurrency cap is not applied: a third scrape reached the gatherer")
-		close(g.release)
-		<-third // let it finish so the test can report cleanly
-		return
-	case <-time.After(5 * time.Second):
-		t.Fatal("the third scrape neither returned nor reached the gatherer")
-	}
+			// The next request arrives while all slots are held: 503, and it
+			// must never reach the inner handler. Served from a goroutine with
+			// a bound so a regression that removes the cap fails fast instead
+			// of hanging until the package timeout.
+			third := make(chan int, 1)
+			go func() {
+				rec := httptest.NewRecorder()
+				h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tc.path, nil))
+				third <- rec.Code
+			}()
+			select {
+			case got := <-third:
+				if got != http.StatusServiceUnavailable {
+					t.Errorf("a request beyond the %d-slot cap must get 503, got %d", maxConcurrentScrapes, got)
+				}
+			case <-entered:
+				t.Error("the concurrency cap is not applied: a further request reached the inner handler")
+				close(release)
+				<-third
+				return
+			case <-time.After(5 * time.Second):
+				t.Fatal("the excess request neither returned nor reached the inner handler")
+			}
 
-	close(g.release)
-	for i := range recs {
-		select {
-		case <-done[i]:
-		case <-time.After(5 * time.Second):
-			t.Fatalf("scrape %d did not finish after release", i)
-		}
-		if recs[i].Code != http.StatusOK {
-			t.Errorf("in-flight scrape %d must complete with 200, got %d", i, recs[i].Code)
-		}
-	}
+			close(release)
+			for i := range recs {
+				select {
+				case <-done[i]:
+				case <-time.After(5 * time.Second):
+					t.Fatalf("request %d did not finish after release", i)
+				}
+				if recs[i].Code != http.StatusOK {
+					t.Errorf("in-flight request %d must complete with 200, got %d", i, recs[i].Code)
+				}
+			}
 
-	// And the cap must not leak: a scrape after the burst is served normally.
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
-	if rec.Code != http.StatusOK {
-		t.Errorf("cap must release after the burst, got %d", rec.Code)
-	}
-}
-
-func TestStatusHandler_ConcurrencyCapReturns503(t *testing.T) {
-	prober.InitMetrics()
-	inner := &blockingStatusHandler{entered: make(chan struct{}, 8), release: make(chan struct{})}
-	h := limitConcurrent(maxConcurrentScrapes, inner)
-
-	recs := make([]*httptest.ResponseRecorder, maxConcurrentScrapes)
-	done := make([]chan struct{}, len(recs))
-	for i := range recs {
-		recs[i] = httptest.NewRecorder()
-		done[i] = make(chan struct{})
-		go func(i int) {
-			defer close(done[i])
-			h.ServeHTTP(recs[i], httptest.NewRequest(http.MethodGet, "/status", nil))
-		}(i)
-	}
-	for range maxConcurrentScrapes {
-		select {
-		case <-inner.entered:
-		case <-time.After(5 * time.Second):
-			t.Fatal("status requests never reached the handler (cap not applied?)")
-		}
-	}
-
-	// The third request arrives while both slots are held: 503, and it must
-	// never reach the status handler itself.
-	third := make(chan int, 1)
-	go func() {
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
-		third <- rec.Code
-	}()
-	select {
-	case got := <-third:
-		if got != http.StatusServiceUnavailable {
-			t.Errorf("a request beyond the %d-request cap must get 503, got %d", maxConcurrentScrapes, got)
-		}
-	case <-inner.entered:
-		t.Error("the concurrency cap is not applied: a third request reached the status handler")
-		close(inner.release)
-		<-third
-		return
-	case <-time.After(5 * time.Second):
-		t.Fatal("the third request neither returned nor reached the handler")
-	}
-
-	close(inner.release)
-	for i := range recs {
-		select {
-		case <-done[i]:
-		case <-time.After(5 * time.Second):
-			t.Fatalf("request %d did not finish after release", i)
-		}
-		if recs[i].Code != http.StatusOK {
-			t.Errorf("in-flight request %d must complete with 200, got %d", i, recs[i].Code)
-		}
-	}
-
-	// Release happens on every path (including a handler panic), and slots
-	// must have returned, so 10 sequential requests after the burst are all
-	// served normally (release is closed above, so they complete at once).
-	for range 10 {
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
-		if rec.Code != http.StatusOK {
-			t.Errorf("cap must serve sequential requests after the burst, got %d", rec.Code)
-		}
+			// Slots must be reusable after the burst. /status runs ten
+			// sequential requests because its release path must not leak a
+			// slot across a run (including the panic path); /metrics only
+			// needs one to prove the cap fell back to zero.
+			for range tc.postBurst {
+				rec := httptest.NewRecorder()
+				h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tc.path, nil))
+				if rec.Code != http.StatusOK {
+					t.Errorf("cap must release after the burst, got %d", rec.Code)
+				}
+			}
+		})
 	}
 }
 
@@ -240,6 +194,12 @@ func TestStatusHandler_ConcurrencyCapReturns503(t *testing.T) {
 // blockingGatherer for /metrics). After release is closed, later requests
 // complete immediately, so the test can verify slots are reusable afterward.
 
+// TestStatusHandler_CapReleasesOnPanic pins that a panicking request still
+// frees its semaphore slot: the cap wraps arbitrary handlers and a leaked
+// slot would eventually 503 every /status request forever. The wrapper lets
+// the panic propagate to net/http's server-side recovery, so the test
+// mirrors that by recovering it itself. The inner handler panics exactly
+// once, so the request after the panic also proves the freed slot serves.
 // TestStatusHandler_CapReleasesOnPanic pins that a panicking request still
 // frees its semaphore slot: the cap wraps arbitrary handlers and a leaked
 // slot would eventually 503 every /status request forever. The wrapper lets

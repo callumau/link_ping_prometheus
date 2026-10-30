@@ -5,32 +5,33 @@ import (
 	"encoding/json"
 	"net"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"link_ping_prometheus/internal/prober"
 )
 
-func TestLoadTargets(t *testing.T) {
-	tmpfile, err := os.CreateTemp("", "targets-*.json")
-	if err != nil {
+// writeTempTargets writes body to a fresh 0600 targets file under the test's
+// temporary directory and returns its path. LoadTargets refuses group/world
+// writable files, so 0600 matters.
+func writeTempTargets(t *testing.T, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "targets.json")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	defer os.Remove(tmpfile.Name())
+	return path
+}
 
+func TestLoadTargets(t *testing.T) {
 	targets := []prober.Target{
 		{Name: "google", Address: "google.com:80"},
 		{Name: "local", Address: "localhost:4000"},
 	}
 	data, _ := json.Marshal(targets)
-	if _, err := tmpfile.Write(data); err != nil {
-		t.Fatal(err)
-	}
-	if err := tmpfile.Close(); err != nil {
-		t.Fatal(err)
-	}
 
-	loaded, err := prober.LoadTargets(tmpfile.Name())
+	loaded, err := prober.LoadTargets(writeTempTargets(t, string(data)))
 	if err != nil {
 		t.Fatalf("LoadTargets failed: %v", err)
 	}
@@ -41,12 +42,7 @@ func TestLoadTargets(t *testing.T) {
 		t.Errorf("expected first target name 'google', got %s", loaded[0].Name)
 	}
 
-	tmpfileInvalid, _ := os.CreateTemp("", "invalid-*.json")
-	defer os.Remove(tmpfileInvalid.Name())
-	tmpfileInvalid.Write([]byte("{invalid-json"))
-	tmpfileInvalid.Close()
-
-	_, err = prober.LoadTargets(tmpfileInvalid.Name())
+	_, err = prober.LoadTargets(writeTempTargets(t, "{invalid-json"))
 	if err == nil {
 		t.Error("expected error for invalid json, got nil")
 	}
@@ -228,18 +224,7 @@ func TestLoadTargets_PerTargetIntervalTimeout(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			f, err := os.CreateTemp("", "targets-per-target-*.json")
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer os.Remove(f.Name())
-			if _, err := f.WriteString(tc.body); err != nil {
-				t.Fatal(err)
-			}
-			if err := f.Close(); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := prober.LoadTargets(f.Name()); (err != nil) != tc.wantErr {
+			if _, err := prober.LoadTargets(writeTempTargets(t, tc.body)); (err != nil) != tc.wantErr {
 				t.Errorf("LoadTargets error = %v, wantErr %v", err, tc.wantErr)
 			}
 		})
@@ -247,23 +232,13 @@ func TestLoadTargets_PerTargetIntervalTimeout(t *testing.T) {
 }
 
 func TestLoadTargets_DuplicateNames(t *testing.T) {
-	tmpfile, err := os.CreateTemp("", "targets-dup-*.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.Remove(tmpfile.Name())
-
 	targets := []prober.Target{
 		{Name: "same", Address: "127.0.0.1:4000"},
 		{Name: "same", Address: "127.0.0.1:4001"},
 	}
 	data, _ := json.Marshal(targets)
-	if _, err := tmpfile.Write(data); err != nil {
-		t.Fatal(err)
-	}
-	tmpfile.Close()
 
-	if _, err := prober.LoadTargets(tmpfile.Name()); err == nil {
+	if _, err := prober.LoadTargets(writeTempTargets(t, string(data))); err == nil {
 		t.Error("expected error for duplicate target names, got nil")
 	}
 }
