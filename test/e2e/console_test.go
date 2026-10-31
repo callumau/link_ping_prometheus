@@ -189,14 +189,14 @@ func TestE2EInOutMTUSweep(t *testing.T) {
 		"-mtu-sweep", "200ms",
 		"-metrics", "127.0.0.1:"+itoa(cp))
 
-	body := waitHTTP(t, "http://127.0.0.1:"+itoa(cp)+"/metrics",
-		"link_path_mtu_bytes{", 20*time.Second)
-	if got := metricValue(body, "link_path_mtu_bytes"); got <= 0 {
-		t.Fatalf("path MTU = %v, want > 0 after sweep", got)
-	}
-	if got := metricValue(body, "link_mtu_probes_sent_total"); got < 1 {
-		t.Errorf("mtu probes sent = %v, want >= 1", got)
-	}
+	base := "http://127.0.0.1:" + itoa(cp) + "/metrics"
+	// SeedMetrics creates link_path_mtu_bytes at 0 before the first sweep.
+	// Waiting for the SERIES is therefore not enough: on a slower Windows
+	// runner the scrape can land on the seeded 0 and the assertion fails
+	// before any DF probe has completed. Wait for the sweep's positive
+	// value and its sent counter instead.
+	waitMetricGTE(t, base, "link_path_mtu_bytes", 1, 20*time.Second)
+	waitMetricGTE(t, base, "link_mtu_probes_sent_total", 1, 20*time.Second)
 }
 
 // TestE2ETargetsHotReload tries the -targets-reload-interval path on
