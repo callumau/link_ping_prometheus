@@ -79,7 +79,12 @@ func TestE2EWindowsServiceLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("service not found after -svc=install: %v", err)
 	}
-	defer s.Close() // pi-lens-ignore: go-ignored-call-result
+	sClosed := false
+	defer func() {
+		if !sClosed {
+			_ = s.Close()
+		}
+	}()
 	cfg, err := s.Config()
 	if err != nil {
 		t.Fatalf("query service config: %v", err)
@@ -92,9 +97,14 @@ func TestE2EWindowsServiceLifecycle(t *testing.T) {
 	}
 
 	// CI runs only the install half. Assert the teardown here so the CI run
-	// still covers install -> SCM config -> uninstall.
+	// still covers install -> SCM config -> uninstall. The open service
+	// handle MUST be closed before DeleteService: Windows marks the service
+	// for deletion but keeps it openable by name while any handle remains,
+	// so the post-uninstall OpenService check would still find it.
 	if !full {
 		t.Log("LPP_E2E_WINDOWS unset: verified install/config/uninstall; SCM start/stop is manual-only")
+		_ = s.Close()
+		sClosed = true
 		uninstallSvc(t, m, svcName)
 		return
 	}
@@ -171,7 +181,10 @@ func TestE2EWindowsServiceLifecycle(t *testing.T) {
 		time.Sleep(250 * time.Millisecond) // e2e poll
 	}
 
-	// uninstall removes the service entirely.
+	// uninstall removes the service entirely. Close our handle first for the
+	// same reason as the install-only path above.
+	_ = s.Close()
+	sClosed = true
 	uninstallSvc(t, m, svcName)
 }
 
