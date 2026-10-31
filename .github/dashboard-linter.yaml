@@ -1,12 +1,14 @@
 ---
 # grafana/dashboard-linter exclusions for grafana-dashboard.json.
 #
-# This dashboard is exported in the dashboard.grafana.app/v2 schema with a
-# directly pinned Prometheus datasource and keys on the prober's own labels
-# (source/target/address) instead of job/instance, so the linter's
-# templated-datasource and job/instance-matcher style rules do not apply.
+# This dashboard is a portable template in the dashboard.grafana.app/v2
+# schema: it intentionally pins NO datasource (Grafana resolves the default
+# Prometheus) and keys on the prober's own labels (source/target) instead of
+# job/instance, so the linter's templated-datasource and job/instance
+# matcher style rules do not apply.
 exclusions:
-  # Datasource is pinned directly in the v2 schema (no $datasource variable).
+  # No $datasource variable: panels and variables use the default
+  # Prometheus datasource, which is what makes the export portable.
   template-datasource-rule: {}
   panel-datasource-rule: {}
   # Panels query the monitor's own labels (source/target/address),
@@ -18,6 +20,6 @@ exclusions:
   # Variables refresh on dashboard load (1); link targets change rarely,
   # so On Time Range Change is not required.
   template-on-time-change-reload-rule: {}
-  # Deliberately shipped editable: ops tune thresholds and drop panels
-  # per deployment. The tracked copy stays the reference, not a template.
+  # Shipped editable as a starting point: ops tune thresholds and drop
+  # panels per deployment. The tracked copy is the reference template.
   uneditable-dashboard: {}
