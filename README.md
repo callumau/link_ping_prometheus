@@ -40,6 +40,15 @@ half-configured fleet reads healthy unauthenticated.
 Then scrape both `/metrics` endpoints and open the
 [bundled dashboard](grafana-dashboard.json).
 
+## Dashboard
+
+[![Link Monitor dashboard](.docs/screenshot01.png)](.docs/screenshot01.png)
+
+The repo ships a Grafana v2 dashboard ([`grafana-dashboard.json`](grafana-dashboard.json)).
+It pins no datasource — panels use Grafana's default Prometheus datasource —
+and filters by `source`/`target`, both defaulting to **All**, so it imports
+without any site-specific configuration.
+
 ## Installation
 
 | Platform | Guide |
