@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"math"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -288,9 +289,21 @@ func TestAccuracy_KnownLatencyAndLoss(t *testing.T) {
 		t.Errorf("Loss accuracy mismatch: expected exactly %d timeouts (1/%d of first %d), got %v", expectedDrops, dropMod, dropWindow, timeoutCount)
 	}
 
-	if rttVal < delay.Seconds()-0.003 || rttVal > delay.Seconds()+0.015 {
-		t.Errorf("RTT accuracy mismatch: expected ~%vs (delay %v), got %vs", delay.Seconds(), delay, rttVal)
+	if rttVal < delay.Seconds()-0.003 || rttVal > maxRTT(delay).Seconds() {
+		t.Errorf("RTT accuracy mismatch: expected ~%vs (delay %v, upper bound %v), got %vs", delay.Seconds(), delay, maxRTT(delay), rttVal)
 	}
+}
+
+// maxRTT is the accepted upper bound for the injected echo delay. Windows
+// timer granularity rounds a 17ms sleep up by roughly a scheduler tick, and
+// the hosted runner routinely measures ~44ms; keep the strict lower bound
+// (a regression that drops the delay still fails) and widen only the upper
+// bound on Windows.
+func maxRTT(delay time.Duration) time.Duration {
+	if runtime.GOOS == "windows" {
+		return delay + 40*time.Millisecond
+	}
+	return delay + 15*time.Millisecond
 }
 
 // pi-lens-ignore: jscpd:duplicate

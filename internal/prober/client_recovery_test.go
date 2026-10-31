@@ -835,6 +835,19 @@ func TestProbeTarget_PanicRestartCyclesKeepBalance(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	cycles := dials.Load()
+
+	// Let the third cycle reach its injected panic (the third write) so the
+	// panic flush accounts its two writes as timeouts. Cancelling right after
+	// the dial can abandon both while they are still pending, which is the
+	// documented cancel-instant residual, not an accounting leak — on a
+	// slower Windows runner that residual was 2, tripping the <=1 guard.
+	flushDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(flushDeadline) {
+		if wbCounter(ProbesSent, src, name, addr) >= 6 && wbCounter(ProbesTimedOut, src, name, addr) >= 6 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 	cancel()
 	select {
 	case <-done:
