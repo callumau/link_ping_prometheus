@@ -149,6 +149,29 @@ func installServiceArgs() ([]string, error) {
 	return args, nil
 }
 
+// runServiceInstall validates the persisted configuration and hands the
+// validated argument array to install. Kept as one function so the array
+// installServiceArgs validated and the array the platform installs cannot
+// diverge, and so the flow is testable without Windows.
+func runServiceInstall(install func([]string) error) error {
+	args, err := installServiceArgs()
+	if err != nil {
+		return fmt.Errorf("service install refused: the persisted configuration would fail at startup: %w", err)
+	}
+	if err := install(args); err != nil {
+		return fmt.Errorf("service install failed: %w", err)
+	}
+	return nil
+}
+
+// installServiceHook is the platform install seam. Production installs go
+// through platformInstallService; tests substitute a stub to assert that the
+// array installServiceArgs validated is the array handed to the platform.
+// This exists because the two once drifted: platformInstallService received
+// argv and silently dropped it, so every Windows service was registered with
+// a bare ImagePath and could never start.
+var installServiceHook = platformInstallService
+
 // handleService manages the service lifecycle. Install/uninstall are
 // Windows-only (gated by svcActionSupported: Linux deploys use the static
 // systemd unit via the Ansible play, and the Linux renderers flagged by
@@ -168,14 +191,13 @@ func handleService(action string, logSink *countedWriter) {
 	case "install":
 		// Validate first: nothing below may reach the SCM for a config the
 		// runtime will refuse on every start (see installServiceArgs).
-		args, err := installServiceArgs()
-		if err != nil {
-			slog.Error("Service install refused: the persisted configuration would fail at startup", "err", err)
-			fmt.Fprintf(os.Stderr, "service install refused: %v\n", err)
-			os.Exit(1)
-		}
-		if err := platformInstallService(args); err != nil {
+		// runServiceInstall passes the SAME array it validated to the
+		// platform hook; the two once diverged (the hook received argv and
+		// dropped it), which registered every Windows service with a bare
+		// ImagePath.
+		if err := runServiceInstall(installServiceHook); err != nil {
 			slog.Error("Service install failed", "err", err)
+			fmt.Fprintf(os.Stderr, "%v\n", err)
 			os.Exit(1)
 		}
 		if *flMetricsBasicAuthUser != "" || *flMetricsBasicAuthPass != "" {

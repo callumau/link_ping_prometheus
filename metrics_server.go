@@ -2,13 +2,16 @@ package main
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
 	"link_ping_prometheus/internal/prober"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"sync"
 	"time"
 
@@ -147,7 +150,70 @@ type metricsCertReloader struct {
 	statFailed bool
 }
 
+// maxTLSFileSize bounds a metrics TLS file. A PEM pair is a few KiB; the cap
+// stops a non-regular or runaway object from being read into memory.
+const maxTLSFileSize = 1 << 20
+
+// loadMetricsPair reads and validates the metrics TLS pair with the same
+// provenance rule the targets file and the log sink use. tls.LoadX509KeyPair
+// cannot be used directly: it re-resolves both paths by name with no type,
+// ownership or mode check, so a symlink at either path is followed, a FIFO
+// blocks the caller inside the reloader mutex, and a group/world-readable key
+// is accepted silently. Here the Lstat decision is bound to the descriptor
+// actually read, and the key must not be world- or group-readable.
+func loadMetricsPair(certPath, keyPath string) (tls.Certificate, error) {
+	certPEM, err := readTrustedPairFile(certPath, false)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("certificate: %w", err)
+	}
+	keyPEM, err := readTrustedPairFile(keyPath, true)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("key: %w", err)
+	}
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	return cert, nil
+}
+
+func readTrustedPairFile(path string, secret bool) ([]byte, error) {
+	li, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !li.Mode().IsRegular() {
+		return nil, fmt.Errorf("refusing non-regular TLS file %q (%s): only a regular file may hold the metrics TLS pair", path, li.Mode().Type())
+	}
+	f, err := openPairFile(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() || !os.SameFile(li, fi) {
+		return nil, fmt.Errorf("TLS file %q changed between check and open", path)
+	}
+	if err := checkPairOwner(f); err != nil {
+		return nil, fmt.Errorf("TLS file %q %w", path, err)
+	}
+	if runtime.GOOS != "windows" {
+		perm := fi.Mode().Perm()
+		if perm&0o022 != 0 || (secret && perm&0o044 != 0) {
+			return nil, fmt.Errorf("TLS file %q mode %04o exposes the pair: another local user could read the private key or replace it", path, perm)
+		}
+	}
+	if fi.Size() > maxTLSFileSize {
+		return nil, fmt.Errorf("TLS file %q is too large for a certificate pair (%d bytes)", path, fi.Size())
+	}
+	return io.ReadAll(io.LimitReader(f, maxTLSFileSize))
+}
+
 // certFingerprint identifies a certificate/key file pair by the metadata a
+
 // renewal changes. Hashing the contents would cost a full read on every
 // handshake; (mtime, size) is what rotators and `mv` in place actually touch.
 type certFingerprint struct {
@@ -174,7 +240,7 @@ func fingerprintCertPair(certPath, keyPath string) (certFingerprint, error) {
 // same load run() performs as startup validation. A pair that will not load is
 // a startup error, never a listener that serves nothing.
 func newMetricsCertReloader(certPath, keyPath string) (*metricsCertReloader, error) {
-	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	cert, err := loadMetricsPair(certPath, keyPath)
 	if err != nil {
 		return nil, err
 	}
@@ -208,7 +274,7 @@ func (r *metricsCertReloader) GetCertificate(*tls.ClientHelloInfo) (*tls.Certifi
 		return r.cert, nil
 	}
 	r.attempted, r.attemptedAt = fp, time.Now()
-	cert, err := tls.LoadX509KeyPair(r.certPath, r.keyPath)
+	cert, err := loadMetricsPair(r.certPath, r.keyPath)
 	if err != nil {
 		// A half-written renewal or a key that does not match: keep the working
 		// cert and say so once. Failing the handshake instead would black out
@@ -218,7 +284,15 @@ func (r *metricsCertReloader) GetCertificate(*tls.ClientHelloInfo) (*tls.Certifi
 		return r.cert, nil
 	}
 	r.cert, r.loaded = &cert, fp
-	slog.Info("Metrics TLS certificate reloaded", "cert", r.certPath, "key", r.keyPath)
+	// Log the served leaf so a substitution is distinguishable from a
+	// renewal: two reload lines naming only the paths look identical.
+	cn, serial := "", ""
+	if len(cert.Certificate) > 0 {
+		if leaf, err := x509.ParseCertificate(cert.Certificate[0]); err == nil {
+			cn, serial = leaf.Subject.CommonName, leaf.SerialNumber.String()
+		}
+	}
+	slog.Info("Metrics TLS certificate reloaded", "cert", r.certPath, "key", r.keyPath, "cn", cn, "serial", serial)
 	return r.cert, nil
 }
 

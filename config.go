@@ -1,7 +1,6 @@
 package main
 
 import (
-	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -317,9 +316,11 @@ func checkStartupFlags() (startupFlags, error) {
 	}
 	if sf.metricsCert != "" {
 		// Validation only: the pair is loaded again by the listener, which
-		// seeds its reload cache with it.
+		// seeds its reload cache with it. Same provenance rule as the
+		// listener: a symlink, a non-regular object, a foreign owner or a
+		// group/world-readable key is refused before anything binds.
 		// pi-lens-ignore: go-ignored-call-result
-		if _, err := tls.LoadX509KeyPair(sf.metricsCert, sf.metricsKey); err != nil {
+		if _, err := loadMetricsPair(sf.metricsCert, sf.metricsKey); err != nil {
 			return startupFlags{}, fmt.Errorf("metrics TLS: %w", err)
 		}
 	}
