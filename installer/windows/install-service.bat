@@ -17,7 +17,7 @@ setlocal EnableExtensions
 ::   - Binary placed in %ProgramFiles%\link_ping_prometheus (Admins-only write)
 ::   - ACL-hardened log dir; per-service SID granted write access to it only
 ::   - Credentials NEVER persisted into the service config (env vars instead)
-::   - The credential Environment key is ACL-restricted to SYSTEM/Admins
+::   - The SCM Environment value lives on the ACL-restricted service key
 ::   - Lifecycle/fatal events go to the Windows Event Log
 ::
 :: Re-running on an existing installation performs an in-place UPGRADE:
@@ -390,12 +390,11 @@ if not "%SERVICE_ACCOUNT%"=="" (
 :: Credential environment variables (optional) ----------------------------------
 :: The service reads LINK_PING_METRICS_USER/PASS, LINK_PING_ECHO_SECRET and
 :: LINK_PING_ECHO_SECRET_OLD (rotation window) from its process environment. The
-:: per-service Environment registry key is the delivery mechanism, and it is
-:: world-readable until the ACL step below runs. Press Enter to skip any value
-:: you do not need.
+:: SCM builds that environment from the REG_MULTI_SZ VALUE named Environment on
+:: the service key (a same-named SUBKEY is ignored), and the key is protected
+:: before the value is written. Press Enter to skip any value you do not need.
 echo.
 echo === Optional credential environment variables (Enter to skip) ===
-set "ENV_KEY=HKLM\SYSTEM\CurrentControlSet\Services\%SERVICE_NAME%\Environment"
 
 :wiz_muser
 set "MUser="
@@ -514,63 +513,38 @@ if not "%MUser%"=="" if not "%MPass%"=="" if not defined METRICS_TRANSPORT_OK (
     exit /b 1
 )
 
-:: Restrict the key BEFORE writing any value.
+:: Credentials go into the SCM's per-service environment ---------------------
 ::
-:: The key inherits BUILTIN\Users read from ...\Services, so writing the four
-:: secrets first (the previous order) exposed the plaintext metrics password
-:: and echo HMAC secret to every local user until this separate PowerShell
-:: process had started and replaced the DACL. Creating the key and applying the
-:: protected DACL first means the values are only ever stored in a key that
-:: SYSTEM and Administrators can read. The identical step is repeated after the
-:: writes as defence in depth.
+:: The SCM builds a service's environment from the REG_MULTI_SZ VALUE named
+:: "Environment" on the SERVICE KEY, containing "NAME=value" strings. It does
+:: NOT read an "Environment" SUBKEY, and a subkey full of REG_SZ values (what
+:: this wizard used to write) is silently ignored: the agent started with no
+:: credentials at all, so metrics auth was off and HMAC was never enabled while
+:: the operator believed both were configured.
 ::
-:: The invocation is one physical line on purpose (a ^ inside the quoted
-:: -Command is a literal caret) and prints nothing, so a failure is reported by
-:: the errorlevel check rather than by a half-applied ACL.
-powershell -NoProfile -Command "$k='HKLM:\SYSTEM\CurrentControlSet\Services\%SERVICE_NAME%\Environment'; if (-not (Test-Path $k)) { New-Item -Path $k -Force | Out-Null }; $a=Get-Acl $k; $a.SetAccessRuleProtection($true,$false); foreach($n in 'S-1-5-18','S-1-5-32-544'){ $sid=(New-Object System.Security.Principal.SecurityIdentifier($n)); $a.AddAccessRule((New-Object System.Security.AccessControl.RegistrySystemAccessRule($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'))) }; Set-Acl -Path $k -AclObject $a" >nul 2>&1
+:: Order matters: the service key inherits BUILTIN\Users read from ...\Services,
+:: so the key is protected FIRST and the value written into the protected key.
+:: The DACL carries both an inheriting pair (subkeys) and a plain pair (this
+:: key): an ACE that only inherits does not grant on the key itself.
+::
+:: Existing entries are preserved and the four names are reconciled: a value
+:: the operator cleared is REMOVED, so a retired HMAC secret does not survive in
+:: the environment. Values never touch a command line - they are read from the
+:: environment PowerShell inherited from this script.
+::
+:: One physical line on purpose: a ^ inside the quoted -Command is a literal
+:: caret, not a line join, and a ")" in a typed password would close a block.
+:: The identities are SIDs because the account names are localized.
+powershell -NoProfile -Command "$ErrorActionPreference='Stop'; $k='HKLM:\SYSTEM\CurrentControlSet\Services\%SERVICE_NAME%'; $a=Get-Acl -LiteralPath $k; $a.SetSecurityDescriptorSddlForm('D:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)(A;;KA;;;SY)(A;;KA;;;BA)'); Set-Acl -LiteralPath $k -AclObject $a; $cur=(Get-ItemProperty -Path $k -Name Environment -ErrorAction SilentlyContinue).Environment; $m=[ordered]@{}; if($cur){ foreach($l in $cur){ $i=$l.IndexOf('='); if($i -gt 0){ $m[$l.Substring(0,$i)]=$l.Substring($i+1) } } }; foreach($p in @(@('LINK_PING_METRICS_USER',$env:MUser),@('LINK_PING_METRICS_PASS',$env:MPass),@('LINK_PING_ECHO_SECRET',$env:ESecret),@('LINK_PING_ECHO_SECRET_OLD',$env:ESecretOld))){ if([string]::IsNullOrEmpty($p[1])){ $m.Remove($p[0]) } else { $m[$p[0]]=$p[1] } }; if($m.Count -gt 0){ $v=@(); foreach($x in $m.Keys){ $v += ($x + '=' + $m[$x]) }; New-ItemProperty -Path $k -Name Environment -PropertyType MultiString -Value ([string[]]$v) -Force | Out-Null } else { Remove-ItemProperty -Path $k -Name Environment -ErrorAction SilentlyContinue }"
 if errorlevel 1 (
-    echo ERROR: could not create/restrict "%ENV_KEY%" before storing credentials.
-    echo        Not writing plaintext secrets into a key every local user can read.
+    echo ERROR: could not store the credentials in the service Environment value,
+    echo        or could not restrict the service key ACL.
+    echo        Audit with:
+    echo          reg query "HKLM\SYSTEM\CurrentControlSet\Services\%SERVICE_NAME%" /v Environment
+    echo          powershell -NoProfile -Command "Get-Acl 'HKLM:\SYSTEM\CurrentControlSet\Services\%SERVICE_NAME%'"
     exit /b 1
 )
-
-if not "%MUser%"=="" reg add "%ENV_KEY%" /v LINK_PING_METRICS_USER /t REG_SZ /d "%MUser%" /f >nul
-if not "%MPass%"=="" reg add "%ENV_KEY%" /v LINK_PING_METRICS_PASS /t REG_SZ /d "%MPass%" /f >nul
-if not "%ESecret%"=="" reg add "%ENV_KEY%" /v LINK_PING_ECHO_SECRET /t REG_SZ /d "%ESecret%" /f >nul
-if not "%ESecretOld%"=="" reg add "%ENV_KEY%" /v LINK_PING_ECHO_SECRET_OLD /t REG_SZ /d "%ESecretOld%" /f >nul
-
-:: Restrict the credential key ------------------------------------------------
-:: The per-service Environment key inherits its ACL from ...\Services, so
-:: before this step every local user could read the plaintext metrics password
-:: and echo HMAC secret just written above. The binary cannot take them as
-:: flags - credential flags are deliberately stripped from the persisted
-:: service config - so this key ACL is the ONLY control on the secret.
-:: Inheritance is dropped (the inherited Everyone/BUILTIN\Users read goes with
-:: it) and full control is re-granted explicitly to SYSTEM and to
-:: BUILTIN\Administrators. No per-service SID grant is needed: the service
-:: process never reads this key itself - the SCM reads it as LocalSystem and
-:: injects the values into the service environment - so a custom service
-:: account is unaffected either way.
-::
-:: The step runs unconditionally and no-ops inside PowerShell when the key
-:: does not exist (no credential was entered, so nothing to protect; only the
-:: reg adds above ever create the key). That keeps the whole step a flat line
-:: with no parenthesized block, which matters here: a ")" inside a user-typed
-:: password would close a block at parse time. The PowerShell invocation is
-:: one physical line on purpose - a ^ inside the quoted -Command is a literal
-:: caret, not a line join. An operator can paste the identical snippet to
-:: re-apply or audit the ACL by hand.
-:: The identities are SIDs (S-1-5-18 = SYSTEM, S-1-5-32-544 = Administrators):
-:: the names are localized on non-English Windows and would not resolve.
-powershell -NoProfile -Command "$k='HKLM:\SYSTEM\CurrentControlSet\Services\%SERVICE_NAME%\Environment'; if (-not (Test-Path $k)) { exit 0 }; $a=Get-Acl $k; $a.SetAccessRuleProtection($true,$false); foreach($n in 'S-1-5-18','S-1-5-32-544'){ $sid=(New-Object System.Security.Principal.SecurityIdentifier($n)); $a.AddAccessRule((New-Object System.Security.AccessControl.RegistrySystemAccessRule($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'))) }; Set-Acl -Path $k -AclObject $a; Write-Host 'Environment key ACL restricted to SYSTEM + BUILTIN\Administrators.'"
-:: Fail loud: a credential-bearing key left world-readable is exactly the
-:: exposure this step removes, so never continue past a failed ACL.
-if errorlevel 1 (
-    echo ERROR: could not restrict the ACL on "%ENV_KEY%" - it may still be readable by every local user.
-    echo        Audit it with: powershell -NoProfile -Command "Get-Acl HKLM:\SYSTEM\CurrentControlSet\Services\%SERVICE_NAME%\Environment"
-    exit /b 1
-)
-
+echo Environment value written for %SERVICE_NAME%; SCM will inject it at service start.
 
 :: Start and verify -------------------------------------------------------------
 echo.

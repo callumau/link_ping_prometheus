@@ -70,75 +70,85 @@ quote). The echo HMAC secret (and its rotation predecessor) must be at least 16
 characters: it is the key material for HMAC-SHA256 probe authentication, and a
 short value is brute-forceable.
 
-## Credential storage and the `Environment` key
+## Credential storage and the `Environment` value
 
 The credential flags are deliberately stripped from the persisted service
-config, so the per-service `Environment` key
+config, so the SCM's per-service environment is the only delivery path for the
+echo HMAC secret and the metrics Basic-auth password. That environment is a
+**`REG_MULTI_SZ` value** on the service key:
 
 ```text
-HKLM\SYSTEM\CurrentControlSet\Services\link_ping_prometheus\Environment
+HKLM\SYSTEM\CurrentControlSet\Services\link_ping_prometheus
+    Environment    REG_MULTI_SZ    LINK_PING_ECHO_SECRET=...\0LINK_PING_METRICS_USER=...
 ```
 
-is the only delivery path for the echo HMAC secret and the metrics Basic-auth
-password. Windows gives that key an inherited ACL that lets **every local user**
-read it.
+It is a **value, not a subkey**. An `Environment` *subkey* full of `REG_SZ`
+values — which is what `win_regedit` produces by default, and what this
+project's installer and plays used to write — is completely ignored by the SCM.
+The agent then starts with no credentials: metrics auth is off, HMAC is not
+enabled, and nothing in the configuration looks wrong. That is why the
+mechanism is spelled out here and pinned by the e2e below.
 
-`install-service.bat` therefore drops inheritance and re-grants access
-explicitly whenever a credential was entered:
+Windows gives the service key an inherited ACL that lets **every local user**
+read it, so `install-service.bat` protects the key first and only then writes
+the value. The DACL carries both an inheriting pair (subkeys) and a plain pair
+(the key itself — an ACE that only inherits does not grant on the key):
 
 - `SYSTEM` — full control
 - `BUILTIN\Administrators` — full control
 - No per-service SID grant: the service process never reads this key. The SCM
-  reads it as LocalSystem and injects the values into the service environment,
-  so a custom service account is unaffected.
+  reads it as LocalSystem and injects the entries into the service
+  environment, so a custom service account is unaffected.
 
-**Verifying delivery.** The SCM reads the key at service start, so a restart
-picks up changed values. A quick smoke check that the values actually reached
-the service: with credentials set, any HTTP client on the metrics endpoint must
-answer **401** without credentials and **200** with
-`LINK_PING_METRICS_USER`/`LINK_PING_METRICS_PASS`.
+**Verifying delivery.** The SCM reads the value at service start, so a restart
+picks up changed values. Two smoke checks that the values actually reached the
+service:
+
+- with metrics credentials set, the endpoint answers **401** without
+  credentials and **200** with `LINK_PING_METRICS_USER`/`LINK_PING_METRICS_PASS`;
+- with an echo secret set, the peer's `link_server_clock_skew_seconds` appears
+  (it is only exported for HMAC-authenticated frames) and
+  `link_probes_sent_total` starts moving on a 32-byte frame (MTU sweep reports
+  `1432` instead of `1424`).
 
 The gated Windows e2e suite asserts the same automatically
 (`LPP_E2E_WINDOWS=1 go test -run TestE2EWindowsCredentialEnvDelivery ./test/e2e/`),
-writing the values through the same `reg add` form and probing a real
-SCM-started service.
+writing the values as a multi-string on a real SCM-started service. It is not
+run by CI: the service start path needs an elevated host with a working SCM,
+which the hosted runners do not provide.
 
-The step fails loudly: if the ACL cannot be set, the installer prints an `ERROR`
-line and exits non-zero rather than leaving a world-readable key behind.
+The step fails loudly: if the key cannot be protected or the value cannot be
+written, the installer prints an `ERROR` line and exits non-zero.
 
-On success it echoes `Environment key ACL restricted to SYSTEM + BUILTIN\Administrators.`
+A non-administrator querying the service key (for example
+`reg query HKLM\SYSTEM\CurrentControlSet\Services\link_ping_prometheus /v Environment`)
+gets **access denied**. Administrators still read the plaintext values, which
+includes every account that can take the machine over. Protecting the service
+key also removes non-administrator read access, so `sc query` from a standard
+account stops working — the intended trade-off.
 
-A non-administrator querying the key (for example
-`reg query HKLM\SYSTEM\CurrentControlSet\Services\link_ping_prometheus\Environment`)
-gets **access denied**, and `Get-Acl` shows only the two entries above with
-inheritance disabled. Administrators still read the plaintext values, which
-includes every account that can take the machine over.
-
-**Rotation.** The values in that key are plaintext: anything that could read the
-key before the ACL step (or while the ACL was still inherited) can still use the
-secret. Treat the secret as compromised and rotate it — the zero-downtime
-rotation runbook (new secret + previous secret in the service environment, then
-drop the old one) is in the [security guide](../../docs/security.md).
+**Rotation.** The values are plaintext: anything that could read the key before
+the ACL step (or while the ACL was still inherited) can still use the secret.
+Treat the secret as compromised and rotate it — the zero-downtime rotation
+runbook (new secret + previous secret in the service environment, then drop the
+old one) is in the [security guide](../../docs/security.md).
 
 The wizard's own "previous, for rotation" prompt writes
 `LINK_PING_ECHO_SECRET_OLD` for exactly that runbook. Rotate the metrics password
-by replacing the value and restarting the service.
+by replacing the entry and restarting the service.
 
-**Sites that manage registry ACLs by policy.** The installer's PowerShell
-snippet is exactly what a GPO-driven equivalent should apply, and it can be
-re-run by hand at any time to re-apply or audit the ACL:
+**Sites that manage registry ACLs by policy.** The installer's snippet is
+exactly what a GPO-driven equivalent should apply, and it can be re-run by hand
+at any time to re-apply or audit:
 
 ```powershell
-powershell -NoProfile -Command "$k='HKLM:\SYSTEM\CurrentControlSet\Services\link_ping_prometheus\Environment'; $a=Get-Acl $k; $a.SetAccessRuleProtection($true,$false); foreach($n in 'S-1-5-18','S-1-5-32-544'){ $sid=(New-Object System.Security.Principal.SecurityIdentifier($n)); $a.AddAccessRule((New-Object System.Security.AccessControl.RegistrySystemAccessRule($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'))) }; Set-Acl -Path $k -AclObject $a"
+$k = 'HKLM:\SYSTEM\CurrentControlSet\Services\link_ping_prometheus'
+$a = Get-Acl $k
+$a.SetSecurityDescriptorSddlForm('D:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)(A;;KA;;;SY)(A;;KA;;;BA)')
+Set-Acl -Path $k -AclObject $a
 ```
 
-`icacls` is the equivalent for sites that standardize on it:
-
-```bat
-icacls "HKLM\SYSTEM\CurrentControlSet\Services\link_ping_prometheus\Environment" /inheritance:r /grant "*S-1-5-18:(F)" "*S-1-5-32-544:(F)"
-```
-
-Both forms name the principals by SID (`S-1-5-18` = SYSTEM, `S-1-5-32-544` =
+Both ACE pairs name the principals by SID (`S-1-5-18` = SYSTEM, `S-1-5-32-544` =
 Administrators) instead of by account name: the names are localized on
 non-English Windows ("Administratoren" on a German install) and would not
 resolve, so the ACL step would fail on a host that is otherwise fine.
@@ -149,7 +159,7 @@ resolve, so the ACL step would fail on a host that is otherwise fine.
   `NT AUTHORITY\LocalService` or a gMSA) for least privilege.
 - Arguments are snapshotted at install time: changing runtime flags requires
   uninstall/reinstall.
-- Credentials in the `Environment` key are plaintext and readable by
+- Credentials in the `Environment` value are plaintext and readable by
   administrators; restrict who counts as an administrator on the node.
 
 See the [Windows service guide](../../docs/windows-service.md) for full detail.

@@ -549,9 +549,6 @@
       {{ link_ping_mesh_allow_opt }}
       -log-file="{{ link_ping_win_log_dir }}\service.log"
       {{ link_ping_extra_args }}
-    svc_env_key: >-
-      HKLM:\SYSTEM\CurrentControlSet\Services\{{ link_ping_service_name
-      }}\Environment
   tasks:
     # Same guardrails as the Linux play: plays share no vars, so they are
     # restated rather than factored into a file the play does not own.
@@ -818,70 +815,71 @@
         reset= 86400 actions= restart/5000/restart/5000/restart/5000
 
     - name: Reconcile credentials in the service environment
-      # no_log: `data` carries plaintext secrets; without it they show up in
-      # `-v` task output and in any CI transcript.
+      # no_log: the rendered environment carries plaintext secrets.
       #
-      # state is DERIVED, never a bare `present`: an emptied vault variable
-      # must DELETE its registry value, or the previous run's secret stays
-      # installed and the SCM keeps injecting it. This task used to carry
-      # `when: item.data | length > 0`, so the documented rotation's final
-      # clear removed nothing and the retired HMAC secret kept authenticating
-      # probes as the server's -echo-secret-old.
+      # The SCM builds a service's environment from the REG_MULTI_SZ VALUE
+      # named Environment on the SERVICE KEY, with "NAME=value" entries. It
+      # ignores an Environment SUBKEY, so the previous win_regedit task (one
+      # REG_SZ value per credential under that subkey) delivered nothing: the
+      # agent started with metrics auth off and HMAC unset while the play
+      # reported success.
+      #
+      # The key is protected BEFORE the value is written: it inherits
+      # BUILTIN\\Users read from ...\\Services, and the DACL needs both an
+      # inheriting pair (subkeys) and a plain pair (the key itself - an ACE
+      # that only inherits does not grant on the key). Existing entries are
+      # preserved; a cleared variable is REMOVED, so a retired HMAC secret
+      # does not survive in the service environment.
       no_log: true
-      ansible.windows.win_regedit:
-        path: "{{ svc_env_key }}"
-        name: "{{ item.name }}"
-        data: "{{ item.data }}"
-        datatype: string
-        state: "{{ 'present' if item.data | length > 0 else 'absent' }}"
-      loop:
-        - name: LINK_PING_ECHO_SECRET
-          data: "{{ link_ping_echo_secret }}"
-        - name: LINK_PING_ECHO_SECRET_OLD
-          data: "{{ link_ping_echo_secret_old }}"
-        - name: LINK_PING_METRICS_USER
-          data: "{{ link_ping_metrics_user }}"
-        - name: LINK_PING_METRICS_PASS
-          data: "{{ link_ping_metrics_pass }}"
-      loop_control:
-        label: "{{ item.name }}"
+      ansible.windows.win_shell: |
+          $ErrorActionPreference = 'Stop'
+          $k = 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\{{ link_ping_service_name }}'
+          $a = Get-Acl -LiteralPath $k
+          $a.SetSecurityDescriptorSddlForm('D:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)(A;;KA;;;SY)(A;;KA;;;BA)')
+          Set-Acl -LiteralPath $k -AclObject $a
+
+          $cur = (Get-ItemProperty -Path $k -Name Environment -ErrorAction SilentlyContinue).Environment
+          $m = [ordered]@{}
+          if ($cur) {
+              foreach ($l in $cur) {
+                  $i = $l.IndexOf('=')
+                  if ($i -gt 0) { $m[$l.Substring(0, $i)] = $l.Substring($i + 1) }
+              }
+          }
+          $wanted = @(
+              @('LINK_PING_METRICS_USER', $env:LPP_METRICS_USER),
+              @('LINK_PING_METRICS_PASS', $env:LPP_METRICS_PASS),
+              @('LINK_PING_ECHO_SECRET', $env:LPP_ECHO_SECRET),
+              @('LINK_PING_ECHO_SECRET_OLD', $env:LPP_ECHO_SECRET_OLD)
+          )
+          foreach ($p in $wanted) {
+              if ([string]::IsNullOrEmpty($p[1])) { $m.Remove($p[0]) } else { $m[$p[0]] = $p[1] }
+          }
+          $old = ''
+          if ($cur) { $old = ($cur -join "`n") }
+          $v = @()
+          foreach ($x in $m.Keys) { $v += ($x + '=' + $m[$x]) }
+          $new = ($v -join "`n")
+          if ($new -ne $old) {
+              if ($m.Count -gt 0) {
+                  New-ItemProperty -Path $k -Name Environment -PropertyType MultiString -Value ([string[]]$v) -Force | Out-Null
+              } else {
+                  Remove-ItemProperty -Path $k -Name Environment -ErrorAction SilentlyContinue
+              }
+              Write-Output 'changed'
+          } else {
+              Write-Output 'unchanged'
+          }
+      environment:
+        LPP_METRICS_USER: "{{ link_ping_metrics_user }}"
+        LPP_METRICS_PASS: "{{ link_ping_metrics_pass }}"
+        LPP_ECHO_SECRET: "{{ link_ping_echo_secret }}"
+        LPP_ECHO_SECRET_OLD: "{{ link_ping_echo_secret_old }}"
+      register: link_ping_env_reconcile
+      changed_when: "'changed' in link_ping_env_reconcile.stdout"
       # The SCM reads the environment at process start: a rotated (or
       # deleted) secret takes effect only on restart.
       notify: Restart link ping service (windows)
-
-    - name: Restrict the service Environment key ACL
-      # HKLM\SYSTEM\CurrentControlSet\Services\<svc>\Environment is
-      # readable by every local user by default, so the metrics password
-      # and HMAC secret written above are only as private as interactive
-      # logon on the host. Drop the inherited ACEs and keep SYSTEM +
-      # BUILTIN\Administrators — the same rule, and the same PowerShell
-      # calls, the batch installer applies. The SCM builds the service's
-      # environment block as SYSTEM, so the service process itself needs no
-      # read access here.
-      #
-      # win_shell executes PowerShell verbatim (no cmd.exe re-parse of the
-      # $variables and quotes), and $ErrorActionPreference = 'Stop' turns a
-      # failed Get-Acl/Set-Acl into a non-zero exit so the task fails
-      # instead of leaving the key world-readable and reporting success.
-      ansible.windows.win_shell: |
-          $ErrorActionPreference = 'Stop'
-          $k = '{{ svc_env_key }}'
-          function New-AdminRule($n) {
-              $type = 'System.Security.AccessControl.RegistrySystemAccessRule'
-              # SIDs, not names: 'SYSTEM'/'BUILTIN\Administrators' are
-              # localized on non-English Windows and would not resolve.
-              $sid = New-Object System.Security.Principal.SecurityIdentifier($n)
-              $argList = @($sid, 'FullControl',
-                           'ContainerInherit,ObjectInherit', 'None', 'Allow')
-              New-Object -TypeName $type -ArgumentList $argList
-          }
-          $a = Get-Acl $k
-          $a.SetAccessRuleProtection($true, $false)
-          foreach ($n in 'S-1-5-18', 'S-1-5-32-544') {
-              $a.AddAccessRule((New-AdminRule $n))
-          }
-          Set-Acl -Path $k -AclObject $a
-      changed_when: false
 
     - name: Open UDP echo port (server/both mode)
       ansible.windows.win_shell: >-

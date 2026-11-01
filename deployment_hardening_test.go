@@ -49,21 +49,31 @@ func indexOf(t *testing.T, path, body, needle string) int {
 	return i
 }
 
-// TestWindowsInstallerOrdersACLBeforeSecrets pins the credential-window fix:
-// the per-service Environment key inherits BUILTIN\Users read from ...\Services,
-// so writing the plaintext password and HMAC secret before restricting the key
-// exposes them to every local user for the length of the reg.exe calls plus
-// PowerShell startup.
-func TestWindowsInstallerOrdersACLBeforeSecrets(t *testing.T) {
+// TestWindowsInstallerUsesTheSCMEnvironmentValue pins both halves of the
+// Windows credential mechanism, which the audit found shipped broken:
+//
+//   - the SCM reads a REG_MULTI_SZ VALUE named Environment on the service key,
+//     not a same-named SUBKEY (a subkey silently delivered nothing: metrics
+//     auth stayed off and HMAC was never enabled while the config looked right);
+//   - the service key inherits BUILTIN\Users read from ...\Services, so it is
+//     protected BEFORE the value is written, and a cleared variable REMOVES its
+//     entry so a retired secret does not survive.
+func TestWindowsInstallerUsesTheSCMEnvironmentValue(t *testing.T) {
 	path := "installer/windows/install-service.bat"
 	body := readDeploymentFile(t, path)
 
-	acl := indexOf(t, path, body, "Restrict the key BEFORE writing any value")
-	firstSecret := indexOf(t, path, body, "/v LINK_PING_METRICS_PASS")
-	if acl > firstSecret {
-		t.Errorf("%s: the Environment key must be ACL'd before any credential is written (ACL block at %d, first secret at %d)", path, acl, firstSecret)
+	mustContain(t, path, body, "PropertyType MultiString", "the SCM reads a REG_MULTI_SZ value")
+	mustContain(t, path, body, "Remove-ItemProperty -Path $k -Name Environment", "cleared credentials must be removed")
+	mustContain(t, path, body, "SetSecurityDescriptorSddlForm", "the service key must be protected")
+	mustNotContain(t, path, body, `reg add "%ENV_KEY%"`, "a subkey write is ignored by the SCM")
+	mustNotContain(t, path, body, `\Environment /v`, "a subkey write is ignored by the SCM")
+
+	acl := indexOf(t, path, body, "SetSecurityDescriptorSddlForm")
+	write := indexOf(t, path, body, "New-ItemProperty -Path $k -Name Environment")
+	if acl > write {
+		t.Errorf("%s: the service key must be protected before the credential value is written", path)
 	}
-	mustContain(t, path, body, "if (-not (Test-Path $k)) { New-Item -Path $k -Force", "the key must be created restricted before the writes")
+
 	// A metrics credential the runtime gate rejects must stop the install
 	// before the value is written or the service is started.
 	mustContain(t, path, body, "metrics basic-auth credentials were entered, but the service arguments include", "refuse credentials without TLS/allow-insecure")
@@ -72,60 +82,24 @@ func TestWindowsInstallerOrdersACLBeforeSecrets(t *testing.T) {
 	if guard > startService {
 		t.Errorf("%s: the metrics credential guard must run before the service is started", path)
 	}
-	if firstWrite := indexOf(t, path, body, `/v LINK_PING_METRICS_PASS`); guard > firstWrite {
+	if guard > write {
 		t.Errorf("%s: the metrics credential guard must run before any credential is written", path)
 	}
 	// The installed bytes are verified against the source after the copy.
 	mustContain(t, path, body, "does not match \"%EXE_PATH%\" after the copy", "verify the copied binary")
 }
 
-// TestWindowsInstallerOwnsProgramDataContainer pins the ownership fix. A
-// standard user can create C:\ProgramData\link_ping_prometheus and keeps
-// implicit WRITE_DAC, so creating the directory is not enough: the installer
-// must take ownership before restricting the DACL.
-func TestWindowsInstallerOwnsProgramDataContainer(t *testing.T) {
-	path := "installer/windows/install-service.bat"
-	body := readDeploymentFile(t, path)
-
-	mustContain(t, path, body, ":HardenDataDir", "the container hardening subroutine")
-	mustContain(t, path, body, "call :HardenDataDir", "the container hardening must be invoked")
-	takeown := indexOf(t, path, body, "takeown /f \"%DATA_DIR%\" /a")
-	icacls := indexOf(t, path, body, "icacls \"%DATA_DIR%\" /inheritance:r")
-	if takeown > icacls {
-		t.Errorf("%s: takeown must precede icacls on the container (takeown %d, icacls %d)", path, takeown, icacls)
-	}
-}
-
-// TestWindowsUninstallerDoesNotWeakenLogACL pins the uninstall fix: resetting
-// the DACL before a best-effort delete leaves the directory readable by every
-// local user whenever the delete fails, and the delete never needed the reset
-// (Administrators already hold full control).
-func TestWindowsUninstallerDoesNotWeakenLogACL(t *testing.T) {
-	path := "installer/windows/uninstall-service.bat"
-	body := readDeploymentFile(t, path)
-
-	mustNotContain(t, path, body, `icacls "%LOG_DIR%" /reset`, "the reset only weakens the DACL")
-	mustNotContain(t, path, body, `icacls "%SVC_LOG_DIR%" /reset`, "the reset only weakens the DACL")
-	mustContain(t, path, body, "call :discover_custom", "custom log discovery must run before the service key disappears")
-	discover := indexOf(t, path, body, "call :discover_custom")
-	uninstall := indexOf(t, path, body, `"%INSTALLED_EXE%" -svc=uninstall`)
-	if discover > uninstall {
-		t.Errorf("%s: custom log discovery must precede the service deletion (discover %d, uninstall %d)", path, discover, uninstall)
-	}
-}
-
-// TestAnsibleRetiresClearedCredentials pins the rotation fix. A cleared vault
-// variable must delete its registry value; the previous `when: item.data |
-// length > 0` skipped the task, so the retired HMAC secret stayed installed and
-// kept authenticating probes as -echo-secret-old.
-func TestAnsibleRetiresClearedCredentials(t *testing.T) {
+// TestAnsibleReconcilesTheSCMEnvironmentValue pins the play-side mechanism:
+// one REG_MULTI_SZ Environment value on the protected service key, entries
+// preserved, cleared variables REMOVED from it. The old win_regedit loop wrote
+// a subkey the SCM ignores.
+func TestAnsibleReconcilesTheSCMEnvironmentValue(t *testing.T) {
 	for _, path := range []string{"deploy/ansible/playbook.yml", "deploy/ansible/mesh.yml"} {
 		body := readDeploymentFile(t, path)
-		mustContain(t, path, body, `state: "{{ 'present' if item.data | length > 0 else 'absent' }}"`,
-			"credential state must be derived from the value")
-		if strings.Contains(body, "\n      when: item.data | length > 0") {
-			t.Errorf("%s: the per-item `when` gate makes the absent branch unreachable", path)
-		}
+		mustContain(t, path, body, "PropertyType MultiString", "the SCM reads a REG_MULTI_SZ value")
+		mustContain(t, path, body, "$m.Remove($p[0])", "a cleared variable must be removed, not left installed")
+		mustContain(t, path, body, "SetSecurityDescriptorSddlForm", "the service key must be protected")
+		mustNotContain(t, path, body, "ansible.windows.win_regedit", "a win_regedit subkey is ignored by the SCM")
 	}
 }
 

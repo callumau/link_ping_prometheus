@@ -63,7 +63,7 @@ LINK_PING_ECHO_SECRET=<32+ random bytes>   # 0600 env file
 
 ```text
 -svc=install -mode=client -target=203.0.113.10:4000 -metrics=127.0.0.1:2112 -log-file=C:\ProgramData\link_ping_prometheus\logs\service.log
-LINK_PING_ECHO_SECRET=<same secret>        # service Environment key, ACL'd
+LINK_PING_ECHO_SECRET=<same secret>        # SCM Environment value, key ACL'd
 ```
 
 Use `-targets` + `-targets-reload-interval` instead of `-target` when the prober

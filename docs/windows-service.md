@@ -94,14 +94,43 @@ directory, and an optional service account, then shows a summary.
    account, so the previous account's file denies the new one and the
    service exits non-zero at startup (the restart ladder loops until the
    file is removed).
-3. **Secrets delivery.** Set the credential environment variables
-   **per-service**, which is the only scope the installer and the plays ACL:
+3. **Secrets delivery.** The SCM builds a service's environment from a
+   `REG_MULTI_SZ` **value** named `Environment` on the service's key, holding
+   `NAME=value` strings:
 
-   ```sh
-   reg add HKLM\SYSTEM\CurrentControlSet\Services\link_ping_prometheus\Environment /v LINK_PING_METRICS_USER /t REG_SZ /d <user> /f
-   reg add HKLM\SYSTEM\CurrentControlSet\Services\link_ping_prometheus\Environment /v LINK_PING_METRICS_PASS /t REG_SZ /d <pass> /f
-   reg add HKLM\SYSTEM\CurrentControlSet\Services\link_ping_prometheus\Environment /v LINK_PING_ECHO_SECRET /t REG_SZ /d <secret> /f
+   ```powershell
+   $k = 'HKLM:\SYSTEM\CurrentControlSet\Services\link_ping_prometheus'
+   Set-ItemProperty -Path $k -Name Environment -Type MultiString -Value @(
+       'LINK_PING_METRICS_USER=<user>',
+       'LINK_PING_METRICS_PASS=<pass>',
+       'LINK_PING_ECHO_SECRET=<secret>'
+   )
    ```
+
+   It is a **value**, not a subkey. `HKLM\…\Services\link_ping_prometheus\Environment`
+   as a *key* full of `REG_SZ` values is ignored by the SCM: the agent starts
+   with no credentials at all, so metrics auth is off and HMAC is never
+   enabled while the configuration looks correct. Ansible's `win_regedit`
+   default shape (a subkey) is the wrong mechanism for exactly this reason;
+   the plays write the multi-string value instead.
+
+   The service key is readable by `BUILTIN\Users` by default, and unlike a
+   separate subkey it cannot be ACL'd without restricting the service key
+   itself. The installer and the plays protect the key to SYSTEM +
+   Administrators (both an inheriting and a non-inheriting ACE) **before**
+   writing the value. If you add values by hand, do the same:
+
+   ```powershell
+   $a = Get-Acl $k
+   $a.SetSecurityDescriptorSddlForm('D:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)(A;;KA;;;SY)(A;;KA;;;BA)')
+   Set-Acl -Path $k -AclObject $a
+   ```
+
+   Restart the service afterwards: the SCM reads the value at process start.
+   Confirm delivery with `Get-Content` of the log's `Starting metrics server`
+   line (`auth=true`) or with
+   `link_server_clock_skew_seconds` on the peer (only exported for
+   HMAC-authenticated frames).
 
    Do **not** use machine-wide variables (System Properties → Environment
    Variables) for these values. Machine scope lives in
@@ -111,14 +140,11 @@ directory, and an optional service account, then shows a summary.
    The binary reads all four names with `os.Getenv`, so it cannot tell the
    scopes apart and will not warn you.
 
-   The installer and the Ansible play restrict this per-service key's ACL to
-   SYSTEM and Administrators once a value is stored (inheritance off). Run the
-   same snippet by hand if you add values with `reg add`, and confirm a
-   non-admin `reg query` of the key fails. Treat values present before that
-   hardening as disclosed: rotate the echo secret and metrics password (the
-   Security rotation runbook), then restart. The echo secret must be at least
-   16 characters — the HMAC-SHA256 key material, brute-forceable if shorter
-   (the wizard enforces this; no binary-side minimum).
+   Treat values written before the key was protected as disclosed: rotate the
+   echo secret and metrics password (the Security rotation runbook), then
+   restart. The echo secret must be at least 16 characters — the HMAC-SHA256
+   key material, brute-forceable if shorter (the wizard enforces this; no
+   binary-side minimum).
 
    Metrics credentials require TLS as well: the binary refuses Basic auth
    without `-metrics-tls-cert`/`-metrics-tls-key` unless you pass

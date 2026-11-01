@@ -139,12 +139,19 @@ Two load-bearing warnings:
   enforces the file's DACL (SYSTEM, Administrators, service account) at
   startup.
 - `-echo-secret` is not persisted and would show on a command line; deliver
-  it via the service environment, then restrict that key's ACL (see the
+  it through the SCM environment **value** (a `REG_MULTI_SZ` named
+  `Environment` on the service key — a subkey of the same name is ignored by
+  the SCM), then protect the service key (see the
   [Windows service guide](windows-service.md)):
 
 ```powershell
-reg add "HKLM\SYSTEM\CurrentControlSet\Services\link_ping_prometheus\Environment" `
-  /v LINK_PING_ECHO_SECRET /t REG_SZ /d "<shared-secret>" /f
+$k = 'HKLM:\SYSTEM\CurrentControlSet\Services\link_ping_prometheus'
+Set-ItemProperty -Path $k -Name Environment -Type MultiString -Value @(
+    'LINK_PING_ECHO_SECRET=<shared-secret>'
+)
+$a = Get-Acl $k
+$a.SetSecurityDescriptorSddlForm('D:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)(A;;KA;;;SY)(A;;KA;;;BA)')
+Set-Acl -Path $k -AclObject $a
 ```
 
 - `-targets-reload-interval` is mandatory: a service has no SIGHUP.

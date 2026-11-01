@@ -105,13 +105,13 @@ if not "%SVC_LOG_DIR%"=="" if /i not "%SVC_LOG_DIR%"=="%LOG_DIR%" (
 )
 
 :: Credential scrub runs while the key still exists: a failed delete left it
-:: on disk, and kardianos's uninstall would only remove the values with the
-:: whole key. Idempotent, and harmless (no-op) when the key is already gone.
-set "ENV_KEY=HKLM\SYSTEM\CurrentControlSet\Services\%SERVICE_NAME%\Environment"
-reg delete "%ENV_KEY%" /v LINK_PING_METRICS_USER /f >nul 2>&1
-reg delete "%ENV_KEY%" /v LINK_PING_METRICS_PASS /f >nul 2>&1
-reg delete "%ENV_KEY%" /v LINK_PING_ECHO_SECRET /f >nul 2>&1
-reg delete "%ENV_KEY%" /v LINK_PING_ECHO_SECRET_OLD /f >nul 2>&1
+:: on disk, and the SCM would keep injecting the secrets on the next start.
+:: The credentials live in the REG_MULTI_SZ "Environment" VALUE on the service
+:: key (the SCM ignores an "Environment" subkey), so deleting that value
+:: removes every credential this project stores. Idempotent, and harmless
+:: (no-op) when the key or value is already gone.
+set "SVC_KEY=HKLM\SYSTEM\CurrentControlSet\Services\%SERVICE_NAME%"
+reg delete "%SVC_KEY%" /v Environment /f >nul 2>&1
 
 :: === Remove Program Files placement (binary) =================================
 :remove_files

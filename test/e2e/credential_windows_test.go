@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,15 +17,15 @@ import (
 )
 
 // Credential env-delivery e2e: the linchpin of the Windows credentials
-// story. install-service.bat stores LINK_PING_METRICS_USER/PASS and
-// LINK_PING_ECHO_SECRET as REG_SZ values under the per-service
-// HKLM\SYSTEM\CurrentControlSet\Services\<name>\Environment subkey and
-// stakes the whole "credentials never persisted into the service config"
-// design on the SCM reading that subkey and injecting the values into the
-// service process at start. No unit test can settle that claim — this e2e
-// writes the values with the SAME reg add form the wizard uses, starts
-// the real service, and asserts the binary actually received and
-// enforced them:
+// story. The SCM builds a service's environment from the REG_MULTI_SZ VALUE
+// named "Environment" on the service key, holding "NAME=value" strings, and
+// the "credentials never persisted into the service config" design depends on
+// that value injecting them into the service process at start. A same-named
+// SUBKEY is ignored by the SCM — this project's installer and plays shipped
+// that mistake and silently delivered nothing, so the distinction is pinned
+// here. No unit test can settle the delivery claim — this e2e writes the
+// value with the SAME form the wizard uses, starts the real service, and
+// asserts the binary actually received and enforced them:
 //   - /metrics answers 401 without credentials and with a WRONG password,
 //     200 with the env-delivered pair (metrics-credential delivery);
 //   - a probe client carrying the matching secret is echoed and counted
@@ -34,7 +35,7 @@ import (
 // Gated behind LPP_E2E_WINDOWS=1 like the SCM lifecycle e2e: it needs an
 // elevated host with a working SCM-start path (see that test's skip note
 // for why the GitHub runner is not one). Cleanup unconditionally stops,
-// uninstalls, and scrubs the Environment key, so a crashed run cannot
+// uninstalls, and removes the Environment value, so a crashed run cannot
 // leave credentials on the host.
 
 func TestE2EWindowsCredentialEnvDelivery(t *testing.T) {
@@ -45,16 +46,16 @@ func TestE2EWindowsCredentialEnvDelivery(t *testing.T) {
 		t.Skip("SCM manager connect needs elevation; runner lacks it")
 	}
 	const svcName = "link_ping_prometheus"
-	envKey := `HKLM\SYSTEM\CurrentControlSet\Services\` + svcName + `\Environment`
+	svcKey := `HKLM\SYSTEM\CurrentControlSet\Services\` + svcName
 	mUser, mPass := "e2e-metrics-user", "e2e-metrics-pass-0123456789"
 	hmacSecret := "e2e-echo-secret-0123456789abcdef" // >= 16 chars (wizard rule)
 
 	// stop/uninstall/scrub runs BEFORE the test too: a stale service or
-	// Environment key from a crashed prior run would inject old values.
+	// Environment value from a crashed prior run would inject old values.
 	cleanup := func() {
 		_ = exec.Command(binPath, "-svc=stop").Run()
 		_ = exec.Command(binPath, "-svc=uninstall").Run()
-		_ = exec.Command("reg", "delete", envKey, "/f").Run()
+		_ = exec.Command("reg", "delete", svcKey, "/v", "Environment", "/f").Run()
 	}
 	cleanup()
 	t.Cleanup(cleanup)
@@ -70,7 +71,7 @@ func TestE2EWindowsCredentialEnvDelivery(t *testing.T) {
 	// Install WITHOUT any credential flag: credential flags are stripped
 	// from the persisted service config by design (main.go flag.Visit
 	// exclusion), so the ONLY delivery path for the secrets below is the
-	// Environment key written next.
+	// Environment value written next.
 	install := exec.Command(binPath,
 		"-svc=install",
 		"-mode=server",
@@ -82,17 +83,17 @@ func TestE2EWindowsCredentialEnvDelivery(t *testing.T) {
 		t.Fatalf("-svc=install failed: %v\noutput: %.600s", err, out)
 	}
 
-	// Write the credentials EXACTLY the way install-service.bat does: one
-	// reg add per variable, REG_SZ, under the Environment subkey.
-	for _, c := range []struct{ name, val string }{
-		{"LINK_PING_METRICS_USER", mUser},
-		{"LINK_PING_METRICS_PASS", mPass},
-		{"LINK_PING_ECHO_SECRET", hmacSecret},
-	} {
-		cmd := exec.Command("reg", "add", envKey, "/v", c.name, "/t", "REG_SZ", "/d", c.val, "/f")
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("reg add %s: %v\noutput: %.400s", c.name, err, out)
-		}
+	// Write the credentials EXACTLY the way install-service.bat and the plays
+	// do: ONE REG_MULTI_SZ value named Environment on the service key, with
+	// "NAME=value" entries separated by \0. A subkey would be ignored by the
+	// SCM and the assertions below would fail.
+	envValue := strings.Join([]string{
+		"LINK_PING_METRICS_USER=" + mUser,
+		"LINK_PING_METRICS_PASS=" + mPass,
+		"LINK_PING_ECHO_SECRET=" + hmacSecret,
+	}, `\0`)
+	if out, err := exec.Command("reg", "add", svcKey, "/v", "Environment", "/t", "REG_MULTI_SZ", "/d", envValue, "/f").CombinedOutput(); err != nil {
+		t.Fatalf("reg add Environment value: %v\noutput: %.400s", err, out)
 	}
 
 	if out, err := exec.Command(binPath, "-svc=start").CombinedOutput(); err != nil {

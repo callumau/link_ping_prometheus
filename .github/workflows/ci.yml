@@ -71,7 +71,7 @@ jobs:
       # The Ansible playbooks ship to fleet hosts but CI never parsed them, so
       # a task naming a module that does not exist could sit here unnoticed —
       # it did: playbook.yml used ansible.windows.win_script, which exists in
-      # no collection, so the Windows play's Environment-key ACL step (the one
+      # no collection, so the Windows play's Environment-value step (the one
       # that stops every local user reading the HMAC secret) would have failed
       # at run time. --syntax-check resolves module FQCNs, so the
       # ansible.windows collection must be installed; ansible-core and the
