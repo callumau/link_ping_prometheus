@@ -189,3 +189,14 @@ func TestWindowsGuideRejectsMachineScopeCredentials(t *testing.T) {
 		t.Error("docs/windows-service.md: still presents machine-wide variables as an equivalent delivery path")
 	}
 }
+
+// TestGitignoreCoversKeyMaterial pins the forward guard. The audit found a
+// live targets.json still retrievable from history after it was untracked:
+// untracking does not remove the blob, so the ignore list must cover the
+// files the binary consumes before they are ever committed.
+func TestGitignoreCoversKeyMaterial(t *testing.T) {
+	body := readDeploymentFile(t, ".gitignore")
+	for _, want := range []string{"targets.json", "dev_push.sh", ".env", "*.key", "*.pem", "*.p12", "*.pfx", "credentials*"} {
+		mustContain(t, ".gitignore", body, want, "the forward guard must cover this path")
+	}
+}

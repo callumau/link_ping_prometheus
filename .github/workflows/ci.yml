@@ -34,6 +34,20 @@ jobs:
           # and this project's deps are few enough to fetch per run.
           cache: false
 
+      # The binary consumes -metrics-tls-key/-metrics-tls-cert and a
+      # LINK_PING_* credential env file, and its live targets file is
+      # per-host. None of those may be tracked: the audit found a live
+      # targets.json still retrievable from history after it was untracked,
+      # and untracking does not remove the blob. This is the forward guard.
+      - name: Reject live configuration and key material
+        run: |
+          set -eu
+          if git ls-files | grep -Eq '(^|/)(targets\.json|dev_push\.sh|\.env[^/]*|credentials[^/]*)$|\.(key|pem|p12|pfx)$'; then
+            echo '::error::live configuration or key material is tracked in this commit'
+            git ls-files | grep -E '(^|/)(targets\.json|dev_push\.sh|\.env[^/]*|credentials[^/]*)$|\.(key|pem|p12|pfx)$'
+            exit 1
+          fi
+
       - name: Vet
         run: go vet ./...
 

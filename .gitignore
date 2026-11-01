@@ -13,3 +13,13 @@ targets.json
 dev_push.sh
 
 .venv-ansible/
+
+# key material and credential files the binary consumes (-metrics-tls-key,
+# -metrics-tls-cert, LINK_PING_* credential env files). Never commit them.
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.pfx
+credentials*
