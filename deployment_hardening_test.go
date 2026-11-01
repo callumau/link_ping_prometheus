@@ -302,3 +302,18 @@ func TestSignPathArtifactConfigurationMatchesTheBuild(t *testing.T) {
 	wf := readDeploymentFile(t, ".github/workflows/release.yml")
 	mustContain(t, ".github/workflows/release.yml", wf, "certificate by [SignPath Foundation]", "release pages must carry the statement")
 }
+
+// TestLongTermRunbookCoversBothPlatforms pins the two-node runbook: it must
+// describe the Linux and Windows sides, warn about the one-sided-secret trap,
+// and give a daily check that reads /status and /metrics on both.
+func TestLongTermRunbookCoversBothPlatforms(t *testing.T) {
+	doc := readDeploymentFile(t, "docs/long-term-test.md")
+	mustContain(t, "docs/long-term-test.md", doc, "-mode=both", "both ends must probe and answer")
+	mustContain(t, "docs/long-term-test.md", doc, "Windows (SCM)", "the Windows side must be documented")
+	mustContain(t, "docs/long-term-test.md", doc, "/status", "daily checks read the process snapshot")
+	mustContain(t, "docs/long-term-test.md", doc, "replay window is ±30 s", "clock sync is load-bearing")
+	mustContain(t, "docs/long-term-test.md", doc, "one-sided secret", "the half-configured trap must be called out")
+
+	index := readDeploymentFile(t, "docs/README.md")
+	mustContain(t, "docs/README.md", index, "long-term-test.md", "the runbook must be in the docs index")
+}

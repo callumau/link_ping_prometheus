@@ -21,7 +21,9 @@ SOAK_SECONDS=600 go test -count=1 -timeout 15m -run TestSoakMemory -v ./test/
 ```
 
 The soak test is opt-in; `-timeout` is mandatory because the default 10m expires
-mid-run. The heap must stay flat (+8MB ceiling).
+mid-run. The heap must stay flat (+8MB ceiling). This is a single-process
+diagnostic; for a deployment left running for days see the
+[long-term test](long-term-test.md) runbook (Linux + Windows pair).
 
 The test layout follows Go ecosystem convention, as in prometheus/client_golang
 and windows_exporter:

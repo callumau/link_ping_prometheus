@@ -37,4 +37,5 @@ pages here go deeper.
 | [Wire protocol](wire-protocol.md) | The 24/32-byte UDP datagram, HMAC coverage, and MTU sweep probes |
 | [Security](security.md) | Allowlist, HMAC, the replay window, metrics auth and TLS |
 | [Release signing](release-signing.md) | Code-signing the Windows binaries: cosign/SLSA vs Authenticode, and the free/OSS options |
+| [Long-term test](long-term-test.md) | Running the Linux + Windows pair for days: setup, daily checks, exit criteria |
 | [Development](development.md) | Building, testing, code structure, and contributing |
