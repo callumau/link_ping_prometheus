@@ -78,6 +78,11 @@ func TestE2EWindowsCredentialEnvDelivery(t *testing.T) {
 		"-allow=127.0.0.1",
 		fmt.Sprintf("-listen=127.0.0.1:%d", listenP),
 		fmt.Sprintf("-metrics=127.0.0.1:%d", metricsP),
+		// The credentials below include a metrics pair, and the agent refuses
+		// Basic auth over plaintext HTTP unless this flag is present. Without
+		// it the service exits 1 at startup and /metrics never answers, which
+		// is what made this e2e fail even on a working host.
+		"-metrics-allow-insecure",
 		"-log-file="+logFile)
 	if out, err := install.CombinedOutput(); err != nil {
 		t.Fatalf("-svc=install failed: %v\noutput: %.600s", err, out)
