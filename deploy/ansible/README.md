@@ -128,11 +128,16 @@ of the four controls it names, not silencing the check.
    `link_ping_metrics_pass`; they are delivered through the service environment,
    never the command line. The binary then refuses to start unless TLS or
    `-metrics-allow-insecure` is present too, so pair this with remedy 3.
-3. **Add TLS.** Pass `-metrics-tls-cert` and `-metrics-tls-key` (both, or
-   neither) in `link_ping_extra_args`. `-metrics-allow-insecure` does **not**
-   satisfy this guardrail on its own: without credentials it is a no-op, and it
-   only matters together with remedy 2, where it keeps plaintext HTTP with Basic
-   auth — better than no auth, but the credentials are only base64 on the wire.
+3. **Add TLS as transport, not as access control.** Pass
+   `-metrics-tls-cert` and `-metrics-tls-key` (both, or neither) in
+   `link_ping_extra_args`. TLS encrypts the transport but authenticates the
+   server, not the scraper: a wildcard listener with TLS and **no** credentials
+   still answers unauthenticated `/metrics` and `/status` with the probe
+   topology, which is why the guardrail requires credentials and the play
+   refuses that combination. `-metrics-allow-insecure` does **not** satisfy this
+   guardrail on its own: without credentials it is a no-op, and it only matters
+   together with remedy 2, where it keeps plaintext HTTP with Basic auth —
+   better than no auth, but the credentials are only base64 on the wire.
 4. **Firewall TCP 2112 to the monitoring hosts only.** The play does not open or
    close TCP 2112 (it opens UDP 4000 in the Windows firewall for server/both
    mode), and it cannot verify your firewall, so add the rule in your own

@@ -95,7 +95,7 @@ directory, and an optional service account, then shows a summary.
    service exits non-zero at startup (the restart ladder loops until the
    file is removed).
 3. **Secrets delivery.** Set the credential environment variables
-   machine-wide (System Properties → Environment Variables) or per-service:
+   **per-service**, which is the only scope the installer and the plays ACL:
 
    ```sh
    reg add HKLM\SYSTEM\CurrentControlSet\Services\link_ping_prometheus\Environment /v LINK_PING_METRICS_USER /t REG_SZ /d <user> /f
@@ -103,14 +103,29 @@ directory, and an optional service account, then shows a summary.
    reg add HKLM\SYSTEM\CurrentControlSet\Services\link_ping_prometheus\Environment /v LINK_PING_ECHO_SECRET /t REG_SZ /d <secret> /f
    ```
 
-   The installer and the Ansible play restrict this key's ACL to SYSTEM and
-   Administrators once a value is stored (inheritance off). Run the same
-   snippet by hand if you add values with `reg add`, and confirm a non-admin
-   `reg query` of the key fails. Treat values present before that hardening
-   as disclosed: rotate the echo secret and metrics password (the Security
-   rotation runbook), then restart. The echo secret must be at least 16
-   characters — the HMAC-SHA256 key material, brute-forceable if shorter
+   Do **not** use machine-wide variables (System Properties → Environment
+   Variables) for these values. Machine scope lives in
+   `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment`, which
+   every local user can read and every process inherits; there is no ACL step
+   to apply there, and the uninstaller does not remove machine-scope values.
+   The binary reads all four names with `os.Getenv`, so it cannot tell the
+   scopes apart and will not warn you.
+
+   The installer and the Ansible play restrict this per-service key's ACL to
+   SYSTEM and Administrators once a value is stored (inheritance off). Run the
+   same snippet by hand if you add values with `reg add`, and confirm a
+   non-admin `reg query` of the key fails. Treat values present before that
+   hardening as disclosed: rotate the echo secret and metrics password (the
+   Security rotation runbook), then restart. The echo secret must be at least
+   16 characters — the HMAC-SHA256 key material, brute-forceable if shorter
    (the wizard enforces this; no binary-side minimum).
+
+   Metrics credentials require TLS as well: the binary refuses Basic auth
+   without `-metrics-tls-cert`/`-metrics-tls-key` unless you pass
+   `-metrics-allow-insecure`, so a service started with only the credential
+   environment variables exits 1 on every start. Add the TLS pair (or the
+   explicit insecure flag) to the service arguments at install time.
+
 4. **Further hardening (optional).** The installer applies the restart
    escalation ladder (`sc.exe failure ... actions=
    restart/5000/restart/30000/restart/60000`), the per-service SID

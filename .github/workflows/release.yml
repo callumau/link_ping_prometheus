@@ -32,8 +32,39 @@ permissions:
 # the ruleset remains the first line of defense for the primary repo.
 
 jobs:
+  # Tests run in their own read-only job: the release job below holds the
+  # keyless signing identity (id-token: write) and the repository write
+  # token, and it used to run the repository's test suite in that same job.
+  # Ordinary test/source code could then influence the signing identity and
+  # the later GoReleaser step through the runner command files. Splitting it
+  # keeps repo code execution away from the publish privileges.
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # v7.0.1 (SHA-pinned for supply-chain safety)
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # v7.0.0 (SHA-pinned for supply-chain safety)
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: "1.27.3"
+          cache: false
+
+      - name: Run Tests
+        # -count=1 bypasses the Go test cache; -race matches ci.yml.
+        run: go test -count=1 -race -v ./...
+
   release:
     name: Release
+    needs: test
     runs-on: ubuntu-latest
     # Workflow-level guard (second layer on top of the tag-creation
     # ruleset above): a fork or collaborator re-tag of `v*` in another
@@ -70,10 +101,6 @@ jobs:
           # No action cache: a poisoned cache is a supply-chain vector,
           # and this project's deps are few enough to fetch per run.
           cache: false
-
-      - name: Run Tests
-        # -count=1 bypasses the Go test cache; -race matches ci.yml.
-        run: go test -count=1 -race -v ./...
 
       # v4.6.0 (SHA-pinned for supply-chain safety)
       - name: Log in to GHCR

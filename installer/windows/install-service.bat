@@ -33,6 +33,7 @@ set "EXE_PATH=%~dp0link_ping_prometheus.exe"
 set "INSTALL_DIR=%ProgramFiles%\link_ping_prometheus"
 set "DEF_METRICS=127.0.0.1:2112"
 set "DEF_LOG_DIR=C:\ProgramData\link_ping_prometheus\logs"
+set "DATA_DIR=C:\ProgramData\link_ping_prometheus"
 :: -----------------------------------------------------------------------------
 
 :: --- 1. Admin check ----------------------------------------------------------
@@ -293,6 +294,17 @@ set "EXE_PATH=%INSTALLED_EXE%"
 echo === Installing %SERVICE_NAME% from "%EXE_PATH%" ===
 
 :: Log directory with restrictive ACLs -----------------------------------------
+::
+:: The ProgramData container is created and re-owned FIRST when the operator
+:: kept the default log directory. ProgramData's default ACL lets
+:: BUILTIN\Users create subdirectories, and the creator keeps implicit
+:: WRITE_DAC, so a user who created C:\ProgramData\link_ping_prometheus before
+:: this installer ran could re-grant itself access to everything below it.
+:: takeown /a forces the owner to Administrators; the icacls that follows drops
+:: inheritance and keeps SYSTEM + Administrators only. A custom log directory
+:: is left alone here: its own ACL is applied below and the installer must not
+:: seize an unrelated parent directory.
+if /i "%LOG_DIR%"=="%DEF_LOG_DIR%" call :HardenDataDir
 if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
 :: SIDs (*S-1-5-18 = SYSTEM, *S-1-5-32-544 = Administrators), never the
 :: account NAMES: "Administrators" is localized ("Administratoren" on German
@@ -465,6 +477,26 @@ if "%MUser:~-1%"=="\" set "MUser=%MUser:~0,-1%"
 if "%MPass:~-1%"=="\" set "MPass=%MPass:~0,-1%"
 if "%ESecret:~-1%"=="\" set "ESecret=%ESecret:~0,-1%"
 if "%ESecretOld:~-1%"=="\" set "ESecretOld=%ESecretOld:~0,-1%"
+:: Restrict the key BEFORE writing any value.
+::
+:: The key inherits BUILTIN\Users read from ...\Services, so writing the four
+:: secrets first (the previous order) exposed the plaintext metrics password
+:: and echo HMAC secret to every local user until this separate PowerShell
+:: process had started and replaced the DACL. Creating the key and applying the
+:: protected DACL first means the values are only ever stored in a key that
+:: SYSTEM and Administrators can read. The identical step is repeated after the
+:: writes as defence in depth.
+::
+:: The invocation is one physical line on purpose (a ^ inside the quoted
+:: -Command is a literal caret) and prints nothing, so a failure is reported by
+:: the errorlevel check rather than by a half-applied ACL.
+powershell -NoProfile -Command "$k='HKLM:\SYSTEM\CurrentControlSet\Services\%SERVICE_NAME%\Environment'; if (-not (Test-Path $k)) { New-Item -Path $k -Force | Out-Null }; $a=Get-Acl $k; $a.SetAccessRuleProtection($true,$false); foreach($n in 'S-1-5-18','S-1-5-32-544'){ $sid=(New-Object System.Security.Principal.SecurityIdentifier($n)); $a.AddAccessRule((New-Object System.Security.AccessControl.RegistrySystemAccessRule($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'))) }; Set-Acl -Path $k -AclObject $a" >nul 2>&1
+if errorlevel 1 (
+    echo ERROR: could not create/restrict "%ENV_KEY%" before storing credentials.
+    echo        Not writing plaintext secrets into a key every local user can read.
+    exit /b 1
+)
+
 if not "%MUser%"=="" reg add "%ENV_KEY%" /v LINK_PING_METRICS_USER /t REG_SZ /d "%MUser%" /f >nul
 if not "%MPass%"=="" reg add "%ENV_KEY%" /v LINK_PING_METRICS_PASS /t REG_SZ /d "%MPass%" /f >nul
 if not "%ESecret%"=="" reg add "%ENV_KEY%" /v LINK_PING_ECHO_SECRET /t REG_SZ /d "%ESecret%" /f >nul
@@ -576,3 +608,23 @@ exit /b %errorlevel%
 :CheckSecretLength
 powershell -NoProfile -Command "if ($env:%~1.Length -lt 16) { exit 1 } else { exit 0 }" >nul 2>&1
 exit /b %errorlevel%
+
+:: HardenDataDir
+::   Creates C:\ProgramData\link_ping_prometheus if absent and forces its owner
+::   to Administrators before dropping inherited ACEs. Without the takeown an
+::   owner that a local user established before the first install keeps
+::   implicit WRITE_DAC and can re-grant itself access to the log directory,
+::   the target file and (in mesh deployments) the config checkout. Called only
+::   for the default log directory, so a custom path never causes the
+::   installer to seize an unrelated parent directory.
+:HardenDataDir
+if not exist "%DATA_DIR%" mkdir "%DATA_DIR%"
+takeown /f "%DATA_DIR%" /a >nul || (
+    echo ERROR: could not take ownership of "%DATA_DIR%"
+    exit /b 1
+)
+icacls "%DATA_DIR%" /inheritance:r /grant "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" >nul || (
+    echo ERROR: failed to ACL "%DATA_DIR%"
+    exit /b 1
+)
+exit /b 0
