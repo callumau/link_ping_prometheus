@@ -126,6 +126,42 @@ jobs:
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # yamllint disable-line rule:line-length
 
       # v7.2.3 (SHA-pinned for supply-chain safety)
+      # Windows Authenticode signing is OFF unless the repository variable
+      # WINDOWS_AUTHENTICODE is "true" and the certificate secrets are set.
+      # The signer is built from a pinned commit rather than taken from the
+      # runner image: it runs in the job that also holds the signing key, so
+      # an unpinned tool would be a supply-chain path to that key.
+      - name: Install osslsigncode (pinned)
+        if: vars.WINDOWS_AUTHENTICODE == 'true'
+        run: |
+          set -eu
+          OSSL_TAG=2.14
+          OSSL_SHA=65a4c40460ea81a10c4df3e609edc4634a52b51f
+          git clone --depth 1 --branch "$OSSL_TAG" https://github.com/mtrojnar/osslsigncode.git
+          cd osslsigncode
+          test "$(git rev-parse HEAD)" = "$OSSL_SHA" || {
+            echo "osslsigncode commit does not match the pinned SHA" >&2
+            exit 1
+          }
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DUSE_CURL=OFF
+          cmake --build build -j"$(nproc)"
+          sudo cmake --install build
+
+      # The key never enters the repository, and is removed with the runner.
+      - name: Materialise the Windows signing certificate
+        if: vars.WINDOWS_AUTHENTICODE == 'true'
+        env:
+          WINDOWS_SIGN_PFX_B64: ${{ secrets.WINDOWS_SIGN_PFX_B64 }}
+          WINDOWS_SIGN_PFX_PASS: ${{ secrets.WINDOWS_SIGN_PFX_PASS }}
+        run: |
+          set -eu
+          if [ -z "$WINDOWS_SIGN_PFX_B64" ]; then
+            echo "WINDOWS_AUTHENTICODE=true but WINDOWS_SIGN_PFX_B64 is empty" >&2
+            exit 1
+          fi
+          printf '%s' "$WINDOWS_SIGN_PFX_B64" | base64 -d > "$RUNNER_TEMP/windows-sign.pfx"
+          chmod 600 "$RUNNER_TEMP/windows-sign.pfx"
+
       - name: Run GoReleaser
         # The full action SHA makes this line exceed the raw 80-col cap;
         # the reference is pinned and literal, so length is waived here.
@@ -139,6 +175,14 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Empty unless signing is enabled; the hook script treats an empty
+          # configuration as a no-op (and fails instead when REQUIRED is 1).
+          WINDOWS_SIGN_PFX: ${{ vars.WINDOWS_AUTHENTICODE == 'true' && format('{0}/windows-sign.pfx', runner.temp) || '' }}
+          WINDOWS_SIGN_PFX_PASS: ${{ secrets.WINDOWS_SIGN_PFX_PASS }}
+          WINDOWS_SIGN_REQUIRED: ${{ vars.WINDOWS_AUTHENTICODE == 'true' && '1' || '0' }}
+          WINDOWS_SIGN_TS: ${{ vars.WINDOWS_SIGN_TS || 'http://timestamp.digicert.com' }}
+          WINDOWS_SIGN_DESC: Link Ping Prometheus
+          WINDOWS_SIGN_URL: https://github.com/callumau/link_ping_prometheus
 
       # v4.2.2 (SHA-pinned for supply-chain safety). SLSA build provenance
       # for the release artifacts: every artifact listed in GoReleaser's

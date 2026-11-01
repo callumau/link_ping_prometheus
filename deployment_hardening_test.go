@@ -235,3 +235,29 @@ func TestSecurityDocDocumentsTheWeakModes(t *testing.T) {
 	mustContain(t, "docs/security.md", body, "v0.7 interop escape hatch", "header coverage must be documented as interop-only")
 	mustContain(t, "docs/security.md", body, "targeted\n    \"100% loss\"", "secret-less budget spoofing must be documented")
 }
+
+// TestWindowsSigningIsWiredAndInert pins the Authenticode plumbing: GoReleaser
+// must sign each Windows binary BEFORE it is archived (signing the zip would
+// leave the exe inside unsigned), the hook must be a no-op when no certificate
+// is configured (so developer/snapshot builds keep working), and the release
+// workflow must gate signing on a repository variable rather than failing every
+// release until secrets exist.
+func TestWindowsSigningIsWiredAndInert(t *testing.T) {
+	gr := readDeploymentFile(t, ".goreleaser.yaml")
+	mustContain(t, ".goreleaser.yaml", gr, "sign-windows.sh", "the post-build hook must call the signer")
+	mustContain(t, ".goreleaser.yaml", gr, "hooks:", "signing must run before archiving")
+
+	script := readDeploymentFile(t, "installer/windows/sign-windows.sh")
+	mustContain(t, "installer/windows/sign-windows.sh", script, "no signing certificate configured", "an unconfigured run must be a no-op")
+	mustContain(t, "installer/windows/sign-windows.sh", script, "WINDOWS_SIGN_REQUIRED", "CI must be able to make it fatal")
+	mustContain(t, "installer/windows/sign-windows.sh", script, "Number of verified signatures: 1", "the script must verify its own output (exit code alone fails for self-signed)")
+
+	wf := readDeploymentFile(t, ".github/workflows/release.yml")
+	mustContain(t, ".github/workflows/release.yml", wf, "vars.WINDOWS_AUTHENTICODE == 'true'", "signing must be opt-in")
+	mustContain(t, ".github/workflows/release.yml", wf, "WINDOWS_SIGN_REQUIRED", "the release must fail if signing is enabled but unconfigured")
+	mustContain(t, ".github/workflows/release.yml", wf, "OSSL_SHA=", "the signer must be pinned")
+
+	doc := readDeploymentFile(t, "docs/release-signing.md")
+	mustContain(t, "docs/release-signing.md", doc, "SignPath Foundation", "the free OSS option must be documented")
+	mustContain(t, "docs/release-signing.md", doc, "Azure Artifact Signing", "the managed option must be documented")
+}

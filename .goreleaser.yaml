@@ -17,6 +17,15 @@ builds:
     ldflags:
       - -s -w
       - -X main.version={{.Version}}
+    # Authenticode-sign each Windows binary BEFORE it is wrapped in a zip, so
+    # the .exe inside the archive carries the signature. The script is a
+    # successful no-op when no certificate is configured (a developer or
+    # snapshot build keeps working) and refuses to run half-configured. See
+    # docs/release-signing.md.
+    hooks:
+      post:
+        - >-
+          sh ./installer/windows/sign-windows.sh "{{ .Path }}"
 
 archives:
   - formats: ["tar.gz"]
