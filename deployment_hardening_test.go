@@ -19,7 +19,11 @@ func readDeploymentFile(t *testing.T, path string) string {
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
 	}
-	return string(b)
+	// actions/checkout on the windows-latest runner leaves core.autocrlf at
+	// its default, so these files arrive with CRLF. Normalise before any
+	// multi-line assertion; the shipped bytes are LF and CI must not depend
+	// on the runner's git configuration.
+	return strings.ReplaceAll(string(b), "\r\n", "\n")
 }
 
 func mustContain(t *testing.T, path, body, needle, why string) {
