@@ -32,9 +32,8 @@ import (
 //     server-side, while a secret-less client's frames are dropped with
 //     reason=hmac (HMAC-credential delivery AND enforcement).
 //
-// Gated behind LPP_E2E_WINDOWS=1 like the SCM lifecycle e2e: it needs an
-// elevated host with a working SCM-start path (see that test's skip note
-// for why the GitHub runner is not one). Cleanup unconditionally stops,
+// Runs in CI on windows-latest with LPP_E2E_WINDOWS=1 (the Windows job sets
+// it), alongside the SCM lifecycle e2e. Cleanup unconditionally stops,
 // uninstalls, and removes the Environment value, so a crashed run cannot
 // leave credentials on the host.
 

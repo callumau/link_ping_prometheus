@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,14 +32,14 @@ func svcHasAdmin(t *testing.T) bool {
 }
 
 func TestE2EWindowsServiceLifecycle(t *testing.T) {
-	// Install/config/uninstall is CI-safe and runs with
-	// LPP_E2E_WINDOWS_INSTALL=1. The SCM start/stop half stays behind the
-	// manual gate: on hosted runners the SCM-started process dies
-	// pre-dispatch under LocalSystem (1053) and is only debuggable on an
-	// interactive host (see docs/development.md).
+	// Both halves run in CI on windows-latest: LPP_E2E_WINDOWS_INSTALL covers
+	// install/config/uninstall, LPP_E2E_WINDOWS additionally starts and stops
+	// the service through the SCM. The start/stop half used to be gated on a
+	// "1053 pre-dispatch" theory; it passes on the hosted runner, and the
+	// failures that had kept it gated were bugs in this test.
 	full := os.Getenv("LPP_E2E_WINDOWS") == "1"
 	if !full && os.Getenv("LPP_E2E_WINDOWS_INSTALL") != "1" {
-		t.Skip("set LPP_E2E_WINDOWS_INSTALL=1 for the install/config/uninstall e2e (CI), or LPP_E2E_WINDOWS=1 for the full SCM start/stop lifecycle (manual)")
+		t.Skip("set LPP_E2E_WINDOWS_INSTALL=1 for install/config/uninstall, or LPP_E2E_WINDOWS=1 to also start/stop the service")
 	}
 	if !svcHasAdmin(t) {
 		t.Skip("SCM manager connect needs elevation; runner lacks it")
@@ -94,6 +95,14 @@ func TestE2EWindowsServiceLifecycle(t *testing.T) {
 	}
 	if len(cfg.Dependencies) < 2 {
 		t.Errorf("dependencies not recorded: %v (want Tcpip + W32Time)", cfg.Dependencies)
+	}
+	// Regression guard for the audit finding that every -svc=install
+	// registered a bare ImagePath: platformInstallService received the
+	// validated argv and never forwarded it, so the SCM launched the agent
+	// with no flags and it exited 1 every five seconds. The persisted command
+	// line MUST carry the validated args.
+	if !strings.Contains(cfg.BinaryPathName, "-svc=run") || !strings.Contains(cfg.BinaryPathName, "-mode=server") || !strings.Contains(cfg.BinaryPathName, "-allow=127.0.0.1") {
+		t.Errorf("service ImagePath lost the validated argv: %q", cfg.BinaryPathName)
 	}
 
 	// CI runs only the install half. Assert the teardown here so the CI run

@@ -210,11 +210,16 @@ jobs:
           cache: false
 
       - name: Run Tests (race detector)
-        # LPP_E2E_WINDOWS_INSTALL=1 runs the CI-safe install/config/uninstall
-        # half of the Windows service e2e. LPP_E2E_WINDOWS is deliberately NOT
-        # set: the SCM start/stop lifecycle dies pre-dispatch under LocalSystem
-        # (1053) on hosted runners and stays manual (see docs/development.md).
+        # Both Windows service e2e halves run here: install/config/uninstall
+        # (LPP_E2E_WINDOWS_INSTALL) and the full SCM start/stop lifecycle plus
+        # credential env-delivery (LPP_E2E_WINDOWS). The start/stop half was
+        # gated for years on a "1053 pre-dispatch" theory; when it was finally
+        # run on this runner it passed, and the failures that had kept it gated
+        # were bugs in the test itself (metrics auth over plaintext without
+        # -metrics-allow-insecure, and a drop-series assertion that could never
+        # match). Do not re-gate without a fresh runner log showing a real
+        # dispatch failure.
         env:
           LPP_E2E_WINDOWS_INSTALL: "1"
-          LPP_E2E_WINDOWS: "1"   # TEMPORARY experiment: does SCM start work on today's runner?
+          LPP_E2E_WINDOWS: "1"
         run: go test -count=1 -race -timeout 30m -v ./...
