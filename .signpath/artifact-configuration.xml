@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  SignPath artifact configuration for the Windows release archives.
+
+  Input: one of the GoReleaser Windows zips
+  (link_ping_prometheus_Windows_{i386,x86_64,arm64}.zip), which contains
+  link_ping_prometheus.exe at the archive root.
+
+  The metadata restrictions are not decorative: SignPath Foundation requires
+  every signed PE to carry product name/version attributes, and the build
+  embeds them with installer/windows/gen-versioninfo.sh. If the binary is built
+  without that resource, the signing request is rejected here rather than
+  producing a signed-but-unattributable file.
+
+  `${version}` is a user-defined parameter: pass the release version (for
+  example 0.9.0, without the leading v) with each signing request.
+-->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <parameters>
+    <parameter name="version" required="true" />
+  </parameters>
+  <zip-file>
+    <pe-file path="link_ping_prometheus.exe"
+             product-name="Link Ping Prometheus"
+             product-version="${version}"
+             file-version="${version}"
+             company-name="link_ping_prometheus"
+             original-filename="link_ping_prometheus.exe">
+      <authenticode-sign
+        description="Link Ping Prometheus"
+        description-url="https://github.com/callumau/link_ping_prometheus" />
+    </pe-file>
+  </zip-file>
+</artifact-configuration>

@@ -251,6 +251,18 @@ jobs:
               echo "$others"
               echo ""
             fi
+            echo "## Code signing policy"
+            echo ""
+            echo "Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org)."
+            echo ""
+            if [ "${WINDOWS_AUTHENTICODE:-}" = "true" ]; then
+              echo "The Windows executables in this release are Authenticode-signed by SignPath Foundation."
+            else
+              echo "Windows executables in this release are **not** Authenticode-signed yet (the SignPath project is pending approval). Verify the download with the signed checksums instead: [CODE_SIGNING_POLICY.md](https://github.com/${REPO}/blob/${TAG}/CODE_SIGNING_POLICY.md)."
+            fi
+            echo ""
+            echo "Scope, roles and the privacy policy: [CODE_SIGNING_POLICY.md](https://github.com/${REPO}/blob/${TAG}/CODE_SIGNING_POLICY.md)."
+            echo ""
             echo "## Full changelog"
             if [[ -n "$PREV" ]]; then
               URL="https://github.com/${REPO}/compare/${PREV}...${TAG}"
@@ -264,3 +276,4 @@ jobs:
           gh release edit "$TAG" --notes-file "$BODY"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WINDOWS_AUTHENTICODE: ${{ vars.WINDOWS_AUTHENTICODE }}

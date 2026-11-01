@@ -261,3 +261,44 @@ func TestWindowsSigningIsWiredAndInert(t *testing.T) {
 	mustContain(t, "docs/release-signing.md", doc, "SignPath Foundation", "the free OSS option must be documented")
 	mustContain(t, "docs/release-signing.md", doc, "Azure Artifact Signing", "the managed option must be documented")
 }
+
+// TestCodeSigningPolicyIsComplete pins the SignPath Foundation requirements a
+// reviewer checks before accepting a project: the exact statement, the three
+// named roles, a privacy policy, the "not a hacking tool" clarification, and
+// the term "Code signing policy" on the home page.
+func TestCodeSigningPolicyIsComplete(t *testing.T) {
+	policy := readDeploymentFile(t, "CODE_SIGNING_POLICY.md")
+	mustContain(t, "CODE_SIGNING_POLICY.md", policy,
+		"Free code signing provided by [SignPath.io](https://about.signpath.io),",
+		"the required statement")
+	mustContain(t, "CODE_SIGNING_POLICY.md", policy, "certificate by [SignPath Foundation](https://signpath.org)", "the required statement")
+	for _, role := range []string{"**Authors**", "**Reviewers**", "**Approvers**"} {
+		mustContain(t, "CODE_SIGNING_POLICY.md", policy, role, "SignPath requires named roles")
+	}
+	mustContain(t, "CODE_SIGNING_POLICY.md", policy, "transfers no information to other networked systems", "privacy policy")
+	mustContain(t, "CODE_SIGNING_POLICY.md", policy, "not a security\nscanner", "the no-hacking-tools clause needs an explicit answer")
+
+	readme := readDeploymentFile(t, "README.md")
+	mustContain(t, "README.md", readme, "## Code signing policy", "the home page must name the policy")
+	mustContain(t, "README.md", readme, "CODE_SIGNING_POLICY.md", "the home page must link the policy")
+}
+
+// TestSignPathArtifactConfigurationMatchesTheBuild pins the artifact config
+// against what the build actually produces: the archive root holds the exe and
+// the metadata restrictions match the values gen-versioninfo.sh embeds. A
+// mismatch makes every signing request fail at SignPath.
+func TestSignPathArtifactConfigurationMatchesTheBuild(t *testing.T) {
+	cfg := readDeploymentFile(t, ".signpath/artifact-configuration.xml")
+	mustContain(t, ".signpath/artifact-configuration.xml", cfg, `path="link_ping_prometheus.exe"`, "the exe sits at the zip root")
+
+	gen := readDeploymentFile(t, "installer/windows/gen-versioninfo.sh")
+	mustContain(t, "installer/windows/gen-versioninfo.sh", gen, `-product-name "Link Ping Prometheus"`, "product name must match the artifact config")
+	mustContain(t, "installer/windows/gen-versioninfo.sh", gen, `-original-name "link_ping_prometheus.exe"`, "original filename must match")
+
+	gr := readDeploymentFile(t, ".goreleaser.yaml")
+	mustContain(t, ".goreleaser.yaml", gr, "gen-versioninfo.sh", "the version resource must be generated before builds")
+
+	// The release body carries the required statement on every download page.
+	wf := readDeploymentFile(t, ".github/workflows/release.yml")
+	mustContain(t, ".github/workflows/release.yml", wf, "certificate by [SignPath Foundation]", "release pages must carry the statement")
+}

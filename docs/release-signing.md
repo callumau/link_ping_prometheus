@@ -73,21 +73,53 @@ an open-source Windows binary for free".
 - **Trust:** public — SmartScreen/AppLocker accept it. The publisher shown is
   *SignPath Foundation* on behalf of the project, not the maintainer.
 - **Eligibility:** OSI-approved licence, public actively-developed repository,
-  no proprietary components, no malware. This repository is GPL-3.0, so it
-  qualifies on licence.
-- **Requires:** MFA on SignPath and GitHub, named signing roles, a repository
-  page headed **Code signing policy** naming the committers/reviewers/approvers
-  and stating "Free code signing provided by SignPath.io, certificate by
-  SignPath Foundation", and a manual approval for each signing request.
-- **Integration:** GitHub Action `SignPath/github-action-submit-signing-request`
-  plus an artifact-configuration XML; the release flow becomes
-  build → submit → approve → download signed artifact → publish. That is a
-  larger restructuring than the hook below, and it cannot be tested without an
-  approved SignPath project, so it is documented here rather than pre-wired.
+  released, documented, no proprietary components, no malware, no hacking
+  tools. This repository is GPL-3.0 and qualifies on licence; the policy in
+  [CODE_SIGNING_POLICY.md](../CODE_SIGNING_POLICY.md) covers the roles, privacy
+  and "not a security scanner" points.
+- **Requires:** MFA on SignPath and GitHub, named signing roles, the policy page
+  above, and a manual approval for each signing request.
 
-If you want this path, apply at <https://signpath.org/apply> and then replace
-the GoReleaser post hook with a SignPath signing step. Keep the hook's
-no-op-when-unconfigured behaviour.
+#### Readiness in this repository
+
+| Requirement | Where |
+|---|---|
+| "Code signing policy" page with the required statement, roles and privacy policy | [CODE_SIGNING_POLICY.md](../CODE_SIGNING_POLICY.md) and the README section linking it |
+| The statement on download/release pages | generated into every release body by `.github/workflows/release.yml` |
+| PE product name/version metadata (their artifact configuration enforces it) | `installer/windows/gen-versioninfo.sh` runs in GoReleaser's `before` hook; `installer/windows/versioninfo.json` |
+| Artifact configuration | `.signpath/artifact-configuration.xml` (one Windows zip → sign the exe inside, with metadata restrictions) |
+| Release is reproducible from a tag by the project's own CI | `release.yml` builds, tests and packages from `v*` tags |
+| Not a hacking tool | policy section explaining the fixed echo protocol and fail-closed allowlist |
+
+#### Applying
+
+1. Push the policy page and README link to `main` first — SignPath reviews the
+   public repository.
+2. Apply at <https://signpath.org/apply> with the repository URL, the download
+   page (`https://github.com/callumau/link_ping_prometheus/releases`), the
+   licence and the policy URL.
+3. On acceptance, install the SignPath GitHub App, create the project, upload
+   `.signpath/artifact-configuration.xml`, and create a signing policy that
+   - uses the SignPath Foundation certificate,
+   - requires GitHub origin verification (restricted to this repository and the
+     `release.yml` workflow on `v*` tags),
+   - requires one manual approval per signing request.
+4. Create an API token for a submitter-only CI user and store it as the
+   repository secret `SIGNPATH_API_TOKEN`; add the variables
+   `SIGNPATH_ORGANIZATION_ID`, `SIGNPATH_PROJECT_SLUG` and
+   `SIGNPATH_SIGNING_POLICY_SLUG`.
+
+The release flow then becomes: build and package with GoReleaser **without**
+publishing, submit the Windows zips to SignPath, wait for approval, download the
+signed zips, and publish those as the GitHub release. SignPath's action is
+`SignPath/github-action-submit-signing-request` (pin it by SHA like every other
+action here); the request needs `artifact-configuration-slug` and the
+`version` parameter from `.signpath/artifact-configuration.xml`.
+
+Because that restructuring needs an approved project to test, it is not
+pre-wired: the self-signed hook below stays the default until the project is
+accepted, then the Windows zips are routed through SignPath and the
+`WINDOWS_AUTHENTICODE` self-signed path is retired.
 
 ### 2. Azure Artifact Signing (formerly Trusted Signing) — cheap, managed
 

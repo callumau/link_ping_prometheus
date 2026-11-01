@@ -2,6 +2,14 @@ version: 2
 
 project_name: link_ping_prometheus
 
+# The Windows binaries need a PE VERSIONINFO resource: Windows Explorer and the
+# UAC prompt read it, and SignPath's artifact configuration ENFORCES product
+# name/version metadata, so a binary without it cannot be signed. Generated
+# before the builds so Go picks up resource_windows_<goarch>.syso.
+before:
+  hooks:
+    - sh ./installer/windows/gen-versioninfo.sh {{ .Version }}
+
 builds:
   - env:
       - CGO_ENABLED=0

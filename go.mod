@@ -11,6 +11,11 @@ require (
 )
 
 require (
+	github.com/akavel/rsrc v0.10.2 // indirect
+	github.com/josephspurrier/goversioninfo v1.7.0 // indirect
+)
+
+require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
@@ -19,3 +24,5 @@ require (
 	golang.org/x/sys v0.48.0
 	google.golang.org/protobuf v1.36.12 // indirect
 )
+
+tool github.com/josephspurrier/goversioninfo/cmd/goversioninfo
