@@ -110,9 +110,23 @@ func (a *AdaptiveStats) maxRTO() float64 {
 // in +Inf on such links. Capping the SEED (see maxRTO) would be worse still:
 // it discards the operator's -timeout, so a path slower than 3s never
 // bootstraps at all.
+// maxAppliedRTOSec bounds the applied RTO at 24h. It exists to keep the
+// seconds -> Duration conversion inside int64 nanoseconds (max ~292 years);
+// any real link is orders of magnitude below it.
+const maxAppliedRTOSec = 24 * 60 * 60
+
 func (a *AdaptiveStats) CurrentRTO() time.Duration {
 	floor := math.Max(DefaultMinRTO.Seconds(), 2*a.srtt)
 	val := math.Max(math.Min(a.rto, a.maxRTO()), floor)
+	// Saturate before the float64 -> int64 nanosecond conversion. A seed near
+	// the Duration maximum overflows that conversion to a NEGATIVE Duration,
+	// which the probe loop would apply as a write deadline in the past: no
+	// probe sent, link_up 0, send errors. Config.Validate caps -timeout well
+	// below this, so the clamp is a backstop for values reaching the type
+	// directly (tests, embedders).
+	if val > maxAppliedRTOSec {
+		val = maxAppliedRTOSec
+	}
 	return time.Duration(val * float64(time.Second))
 }
 

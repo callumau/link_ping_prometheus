@@ -123,11 +123,16 @@ func mtuDeadline(cfg Config, state *probeLoopState) time.Duration {
 // Forged or stale frames are skipped the same way, and the deadline is
 // absolute, so skipping cannot extend the wait (and a stream of foreign
 // datagrams cannot spin the loop past it).
+// mtuMaxReadErrors bounds consecutive non-timeout read errors tolerated while
+// waiting for one sweep echo (see the loop in readEcho).
+const mtuMaxReadErrors = 3
+
 func readEcho(ctx context.Context, conn net.Conn, buf []byte, size int, seqs []uint64, sent map[uint64]uint64, secret string, coverage HmacCoverage, deadline time.Time) error {
 	var verifyMac *probeMACer
 	if secret != "" {
 		verifyMac = newProbeMACer(secret)
 	}
+	readErrs := 0
 	for {
 		// The absolute probe deadline is SLICED into bounded re-arms: a
 		// mid-wait cancellation (reload stop, process shutdown) unblocks
@@ -155,10 +160,26 @@ func readEcho(ctx context.Context, conn net.Conn, buf []byte, size int, seqs []u
 				if cerr := ctx.Err(); cerr != nil {
 					return cerr
 				}
+				readErrs = 0
+				continue
+			}
+			// A non-timeout error on a connected UDP socket is usually an
+			// ICMP-derived condition (frag-needed/EMSGSIZE from an earlier,
+			// larger DF probe, or port/host unreachable). ICMP messages carry
+			// no sequence identity, so charging one to the probe currently
+			// awaited would step the search below the real MTU. The probes
+			// were already sent; only the absolute deadline decides loss.
+			// Bounded so a genuinely broken socket cannot spin here.
+			if !time.Now().After(deadline) && readErrs < mtuMaxReadErrors {
+				readErrs++
+				if cerr := ctx.Err(); cerr != nil {
+					return cerr
+				}
 				continue
 			}
 			return err
 		}
+		readErrs = 0
 		// Cancellation checkpoint on EVERY received datagram, not only
 		// on arm expiry: the skip paths below re-arm immediately, so a
 		// socket that receives at least one datagram per arm (late echoes
@@ -199,18 +220,18 @@ func readEcho(ctx context.Context, conn net.Conn, buf []byte, size int, seqs []u
 			continue
 		}
 		if secret != "" {
-			// Verify under the coverage the sweep sent with; no fallback: the
-			// server echoes buf[:n] unmodified, so an echo can only carry the
-			// tag we wrote. buf[24:32] is in bounds here: secret set means
-			// size is at least PayloadSizeWithHMAC, and the size gate above
-			// already matched n == size.
-			ok := verifyMac.verifyHeader(got, wantSent, buf[24:32])
-			if !ok && coverage == HMACFullFrameCoverage {
-				// Full-frame coverage: the header check fails for a
-				// payload-bearing frame's full-frame tag, so verify the whole
-				// frame instead (tag slot skipped). Header-only probes
-				// already passed above — the coverages coincide there.
+			// Verify under the coverage the sweep SENT with — exactly one,
+			// never either. Accepting the other coverage would let a frame
+			// tagged for a different deployment satisfy this probe, and it
+			// contradicts the main reader, which has no fallback. buf[24:32]
+			// is in bounds here: secret set means size >= PayloadSizeWithHMAC
+			// and the size gate above matched n == size.
+			payload := size - PayloadSizeWithHMAC
+			var ok bool
+			if tagsPayload(coverage, payload) {
 				ok = verifyMac.verifyFullFrame(buf[:n])
+			} else {
+				ok = verifyMac.verifyHeader(got, wantSent, buf[24:32])
 			}
 			if !ok {
 				continue // wrong tag: not an echo the prober sent

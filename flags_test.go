@@ -401,14 +401,15 @@ func TestResolveAllowlist(t *testing.T) {
 // TestValidateScavengeInterval pins the -mem-scavenge floor: each tick is a
 // stop-the-world runtime.ReadMemStats (plus debug.FreeOSMemory above the
 // releasable threshold), so a sub-100ms interval would distort the RTT this
-// agent exists to measure. 0 keeps meaning "disabled".
+// agent exists to measure. 0 keeps meaning "disabled"; a NEGATIVE value is
+// refused rather than silently disabling the scavenger.
 func TestValidateScavengeInterval(t *testing.T) {
 	for _, tc := range []struct {
 		every   time.Duration
 		wantErr bool
 	}{
 		{0, false},
-		{-time.Second, false},
+		{-time.Second, true},
 		{time.Millisecond, true},
 		{minScavengeInterval - time.Millisecond, true},
 		{minScavengeInterval, false},
@@ -489,4 +490,29 @@ func TestBuildConfigMeshSelfSkip(t *testing.T) {
 			t.Errorf("client mode must keep all 3 targets, got %d", len(cfg.Targets))
 		}
 	})
+}
+
+// TestWarnShadowedAndWeakenedConfig pins the two silent configurations the
+// audit found: a flag silently overriding a credential already present in the
+// environment (a rotation then has no effect and nothing says so), and
+// -hmac-coverage=header with a payload, which authenticates only the header.
+func TestWarnShadowedAndWeakenedConfig(t *testing.T) {
+	saveFlags(t)
+	t.Setenv("LINK_PING_ECHO_SECRET", "env-secret")
+	*flEchoSecret = "flag-secret"
+	*flHMACCoverage = "header"
+	*flPayload = 16
+
+	logs := captureLogs(t)
+	warnShadowedAndWeakenedConfig(startupFlags{echoSecret: "flag-secret"})
+	waitForLog(t, logs, "shadows the environment")
+	waitForLog(t, logs, "authenticates only the 24-byte header")
+
+	// Identical values must not warn about shadowing. The channel is drained
+	// for a short window so the assertion sees any record that was emitted.
+	*flEchoSecret = "env-secret"
+	warnShadowedAndWeakenedConfig(startupFlags{echoSecret: "env-secret"})
+	if n := countLogs(logs, "shadows the environment", 200*time.Millisecond); n != 0 {
+		t.Errorf("identical flag/env values warned about shadowing %d time(s)", n)
+	}
 }

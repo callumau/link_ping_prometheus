@@ -45,7 +45,7 @@ func resolveEchoSecretOld() string {
 //     /readyz answers 200 unconditionally.
 //   - with both -targets and -target set, buildConfig's else-if means -targets wins.
 func warnIgnoredFlags(mode string) {
-	if *flEchoSecretOld != "" && mode == "client" {
+	if resolveEchoSecretOld() != "" && mode == "client" {
 		slog.Warn("-echo-secret-old set but ignored: the old secret is only accepted by the echo server (server/both mode), not by the client")
 	}
 	// -listen's default (":4000") is non-empty, so compare against the
@@ -180,6 +180,43 @@ func resolveSource() (string, error) {
 	return source, nil
 }
 
+// warnShadowedAndWeakenedConfig surfaces two silent configurations that have
+// caused real incidents:
+//
+//   - a flag silently shadowing a credential already present in the
+//     environment. A unit file that keeps an old -echo-secret while the env
+//     file is rotated leaves the retired secret as the primary forever,
+//     because the env change has no effect and nothing says so.
+//   - -hmac-coverage=header with -payload and a secret. The v0.7 escape hatch
+//     authenticates the header only, so a payload tampered in flight (or
+//     substituted under a captured header tag) still authenticates. It is
+//     legitimate while a v0.7 reflector is still deployed; it must not be left
+//     on afterwards by accident.
+func warnShadowedAndWeakenedConfig(sf startupFlags) {
+	type shadow struct {
+		flagName string
+		flagVal  string
+		envName  string
+	}
+	for _, sh := range []shadow{
+		{"echo-secret", *flEchoSecret, "LINK_PING_ECHO_SECRET"},
+		{"echo-secret-old", *flEchoSecretOld, "LINK_PING_ECHO_SECRET_OLD"},
+		{"metrics-user", *flMetricsBasicAuthUser, "LINK_PING_METRICS_USER"},
+	} {
+		env := os.Getenv(sh.envName)
+		if sh.flagVal == "" || env == "" || sh.flagVal == env {
+			continue
+		}
+		slog.Warn("flag shadows the environment value: the environment one is ignored",
+			"flag", "-"+sh.flagName, "env", sh.envName,
+			"fix", "set only one of them, or make them identical")
+	}
+
+	if *flHMACCoverage == "header" && *flPayload > 0 && sf.echoSecret != "" {
+		slog.Warn("-hmac-coverage=header with -payload authenticates only the 24-byte header: a payload tampered in flight or substituted under a captured header tag still verifies; use full-frame unless the reflector is still v0.7")
+	}
+}
+
 // buildConfig resolves CLI flags into a prober.Config. It handles single
 // (-target) and multi-target (-targets) modes. Failures are returned as
 // errors so the caller can abort before any server starts.
@@ -304,6 +341,7 @@ func checkStartupFlags() (startupFlags, error) {
 	// Runs here (not in run()) so the ignored-flag warnings also reach an
 	// operator at install time, when the persisted flags are still editable.
 	warnIgnoredFlags(*flMode)
+	warnShadowedAndWeakenedConfig(sf)
 
 	user, pass, err := resolveMetricsAuth()
 	if err != nil {
