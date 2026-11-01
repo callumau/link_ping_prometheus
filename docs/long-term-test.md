@@ -17,48 +17,58 @@ other, left running for several days.
 
 ## Topology
 
+The deployed test is **one-directional and cross-platform**: the Linux host is
+the reflector, the Windows host is the prober. That is the shape the mesh
+deployments use most often (one shared echo server per site, N clients), and it
+puts the Windows client code — clock, MTU sweep, targets file, log/DACL — under
+a real WAN path.
+
 ```text
-   linux-site  (Linux, -mode=both)  ── UDP 4000 echo ──  win-site (Windows, -mode=both)
-        │                                                       │
-        └──────────── TCP 2112 /metrics, /status ───────────────┘
-                       scraped by Prometheus
+   win-site (Windows, -mode=client)  ── UDP 4000 probes ──▶  linux-site (Linux, -mode=server)
+        └──────────── TCP 2112 /metrics, /status ────────────────┘
 ```
 
-Each node both probes the other and answers its probes:
-
-| Node | Role | Why both |
+| Node | Mode | Why |
 |---|---|---|
-| `linux-site` | probes `win-site`, answers `win-site` | exercises the Linux service, log sink, clock |
-| `win-site` | probes `linux-site`, answers `linux-site` | exercises the SCM service, DACL recheck, Windows clock |
+| `linux-site` | `-mode=server` | exercises the echo loop, allowlist, rate budgets and metric cardinality under continuous load |
+| `win-site` | `-mode=client` | exercises the probe loop, adaptive RTO, MTU sweep, targets file and the SCM service for days |
 
-Running `-mode=both` on both ends also covers the mixed-platform wire path:
-HMAC tag coverage, the 24/32-byte frame choice, and the replay window.
+If you also want both endpoints' *client* code under soak (and the mixed-platform
+echo path in both directions), run `-mode=both` on both hosts instead. That
+doubles the probe load per host and adds the Windows echo loop; the daily checks
+below are unchanged.
 
 ## Setup
 
 Use the released binaries of the **same version** on both hosts and record it
 (`link_ping_build_info`); a version skew invalidates the comparison.
 
-**`targets.json` on each host** (one entry: the peer). Keep it 0644 root-owned;
-the agent refuses symlinks and group/world-writable files.
+**`targets.json` on the Windows prober** (one entry: the reflector). Keep it
+0644 root-owned (POSIX) or admin-owned with an inherited-only DACL on Windows;
+the agent refuses symlinks and group/world-writable files on POSIX and checks
+the owner on both.
 
 ```json
 [{ "name": "peer", "address": "203.0.113.10:4000" }]
 ```
 
-**Linux (systemd):** install from [linux-systemd](linux-systemd.md) with
+**Linux reflector:** install from [linux-systemd](linux-systemd.md) with
 
 ```text
-OPTIONS="-mode=both -listen=:4000 -allow=203.0.113.20 -metrics=127.0.0.1:2112 -targets=/etc/link_ping_prometheus/targets.json -log-file=/var/log/link_ping_prometheus/service.log"
+OPTIONS="-mode=server -listen=:4000 -allow=203.0.113.20 -metrics=127.0.0.1:2112"
 LINK_PING_ECHO_SECRET=<32+ random bytes>   # 0600 env file
 ```
 
-**Windows (SCM):** install from [windows-service](windows-service.md) with
+**Windows prober:** install from [windows-service](windows-service.md) with
 
 ```text
--svc=install -mode=both -listen=:4000 -allow=203.0.113.10 -metrics=127.0.0.1:2112 -targets=C:\ProgramData\link_ping_prometheus\targets.json -log-file=C:\ProgramData\link_ping_prometheus\logs\service.log -targets-reload-interval=5m
+-svc=install -mode=client -target=203.0.113.10:4000 -metrics=127.0.0.1:2112 -log-file=C:\ProgramData\link_ping_prometheus\logs\service.log
 LINK_PING_ECHO_SECRET=<same secret>        # service Environment key, ACL'd
 ```
+
+Use `-targets` + `-targets-reload-interval` instead of `-target` when the prober
+also needs hot reload; a Windows service has no SIGHUP, so without the interval
+the file is read once at start.
 
 Checklist before starting the clock:
 
@@ -67,7 +77,8 @@ Checklist before starting the clock:
 - [ ] NTP/`W32Time` healthy on both; the replay window is ±30 s.
 - [ ] `-allow` on each host lists the peer's egress address exactly, or a
       narrow prefix. Wide prefixes without a secret are warned at startup.
-- [ ] `-targets-reload-interval` is non-zero on Windows (no SIGHUP under the SCM).
+- [ ] If the prober uses `-targets`, `-targets-reload-interval` is non-zero on
+      Windows (no SIGHUP under the SCM).
 - [ ] Prometheus scrapes both `/metrics` (or a cron `curl` into a file, below).
 - [ ] Both clocks and `TZ` recorded; logs are UTC.
 

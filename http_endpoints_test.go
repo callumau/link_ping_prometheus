@@ -378,7 +378,11 @@ func TestMetricsServerCertReloadWithoutRestart(t *testing.T) {
 // a pure "already tried" memo would serve the expired certificate forever.
 func TestMetricsServerCertReloadFailureKeepsPrevious(t *testing.T) {
 	origCooldown := certReloadRetryCooldown
-	certReloadRetryCooldown = 200 * time.Millisecond
+	// 2s, not 200ms: the "still inside the cooldown" assertion spans two TLS
+	// handshakes, and a loaded CI runner can stall longer than a few hundred
+	// milliseconds between them. That flaked as "served serial 202, want the
+	// cached 101" — the test measuring the scheduler, not the reloader.
+	certReloadRetryCooldown = 2 * time.Second
 	t.Cleanup(func() { certReloadRetryCooldown = origCooldown })
 
 	prober.InitMetrics()
