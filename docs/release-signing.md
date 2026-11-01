@@ -1,5 +1,13 @@
 # Signing the Windows executables
 
+## Status
+
+**Not enabled.** No certificate is configured, so `sign-windows.sh` is a no-op
+and Windows releases are currently **unsigned**. The SignPath Foundation
+application has not been submitted. Self-signing was evaluated for the
+Ansible-managed fleet but parked: a private CA cannot also serve public
+downloads, so the decision waits on a certificate that covers both.
+
 The release pipeline already produces three pieces of evidence that the
 binaries are the ones this repository built:
 

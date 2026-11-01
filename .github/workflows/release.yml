@@ -256,7 +256,10 @@ jobs:
             echo "Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org)."
             echo ""
             if [ "${WINDOWS_AUTHENTICODE:-}" = "true" ]; then
-              echo "The Windows executables in this release are Authenticode-signed by SignPath Foundation."
+              # Neutral on purpose: the signer identity is whatever certificate
+              # was configured (SignPath Foundation, a commercial CA, or a
+              # private CA), so name it in the certificate, not here.
+              echo "The Windows executables in this release are Authenticode-signed; the signer identity is the certificate subject (verify with \`Get-AuthenticodeSignature\`)."
             else
               echo "Windows executables in this release are **not** Authenticode-signed yet (the SignPath project is pending approval). Verify the download with the signed checksums instead: [CODE_SIGNING_POLICY.md](https://github.com/${REPO}/blob/${TAG}/CODE_SIGNING_POLICY.md)."
             fi
