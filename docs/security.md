@@ -108,3 +108,8 @@
   never silent — and `-targets`/`-target` together (`-targets` wins).
 - The wire protocol carries no sensitive data (sequence numbers and timestamps
   only) and has no TLS; firewall untrusted networks.
+- The agent does not patch or isolate the host kernel. Its metrics HTTP server
+  and any SSH/other TCP services on the box share the host TCP stack, so
+  kernel CVEs are fixed by OS updates and a reboot, not by a link-monitor
+  release. `govulncheck ./...` covers the Go dependency surface, not the
+  kernel; keep the host on a supported, patched kernel.
