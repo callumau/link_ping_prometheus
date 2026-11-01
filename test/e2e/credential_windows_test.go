@@ -142,12 +142,19 @@ func TestE2EWindowsCredentialEnvDelivery(t *testing.T) {
 	_ = client
 	waitMetricAuthGTE(t, base, mUser, mPass, "link_server_probes_received_total", 1, 20*time.Second)
 
-	// Enforcement, not mere presence: a secret-less client's frames must
-	// be REJECTED with reason=hmac by the env-authenticated server.
+	// Enforcement, not mere presence: a secret-less client's frames must be
+	// REJECTED with reason=hmac by the env-authenticated server.
+	//
+	// -payload 8 is load-bearing. A secret-less client sends a 24-byte
+	// header; with a secret configured the server expects at least 32 bytes
+	// and drops that frame at the SIZE gate, so reason=hmac would never
+	// increment. A 24+8 frame passes the size gate and fails authentication,
+	// which is the claim being tested.
 	noSecret := startBin(t,
 		"-mode=client",
 		"-source=e2enosecret",
 		fmt.Sprintf("-target=127.0.0.1:%d", listenP),
+		"-payload", "8",
 		"-interval=200ms", "-timeout=1s")
 	_ = noSecret
 	waitMetricAuthGTE(t, base, mUser, mPass, `link_server_probes_dropped_total{reason="hmac"}`, 1, 20*time.Second)
