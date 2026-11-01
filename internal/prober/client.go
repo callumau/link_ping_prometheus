@@ -161,15 +161,14 @@ func FilterSelfTargets(targets []Target, source string) []Target {
 // lets any local user make that decision. Lstat, not Stat: following a symlink
 // is exactly what a local attacker would rely on.
 func LoadTargets(path string) ([]Target, error) {
-	info, err := os.Lstat(path)
+	// Read from a verified descriptor rather than re-opening by path: the
+	// check and the read must resolve to the same object, or a directory
+	// writer can swap a symlink/FIFO in after the Lstat (the log sink and the
+	// metrics TLS pair use the same rule). A FIFO also used to block the
+	// reload supervisor inside os.ReadFile with no timeout.
+	data, info, err := ReadTrustedFile(path, MaxTargetsFileSize)
 	if err != nil {
 		return nil, fmt.Errorf("read targets file: %w", err)
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("refusing symlinked targets file %q: a symlink lets another local user repoint the probes; point -targets at the real file", path)
-	}
-	if info.Mode().IsDir() {
-		return nil, fmt.Errorf("targets path is a directory, not a file")
 	}
 	if runtime.GOOS != "windows" && info.Mode().Perm()&0o022 != 0 {
 		// 0644/0604/0620 stay accepted (readable is not the risk — writing
@@ -180,21 +179,15 @@ func LoadTargets(path string) ([]Target, error) {
 		return nil, fmt.Errorf("targets file %q is group/world-writable (mode %04o): another local user could redirect or blank the probe set; fix with: chmod o-w,g-w %s (0600 is recommended)",
 			path, info.Mode().Perm(), path)
 	}
-	if info.Size() > MaxTargetsFileSize {
-		return nil, fmt.Errorf("targets file too large: %d bytes (max %d)", info.Size(), MaxTargetsFileSize)
-	}
-
-	// pi-lens-ignore: go-path-traversal
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read targets file: %w", err)
-	}
-	if len(data) > MaxTargetsFileSize {
-		return nil, fmt.Errorf("targets file too large after read: %d bytes (max %d)", len(data), MaxTargetsFileSize)
-	}
 	var targets []Target
 	if err := json.Unmarshal(data, &targets); err != nil {
 		return nil, fmt.Errorf("parse targets json: %w", err)
+	}
+	// A document that is not an array must not silently mean "probe nothing":
+	// `null` used to unmarshal into a nil slice with no error, blanking the
+	// probe set and purging every series exactly like [] (which at least warns).
+	if targets == nil {
+		return nil, fmt.Errorf("parse targets json: expected an array of targets, got null")
 	}
 	if len(targets) > MaxTargetsCount {
 		return nil, fmt.Errorf("too many targets: %d (max %d)", len(targets), MaxTargetsCount)
