@@ -410,24 +410,36 @@ reads the file.
 ```powershell
 # 1. Script and its settings directory (no spaces in the path: the
 #    scheduled task's command line must not need quoting).
-New-Item -ItemType Directory -Force -Path 'C:\ProgramData\link_ping_prometheus\pull_config' | Out-Null
+#
+#    ProgramData lets standard users create subdirectories and keeps the
+#    creator as owner, and an owner retains implicit WRITE_DAC - so create the
+#    container, take ownership to Administrators and drop inherited ACEs
+#    BEFORE the SYSTEM task runs anything from it. Skip this and a local user
+#    who created the directory first can rewrite pull-config.ps1 (executed as
+#    SYSTEM) or the config checkout it fetches into.
+$data = 'C:\ProgramData\link_ping_prometheus'
+New-Item -ItemType Directory -Force -Path $data | Out-Null
+takeown.exe /f $data /a | Out-Null
+icacls.exe $data /inheritance:r /grant "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" | Out-Null
+
+New-Item -ItemType Directory -Force -Path "$data\pull_config" | Out-Null
 Copy-Item deploy\mesh\pull-config.ps1 `
-  'C:\ProgramData\link_ping_prometheus\pull_config\pull-config.ps1'
+  "$data\pull_config\pull-config.ps1"
 
 # 2. Deploy key, DACL restricted to SYSTEM + Administrators.
 Copy-Item \\deploy\secrets\mesh-config-deploy-key `
-  'C:\ProgramData\link_ping_prometheus\pull_config\deploy_key'
-icacls 'C:\ProgramData\link_ping_prometheus\pull_config\deploy_key' `
+  "$data\pull_config\deploy_key"
+icacls "$data\pull_config\deploy_key" `
   /inheritance:r /grant "*S-1-5-18:F" "*S-1-5-32-544:F"
 
 # 3. known_hosts (verify the fingerprints first), then run once by hand.
 Copy-Item \\deploy\secrets\github_known_hosts `
-  'C:\ProgramData\link_ping_prometheus\pull_config\known_hosts'
-& 'C:\ProgramData\link_ping_prometheus\pull_config\pull-config.ps1'
+  "$data\pull_config\known_hosts"
+& "$data\pull_config\pull-config.ps1"
 
 # 4. Schedule it. Machine-scope env vars give the script its settings.
 schtasks /Create /TN "LinkPing config pull" /SC MINUTE /MO 5 /RU SYSTEM `
-  /RL HIGHEST /F /TR "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\ProgramData\link_ping_prometheus\pull_config\pull-config.ps1"
+  /RL HIGHEST /F /TR "powershell.exe -NoProfile -ExecutionPolicy Bypass -File $data\pull_config\pull-config.ps1"
 ```
 
 Settings are machine environment variables (parameters too):
