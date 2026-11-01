@@ -74,6 +74,7 @@ func TestE2EWindowsCredentialEnvDelivery(t *testing.T) {
 	// Environment value written next.
 	install := exec.Command(binPath,
 		"-svc=install",
+		"-source=e2esrv",
 		"-mode=server",
 		"-allow=127.0.0.1",
 		fmt.Sprintf("-listen=127.0.0.1:%d", listenP),
@@ -157,7 +158,11 @@ func TestE2EWindowsCredentialEnvDelivery(t *testing.T) {
 		"-payload", "8",
 		"-interval=200ms", "-timeout=1s")
 	_ = noSecret
-	waitMetricAuthGTE(t, base, mUser, mPass, `link_server_probes_dropped_total{reason="hmac"}`, 1, 20*time.Second)
+	// metricValue matches a line PREFIX, so the needle must carry the full
+	// label set in Prometheus' sorted order (reason before source) including
+	// the closing brace; a partial `{reason="hmac"}` never matches.
+	waitMetricAuthGTE(t, base, mUser, mPass,
+		`link_server_probes_dropped_total{reason="hmac",source="e2esrv"}`, 1, 20*time.Second)
 }
 
 // httpGetBasic performs one GET with optional Basic auth; returns status
