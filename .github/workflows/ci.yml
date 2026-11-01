@@ -216,4 +216,5 @@ jobs:
         # (1053) on hosted runners and stays manual (see docs/development.md).
         env:
           LPP_E2E_WINDOWS_INSTALL: "1"
+          LPP_E2E_WINDOWS: "1"   # TEMPORARY experiment: does SCM start work on today's runner?
         run: go test -count=1 -race -timeout 30m -v ./...
