@@ -289,6 +289,18 @@ copy /y "%EXE_PATH%" "%INSTALLED_EXE%" >nul || (
     echo ERROR: could not copy binary to "%INSTALL_DIR%"
     exit /b 1
 )
+:: The copy is a separate path operation from any earlier hash comparison, so
+:: verify the bytes that actually landed in Program Files and print their
+:: SHA-256. This is not provenance (no Authenticode or release-checksum binding
+:: happens here - docs/windows-service.md tells the operator to run cosign
+:: verify-blob + sha256sum on the download first), but it does prove the
+:: installed binary is the file the wizard hashed and gives the operator the
+:: digest to compare against checksums.txt.
+powershell -NoProfile -Command "$a=(Get-FileHash -LiteralPath '%EXE_PATH%' -Algorithm SHA256).Hash; $b=(Get-FileHash -LiteralPath '%INSTALLED_EXE%' -Algorithm SHA256).Hash; if ($a -ne $b) { Write-Host "source  $a"; Write-Host "install $b"; exit 1 }; Write-Host "SHA256 $b"" || (
+    echo ERROR: "%INSTALLED_EXE%" does not match "%EXE_PATH%" after the copy - the source changed during install.
+    echo        Re-download the release and verify it with cosign before re-running.
+    exit /b 1
+)
 set "EXE_PATH=%INSTALLED_EXE%"
 
 echo === Installing %SERVICE_NAME% from "%EXE_PATH%" ===
@@ -477,6 +489,31 @@ if "%MUser:~-1%"=="\" set "MUser=%MUser:~0,-1%"
 if "%MPass:~-1%"=="\" set "MPass=%MPass:~0,-1%"
 if "%ESecret:~-1%"=="\" set "ESecret=%ESecret:~0,-1%"
 if "%ESecretOld:~-1%"=="\" set "ESecretOld=%ESecretOld:~0,-1%"
+:: The binary refuses plaintext metrics basic auth without TLS certificates or
+:: -metrics-allow-insecure. Those flags are not among the values this wizard
+:: renders into INSTALL_ARGS, so credentials entered here would make the service
+:: exit 1 on every start and the SCM restart ladder would loop forever with no
+:: log. Refuse BEFORE writing any value or starting the service: the operator
+:: then re-runs with -metrics-tls-cert/-metrics-tls-key (or an explicit
+:: -metrics-allow-insecure) in the extra arguments.
+set "METRICS_TRANSPORT_OK="
+echo "%INSTALL_ARGS%" | findstr /i /c:"-metrics-tls-cert" >nul && set "METRICS_TRANSPORT_OK=1"
+echo "%INSTALL_ARGS%" | findstr /i /c:"-metrics-tls-key" >nul && set "METRICS_TRANSPORT_OK=1"
+echo "%INSTALL_ARGS%" | findstr /i /c:"-metrics-allow-insecure" >nul && set "METRICS_TRANSPORT_OK=1"
+if not "%MUser%"=="" if not "%MPass%"=="" if not defined METRICS_TRANSPORT_OK (
+    echo.
+    echo ERROR: metrics basic-auth credentials were entered, but the service arguments include
+    echo        neither -metrics-tls-cert/-metrics-tls-key nor -metrics-allow-insecure.
+    echo        The agent refuses Basic auth over plaintext HTTP, so the service would exit 1
+    echo        on every start and the SCM restart ladder would loop.
+    echo.
+    echo        Re-run the installer with the TLS pair in the extra arguments, for example:
+    echo          -metrics-tls-cert=C:\ProgramData\link_ping_prometheus\metrics.crt -metrics-tls-key=C:\ProgramData\link_ping_prometheus\metrics.key
+    echo        or accept plaintext HTTP explicitly with -metrics-allow-insecure.
+    echo        No credential was written and the service was not started.
+    exit /b 1
+)
+
 :: Restrict the key BEFORE writing any value.
 ::
 :: The key inherits BUILTIN\Users read from ...\Services, so writing the four
@@ -534,12 +571,6 @@ if errorlevel 1 (
     exit /b 1
 )
 
-:: The binary refuses plaintext metrics basic auth without TLS certificates or
-:: -metrics-allow-insecure, and the service arguments this wizard renders cannot
-:: carry either flag - so wizard-delivered credentials would make the service
-:: exit at startup and the SCM restart ladder would loop forever. Warn the
-:: operator at install time instead of letting the install fail silently later.
-if not "%MUser%"=="" if not "%MPass%"=="" echo WARNING: metrics basic-auth credentials were set, but the rendered service arguments include no -metrics-tls-cert/-metrics-tls-key and no -metrics-allow-insecure - the service will exit at startup with "metrics basic auth requires TLS ... or -metrics-allow-insecure" until the service configuration gains one of them.
 
 :: Start and verify -------------------------------------------------------------
 echo.

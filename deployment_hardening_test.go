@@ -64,6 +64,19 @@ func TestWindowsInstallerOrdersACLBeforeSecrets(t *testing.T) {
 		t.Errorf("%s: the Environment key must be ACL'd before any credential is written (ACL block at %d, first secret at %d)", path, acl, firstSecret)
 	}
 	mustContain(t, path, body, "if (-not (Test-Path $k)) { New-Item -Path $k -Force", "the key must be created restricted before the writes")
+	// A metrics credential the runtime gate rejects must stop the install
+	// before the value is written or the service is started.
+	mustContain(t, path, body, "metrics basic-auth credentials were entered, but the service arguments include", "refuse credentials without TLS/allow-insecure")
+	guard := indexOf(t, path, body, "if not defined METRICS_TRANSPORT_OK")
+	startService := indexOf(t, path, body, "=== Starting service ===")
+	if guard > startService {
+		t.Errorf("%s: the metrics credential guard must run before the service is started", path)
+	}
+	if firstWrite := indexOf(t, path, body, `/v LINK_PING_METRICS_PASS`); guard > firstWrite {
+		t.Errorf("%s: the metrics credential guard must run before any credential is written", path)
+	}
+	// The installed bytes are verified against the source after the copy.
+	mustContain(t, path, body, "does not match \"%EXE_PATH%\" after the copy", "verify the copied binary")
 }
 
 // TestWindowsInstallerOwnsProgramDataContainer pins the ownership fix. A
@@ -203,4 +216,22 @@ func TestGitignoreCoversKeyMaterial(t *testing.T) {
 	for _, want := range []string{"targets.json", "dev_push.sh", ".env", "*.key", "*.pem", "*.p12", "*.pfx", "credentials*"} {
 		mustContain(t, ".gitignore", body, want, "the forward guard must cover this path")
 	}
+}
+
+// TestMeshGuideOwnsThePullDirectory pins the documented manual Windows recipe:
+// following it with an unmanaged ProgramData container reintroduces the
+// SYSTEM-executes-a-user-writable-directory problem that the play now fixes.
+func TestMeshGuideOwnsThePullDirectory(t *testing.T) {
+	body := readDeploymentFile(t, "docs/mesh-deployment.md")
+	mustContain(t, "docs/mesh-deployment.md", body, "takeown.exe /f $data /a", "the manual recipe must take ownership")
+	mustContain(t, "docs/mesh-deployment.md", body, "icacls.exe $data /inheritance:r", "the manual recipe must drop inherited ACEs")
+}
+
+// TestSecurityDocDocumentsTheWeakModes pins the two operational modes that are
+// bounded but real: header-only tag coverage and secret-less allowlist
+// authentication.
+func TestSecurityDocDocumentsTheWeakModes(t *testing.T) {
+	body := readDeploymentFile(t, "docs/security.md")
+	mustContain(t, "docs/security.md", body, "v0.7 interop escape hatch", "header coverage must be documented as interop-only")
+	mustContain(t, "docs/security.md", body, "targeted\n    \"100% loss\"", "secret-less budget spoofing must be documented")
 }
