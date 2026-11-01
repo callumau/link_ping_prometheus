@@ -157,7 +157,7 @@ func platformInstallService(argv []string) error {
 		Dependencies:     spec.Dependencies,
 		DelayedAutoStart: spec.DelayedAutoStart,
 		SidType:          windows.SERVICE_SID_TYPE_UNRESTRICTED,
-	})
+	}, argv...)
 	if err != nil {
 		return fmt.Errorf("create service: %w", err)
 	}

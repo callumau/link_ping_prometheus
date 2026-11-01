@@ -23,6 +23,11 @@
   source. Nodes need synchronized clocks (NTP).
 - `-hmac-coverage=full-frame` closes payload substitution: a tag over
   header+payload rejects a tampered payload riding a captured tag.
+  `-hmac-coverage=header` is the v0.7 interop escape hatch: it authenticates
+  the 24-byte header only, so a payload tampered in flight (or substituted
+  under a captured header tag) still verifies. Use `header` only while a v0.7
+  reflector is still deployed; the agent warns when the combination is in use
+  with `-payload > 0`.
   - It does NOT close tuple replay: a captured frame re-sent from another
     source within the freshness window still authenticates. The dup guard
     allows one echo per (source, seq, ts).
@@ -65,6 +70,18 @@
   The agent refuses to start with `-echo-secret-old` set while `-echo-secret`
   is empty: the old secret alone authenticates nothing, so a rotation deploy
   that lost the new secret fails loudly.
+- Without `-echo-secret`, the allowlist is the only authentication, and an
+  IP/CIDR allowlist cannot tell a real client from a spoofed source. Two
+  consequences follow, and both are bounded but real:
+  - the global packet budget (10000/s) is charged **before** authentication so
+    it can bound HMAC work; any sender able to spoof an address inside the
+    allowlist can spend it and black out every client's probes;
+  - the per-IP budget and the `{source,client}` series are keyed by source IP
+    only, so a spoofed sender inside a wide prefix can hold a victim's budget
+    at the cap and drop the victim's real probes as `rate_ip` — a targeted
+    "100% loss" that reads as a network fault.
+  Set `-echo-secret` on both ends wherever the allowlist admits anything wider
+  than a handful of exact addresses.
 - Firewall-restrict internet-facing echo endpoints to known monitoring sites.
 - `/metrics` supports HTTP Basic Auth (`-metrics-user` / `-metrics-pass`) with
   constant-time comparison over hashed credentials. Both must be set together;

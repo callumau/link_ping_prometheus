@@ -47,7 +47,13 @@ func shouldScavenge(m runtime.MemStats, minUnreleased uint64) bool {
 // minScavengeInterval). 0 keeps meaning "disabled"; only a nonzero interval
 // below the floor is refused.
 func validateScavengeInterval(every time.Duration) error {
-	if every <= 0 || every >= minScavengeInterval {
+	if every < 0 {
+		// Only 0 means "disabled" in the flag documentation; a negative
+		// interval used to be silently accepted and disabled the scavenger,
+		// so a typo read as a working configuration.
+		return fmt.Errorf("-mem-scavenge %v is negative: use 0 to disable or an interval >= %v", every, minScavengeInterval)
+	}
+	if every == 0 || every >= minScavengeInterval {
 		return nil
 	}
 	return fmt.Errorf("-mem-scavenge %v is too small: each scavenge is a stop-the-world runtime.ReadMemStats (plus debug.FreeOSMemory above the releasable threshold), so an interval this small would distort the RTT/loss this agent exists to measure; use 0 to disable or a value >= %v", every, minScavengeInterval)

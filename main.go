@@ -152,9 +152,11 @@ func main() {
 		logRepaired = repaired
 		if *flLogMaxSize == 0 {
 			// 0600 matches lumberjack's default: logs carry peer IPs and
-			// internal topology, so they are not world-readable.
+			// internal topology, so they are not world-readable. Open via the
+			// hardened helper so the sink re-checks the object it writes to
+			// (no O_NOFOLLOW-less path open, no blocking FIFO).
 			// pi-lens-ignore: go-path-traversal
-			f, err := os.OpenFile(*flLogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+			f, err := openLogFileForRepair(*flLogFile)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "open log file %q: %v\n", *flLogFile, err)
 				os.Exit(1)

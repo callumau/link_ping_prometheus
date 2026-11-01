@@ -2,13 +2,17 @@ package main
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"link_ping_prometheus/internal/prober"
+	"log"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
+	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,6 +26,91 @@ import (
 // response (risking a truncated scrape, i.e. the monitor reporting ITSELF
 // down). Excess scrapes get a 503 instead; Prometheus retries.
 const maxConcurrentScrapes = 2
+
+// maxHeaderBytes bounds the request header block the management listener will
+// read before authentication. The only pre-auth header that matters is
+// Authorization; the net/http default of 1 MiB let an unauthenticated client
+// make the process parse ~900 KiB before the 401. Scrapers and orchestrators
+// send well under a kilobyte.
+const maxHeaderBytes = 16 << 10
+
+// maxConcurrentConnections bounds accepted-but-unserved connections. The
+// listener has no auth in front of the TCP accept (and /healthz is open), so
+// an attacker on an exposed bind could otherwise hold an unbounded number of
+// goroutines, TLS handshakes and buffers on a process whose job is measuring
+// RTT. Accept blocks once the limit is reached; the kernel backlog absorbs the
+// rest. 256 is far above any scrape/orchestrator concurrency.
+var maxConcurrentConnections = 256
+
+// handshakeLogInterval throttles the http.Server ErrorLog. net/http reports
+// every failed TLS handshake through it, so an unauthenticated client could
+// emit one log line per connection and rotate the auth-failure evidence out of
+// the retained window.
+var handshakeLogInterval = time.Minute
+
+// rateLimitedLogWriter forwards one message per interval and reports how many
+// similar messages it suppressed, so a flood cannot erase the log window while
+// the first occurrence stays visible.
+type rateLimitedLogWriter struct {
+	mu         sync.Mutex
+	last       time.Time
+	suppressed int
+	forward    func(string)
+}
+
+func (w *rateLimitedLogWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	now := time.Now()
+	if !w.last.IsZero() && now.Sub(w.last) < handshakeLogInterval {
+		w.suppressed++
+		w.mu.Unlock()
+		return len(p), nil
+	}
+	n := w.suppressed
+	w.suppressed = 0
+	w.last = now
+	w.mu.Unlock()
+
+	msg := strings.TrimSpace(string(p))
+	if n > 0 {
+		msg = fmt.Sprintf("%s (%d similar messages suppressed)", msg, n)
+	}
+	w.forward(msg)
+	return len(p), nil
+}
+
+// limitListener caps concurrently accepted connections. Release is tied to
+// Close of the returned connection.
+type limitListener struct {
+	net.Listener
+	sem chan struct{}
+}
+
+func limitListenerFor(l net.Listener, n int) net.Listener {
+	return &limitListener{Listener: l, sem: make(chan struct{}, n)}
+}
+
+func (l *limitListener) Accept() (net.Conn, error) {
+	l.sem <- struct{}{}
+	c, err := l.Listener.Accept()
+	if err != nil {
+		<-l.sem
+		return nil, err
+	}
+	return &limitConn{Conn: c, release: func() { <-l.sem }}, nil
+}
+
+type limitConn struct {
+	net.Conn
+	once    sync.Once
+	release func()
+}
+
+func (c *limitConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(c.release)
+	return err
+}
 
 // shutdownJoinGrace bounds the wait for the metrics serve goroutine to exit
 // after Shutdown: an in-flight scrape holds Serve open up to the 30s
@@ -147,7 +236,49 @@ type metricsCertReloader struct {
 	statFailed bool
 }
 
+// maxTLSFileSize bounds a metrics TLS file. A PEM pair is a few KiB; the cap
+// stops a non-regular or runaway object from being read into memory.
+const maxTLSFileSize = 1 << 20
+
+// loadMetricsPair reads and validates the metrics TLS pair with the same
+// provenance rule the targets file and the log sink use. tls.LoadX509KeyPair
+// cannot be used directly: it re-resolves both paths by name with no type,
+// ownership or mode check, so a symlink at either path is followed, a FIFO
+// blocks the caller inside the reloader mutex, and a group/world-readable key
+// is accepted silently. Here the Lstat decision is bound to the descriptor
+// actually read, and the key must not be world- or group-readable.
+func loadMetricsPair(certPath, keyPath string) (tls.Certificate, error) {
+	certPEM, err := readTrustedPairFile(certPath, false)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("certificate: %w", err)
+	}
+	keyPEM, err := readTrustedPairFile(keyPath, true)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("key: %w", err)
+	}
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	return cert, nil
+}
+
+func readTrustedPairFile(path string, secret bool) ([]byte, error) {
+	data, fi, err := prober.ReadTrustedFile(path, maxTLSFileSize)
+	if err != nil {
+		return nil, err
+	}
+	if runtime.GOOS != "windows" {
+		perm := fi.Mode().Perm()
+		if perm&0o022 != 0 || (secret && perm&0o044 != 0) {
+			return nil, fmt.Errorf("TLS file %q mode %04o exposes the pair: another local user could read the private key or replace it", path, perm)
+		}
+	}
+	return data, nil
+}
+
 // certFingerprint identifies a certificate/key file pair by the metadata a
+
 // renewal changes. Hashing the contents would cost a full read on every
 // handshake; (mtime, size) is what rotators and `mv` in place actually touch.
 type certFingerprint struct {
@@ -174,7 +305,7 @@ func fingerprintCertPair(certPath, keyPath string) (certFingerprint, error) {
 // same load run() performs as startup validation. A pair that will not load is
 // a startup error, never a listener that serves nothing.
 func newMetricsCertReloader(certPath, keyPath string) (*metricsCertReloader, error) {
-	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	cert, err := loadMetricsPair(certPath, keyPath)
 	if err != nil {
 		return nil, err
 	}
@@ -208,7 +339,7 @@ func (r *metricsCertReloader) GetCertificate(*tls.ClientHelloInfo) (*tls.Certifi
 		return r.cert, nil
 	}
 	r.attempted, r.attemptedAt = fp, time.Now()
-	cert, err := tls.LoadX509KeyPair(r.certPath, r.keyPath)
+	cert, err := loadMetricsPair(r.certPath, r.keyPath)
 	if err != nil {
 		// A half-written renewal or a key that does not match: keep the working
 		// cert and say so once. Failing the handshake instead would black out
@@ -218,7 +349,15 @@ func (r *metricsCertReloader) GetCertificate(*tls.ClientHelloInfo) (*tls.Certifi
 		return r.cert, nil
 	}
 	r.cert, r.loaded = &cert, fp
-	slog.Info("Metrics TLS certificate reloaded", "cert", r.certPath, "key", r.keyPath)
+	// Log the served leaf so a substitution is distinguishable from a
+	// renewal: two reload lines naming only the paths look identical.
+	cn, serial := "", ""
+	if len(cert.Certificate) > 0 {
+		if leaf, err := x509.ParseCertificate(cert.Certificate[0]); err == nil {
+			cn, serial = leaf.Subject.CommonName, leaf.SerialNumber.String()
+		}
+	}
+	slog.Info("Metrics TLS certificate reloaded", "cert", r.certPath, "key", r.keyPath, "cn", cn, "serial", serial)
 	return r.cert, nil
 }
 
@@ -293,7 +432,11 @@ func (p *program) startMetricsServer(addr, user, pass, cert, key string, statusR
 		// failing handshake or a panicking handler would leave no trace at all.
 		// Route them through slog so they land in -log-file / the event log
 		// with everything else.
-		ErrorLog: slog.NewLogLogger(slog.Default().Handler(), slog.LevelWarn),
+		ErrorLog: log.New(&rateLimitedLogWriter{forward: func(msg string) {
+			// The message itself, so the std-log line keeps its shape and
+			// waitForLog/log-scraping rules still see "TLS handshake error".
+			slog.Warn(msg)
+		}}, "", 0),
 		// Addr is informational (Serve uses the already-bound listener) but
 		// lets tests and logs address the live server without guessing.
 		Addr:        metricsLn.Addr().String(),
@@ -308,10 +451,14 @@ func (p *program) startMetricsServer(addr, user, pass, cert, key string, statusR
 		// headers land, so a slowloris client could otherwise hold a
 		// connection open indefinitely.
 		ReadHeaderTimeout: 10 * time.Second,
+		// The only pre-auth header that matters is Authorization.
+		MaxHeaderBytes: maxHeaderBytes,
 	}
 	if tlsCfg != nil {
 		metricsSrv.TLSConfig = tlsCfg
 	}
+	// Bound concurrently accepted connections before any request work.
+	metricsLn = limitListenerFor(metricsLn, maxConcurrentConnections)
 	metricsDone := make(chan struct{})
 	go func() {
 		defer close(metricsDone)

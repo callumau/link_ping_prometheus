@@ -119,9 +119,14 @@ func hardenLogSink(path string) (repaired bool, err error) {
 		}
 		// Not there yet: create it at the enforced mode so the lumberjack
 		// path finds an existing 0600 file (its rotation copies the current
-		// file's mode onto artifacts).
+		// file's mode onto artifacts). O_EXCL: if something appeared between
+		// the Lstat and here, fall back to the existing-file path so the
+		// type and ownership checks see it instead of adopting it.
 		// pi-lens-ignore: go-path-traversal (operator-supplied -log-file path)
-		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		f, err := createLogFile(path)
+		if errors.Is(err, os.ErrExist) {
+			return hardenLogSink(path)
+		}
 		if err != nil {
 			return false, err
 		}
@@ -138,17 +143,34 @@ func hardenLogSink(path string) (repaired bool, err error) {
 	if fi.Mode()&os.ModeSymlink != 0 {
 		return false, fmt.Errorf("refusing symlinked log path %q: a symlink can redirect topology-bearing log lines into another local user's file; create the log path directly", path)
 	}
-	// Open the file we Lstat'ed (no O_CREATE: it exists) and repair its mode
-	// on the open descriptor, not by path, so the chmod lands on what we
-	// verified.
+	// Refuse every other non-regular object BEFORE open(2): a FIFO with no
+	// reader blocks a plain open forever, so a post-open check would never
+	// run. Only symlinks were refused before, which let a planted FIFO
+	// receive the whole log stream (with a reader) or hang startup (without).
+	if !fi.Mode().IsRegular() {
+		return false, fmt.Errorf("refusing non-regular log path %q (%s): only a regular file may receive topology-bearing logs", path, fi.Mode().Type())
+	}
+	// Open the file we Lstat'ed, without following a symlink and without
+	// blocking on a FIFO, then repair its mode on the open descriptor.
 	// pi-lens-ignore: go-path-traversal (operator-supplied -log-file path)
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
+	f, err := openLogFileForRepair(path)
 	if err != nil {
 		return false, err
 	}
 	defer f.Close()
 	got, err := f.Stat()
 	if err != nil {
+		return false, err
+	}
+	// Bind the decision to the object actually opened: the path could have
+	// been swapped between the Lstat and the open.
+	if !got.Mode().IsRegular() {
+		return false, fmt.Errorf("refusing non-regular log path %q (%s): only a regular file may receive topology-bearing logs", path, got.Mode().Type())
+	}
+	if !os.SameFile(fi, got) {
+		return false, fmt.Errorf("log path %q changed between check and open; refusing", path)
+	}
+	if err := checkLogFileOwner(f); err != nil {
 		return false, err
 	}
 	if runtime.GOOS == "windows" {

@@ -36,7 +36,7 @@ link_ping_extra_args: ""
 link_ping_targets_json: ""
 
 # Secrets — NEVER passed as CLI flags; delivered via the service
-# environment (EnvironmentFile on Linux, SCM Environment registry key
+# environment (EnvironmentFile on Linux, SCM Environment registry value
 # on Windows). Leave empty to omit. Encrypt with ansible-vault.
 link_ping_echo_secret: ""
 link_ping_echo_secret_old: ""   # only during a rotation

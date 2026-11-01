@@ -101,16 +101,28 @@ try {
 try {
     if (-not (Test-Path -LiteralPath $Key -PathType Leaf)) { Fail "deploy key not found: $Key" }
 
-    # A key any other local principal can read is refused by ssh itself;
-    # fail with a clearer message first. This checks the well-known broad
-    # principals rather than enumerating every ACE: an explicit narrow
-    # grant (for example to the service account) is fine and must not fail.
-    $broad = @('Everyone', 'BUILTIN\Users', 'NT AUTHORITY\Authenticated Users', 'BUILTIN\Guests', 'NT AUTHORITY\ANONYMOUS LOGON')
+    # Well-known SIDs, not localized account names: IdentityReference.Value
+    # returns the display name ("VORDEFINIERT\Benutzer" on a German host), so
+    # a name list silently matches nothing there. SIDs are language-neutral,
+    # the same reason the plays' icacls calls use *S-1-5-...
+    $broadSids = @(
+        'S-1-1-0',      # Everyone
+        'S-1-5-32-545', # BUILTIN\Users
+        'S-1-5-11',     # Authenticated Users
+        'S-1-5-32-546', # Guests
+        'S-1-5-7'       # ANONYMOUS LOGON
+    )
     $wide = @((Get-Acl -LiteralPath $Key).Access | Where-Object {
-            $_.AccessControlType -eq 'Allow' -and ($broad -contains $_.IdentityReference.Value)
+            if ($_.AccessControlType -ne 'Allow') { return $false }
+            try {
+                $sid = $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+            } catch {
+                return $false
+            }
+            return $broadSids -contains $sid
         })
     if ($wide.Count -gt 0) {
-        Fail "$Key is readable by $($wide.IdentityReference -join ', '): the deploy key must be restricted (icacls /inheritance:r /grant SYSTEM:F Administrators:F)"
+        Fail "$Key is readable by a broad local principal: the deploy key must be restricted (icacls /inheritance:r /grant SYSTEM:F Administrators:F)"
     }
 
     if (-not (Test-Path -LiteralPath $KnownHosts -PathType Leaf)) { Fail "known_hosts not found: $KnownHosts" }
@@ -124,11 +136,48 @@ try {
     # global git config.
     $sshCommand = 'ssh -i "{0}" -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="{1}" -o BatchMode=yes' -f $Key, $KnownHosts
 
+    # Repository-local configuration is executable content: core.fsmonitor is
+    # spawned as a command on fetch/reset and core.hooksPath selects hooks
+    # that run in the same commands (measured on git 2.56: both fire even on
+    # a no-op or failed fetch). This task runs as SYSTEM, so a writable
+    # .git/config would be a SYSTEM code-execution primitive. The DIRECTORY
+    # OWNERSHIP enforced by the play is the primary control; these -c
+    # overrides are defence in depth for checkouts that predate it.
+    $noHooks = Join-Path ([System.IO.Path]::GetTempPath()) 'link_ping_no_hooks'
+    $gitHardening = @('-c', 'core.fsmonitor=false', '-c', "core.hooksPath=$noHooks")
+
     if (Test-Path -LiteralPath (Join-Path $Work '.git')) {
+        # Refuse a checkout this task does not own: with a foreign owner the
+        # whole .git (config, hooks) is writable by that account. Git's
+        # safe.directory refusal would also abort the fetch, but failing here
+        # says why instead of surfacing "dubious ownership".
+        $allowedOwners = @('S-1-5-18', 'S-1-5-32-544') # SYSTEM, Administrators
+        foreach ($p in @($Work, (Join-Path $Work '.git'))) {
+            $ownerSid = $null
+            try {
+                $ownerSid = (New-Object System.Security.Principal.NTAccount(
+                        (Get-Acl -LiteralPath $p).Owner)).Translate(
+                    [System.Security.Principal.SecurityIdentifier]).Value
+            } catch {
+                Fail "cannot resolve the owner of $p; refusing an unverified checkout"
+            }
+            if ($allowedOwners -notcontains $ownerSid) {
+                Fail "$p is owned by $ownerSid, not SYSTEM or Administrators: a non-administrative owner can rewrite .git/config and .git/hooks (which run as SYSTEM). Delete the checkout and re-run."
+            }
+        }
+
+        # The checkout must still point at the configured repository; a
+        # swapped remote would install a different topology.
+        $recorded = (& git -C $Work config --get remote.origin.url) | Out-String
+        $recorded = $recorded.Trim()
+        if ($LASTEXITCODE -ne 0 -or $recorded -ne $Repo) {
+            Fail "$Work fetches $recorded, not $Repo; move it aside and re-run"
+        }
+
         Write-PullLog "fetching $Repo ($Branch)"
-        & git -c "core.sshCommand=$sshCommand" -C $Work fetch --depth 1 origin $Branch
+        & git @gitHardening -c "core.sshCommand=$sshCommand" -C $Work fetch --depth 1 origin $Branch
         if ($LASTEXITCODE -ne 0) { Fail "git fetch failed (exit $LASTEXITCODE)" }
-        & git -C $Work reset --hard "origin/$Branch"
+        & git @gitHardening -C $Work reset --hard "origin/$Branch"
         if ($LASTEXITCODE -ne 0) { Fail "git reset failed (exit $LASTEXITCODE)" }
     } elseif (Test-Path -LiteralPath $Work) {
         Fail "$Work exists but is not a git checkout; move it aside and re-run"
@@ -138,7 +187,7 @@ try {
         if ($parent -and -not (Test-Path -LiteralPath $parent)) {
             New-Item -ItemType Directory -Path $parent -Force | Out-Null
         }
-        & git -c "core.sshCommand=$sshCommand" clone --depth 1 --branch $Branch $Repo $Work
+        & git @gitHardening -c "core.sshCommand=$sshCommand" clone --depth 1 --branch $Branch $Repo $Work
         if ($LASTEXITCODE -ne 0) { Fail "git clone failed (exit $LASTEXITCODE)" }
     }
 

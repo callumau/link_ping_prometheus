@@ -69,7 +69,7 @@ link_ping_allow: ""
 link_ping_extra_args: ""
 
 # Secrets - NEVER passed as CLI flags; delivered via the service
-# environment (EnvironmentFile on Linux, SCM Environment registry key on
+# environment (EnvironmentFile on Linux, SCM Environment registry value on
 # Windows). Encrypt with ansible-vault.
 # -echo-secret is STRONGLY RECOMMENDED and cannot be generated for you: a
 # mesh without it has ONLY the derived exact-IP allowlist as reflector

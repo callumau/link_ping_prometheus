@@ -2,6 +2,14 @@ version: 2
 
 project_name: link_ping_prometheus
 
+# The Windows binaries need a PE VERSIONINFO resource: Windows Explorer and the
+# UAC prompt read it, and SignPath's artifact configuration ENFORCES product
+# name/version metadata, so a binary without it cannot be signed. Generated
+# before the builds so Go picks up resource_windows_<goarch>.syso.
+before:
+  hooks:
+    - sh ./installer/windows/gen-versioninfo.sh {{ .Version }}
+
 builds:
   - env:
       - CGO_ENABLED=0
@@ -17,6 +25,15 @@ builds:
     ldflags:
       - -s -w
       - -X main.version={{.Version}}
+    # Authenticode-sign each Windows binary BEFORE it is wrapped in a zip, so
+    # the .exe inside the archive carries the signature. The script is a
+    # successful no-op when no certificate is configured (a developer or
+    # snapshot build keeps working) and refuses to run half-configured. See
+    # docs/release-signing.md.
+    hooks:
+      post:
+        - >-
+          sh ./installer/windows/sign-windows.sh "{{ .Path }}"
 
 archives:
   - formats: ["tar.gz"]

@@ -17,7 +17,7 @@ setlocal EnableExtensions
 ::   - Binary placed in %ProgramFiles%\link_ping_prometheus (Admins-only write)
 ::   - ACL-hardened log dir; per-service SID granted write access to it only
 ::   - Credentials NEVER persisted into the service config (env vars instead)
-::   - The credential Environment key is ACL-restricted to SYSTEM/Admins
+::   - The SCM Environment value lives on the ACL-restricted service key
 ::   - Lifecycle/fatal events go to the Windows Event Log
 ::
 :: Re-running on an existing installation performs an in-place UPGRADE:
@@ -33,6 +33,7 @@ set "EXE_PATH=%~dp0link_ping_prometheus.exe"
 set "INSTALL_DIR=%ProgramFiles%\link_ping_prometheus"
 set "DEF_METRICS=127.0.0.1:2112"
 set "DEF_LOG_DIR=C:\ProgramData\link_ping_prometheus\logs"
+set "DATA_DIR=C:\ProgramData\link_ping_prometheus"
 :: -----------------------------------------------------------------------------
 
 :: --- 1. Admin check ----------------------------------------------------------
@@ -288,11 +289,34 @@ copy /y "%EXE_PATH%" "%INSTALLED_EXE%" >nul || (
     echo ERROR: could not copy binary to "%INSTALL_DIR%"
     exit /b 1
 )
+:: The copy is a separate path operation from any earlier hash comparison, so
+:: verify the bytes that actually landed in Program Files and print their
+:: SHA-256. This is not provenance (no Authenticode or release-checksum binding
+:: happens here - docs/windows-service.md tells the operator to run cosign
+:: verify-blob + sha256sum on the download first), but it does prove the
+:: installed binary is the file the wizard hashed and gives the operator the
+:: digest to compare against checksums.txt.
+powershell -NoProfile -Command "$a=(Get-FileHash -LiteralPath '%EXE_PATH%' -Algorithm SHA256).Hash; $b=(Get-FileHash -LiteralPath '%INSTALLED_EXE%' -Algorithm SHA256).Hash; if ($a -ne $b) { Write-Host "source  $a"; Write-Host "install $b"; exit 1 }; Write-Host "SHA256 $b"" || (
+    echo ERROR: "%INSTALLED_EXE%" does not match "%EXE_PATH%" after the copy - the source changed during install.
+    echo        Re-download the release and verify it with cosign before re-running.
+    exit /b 1
+)
 set "EXE_PATH=%INSTALLED_EXE%"
 
 echo === Installing %SERVICE_NAME% from "%EXE_PATH%" ===
 
 :: Log directory with restrictive ACLs -----------------------------------------
+::
+:: The ProgramData container is created and re-owned FIRST when the operator
+:: kept the default log directory. ProgramData's default ACL lets
+:: BUILTIN\Users create subdirectories, and the creator keeps implicit
+:: WRITE_DAC, so a user who created C:\ProgramData\link_ping_prometheus before
+:: this installer ran could re-grant itself access to everything below it.
+:: takeown /a forces the owner to Administrators; the icacls that follows drops
+:: inheritance and keeps SYSTEM + Administrators only. A custom log directory
+:: is left alone here: its own ACL is applied below and the installer must not
+:: seize an unrelated parent directory.
+if /i "%LOG_DIR%"=="%DEF_LOG_DIR%" call :HardenDataDir
 if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
 :: SIDs (*S-1-5-18 = SYSTEM, *S-1-5-32-544 = Administrators), never the
 :: account NAMES: "Administrators" is localized ("Administratoren" on German
@@ -366,12 +390,11 @@ if not "%SERVICE_ACCOUNT%"=="" (
 :: Credential environment variables (optional) ----------------------------------
 :: The service reads LINK_PING_METRICS_USER/PASS, LINK_PING_ECHO_SECRET and
 :: LINK_PING_ECHO_SECRET_OLD (rotation window) from its process environment. The
-:: per-service Environment registry key is the delivery mechanism, and it is
-:: world-readable until the ACL step below runs. Press Enter to skip any value
-:: you do not need.
+:: SCM builds that environment from the REG_MULTI_SZ VALUE named Environment on
+:: the service key (a same-named SUBKEY is ignored), and the key is protected
+:: before the value is written. Press Enter to skip any value you do not need.
 echo.
 echo === Optional credential environment variables (Enter to skip) ===
-set "ENV_KEY=HKLM\SYSTEM\CurrentControlSet\Services\%SERVICE_NAME%\Environment"
 
 :wiz_muser
 set "MUser="
@@ -465,49 +488,63 @@ if "%MUser:~-1%"=="\" set "MUser=%MUser:~0,-1%"
 if "%MPass:~-1%"=="\" set "MPass=%MPass:~0,-1%"
 if "%ESecret:~-1%"=="\" set "ESecret=%ESecret:~0,-1%"
 if "%ESecretOld:~-1%"=="\" set "ESecretOld=%ESecretOld:~0,-1%"
-if not "%MUser%"=="" reg add "%ENV_KEY%" /v LINK_PING_METRICS_USER /t REG_SZ /d "%MUser%" /f >nul
-if not "%MPass%"=="" reg add "%ENV_KEY%" /v LINK_PING_METRICS_PASS /t REG_SZ /d "%MPass%" /f >nul
-if not "%ESecret%"=="" reg add "%ENV_KEY%" /v LINK_PING_ECHO_SECRET /t REG_SZ /d "%ESecret%" /f >nul
-if not "%ESecretOld%"=="" reg add "%ENV_KEY%" /v LINK_PING_ECHO_SECRET_OLD /t REG_SZ /d "%ESecretOld%" /f >nul
-
-:: Restrict the credential key ------------------------------------------------
-:: The per-service Environment key inherits its ACL from ...\Services, so
-:: before this step every local user could read the plaintext metrics password
-:: and echo HMAC secret just written above. The binary cannot take them as
-:: flags - credential flags are deliberately stripped from the persisted
-:: service config - so this key ACL is the ONLY control on the secret.
-:: Inheritance is dropped (the inherited Everyone/BUILTIN\Users read goes with
-:: it) and full control is re-granted explicitly to SYSTEM and to
-:: BUILTIN\Administrators. No per-service SID grant is needed: the service
-:: process never reads this key itself - the SCM reads it as LocalSystem and
-:: injects the values into the service environment - so a custom service
-:: account is unaffected either way.
-::
-:: The step runs unconditionally and no-ops inside PowerShell when the key
-:: does not exist (no credential was entered, so nothing to protect; only the
-:: reg adds above ever create the key). That keeps the whole step a flat line
-:: with no parenthesized block, which matters here: a ")" inside a user-typed
-:: password would close a block at parse time. The PowerShell invocation is
-:: one physical line on purpose - a ^ inside the quoted -Command is a literal
-:: caret, not a line join. An operator can paste the identical snippet to
-:: re-apply or audit the ACL by hand.
-:: The identities are SIDs (S-1-5-18 = SYSTEM, S-1-5-32-544 = Administrators):
-:: the names are localized on non-English Windows and would not resolve.
-powershell -NoProfile -Command "$k='HKLM:\SYSTEM\CurrentControlSet\Services\%SERVICE_NAME%\Environment'; if (-not (Test-Path $k)) { exit 0 }; $a=Get-Acl $k; $a.SetAccessRuleProtection($true,$false); foreach($n in 'S-1-5-18','S-1-5-32-544'){ $sid=(New-Object System.Security.Principal.SecurityIdentifier($n)); $a.AddAccessRule((New-Object System.Security.AccessControl.RegistrySystemAccessRule($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'))) }; Set-Acl -Path $k -AclObject $a; Write-Host 'Environment key ACL restricted to SYSTEM + BUILTIN\Administrators.'"
-:: Fail loud: a credential-bearing key left world-readable is exactly the
-:: exposure this step removes, so never continue past a failed ACL.
-if errorlevel 1 (
-    echo ERROR: could not restrict the ACL on "%ENV_KEY%" - it may still be readable by every local user.
-    echo        Audit it with: powershell -NoProfile -Command "Get-Acl HKLM:\SYSTEM\CurrentControlSet\Services\%SERVICE_NAME%\Environment"
+:: The binary refuses plaintext metrics basic auth without TLS certificates or
+:: -metrics-allow-insecure. Those flags are not among the values this wizard
+:: renders into INSTALL_ARGS, so credentials entered here would make the service
+:: exit 1 on every start and the SCM restart ladder would loop forever with no
+:: log. Refuse BEFORE writing any value or starting the service: the operator
+:: then re-runs with -metrics-tls-cert/-metrics-tls-key (or an explicit
+:: -metrics-allow-insecure) in the extra arguments.
+set "METRICS_TRANSPORT_OK="
+echo "%INSTALL_ARGS%" | findstr /i /c:"-metrics-tls-cert" >nul && set "METRICS_TRANSPORT_OK=1"
+echo "%INSTALL_ARGS%" | findstr /i /c:"-metrics-tls-key" >nul && set "METRICS_TRANSPORT_OK=1"
+echo "%INSTALL_ARGS%" | findstr /i /c:"-metrics-allow-insecure" >nul && set "METRICS_TRANSPORT_OK=1"
+if not "%MUser%"=="" if not "%MPass%"=="" if not defined METRICS_TRANSPORT_OK (
+    echo.
+    echo ERROR: metrics basic-auth credentials were entered, but the service arguments include
+    echo        neither -metrics-tls-cert/-metrics-tls-key nor -metrics-allow-insecure.
+    echo        The agent refuses Basic auth over plaintext HTTP, so the service would exit 1
+    echo        on every start and the SCM restart ladder would loop.
+    echo.
+    echo        Re-run the installer with the TLS pair in the extra arguments, for example:
+    echo          -metrics-tls-cert=C:\ProgramData\link_ping_prometheus\metrics.crt -metrics-tls-key=C:\ProgramData\link_ping_prometheus\metrics.key
+    echo        or accept plaintext HTTP explicitly with -metrics-allow-insecure.
+    echo        No credential was written and the service was not started.
     exit /b 1
 )
 
-:: The binary refuses plaintext metrics basic auth without TLS certificates or
-:: -metrics-allow-insecure, and the service arguments this wizard renders cannot
-:: carry either flag - so wizard-delivered credentials would make the service
-:: exit at startup and the SCM restart ladder would loop forever. Warn the
-:: operator at install time instead of letting the install fail silently later.
-if not "%MUser%"=="" if not "%MPass%"=="" echo WARNING: metrics basic-auth credentials were set, but the rendered service arguments include no -metrics-tls-cert/-metrics-tls-key and no -metrics-allow-insecure - the service will exit at startup with "metrics basic auth requires TLS ... or -metrics-allow-insecure" until the service configuration gains one of them.
+:: Credentials go into the SCM's per-service environment ---------------------
+::
+:: The SCM builds a service's environment from the REG_MULTI_SZ VALUE named
+:: "Environment" on the SERVICE KEY, containing "NAME=value" strings. It does
+:: NOT read an "Environment" SUBKEY, and a subkey full of REG_SZ values (what
+:: this wizard used to write) is silently ignored: the agent started with no
+:: credentials at all, so metrics auth was off and HMAC was never enabled while
+:: the operator believed both were configured.
+::
+:: Order matters: the service key inherits BUILTIN\Users read from ...\Services,
+:: so the key is protected FIRST and the value written into the protected key.
+:: The DACL carries both an inheriting pair (subkeys) and a plain pair (this
+:: key): an ACE that only inherits does not grant on the key itself.
+::
+:: Existing entries are preserved and the four names are reconciled: a value
+:: the operator cleared is REMOVED, so a retired HMAC secret does not survive in
+:: the environment. Values never touch a command line - they are read from the
+:: environment PowerShell inherited from this script.
+::
+:: One physical line on purpose: a ^ inside the quoted -Command is a literal
+:: caret, not a line join, and a ")" in a typed password would close a block.
+:: The identities are SIDs because the account names are localized.
+powershell -NoProfile -Command "$ErrorActionPreference='Stop'; $k='HKLM:\SYSTEM\CurrentControlSet\Services\%SERVICE_NAME%'; $a=Get-Acl -LiteralPath $k; $a.SetSecurityDescriptorSddlForm('D:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)(A;;KA;;;SY)(A;;KA;;;BA)'); Set-Acl -LiteralPath $k -AclObject $a; $cur=(Get-ItemProperty -Path $k -Name Environment -ErrorAction SilentlyContinue).Environment; $m=[ordered]@{}; if($cur){ foreach($l in $cur){ $i=$l.IndexOf('='); if($i -gt 0){ $m[$l.Substring(0,$i)]=$l.Substring($i+1) } } }; foreach($p in @(@('LINK_PING_METRICS_USER',$env:MUser),@('LINK_PING_METRICS_PASS',$env:MPass),@('LINK_PING_ECHO_SECRET',$env:ESecret),@('LINK_PING_ECHO_SECRET_OLD',$env:ESecretOld))){ if([string]::IsNullOrEmpty($p[1])){ $m.Remove($p[0]) } else { $m[$p[0]]=$p[1] } }; if($m.Count -gt 0){ $v=@(); foreach($x in $m.Keys){ $v += ($x + '=' + $m[$x]) }; New-ItemProperty -Path $k -Name Environment -PropertyType MultiString -Value ([string[]]$v) -Force | Out-Null } else { Remove-ItemProperty -Path $k -Name Environment -ErrorAction SilentlyContinue }"
+if errorlevel 1 (
+    echo ERROR: could not store the credentials in the service Environment value,
+    echo        or could not restrict the service key ACL.
+    echo        Audit with:
+    echo          reg query "HKLM\SYSTEM\CurrentControlSet\Services\%SERVICE_NAME%" /v Environment
+    echo          powershell -NoProfile -Command "Get-Acl 'HKLM:\SYSTEM\CurrentControlSet\Services\%SERVICE_NAME%'"
+    exit /b 1
+)
+echo Environment value written for %SERVICE_NAME%; SCM will inject it at service start.
 
 :: Start and verify -------------------------------------------------------------
 echo.
@@ -576,3 +613,23 @@ exit /b %errorlevel%
 :CheckSecretLength
 powershell -NoProfile -Command "if ($env:%~1.Length -lt 16) { exit 1 } else { exit 0 }" >nul 2>&1
 exit /b %errorlevel%
+
+:: HardenDataDir
+::   Creates C:\ProgramData\link_ping_prometheus if absent and forces its owner
+::   to Administrators before dropping inherited ACEs. Without the takeown an
+::   owner that a local user established before the first install keeps
+::   implicit WRITE_DAC and can re-grant itself access to the log directory,
+::   the target file and (in mesh deployments) the config checkout. Called only
+::   for the default log directory, so a custom path never causes the
+::   installer to seize an unrelated parent directory.
+:HardenDataDir
+if not exist "%DATA_DIR%" mkdir "%DATA_DIR%"
+takeown /f "%DATA_DIR%" /a >nul || (
+    echo ERROR: could not take ownership of "%DATA_DIR%"
+    exit /b 1
+)
+icacls "%DATA_DIR%" /inheritance:r /grant "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" >nul || (
+    echo ERROR: failed to ACL "%DATA_DIR%"
+    exit /b 1
+)
+exit /b 0

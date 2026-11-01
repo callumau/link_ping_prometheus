@@ -21,7 +21,9 @@ SOAK_SECONDS=600 go test -count=1 -timeout 15m -run TestSoakMemory -v ./test/
 ```
 
 The soak test is opt-in; `-timeout` is mandatory because the default 10m expires
-mid-run. The heap must stay flat (+8MB ceiling).
+mid-run. The heap must stay flat (+8MB ceiling). This is a single-process
+diagnostic; for a deployment left running for days see the
+[long-term test](long-term-test.md) runbook (Linux + Windows pair).
 
 The test layout follows Go ecosystem convention, as in prometheus/client_golang
 and windows_exporter:
@@ -38,11 +40,19 @@ Both suites run in CI. The Windows-only behavioral tests (winsock errno
 classification, DF socket options, log-DACL hardening) execute natively in the
 `test-windows` job.
 
-The Windows service **install/config/uninstall** e2e also runs there
-(`LPP_E2E_WINDOWS_INSTALL=1`). The full SCM **start/stop** lifecycle and the
-credential env-delivery e2e stay manual (`LPP_E2E_WINDOWS=1`): on hosted Windows
-runners the SCM-started process dies before dispatch (1053), and its failure
-surface is only debuggable on an interactive host.
+The Windows service e2e also runs there, both halves: install/config/uninstall
+(`LPP_E2E_WINDOWS_INSTALL=1`) and the full SCM **start/stop** lifecycle plus the
+credential env-delivery test (`LPP_E2E_WINDOWS=1`, both set by the workflow).
+
+That second half was gated for a long time on a "1053 pre-dispatch" theory —
+that the SCM cannot start a service of this kind on a hosted runner. When it was
+finally exercised there it passed; the failures that had kept it gated were
+bugs in the test (metrics auth over plaintext without
+`-metrics-allow-insecure`, and a drop-series assertion that could never match a
+line). If it ever fails again, read the runner log before re-gating: the test
+prints a three-way diagnostic (`sc.exe start`, recovery/binary state, and a
+console `-svc=run` probe) that isolates a genuine dispatch failure from a
+configuration mistake.
 
 Release binaries for Linux, macOS, and Windows are on the
 [Latest Release](https://github.com/callumau/link_ping_prometheus/releases/latest)

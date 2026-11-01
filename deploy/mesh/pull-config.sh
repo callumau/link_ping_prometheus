@@ -98,19 +98,40 @@ esac
 # server cannot collect the key's authentication. IdentitiesOnly stops ssh
 # from offering any other key the host happens to have. BatchMode keeps an
 # unattended run from blocking on a prompt.
-GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$known_hosts -o BatchMode=yes"
+#
+# The paths are shell-quoted INSIDE GIT_SSH_COMMAND: git runs that string
+# through the shell, so a space or metacharacter in a path would otherwise
+# split ssh's argument list or run a second command.
+shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+GIT_SSH_COMMAND="ssh -i $(shq "$key") -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$(shq "$known_hosts") -o BatchMode=yes"
 export GIT_SSH_COMMAND
 
+# Repository-local configuration is executable content: core.fsmonitor is
+# spawned on fetch/reset and core.hooksPath selects hooks that run in the same
+# commands. The systemd oneshot runs as root and this play keeps the work
+# parent root:0700, so ownership is the primary control; these -c overrides
+# are defence in depth for a checkout that predates it.
+GIT_HARDENING="-c core.fsmonitor=false -c core.hooksPath=$work/.no-hooks"
+
 if [ -d "$work/.git" ]; then
+    # Refuse a checkout this run does not own: a foreign owner can rewrite
+    # .git/config and .git/hooks, which run as root.
+    owner=$(stat -c %u "$work/.git" 2>/dev/null || echo "")
+    [ "$owner" = "0" ] || die "$work/.git is owned by uid ${owner:-unknown}, not root; a non-root owner can rewrite the git config/hooks this task executes"
+    recorded=$(git -C "$work" config --get remote.origin.url 2>/dev/null || true)
+    [ "$recorded" = "$repo" ] || die "$work fetches ${recorded:-<none>}, not $repo; move it aside and re-run"
     log "fetching $repo ($branch)"
-    git -C "$work" fetch --depth 1 origin "$branch" || die "git fetch failed"
-    git -C "$work" reset --hard "origin/$branch" || die "git reset failed"
+    # shellcheck disable=SC2086 # GIT_HARDENING is a deliberate word-split list.
+    git $GIT_HARDENING -C "$work" fetch --depth 1 origin "$branch" || die "git fetch failed"
+    # shellcheck disable=SC2086
+    git $GIT_HARDENING -C "$work" reset --hard "origin/$branch" || die "git reset failed"
 elif [ -e "$work" ]; then
     die "$work exists but is not a git checkout; move it aside and re-run"
 else
     log "cloning $repo ($branch) into $work"
     mkdir -p "$(dirname "$work")"
-    git clone --depth 1 --branch "$branch" "$repo" "$work" || die "git clone failed"
+    # shellcheck disable=SC2086
+    git $GIT_HARDENING clone --depth 1 --branch "$branch" "$repo" "$work" || die "git clone failed"
 fi
 
 src=$work/$file

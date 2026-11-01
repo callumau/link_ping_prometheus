@@ -152,6 +152,11 @@ const minProbeInterval = time.Millisecond
 // config inside the limit cannot outrun the drain either.
 const maxPendingWindow = 1000
 
+// maxProbeTimeout bounds the configured probe timeout. A day is already far
+// beyond any link this tool measures; the bound keeps the adaptive RTO (and
+// its float64 seconds -> Duration conversion) away from int64 overflow.
+const maxProbeTimeout = 24 * time.Hour
+
 // checkPendingWindow rejects an effective interval/timeout pair whose in-flight
 // window would be unbounded (see maxPendingWindow). The error names the flags
 // so the operator knows what to change: the timeout is what must come down.
@@ -216,6 +221,12 @@ func (c Config) Validate() error {
 	if c.BaseTimeout < minProbeInterval {
 		return fmt.Errorf("probe timeout (-timeout) must be at least %v, got %v", minProbeInterval, c.BaseTimeout)
 	}
+	if c.BaseTimeout > maxProbeTimeout {
+		// No probe can meaningfully wait a day; the bound also keeps the
+		// applied RTO (and the adaptive seconds -> Duration conversion) far
+		// away from the int64 nanosecond overflow.
+		return fmt.Errorf("probe timeout (-timeout) must be at most %v, got %v", maxProbeTimeout, c.BaseTimeout)
+	}
 	if c.ReconnectInterval < 0 {
 		return fmt.Errorf("reconnect interval must be >= 0, got %v", c.ReconnectInterval)
 	}
@@ -272,6 +283,9 @@ func validateTargets(targets []Target) error {
 		}
 		if t.Timeout < 0 {
 			return fmt.Errorf("target %q: timeout must be >= 0, got %v", t.Name, t.Timeout)
+		}
+		if t.Timeout > maxProbeTimeout {
+			return fmt.Errorf("target %q: timeout must be at most %v, got %v", t.Name, maxProbeTimeout, t.Timeout)
 		}
 		if t.Timeout != 0 && t.Timeout < minProbeInterval {
 			// A per-target override bypasses the global floor otherwise: a

@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -377,7 +378,11 @@ func TestMetricsServerCertReloadWithoutRestart(t *testing.T) {
 // a pure "already tried" memo would serve the expired certificate forever.
 func TestMetricsServerCertReloadFailureKeepsPrevious(t *testing.T) {
 	origCooldown := certReloadRetryCooldown
-	certReloadRetryCooldown = 200 * time.Millisecond
+	// 2s, not 200ms: the "still inside the cooldown" assertion spans two TLS
+	// handshakes, and a loaded CI runner can stall longer than a few hundred
+	// milliseconds between them. That flaked as "served serial 202, want the
+	// cached 101" — the test measuring the scheduler, not the reloader.
+	certReloadRetryCooldown = 2 * time.Second
 	t.Cleanup(func() { certReloadRetryCooldown = origCooldown })
 
 	prober.InitMetrics()
@@ -614,5 +619,99 @@ func countLogs(ch <-chan string, want string, window time.Duration) int {
 		case <-deadline:
 			return n
 		}
+	}
+}
+
+// TestLimitListenerCapsAcceptedConnections pins the pre-auth connection bound:
+// the listener must stop accepting once the cap is reached, so an
+// unauthenticated client cannot hold unbounded goroutines and buffers on a
+// process whose job is measuring RTT.
+func TestLimitListenerCapsAcceptedConnections(t *testing.T) {
+	inner, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inner.Close()
+	ln := limitListenerFor(inner, 1)
+	defer ln.Close()
+
+	accepted := make(chan net.Conn, 2)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			accepted <- c
+		}
+	}()
+
+	dial := func() net.Conn {
+		c, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	first := dial()
+	defer first.Close()
+	var firstServer net.Conn
+	select {
+	case firstServer = <-accepted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first connection was not accepted")
+	}
+
+	// At the cap: a second connection may complete its TCP handshake in the
+	// kernel backlog but must not be handed to the server.
+	second := dial()
+	defer second.Close()
+	select {
+	case <-accepted:
+		t.Fatal("listener accepted a second connection while the cap was 1")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// Releasing the first slot unblocks the next accept.
+	firstServer.Close()
+	select {
+	case c := <-accepted:
+		c.Close()
+	case <-time.After(2 * time.Second):
+		t.Fatal("closing a connection did not release the accept slot")
+	}
+}
+
+// TestRateLimitedLogWriterThrottles pins the handshake-log fix: net/http
+// reports every failed TLS handshake, so an unauthenticated client could emit
+// one line per connection and rotate the auth-failure evidence out of the
+// retained window.
+func TestRateLimitedLogWriterThrottles(t *testing.T) {
+	orig := handshakeLogInterval
+	handshakeLogInterval = time.Hour
+	defer func() { handshakeLogInterval = orig }()
+
+	var mu sync.Mutex
+	var got []string
+	w := &rateLimitedLogWriter{forward: func(msg string) {
+		mu.Lock()
+		got = append(got, msg)
+		mu.Unlock()
+	}}
+	for i := 0; i < 50; i++ {
+		if _, err := w.Write([]byte("TLS handshake error from 192.0.2.1: broken")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// One forwarded immediately; the rest are suppressed.
+	if len(got) != 1 {
+		t.Fatalf("forwarded %d messages while throttled, want 1", len(got))
+	}
+	w.last = time.Time{} // force the window open
+	if _, err := w.Write([]byte("TLS handshake error from 192.0.2.2: broken")); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || !strings.Contains(got[1], "49 similar messages suppressed") {
+		t.Fatalf("suppressed count not reported: %v", got)
 	}
 }
