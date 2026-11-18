@@ -96,6 +96,14 @@ if not "%SVC_LOG_DIR%"=="" if /i not "%SVC_LOG_DIR%"=="%LOG_DIR%" (
     :: No icacls /reset: it cannot help deletion (Administrators already hold
     :: full control) and it would replace the directory's protected DACL with
     :: the inherited, Users-readable one before the delete is attempted.
+    :: rmdir /s on a junction deletes the TARGET's contents on some Windows
+    :: versions, so refuse a reparse point before the recursive delete.
+    powershell -NoProfile -Command "$p='%SVC_LOG_DIR%'; if (Test-Path -LiteralPath $p) { $i=Get-Item -LiteralPath $p -Force; if ($i.Attributes -band [IO.FileAttributes]::ReparsePoint) { exit 1 } }; exit 0" >nul 2>&1
+    if errorlevel 1 (
+        echo ERROR: "%SVC_LOG_DIR%" is a reparse point ^(junction/symlink^).
+        echo        Refusing to delete through it. Remove it manually after checking the target.
+        exit /b 1
+    )
     rmdir /s /q "%SVC_LOG_DIR%" >nul 2>&1
     if exist "%SVC_LOG_DIR%" (
         echo ERROR: could not remove "%SVC_LOG_DIR%" - close anything using it and rerun.
@@ -134,6 +142,12 @@ echo === Removing "%DATA_DIR%" ===
 :: nothing restricts - so a delete that removed nothing still left the
 :: directory, and any unprotected file in it, readable by every local user
 :: while the script printed "Uninstall complete.".
+powershell -NoProfile -Command "$p='%DATA_DIR%'; if (Test-Path -LiteralPath $p) { $i=Get-Item -LiteralPath $p -Force; if ($i.Attributes -band [IO.FileAttributes]::ReparsePoint) { exit 1 } }; exit 0" >nul 2>&1
+if errorlevel 1 (
+    echo ERROR: "%DATA_DIR%" is a reparse point ^(junction/symlink^).
+    echo        Refusing to delete through it. Remove it manually after checking the target.
+    exit /b 1
+)
 if exist "%LOG_DIR%" (
     rmdir /s /q "%LOG_DIR%" >nul 2>&1
 )

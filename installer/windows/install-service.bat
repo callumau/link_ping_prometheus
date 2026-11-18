@@ -318,6 +318,16 @@ echo === Installing %SERVICE_NAME% from "%EXE_PATH%" ===
 :: seize an unrelated parent directory.
 if /i "%LOG_DIR%"=="%DEF_LOG_DIR%" call :HardenDataDir
 if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
+:: A reparse point (junction/symlink) at the log directory would redirect the
+:: ACL rewrite and every topology-bearing log line to a target the user chose.
+:: Refuse it before icacls touches either object.
+powershell -NoProfile -Command "$p='%LOG_DIR%'; if (Test-Path -LiteralPath $p) { $i=Get-Item -LiteralPath $p -Force; if ($i.Attributes -band [IO.FileAttributes]::ReparsePoint) { exit 1 } }; exit 0" >nul 2>&1
+if errorlevel 1 (
+    echo ERROR: "%LOG_DIR%" is a reparse point ^(junction/symlink^).
+    echo        Refusing to rewrite the ACL of whatever it points at. Remove it
+    echo        and rerun the installer, or choose a real log directory.
+    exit /b 1
+)
 :: SIDs (*S-1-5-18 = SYSTEM, *S-1-5-32-544 = Administrators), never the
 :: account NAMES: "Administrators" is localized ("Administratoren" on German
 :: Windows) and icacls exits 1332 on an unresolvable name, aborting the
@@ -403,6 +413,17 @@ call :RejectQuoteAmp MUser
 if errorlevel 1 (
     echo   ERROR: the value cannot contain a double-quote or ampersand -
     echo   those characters cannot be delivered safely through quoting below.
+    goto :wiz_muser
+)
+:: resolveMetricsAuth rejects a colon in the username: HTTP Basic auth splits
+:: user:pass at the FIRST colon, so such a user is unreachable and the binary
+:: exits at startup. A wizard-accepted value would install "successfully" and
+:: then crash-loop under the SCM with stdout discarded. Mirror the rule here.
+powershell -NoProfile -Command "if ($env:MUser -match ':') { exit 1 } else { exit 0 }" >nul 2>&1
+if errorlevel 1 (
+    echo   ERROR: the metrics username cannot contain a colon - HTTP Basic
+    echo   authentication splits user:pass at the first colon, so the agent
+    echo   rejects it at startup and the service would exit 1 on every start.
     goto :wiz_muser
 )
 if "%MUser%"=="" goto :wiz_mpass
@@ -624,6 +645,15 @@ exit /b %errorlevel%
 ::   installer to seize an unrelated parent directory.
 :HardenDataDir
 if not exist "%DATA_DIR%" mkdir "%DATA_DIR%"
+:: takeown /a and icacls operate on the TARGET of a reparse point, so a local
+:: user who pre-created this path as a junction to another directory could
+:: make an elevated install seize and rewrite that directory's ACL. Refuse.
+powershell -NoProfile -Command "$p='%DATA_DIR%'; $i=Get-Item -LiteralPath $p -Force; if ($i.Attributes -band [IO.FileAttributes]::ReparsePoint) { exit 1 }; exit 0" >nul 2>&1
+if errorlevel 1 (
+    echo ERROR: "%DATA_DIR%" is a reparse point ^(junction/symlink^).
+    echo        Refusing to take ownership of an unrelated target. Remove it and rerun.
+    exit /b 1
+)
 takeown /f "%DATA_DIR%" /a >nul || (
     echo ERROR: could not take ownership of "%DATA_DIR%"
     exit /b 1
