@@ -25,6 +25,17 @@ a user from being prompted at all.
 This page covers how to get that signature and how the repository is wired for
 it.
 
+## Authorization precondition
+
+The release job runs on any `v*` tag and holds `contents`, `packages`,
+`id-token` and `attestations` write. Source cannot enforce who may create such
+a tag: repository Rulesets (Settings -> Rules -> Rulesets, a `v*` tag rule that
+also blocks updates and deletion) and the tag-push permission set are the
+authorization control. Verify both before treating a release as reviewed;
+`release.yml` states the same requirement at the top of the file and injects the
+tag back into `gh release edit` from `git log`, so a tag pushed by a lower-trust
+principal is published as that principal wrote it.
+
 ## What the repository does today
 
 `installer/windows/sign-windows.sh` signs every Windows binary during
