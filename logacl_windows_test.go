@@ -223,7 +223,7 @@ func verifyLogDACLRestricted(t *testing.T, path string) {
 
 // TestReapplyLogDACL pins the periodic re-apply path: a file that was
 // created wide (fresh from an inherited directory DACL — exactly what a
-// lumberjack rotation leaves behind) is restricted by reapplyLogDACL, a
+// rotation leaves behind) is restricted by reapplyLogDACL, a
 // compliant file is left alone, a missing file is skipped (rotation
 // gap), and an empty path is a no-op.
 func TestReapplyLogDACL(t *testing.T) {
@@ -252,7 +252,7 @@ func TestReapplyLogDACL(t *testing.T) {
 }
 
 // TestReapplyLogDACL_AfterRotation pins the exact regression the fix
-// targets: harden a live file, simulate a lumberjack rotation (rename the
+// targets: harden a live file, simulate a rotation (rename the
 // live file out, let the framework recreate a fresh file that inherits a
 // wider directory DACL), then verify reapplyLogDACL restores the
 // restricted set on the NEW live file while the renamed backup is

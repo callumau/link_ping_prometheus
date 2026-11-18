@@ -7,7 +7,6 @@ toolchain go1.27.3
 require (
 	github.com/prometheus/client_golang v1.25.0
 	github.com/prometheus/client_model v0.6.3
-	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 )
 
 require (

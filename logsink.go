@@ -2,11 +2,9 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
-	"runtime"
 	"sync"
 	"time"
 )
@@ -96,96 +94,27 @@ func watchLogSink(ctx context.Context, sysLog eventlogSink, sink *countedWriter,
 // provenance. Logs carry peer IPs and internal topology, so they are never
 // world-readable, but os.OpenFile applies its mode only at creation: a file
 // placed at the configured path by someone else keeps its wider mode while
-// the agent appends topology into it, and the lumberjack writer opens the
-// existing file with no mode check and copies the live file's mode onto
-// every rotated artifact — so repairing the live file at startup also
-// protects future rotations. A symlinked path is refused outright: it can
-// redirect topology-bearing log lines into a file owned by another local
-// user. Fail-closed: the caller exits on error, like the allowlist refusal.
+// the agent appends topology into it. The logRotator used for rotation
+// re-runs this same chain on every rotation (see logrotate.go), so a rotated
+// artifact cannot be opened by name behind the check. A symlinked path is
+// refused outright: it can redirect topology-bearing log lines into a file
+// owned by another local user. Fail-closed: the caller exits on error, like
+// the allowlist refusal.
+//
 // Windows: os.OpenFile's 0600 mode, os.Stat (always 0666) and f.Chmod (an
 // attribute toggle) are all meaningless for a DACL, so the POSIX enforcement
 // below cannot restrict one there — Windows delegates to restrictLogDACL
 // (logacl_windows.go), which replaces the file's DACL with a protected set
 // granting full access only to SYSTEM, Administrators and the account this
 // process runs as. The installer's ACL'd log DIRECTORY remains
-// defense-in-depth: log rotation creates fresh files that inherit the
-// directory's DACL, and restricting those on the fly would add a rotation
-// path to hardenLogSink.
+// defense-in-depth.
 func hardenLogSink(path string) (repaired bool, err error) {
-	fi, err := os.Lstat(path)
-	if err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			return false, err
-		}
-		// Not there yet: create it at the enforced mode so the lumberjack
-		// path finds an existing 0600 file (its rotation copies the current
-		// file's mode onto artifacts). O_EXCL: if something appeared between
-		// the Lstat and here, fall back to the existing-file path so the
-		// type and ownership checks see it instead of adopting it.
-		// pi-lens-ignore: go-path-traversal (operator-supplied -log-file path)
-		f, err := createLogFile(path)
-		if errors.Is(err, os.ErrExist) {
-			return hardenLogSink(path)
-		}
-		if err != nil {
-			return false, err
-		}
-		if runtime.GOOS == "windows" {
-			// A fresh file inherits its parent directory's DACL, which may be
-			// wide (a manual install pointing -log-file into a Users-writable
-			// directory); restrict it now so the repair path does not have to
-			// wait for the next start.
-			defer f.Close()
-			return restrictLogDACL(f)
-		}
-		return false, f.Close()
-	}
-	if fi.Mode()&os.ModeSymlink != 0 {
-		return false, fmt.Errorf("refusing symlinked log path %q: a symlink can redirect topology-bearing log lines into another local user's file; create the log path directly", path)
-	}
-	// Refuse every other non-regular object BEFORE open(2): a FIFO with no
-	// reader blocks a plain open forever, so a post-open check would never
-	// run. Only symlinks were refused before, which let a planted FIFO
-	// receive the whole log stream (with a reader) or hang startup (without).
-	if !fi.Mode().IsRegular() {
-		return false, fmt.Errorf("refusing non-regular log path %q (%s): only a regular file may receive topology-bearing logs", path, fi.Mode().Type())
-	}
-	// Open the file we Lstat'ed, without following a symlink and without
-	// blocking on a FIFO, then repair its mode on the open descriptor.
-	// pi-lens-ignore: go-path-traversal (operator-supplied -log-file path)
-	f, err := openLogFileForRepair(path)
+	f, _, repaired, err := openOrCreateLogFile(path)
 	if err != nil {
 		return false, err
 	}
-	defer f.Close()
-	got, err := f.Stat()
-	if err != nil {
-		return false, err
+	if err := f.Close(); err != nil {
+		return repaired, err
 	}
-	// Bind the decision to the object actually opened: the path could have
-	// been swapped between the Lstat and the open.
-	if !got.Mode().IsRegular() {
-		return false, fmt.Errorf("refusing non-regular log path %q (%s): only a regular file may receive topology-bearing logs", path, got.Mode().Type())
-	}
-	if !os.SameFile(fi, got) {
-		return false, fmt.Errorf("log path %q changed between check and open; refusing", path)
-	}
-	if err := checkLogFileOwner(f); err != nil {
-		return false, err
-	}
-	if runtime.GOOS == "windows" {
-		// os.Stat always reports 0666 on Windows, so the perm-bit comparison
-		// is meaningless there: restrictLogDACL reads the actual DACL of the
-		// open descriptor, compares it against the restricted set it pins,
-		// and only rewrites it when it differs (repaired=false for an
-		// already-compliant file).
-		return restrictLogDACL(f)
-	}
-	if got.Mode().Perm() != 0o600 {
-		if err := f.Chmod(0o600); err != nil {
-			return false, err
-		}
-		return true, nil
-	}
-	return false, nil
+	return repaired, nil
 }

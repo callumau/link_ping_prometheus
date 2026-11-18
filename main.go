@@ -28,8 +28,6 @@ import (
 	"time"
 
 	"link_ping_prometheus/internal/prober"
-
-	"gopkg.in/natefinch/lumberjack.v2"
 )
 
 // version is the build version, injected at link time via
@@ -140,7 +138,7 @@ func main() {
 	var logRepaired bool
 	if *flLogFile != "" {
 		// Enforce the 0600 invariant at the sink BEFORE either writer opens
-		// the file: O_CREATE applies the mode only at creation, lumberjack
+		// the file: O_CREATE applies the mode only at creation, the rotator
 		// re-opens pre-existing files with no mode check and copies the live
 		// file's mode onto every rotated artifact, and a symlink would
 		// redirect topology-bearing lines into another local user's file.
@@ -151,7 +149,7 @@ func main() {
 		}
 		logRepaired = repaired
 		if *flLogMaxSize == 0 {
-			// 0600 matches lumberjack's default: logs carry peer IPs and
+			// 0600 matches the rotator's mode: logs carry peer IPs and
 			// internal topology, so they are not world-readable. Open via the
 			// hardened helper so the sink re-checks the object it writes to
 			// (no O_NOFOLLOW-less path open, no blocking FIFO).
@@ -169,16 +167,17 @@ func main() {
 			// warning exists to prevent. Console-first was only ever cosmetic.
 			logW = io.MultiWriter(f, os.Stdout)
 		} else {
-			// ponytail: lumberjack handles rotation (10 MB ×5 ×28d default); no per-line overhead, reopens on rotation
-			// pi-lens-ignore: go-path-traversal
-			lj := &lumberjack.Logger{
-				Filename:   *flLogFile,
-				MaxSize:    *flLogMaxSize,
-				MaxBackups: *flLogMaxBackups,
-				MaxAge:     *flLogMaxAge,
-				Compress:   false,
+			// Rotation is in-process (logrotate.go): every rotation re-runs
+			// the same verified open chain hardenLogSink used, so the
+			// rotation path is not a by-name reopen a log-directory writer
+			// can redirect. pi-lens-ignore: go-path-traversal
+			rot, err := newLogRotator(*flLogFile, *flLogMaxSize, *flLogMaxBackups, *flLogMaxAge)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "open log file %q: %v\n", *flLogFile, err)
+				os.Exit(1)
 			}
-			logW = io.MultiWriter(lj, os.Stdout)
+			defer rot.Close()
+			logW = io.MultiWriter(rot, os.Stdout)
 		}
 	}
 	// Surface runtime sink failures (disk full, log dir removed): the
@@ -263,8 +262,9 @@ func (p *program) run() error {
 	// Log-durability watchers (see logsink.go / logacl_windows.go): sink
 	// write failures surfaced outside the dead sink, and — Windows only —
 	// a periodic idempotent re-apply of the restricted DACL, which a
-	// lumberjack rotation silently regresses when the fresh live file
-	// inherits a wide directory DACL. Both stop with p.ctx in every mode.
+	// rotation would otherwise regress when the fresh live file inherits a
+	// wide directory DACL (the rotator applies it too; the recheck covers a
+	// file created by another process). Both stop with p.ctx in every mode.
 	watchLogSink(p.ctx, p.svc, p.logSink, sinkCheckInterval)
 	startLogDACLRecheck(p.ctx, *flLogFile)
 

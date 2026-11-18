@@ -114,18 +114,18 @@ type logACEKey struct {
 
 // reapplyLogDACL re-restricts the CURRENT live log file's DACL.
 // restrictLogDACL runs once at startup against the file that exists
-// then; after the first lumberjack rotation the fresh live file is
+// then; after the first rotation the fresh live file is
 // created by the framework and inherits the (possibly wide) parent
 // directory DACL, silently regressing the restricted set. Called from a
 // fixed ticker so a manual install into a wide directory regains the
 // "never world-readable" invariant within one interval of each rotation.
 // A file that does not exist right now (mid-rotation gap) is skipped;
-// the next tick covers it once lumberjack recreates it.
+// the next tick covers it once the rotator recreates it.
 func reapplyLogDACL(path string) error {
 	if path == "" {
 		return nil
 	}
-	// Open with FILE_SHARE_DELETE so lumberjack's rotation can rename the
+	// Open with FILE_SHARE_DELETE so the rotator can rename the
 	// live file while this short-lived recheck handle is open. os.OpenFile
 	// omits that share bit on Windows: a rename racing the recheck then
 	// fails with "process cannot access the file because it is being used
