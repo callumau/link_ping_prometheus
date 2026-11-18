@@ -264,7 +264,12 @@ func loadMetricsPair(certPath, keyPath string) (tls.Certificate, error) {
 }
 
 func readTrustedPairFile(path string, secret bool) ([]byte, error) {
-	data, fi, err := prober.ReadTrustedFile(path, maxTLSFileSize)
+	// The key is secret material (no foreign read, no foreign write); a
+	// certificate is public but replacing it still impersonates the endpoint,
+	// so it only needs the write rule. On Windows these become DACL rules;
+	// the mode check below is the unix half.
+	opts := prober.TrustOptions{DenyForeignWrite: true, DenyForeignRead: secret}
+	data, fi, err := prober.ReadTrustedFileWith(path, maxTLSFileSize, opts)
 	if err != nil {
 		return nil, err
 	}

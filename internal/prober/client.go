@@ -166,7 +166,7 @@ func LoadTargets(path string) ([]Target, error) {
 	// writer can swap a symlink/FIFO in after the Lstat (the log sink and the
 	// metrics TLS pair use the same rule). A FIFO also used to block the
 	// reload supervisor inside os.ReadFile with no timeout.
-	data, info, err := ReadTrustedFile(path, MaxTargetsFileSize)
+	data, info, err := ReadTrustedFileWith(path, MaxTargetsFileSize, TrustOptions{DenyForeignWrite: true})
 	if err != nil {
 		return nil, fmt.Errorf("read targets file: %w", err)
 	}

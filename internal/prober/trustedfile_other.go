@@ -16,6 +16,10 @@ func openTrustedFile(path string) (*os.File, error) {
 	return os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 }
 
+// checkTrustedDACL is a no-op off Windows: the callers' mode-bit rules
+// (group/world-writable, key readability) are the control there.
+func checkTrustedDACL(*os.File, TrustOptions) error { return nil }
+
 // checkTrustedOwner refuses a file owned by another local account: the owner
 // keeps implicit WRITE_DAC (and can chmod), so a mode repair or a DACL
 // restriction can always be undone by that account.

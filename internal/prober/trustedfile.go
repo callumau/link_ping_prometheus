@@ -20,6 +20,13 @@ import (
 // its own mode rule (LoadTargets refuses group/world-writable; the metrics TLS
 // key may not be readable by others).
 func ReadTrustedFile(path string, maxBytes int64) ([]byte, os.FileInfo, error) {
+	return ReadTrustedFileWith(path, maxBytes, TrustOptions{})
+}
+
+// ReadTrustedFileWith is ReadTrustedFile plus a Windows DACL policy: the
+// unix mode checks callers apply are meaningless there (os.Stat always
+// reports 0666), so the same rule has to be read from the file's DACL.
+func ReadTrustedFileWith(path string, maxBytes int64, opts TrustOptions) ([]byte, os.FileInfo, error) {
 	li, err := os.Lstat(path)
 	if err != nil {
 		return nil, nil, err
@@ -46,6 +53,9 @@ func ReadTrustedFile(path string, maxBytes int64) ([]byte, os.FileInfo, error) {
 		return nil, nil, fmt.Errorf("file %q changed between check and open; refusing", path)
 	}
 	if err := checkTrustedOwner(f); err != nil {
+		return nil, nil, fmt.Errorf("file %q %w", path, err)
+	}
+	if err := checkTrustedDACL(f, opts); err != nil {
 		return nil, nil, fmt.Errorf("file %q %w", path, err)
 	}
 	data, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
