@@ -70,7 +70,22 @@ func runMTUSweep(ctx context.Context, t Target, cfg Config, m targetMetrics, sta
 				}
 			}
 		}
+		// Cancellation must be able to interrupt a DF send, not only a read:
+		// a UDP write blocks when the local send buffer is saturated, and
+		// sweepOnce's own write deadline is the full probe deadline. Closing
+		// the socket on cancellation unblocks that syscall so probeTarget's
+		// tracked join stays inside stragglerStopTimeout; the cancelled probe
+		// is then not charged as lost (see send).
+		sweepDone := make(chan struct{})
+		go func(c net.Conn) {
+			select {
+			case <-ctx.Done():
+				c.Close()
+			case <-sweepDone:
+			}
+		}(conn)
 		largest, ok := sweepOnce(ctx, conn, cfg, m, state)
+		close(sweepDone)
 		conn.Close()
 		if ok {
 			// Report the full probe frame size (header + payload);
@@ -302,11 +317,23 @@ func sweepOnce(ctx context.Context, conn net.Conn, cfg Config, m targetMetrics, 
 		// send can block when the local send buffer is saturated (peer
 		// stopped reading), and the probe join at client.go's probeTarget
 		// waits on the sweep goroutine — a wedged send would otherwise keep
-		// the target unprobed past every bound.
+		// the target unprobed past every bound. Clamp the deadline to the
+		// caller's cancellation so a reload/shutdown does not wait out the
+		// full probe deadline in a blocked send.
+		writeDeadline := time.Now().Add(deadline)
+		if cd, ok := ctx.Deadline(); ok && cd.Before(writeDeadline) {
+			writeDeadline = cd
+		}
 		// pi-lens-ignore: go-ignored-call-result
-		_ = conn.SetWriteDeadline(time.Now().Add(deadline))
+		_ = conn.SetWriteDeadline(writeDeadline)
 		if _, err := conn.Write(buf[:headerSize+payload]); err != nil {
-			m.mtuLost.Inc()
+			// A cancelled probe is not a lost probe. This is the send-side
+			// twin of waitEcho's guard: counting a teardown here fabricated
+			// loss in link_mtu_probes_lost_total, the ratio operators alert
+			// on, on every mid-sweep reload.
+			if ctx.Err() == nil {
+				m.mtuLost.Inc()
+			}
 			return 0
 		}
 		sent[seq] = ts
