@@ -13,7 +13,8 @@ this repository.
 |---|---|---|
 | `link_ping_prometheus_Windows_*.zip` (the `link_ping_prometheus.exe` inside) | yes, once a SignPath project is approved | Authenticode, SHA-256, timestamped |
 | `link_ping_prometheus_Linux_*.tar.gz`, `link_ping_prometheus_Darwin_*.tar.gz` | no | Linux and macOS do not use Authenticode; integrity is covered by the signed checksums below |
-| `checksums.txt`, container image | yes (keyless cosign + SLSA attestation, independent of SignPath) | verify with `cosign verify-blob` / `gh attestation verify` |
+| `checksums.txt` | yes (keyless cosign + SLSA build-provenance attestation, independent of SignPath) | verify with `cosign verify-blob` / `gh attestation verify` |
+| container image (GHCR) | **not signed by this repository's pipeline**: no cosign signature and no explicit `checksums.txt` binding is produced for the image | pin the image by digest from the release run; verify the per-arch binary against the signed `checksums.txt` inside it |
 
 Releases published before the SignPath project is approved are **unsigned**.
 An existing release does not become signed retroactively; only releases built

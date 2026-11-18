@@ -75,8 +75,9 @@ directory, and an optional service account, then shows a summary.
    (SIDs, not account names: `Administrators` is localized and icacls cannot
    resolve it on a non-English host.)
 
-   The restriction is re-applied every 5 minutes at runtime, repairing a
-   rotation that recreates the live file under a wide directory DACL.
+   The writer re-applies the restriction itself on every rotation, and a
+   periodic runtime check (every 5 minutes) repairs a live file that another
+   process created under a wide directory DACL.
 2. **Service account.** The service installs as `LocalSystem`, more
    privilege than the prober needs (outbound UDP, a metrics port, its log
    directory). Switch to a passwordless built-in or gMSA account after

@@ -109,7 +109,16 @@ func TestAnsibleReconcilesTheSCMEnvironmentValue(t *testing.T) {
 func TestAnsibleOwnedFlagGuardRejectsGNUFlags(t *testing.T) {
 	for _, path := range []string{"deploy/ansible/playbook.yml", "deploy/ansible/mesh.yml"} {
 		body := readDeploymentFile(t, path)
-		mustContain(t, path, body, `select('match', '^--?(metrics|mode|allow`, "both -flag and --flag must be rejected")
+		mustContain(t, path, body, `'^--?(metrics|mode|allow`, "both -flag and --flag must be rejected")
+		// The four credential flags are env-delivered only (README:
+		// "never as service arguments"), and the mesh play templates
+		// -allow-from-targets. A token naming any of them must be rejected
+		// before it is rendered: Go keeps the LAST value, so a rendered
+		// -echo-secret pins a retired secret and -allow-from-targets=false
+		// disables the derived fail-closed allowlist.
+		for _, owned := range []string{"echo-secret|", "echo-secret-old", "metrics-user", "metrics-pass", "allow-from-targets"} {
+			mustContain(t, path, body, owned, "owned-flag guard must cover "+owned)
+		}
 		if strings.Contains(body, `select('match', '^-(metrics|mode|allow`) {
 			t.Errorf("%s: a one-dash-only owned-flag regex lets --flag tokens through", path)
 		}
@@ -125,6 +134,50 @@ func TestAnsibleMetricsGuardrailDoesNotAcceptTLSForAuth(t *testing.T) {
 		mustNotContain(t, path, body, "and not (link_ping_metrics_tls | bool)",
 			"TLS must not substitute for Basic auth in the exposure guardrail")
 	}
+}
+
+// TestAnsibleRefusesMetricsCredentialsWithoutTLS pins the pairing guard in
+// every play: the binary refuses Basic auth over plaintext, so a play that
+// delivers a credential pair without TLS (or an explicit
+// -metrics-allow-insecure) would install a service that exits 1 on every
+// start. The Windows play is the worst case: -svc=install runs before the
+// credentials exist in the environment, so only the play can catch it.
+func TestAnsibleRefusesMetricsCredentialsWithoutTLS(t *testing.T) {
+	for _, path := range []string{"deploy/ansible/playbook.yml", "deploy/ansible/mesh.yml"} {
+		body := readDeploymentFile(t, path)
+		if got := strings.Count(body, "Refuse metrics credentials without TLS"); got != 2 {
+			t.Errorf("%s: found %d pairing guards, want one in each play", path, got)
+		}
+		mustContain(t, path, body, `'-metrics-allow-insecure' in link_ping_extra_args`,
+			"the guard must accept an explicit plaintext opt-in")
+		mustContain(t, path, body, "not (link_ping_metrics_auth | bool)", "the guard must key on the credential pair")
+	}
+}
+
+// TestWindowsInstallerRefusesReparsePoints pins the junction defence: takeown
+// and icacls act on the target of a reparse point, so a local user who
+// pre-creates the ProgramData container or log directory as a junction could
+// have an elevated install seize and rewrite an unrelated directory.
+func TestWindowsInstallerRefusesReparsePoints(t *testing.T) {
+	body := readDeploymentFile(t, "installer/windows/install-service.bat")
+	if got := strings.Count(body, "[IO.FileAttributes]::ReparsePoint"); got < 2 {
+		t.Errorf("installer/windows/install-service.bat: %d reparse-point checks, want one per takeown/icacls site", got)
+	}
+	un := readDeploymentFile(t, "installer/windows/uninstall-service.bat")
+	if got := strings.Count(un, "[IO.FileAttributes]::ReparsePoint"); got < 2 {
+		t.Errorf("installer/windows/uninstall-service.bat: %d reparse-point checks, want one before each recursive delete", got)
+	}
+}
+
+// TestPullScriptHooksPathIsUnpredictable pins the SYSTEM code-execution fix:
+// a fixed hooksPath name in a shared temp directory can be planted by another
+// local user, and git would execute its hooks as SYSTEM. The path must be
+// random and deliberately non-existent.
+func TestPullScriptHooksPathIsUnpredictable(t *testing.T) {
+	ps := readDeploymentFile(t, "deploy/mesh/pull-config.ps1")
+	mustNotContain(t, "deploy/mesh/pull-config.ps1", ps, "'link_ping_no_hooks'",
+		"a fixed hooksPath in shared temp can be pre-created by another local user")
+	mustContain(t, "deploy/mesh/pull-config.ps1", ps, "[guid]::NewGuid()", "the hooksPath must be unpredictable")
 }
 
 // TestAnsibleOwnsTheWindowsServiceDirectories pins that every directory a
