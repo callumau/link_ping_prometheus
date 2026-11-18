@@ -143,7 +143,15 @@ try {
     # .git/config would be a SYSTEM code-execution primitive. The DIRECTORY
     # OWNERSHIP enforced by the play is the primary control; these -c
     # overrides are defence in depth for checkouts that predate it.
-    $noHooks = Join-Path ([System.IO.Path]::GetTempPath()) 'link_ping_no_hooks'
+    #
+    # The hooksPath must not be a predictable name in a shared directory: any
+    # local user who can create C:\Windows\Temp\link_ping_no_hooks (the old
+    # fixed name) could plant hook scripts there and have git execute them as
+    # SYSTEM. A random, deliberately NON-EXISTENT path is the control - git
+    # runs no hook when hooksPath does not exist, and the name cannot be
+    # pre-created.
+    $noHooks = Join-Path ([System.IO.Path]::GetTempPath()) `
+        ('link_ping_no_hooks_' + [guid]::NewGuid().ToString('N'))
     $gitHardening = @('-c', 'core.fsmonitor=false', '-c', "core.hooksPath=$noHooks")
 
     if (Test-Path -LiteralPath (Join-Path $Work '.git')) {
