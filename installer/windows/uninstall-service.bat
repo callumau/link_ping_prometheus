@@ -97,13 +97,11 @@ if not "%SVC_LOG_DIR%"=="" if /i not "%SVC_LOG_DIR%"=="%LOG_DIR%" (
     :: full control) and it would replace the directory's protected DACL with
     :: the inherited, Users-readable one before the delete is attempted.
     :: rmdir /s on a junction deletes the TARGET's contents on some Windows
-    :: versions, so refuse a reparse point before the recursive delete.
-    powershell -NoProfile -Command "$p='%SVC_LOG_DIR%'; if (Test-Path -LiteralPath $p) { $i=Get-Item -LiteralPath $p -Force; if ($i.Attributes -band [IO.FileAttributes]::ReparsePoint) { exit 1 } }; exit 0" >nul 2>&1
-    if errorlevel 1 (
-        echo ERROR: "%SVC_LOG_DIR%" is a reparse point ^(junction/symlink^).
-        echo        Refusing to delete through it. Remove it manually after checking the target.
-        exit /b 1
-    )
+    :: versions, so refuse a reparse point before the recursive delete. The
+    :: check lives in a subroutine: a PowerShell one-liner inside this
+    :: parenthesized block would put ')' characters through cmd's block
+    :: parser.
+    call :RefuseReparse "%SVC_LOG_DIR%" || exit /b 1
     rmdir /s /q "%SVC_LOG_DIR%" >nul 2>&1
     if exist "%SVC_LOG_DIR%" (
         echo ERROR: could not remove "%SVC_LOG_DIR%" - close anything using it and rerun.
@@ -142,12 +140,7 @@ echo === Removing "%DATA_DIR%" ===
 :: nothing restricts - so a delete that removed nothing still left the
 :: directory, and any unprotected file in it, readable by every local user
 :: while the script printed "Uninstall complete.".
-powershell -NoProfile -Command "$p='%DATA_DIR%'; if (Test-Path -LiteralPath $p) { $i=Get-Item -LiteralPath $p -Force; if ($i.Attributes -band [IO.FileAttributes]::ReparsePoint) { exit 1 } }; exit 0" >nul 2>&1
-if errorlevel 1 (
-    echo ERROR: "%DATA_DIR%" is a reparse point ^(junction/symlink^).
-    echo        Refusing to delete through it. Remove it manually after checking the target.
-    exit /b 1
-)
+call :RefuseReparse "%DATA_DIR%" || exit /b 1
 if exist "%LOG_DIR%" (
     rmdir /s /q "%LOG_DIR%" >nul 2>&1
 )
@@ -164,6 +157,20 @@ echo Logs deleted.
 echo.
 echo Uninstall complete.
 endlocal
+
+:RefuseReparse
+:: %1 is a path. Exit 1 when it exists and is a reparse point (junction or
+:: symlink): recursive deletes and ACL rewrites would otherwise act on the
+:: target the link names.
+set "RP_PATH=%~1"
+if "%RP_PATH%"=="" exit /b 0
+powershell -NoProfile -Command "$p=$env:RP_PATH; if (Test-Path -LiteralPath $p) { $i=Get-Item -LiteralPath $p -Force; if ($i.Attributes -band [IO.FileAttributes]::ReparsePoint) { exit 1 } }; exit 0" >nul 2>&1
+if errorlevel 1 (
+    echo ERROR: "%RP_PATH%" is a reparse point ^(junction/symlink^).
+    echo        Refusing to delete through it. Remove it manually after checking the target.
+    exit /b 1
+)
+exit /b 0
 
 :discover_custom
 set "SVC_LOG_DIR="

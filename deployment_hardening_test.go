@@ -164,9 +164,11 @@ func TestWindowsInstallerRefusesReparsePoints(t *testing.T) {
 		t.Errorf("installer/windows/install-service.bat: %d reparse-point checks, want one per takeown/icacls site", got)
 	}
 	un := readDeploymentFile(t, "installer/windows/uninstall-service.bat")
-	if got := strings.Count(un, "[IO.FileAttributes]::ReparsePoint"); got < 2 {
-		t.Errorf("installer/windows/uninstall-service.bat: %d reparse-point checks, want one before each recursive delete", got)
+	if got := strings.Count(un, "call :RefuseReparse"); got < 2 {
+		t.Errorf("installer/windows/uninstall-service.bat: %d reparse-point calls, want one before each recursive delete", got)
 	}
+	mustContain(t, "installer/windows/uninstall-service.bat", un, "[IO.FileAttributes]::ReparsePoint",
+		"the subroutine must actually detect a reparse point")
 }
 
 // TestPullScriptHooksPathIsUnpredictable pins the SYSTEM code-execution fix:
