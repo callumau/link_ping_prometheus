@@ -118,7 +118,7 @@ if exist "%INSTALL_DIR%" (
 echo.
 set "DEL_LOGS="
 set /p "DEL_LOGS=Delete log directory %DATA_DIR%? [y/N]: "
-powershell -NoProfile -Command "if ($env:DEL_LOGS -match '^(?i)y$') { exit 0 } else { exit 1 }" <nul >nul 2>&1
+powershell -NoProfile -InputFormat None -Command "if ($env:DEL_LOGS -match '^(?i)y$') { exit 0 } else { exit 1 }" <nul >nul 2>&1
 if errorlevel 1 goto :done
 
 echo === Removing "%DATA_DIR%" ===
@@ -151,7 +151,7 @@ exit /b 0
 call :RefuseReparse "%SVC_LOG_DIR%" || exit /b 1
 set "DEL_CUSTOM_DIR="
 set /p "DEL_CUSTOM_DIR=Delete entire custom log directory "%SVC_LOG_DIR%" (y=rmdir /s, N=service.log* only)? [y/N]: "
-powershell -NoProfile -Command "if ($env:DEL_CUSTOM_DIR -match '^(?i)y$') { exit 0 } else { exit 1 }" <nul >nul 2>&1
+powershell -NoProfile -InputFormat None -Command "if ($env:DEL_CUSTOM_DIR -match '^(?i)y$') { exit 0 } else { exit 1 }" <nul >nul 2>&1
 if errorlevel 1 (
     echo === Removing "%SVC_LOG_DIR%\service.log*" only ===
     del /f /q "%SVC_LOG_DIR%\service.log*" >nul 2>&1
@@ -172,7 +172,7 @@ exit /b 0
 :: target the link names.
 set "RP_PATH=%~1"
 if "%RP_PATH%"=="" exit /b 0
-powershell -NoProfile -Command "$p=$env:RP_PATH; if (Test-Path -LiteralPath $p) { $i=Get-Item -LiteralPath $p -Force; if ($i.Attributes -band [IO.FileAttributes]::ReparsePoint) { exit 1 } }; exit 0" <nul >nul 2>&1
+powershell -NoProfile -InputFormat None -Command "$p=$env:RP_PATH; if (Test-Path -LiteralPath $p) { $i=Get-Item -LiteralPath $p -Force; if ($i.Attributes -band [IO.FileAttributes]::ReparsePoint) { exit 1 } }; exit 0" <nul >nul 2>&1
 if errorlevel 1 (
     echo ERROR: "%RP_PATH%" is a reparse point ^(junction/symlink^).
     echo        Refusing to delete through it. Remove it manually after checking the target.
@@ -196,7 +196,7 @@ REM inside for /f's IN(...) clause re-enters cmd quoting for the caret and the
 REM single quotes, which is exactly the fragile layering the installer avoids
 REM elsewhere (flat lines, no parenthesized blocks around user-derived text).
 set "SVC_QC_TMP=%TEMP%\lpp_svc_qc_%RANDOM%_%RANDOM%.txt"
-powershell -NoProfile -Command "$bp=((sc.exe qc '%SERVICE_NAME%' 2>$null) -join ' '); if ($bp -match '-log-file=(?:\x22([^\x22]+)\x22|(\S+))') { if ($Matches[1]) { Split-Path ($Matches[1]) -Parent } else { Split-Path ($Matches[2]) -Parent } }" <nul > "%SVC_QC_TMP%" 2>nul
+powershell -NoProfile -InputFormat None -Command "$bp=((sc.exe qc '%SERVICE_NAME%' 2>$null) -join ' '); if ($bp -match '-log-file=(?:\x22([^\x22]+)\x22|(\S+))') { if ($Matches[1]) { Split-Path ($Matches[1]) -Parent } else { Split-Path ($Matches[2]) -Parent } }" <nul > "%SVC_QC_TMP%" 2>nul
 set /p SVC_LOG_DIR=<"%SVC_QC_TMP%"
 del "%SVC_QC_TMP%" >nul 2>&1
 exit /b 0
