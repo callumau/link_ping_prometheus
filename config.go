@@ -202,6 +202,7 @@ func warnShadowedAndWeakenedConfig(sf startupFlags) {
 		{"echo-secret", *flEchoSecret, "LINK_PING_ECHO_SECRET"},
 		{"echo-secret-old", *flEchoSecretOld, "LINK_PING_ECHO_SECRET_OLD"},
 		{"metrics-user", *flMetricsBasicAuthUser, "LINK_PING_METRICS_USER"},
+		{"metrics-pass", *flMetricsBasicAuthPass, "LINK_PING_METRICS_PASS"},
 	} {
 		env := os.Getenv(sh.envName)
 		if sh.flagVal == "" || env == "" || sh.flagVal == env {

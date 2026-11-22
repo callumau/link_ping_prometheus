@@ -83,12 +83,14 @@ func startHeapScavenger(ctx context.Context, every time.Duration, minUnreleased 
 				continue
 			}
 			debug.FreeOSMemory()
-			var after runtime.MemStats
-			runtime.ReadMemStats(&after)
-			logger.Debug("heap scavenge",
-				"releasable_before_mb", releasableHeap(before)>>20,
-				"idle_before_mb", before.HeapIdle>>20, "released_before_mb", before.HeapReleased>>20,
-				"idle_after_mb", after.HeapIdle>>20, "released_after_mb", after.HeapReleased>>20)
+			if logger.Enabled(ctx, slog.LevelDebug) {
+				var after runtime.MemStats
+				runtime.ReadMemStats(&after)
+				logger.Debug("heap scavenge",
+					"releasable_before_mb", releasableHeap(before)>>20,
+					"idle_before_mb", before.HeapIdle>>20, "released_before_mb", before.HeapReleased>>20,
+					"idle_after_mb", after.HeapIdle>>20, "released_after_mb", after.HeapReleased>>20)
+			}
 		}
 	}()
 }

@@ -140,7 +140,8 @@ func platformInstallService(argv []string) error {
 		return fmt.Errorf("connect SCM: %w", err)
 	}
 	defer m.Disconnect()
-	if _, err := m.OpenService(spec.Name); err == nil {
+	if existing, err := m.OpenService(spec.Name); err == nil {
+		_ = existing.Close()
 		return fmt.Errorf("service %q already exists; run -svc=uninstall or an in-place upgrade first", spec.Name)
 	}
 	// mgr.CreateService appends the variadic args with syscall.EscapeArg
@@ -165,9 +166,11 @@ func platformInstallService(argv []string) error {
 	if err := s.SetRecoveryActions([]mgr.RecoveryAction{
 		{Type: mgr.ServiceRestart, Delay: spec.RecoveryDelay},
 	}, spec.RecoveryResetPeriod); err != nil {
+		_ = s.Delete()
 		return fmt.Errorf("set recovery actions: %w", err)
 	}
 	if err := eventlog.InstallAsEventCreate(spec.Name, eventlog.Error|eventlog.Info|eventlog.Warning); err != nil {
+		_ = s.Delete()
 		return fmt.Errorf("register event-log source: %w", err)
 	}
 	return nil

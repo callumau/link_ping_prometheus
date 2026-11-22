@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -713,5 +714,70 @@ func TestRateLimitedLogWriterThrottles(t *testing.T) {
 	}
 	if len(got) != 2 || !strings.Contains(got[1], "49 similar messages suppressed") {
 		t.Fatalf("suppressed count not reported: %v", got)
+	}
+}
+
+// TestLimitListenerShutdownDoesNotDeadlockWhenSaturated pins that saturating
+// all connection slots on limitListener (e.g. idle keep-alives) does not block
+// http.Server.Shutdown indefinitely waiting on Accept's semaphore.
+func TestLimitListenerShutdownDoesNotDeadlockWhenSaturated(t *testing.T) {
+	rawLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln := limitListenerFor(rawLn, 2)
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}),
+		IdleTimeout: 60 * time.Second,
+	}
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- srv.Serve(ln)
+	}()
+
+	addr := rawLn.Addr().String()
+	// Hold 2 idle keep-alive connections open to saturate cap=2.
+	c1, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c1.Close()
+	c2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+	// Send one request on each so Accept hands them off and slots stay held.
+	for _, c := range []net.Conn{c1, c2} {
+		if _, err := c.Write([]byte("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")); err != nil {
+			t.Fatal(err)
+		}
+		buf := make([]byte, 512)
+		if _, err := c.Read(buf); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	shutDone := make(chan error, 1)
+	go func() {
+		shutDone <- srv.Shutdown(ctx)
+	}()
+
+	select {
+	case err := <-shutDone:
+		if err != nil {
+			t.Fatalf("Shutdown failed while limitListener saturated: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Shutdown deadlocked while limitListener was saturated")
+	}
+	select {
+	case <-serveDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve did not return after Shutdown")
 	}
 }

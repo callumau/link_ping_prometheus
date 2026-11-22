@@ -83,15 +83,30 @@ func (w *rateLimitedLogWriter) Write(p []byte) (int, error) {
 // Close of the returned connection.
 type limitListener struct {
 	net.Listener
-	sem chan struct{}
+	sem       chan struct{}
+	closeOnce sync.Once
+	done      chan struct{}
 }
 
 func limitListenerFor(l net.Listener, n int) net.Listener {
-	return &limitListener{Listener: l, sem: make(chan struct{}, n)}
+	return &limitListener{
+		Listener: l,
+		sem:      make(chan struct{}, n),
+		done:     make(chan struct{}),
+	}
+}
+
+func (l *limitListener) Close() error {
+	l.closeOnce.Do(func() { close(l.done) })
+	return l.Listener.Close()
 }
 
 func (l *limitListener) Accept() (net.Conn, error) {
-	l.sem <- struct{}{}
+	select {
+	case <-l.done:
+		return nil, net.ErrClosed
+	case l.sem <- struct{}{}:
+	}
 	c, err := l.Listener.Accept()
 	if err != nil {
 		<-l.sem
@@ -221,7 +236,8 @@ var certReloadRetryCooldown = 30 * time.Second
 type metricsCertReloader struct {
 	certPath, keyPath string
 
-	mu sync.Mutex
+	reloadMu sync.Mutex // serializes disk reads/parses during an actual renewal
+	mu       sync.Mutex // guards the cached snapshot below without holding I/O
 	// cert is the pair currently served. Seeded at construction, so no
 	// handshake can ever observe an empty cache.
 	cert *tls.Certificate
@@ -310,11 +326,14 @@ func fingerprintCertPair(certPath, keyPath string) (certFingerprint, error) {
 // same load run() performs as startup validation. A pair that will not load is
 // a startup error, never a listener that serves nothing.
 func newMetricsCertReloader(certPath, keyPath string) (*metricsCertReloader, error) {
-	cert, err := loadMetricsPair(certPath, keyPath)
+	// Stat BEFORE loading so a rotation occurring mid-load produces a
+	// mismatching fingerprint on the next handshake instead of freezing the
+	// older certificate under the newer fingerprint.
+	fp, err := fingerprintCertPair(certPath, keyPath)
 	if err != nil {
 		return nil, err
 	}
-	fp, err := fingerprintCertPair(certPath, keyPath)
+	cert, err := loadMetricsPair(certPath, keyPath)
 	if err != nil {
 		return nil, err
 	}
@@ -324,36 +343,81 @@ func newMetricsCertReloader(certPath, keyPath string) (*metricsCertReloader, err
 // GetCertificate implements tls.Config.GetCertificate.
 func (r *metricsCertReloader) GetCertificate(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	cachedCert := r.cert
+	loaded := r.loaded
+	attempted := r.attempted
+	attemptedAt := r.attemptedAt
+	wasStatFailed := r.statFailed
+	r.mu.Unlock()
+
 	fp, err := fingerprintCertPair(r.certPath, r.keyPath)
 	if err != nil {
 		// Unstattable (a rename-in-progress, a rotated-away inode): keep serving
 		// the cached pair rather than failing every handshake on the way past.
-		if !r.statFailed {
+		if !wasStatFailed {
+			r.mu.Lock()
+			first := !r.statFailed
 			r.statFailed = true
-			slog.Warn("Metrics TLS certificate files are not statable; keeping the previously loaded certificate",
-				"cert", r.certPath, "key", r.keyPath, "err", err)
+			cachedCert = r.cert
+			r.mu.Unlock()
+			if first {
+				slog.Warn("Metrics TLS certificate files are not statable; keeping the previously loaded certificate",
+					"cert", r.certPath, "key", r.keyPath, "err", err)
+			}
 		}
-		return r.cert, nil
+		return cachedCert, nil
 	}
-	r.statFailed = false
-	if fp == r.loaded {
-		return r.cert, nil
+	if wasStatFailed {
+		r.mu.Lock()
+		r.statFailed = false
+		r.mu.Unlock()
 	}
-	if fp == r.attempted && time.Since(r.attemptedAt) < certReloadRetryCooldown {
-		return r.cert, nil
+	if fp == loaded {
+		return cachedCert, nil
 	}
-	r.attempted, r.attemptedAt = fp, time.Now()
-	cert, err := loadMetricsPair(r.certPath, r.keyPath)
+	if fp == attempted && time.Since(attemptedAt) < certReloadRetryCooldown {
+		return cachedCert, nil
+	}
+
+	r.reloadMu.Lock()
+	defer r.reloadMu.Unlock()
+
+	// Re-check under reloadMu in case another handshake already reloaded it.
+	r.mu.Lock()
+	cachedCert = r.cert
+	loaded = r.loaded
+	attempted = r.attempted
+	attemptedAt = r.attemptedAt
+	r.mu.Unlock()
+
+	fp, err = fingerprintCertPair(r.certPath, r.keyPath)
 	if err != nil {
+		return cachedCert, nil
+	}
+	if fp == loaded {
+		return cachedCert, nil
+	}
+	if fp == attempted && time.Since(attemptedAt) < certReloadRetryCooldown {
+		return cachedCert, nil
+	}
+
+	cert, err := loadMetricsPair(r.certPath, r.keyPath)
+	now := time.Now()
+	r.mu.Lock()
+	r.attempted, r.attemptedAt = fp, now
+	if err != nil {
+		cachedCert = r.cert
+		r.mu.Unlock()
 		// A half-written renewal or a key that does not match: keep the working
 		// cert and say so once. Failing the handshake instead would black out
 		// every scrape over a transient write.
 		slog.Warn("Metrics TLS certificate reload failed; keeping the previously loaded certificate",
 			"cert", r.certPath, "key", r.keyPath, "err", err)
-		return r.cert, nil
+		return cachedCert, nil
 	}
 	r.cert, r.loaded = &cert, fp
+	r.mu.Unlock()
+
 	// Log the served leaf so a substitution is distinguishable from a
 	// renewal: two reload lines naming only the paths look identical.
 	cn, serial := "", ""
@@ -363,7 +427,7 @@ func (r *metricsCertReloader) GetCertificate(*tls.ClientHelloInfo) (*tls.Certifi
 		}
 	}
 	slog.Info("Metrics TLS certificate reloaded", "cert", r.certPath, "key", r.keyPath, "cn", cn, "serial", serial)
-	return r.cert, nil
+	return &cert, nil
 }
 
 // warnUnauthenticatedMetricsBind warns when the metrics listener came up on an

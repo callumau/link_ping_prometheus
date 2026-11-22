@@ -516,3 +516,15 @@ func TestWarnShadowedAndWeakenedConfig(t *testing.T) {
 		t.Errorf("identical flag/env values warned about shadowing %d time(s)", n)
 	}
 }
+
+// TestWarnShadowedMetricsPass pins that -metrics-pass shadowing
+// LINK_PING_METRICS_PASS logs the same shadowing warning as -metrics-user.
+func TestWarnShadowedMetricsPass(t *testing.T) {
+	saveFlags(t)
+	t.Setenv("LINK_PING_METRICS_PASS", "env-pass")
+	*flMetricsBasicAuthPass = "flag-pass"
+
+	logs := captureLogs(t)
+	warnShadowedAndWeakenedConfig(startupFlags{metricsPass: "flag-pass"})
+	waitForLog(t, logs, "shadows the environment")
+}
