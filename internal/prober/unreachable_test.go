@@ -57,19 +57,14 @@ func TestIsPeerUnreachable(t *testing.T) {
 // hot-spinning); it still lets the reader survive many read errors, so a
 // regression treating ECONNREFUSED as a local failure would exhaust
 // maxConsecutiveReadFails and kill the reader inside the test window.
-type refuseConn struct{}
+type refuseConn struct {
+	stubConn
+}
 
 func (c *refuseConn) Read([]byte) (int, error) {
 	time.Sleep(2 * time.Millisecond)
 	return 0, syscall.ECONNREFUSED
 }
-func (c *refuseConn) Write(b []byte) (int, error)      { return len(b), nil }
-func (c *refuseConn) Close() error                     { return nil }
-func (c *refuseConn) LocalAddr() net.Addr              { return nil }
-func (c *refuseConn) RemoteAddr() net.Addr             { return nil }
-func (c *refuseConn) SetDeadline(time.Time) error      { return nil }
-func (c *refuseConn) SetReadDeadline(time.Time) error  { return nil }
-func (c *refuseConn) SetWriteDeadline(time.Time) error { return nil }
 
 // TestProbeTarget_PeerUnreachableKeepsReaderAlive drives probeTarget with a
 // socket whose Read keeps reporting ECONNREFUSED: the reader must treat it

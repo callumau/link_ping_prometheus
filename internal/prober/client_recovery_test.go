@@ -11,83 +11,11 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/prometheus/client_golang/prometheus"
-	dto "github.com/prometheus/client_model/go"
 )
 
 // White-box recovery tests for runEchoLoop/probeTarget exit paths that
 // cannot be triggered through the public API (write failures, injected
-// panics, dial-retry link_up state). Complements the external suite in
-// test/.
-
-// wbCounter reads a counter series for the given client labels.
-func wbCounter(vec *prometheus.CounterVec, source, name, addr string) float64 {
-	var m dto.Metric
-	if err := vec.WithLabelValues(source, name, addr).Write(&m); err != nil {
-		return 0
-	}
-	return m.GetCounter().GetValue()
-}
-
-// wbGauge reads a gauge series for the given client labels.
-func wbGauge(vec *prometheus.GaugeVec, source, name, addr string) float64 {
-	var m dto.Metric
-	if err := vec.WithLabelValues(source, name, addr).Write(&m); err != nil {
-		return 0
-	}
-	return m.GetGauge().GetValue()
-}
-
-// wbHistCount reads an RTT histogram sample count.
-func wbHistCount(source, name, addr string) float64 {
-	obs, err := RTTSeconds.GetMetricWithLabelValues(source, name, addr)
-	if err != nil {
-		return 0
-	}
-	var d dto.Metric
-	if err := obs.(prometheus.Metric).Write(&d); err != nil {
-		return 0
-	}
-	return float64(d.GetHistogram().GetSampleCount())
-}
-
-// wbCounterLabels reads a counter series by its full label set. Unlike
-// wbCounter it handles vecs whose label cardinality differs from the
-// client {source,target,address} shape (e.g. ProberInternalErrors, which
-// adds a reason label).
-func wbCounterLabels(vec *prometheus.CounterVec, labels ...string) float64 {
-	var m dto.Metric
-	if err := vec.WithLabelValues(labels...).Write(&m); err != nil {
-		return 0
-	}
-	return m.GetCounter().GetValue()
-}
-
-// wbRealEchoServer starts a production ServePacketConn echo responder on
-// an ephemeral loopback port with a fail-closed allowlist, closing it on
-// ctx cancellation. Unlike wbEchoServer it validates frames exactly like
-// a deployed server (allowlist, size, magic), so link-up tests observe a
-// genuine end-to-end echo rather than an unconditional reflector.
-func wbRealEchoServer(t *testing.T, ctx context.Context, secret string) string {
-	t.Helper()
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	allowed, err := ParseAllowlist("127.0.0.1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	go func() {
-		<-ctx.Done()
-		pc.Close()
-	}()
-	go func() {
-		ServePacketConn(ctx, pc, "test", allowed, secret)
-	}()
-	return pc.LocalAddr().String()
-}
+// panics, dial-retry link_up state).
 
 // deadlineFailConn is a net.Conn whose SetReadDeadline always fails, so
 // the runEchoLoop reader gives up after its 3-failure bound. Read blocks
@@ -98,6 +26,7 @@ func wbRealEchoServer(t *testing.T, ctx context.Context, secret string) string {
 // flush (abandoned probes counted as timeouts) is exercised — while still
 // dying well inside probeTarget's 1s re-dial pause the test cancels in.
 type deadlineFailConn struct {
+	stubConn
 	closed chan struct{}
 	once   sync.Once
 }
@@ -111,44 +40,31 @@ func (c *deadlineFailConn) Read([]byte) (int, error) {
 	return 0, net.ErrClosed
 }
 
-func (c *deadlineFailConn) Write(b []byte) (int, error) { return len(b), nil }
-
 func (c *deadlineFailConn) Close() error {
 	c.once.Do(func() { close(c.closed) })
 	return nil
 }
 
-func (c *deadlineFailConn) LocalAddr() net.Addr  { return nil }
-func (c *deadlineFailConn) RemoteAddr() net.Addr { return nil }
-func (c *deadlineFailConn) SetDeadline(time.Time) error {
-	return nil
-}
 func (c *deadlineFailConn) SetReadDeadline(time.Time) error {
 	// Deliberate delay: see the type comment. Keeps the reader alive long
 	// enough for probes to be in flight when it dies.
 	time.Sleep(15 * time.Millisecond)
 	return errors.New("injected SetReadDeadline failure")
 }
-func (c *deadlineFailConn) SetWriteDeadline(time.Time) error { return nil }
 
 // readFailConn is a net.Conn whose Read returns a persistent non-timeout
 // error every time (and whose SetReadDeadline succeeds, so the reader
 // actually reaches Read). The reader must exit after the bounded
 // maxConsecutiveReadFails instead of spinning forever.
-type readFailConn struct{}
+type readFailConn struct {
+	stubConn
+}
 
 func newReadFailConn() *readFailConn { return &readFailConn{} }
 
 func (c *readFailConn) Read([]byte) (int, error) {
 	return 0, errors.New("injected persistent UDP read error")
 }
-func (c *readFailConn) Write(b []byte) (int, error)      { return len(b), nil }
-func (c *readFailConn) Close() error                     { return nil }
-func (c *readFailConn) LocalAddr() net.Addr              { return nil }
-func (c *readFailConn) RemoteAddr() net.Addr             { return nil }
-func (c *readFailConn) SetDeadline(time.Time) error      { return nil }
-func (c *readFailConn) SetReadDeadline(time.Time) error  { return nil }
-func (c *readFailConn) SetWriteDeadline(time.Time) error { return nil }
 
 // firstDeadlineOKConn wraps a real UDP conn and lets the FIRST
 // SetReadDeadline through, failing every subsequent call. The reader thus
@@ -1159,6 +1075,7 @@ func TestProbeTarget_BoundedReadErrorsRedial(t *testing.T) {
 // later Read returns net.ErrClosed, mirroring a closed socket. No real
 // UDP involved - the loop is driven through runEchoLoop directly.
 type delayedEchoConn struct {
+	stubConn
 	mu        sync.Mutex
 	frame     []byte
 	echoReady chan struct{} // closed when the released echo becomes readable
@@ -1194,12 +1111,7 @@ func (c *delayedEchoConn) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (c *delayedEchoConn) Close() error                       { c.deadOnce.Do(func() { close(c.dead) }); return nil }
-func (c *delayedEchoConn) LocalAddr() net.Addr                { return nil }
-func (c *delayedEchoConn) RemoteAddr() net.Addr               { return nil }
-func (c *delayedEchoConn) SetDeadline(t time.Time) error      { return nil }
-func (c *delayedEchoConn) SetWriteDeadline(t time.Time) error { return nil }
-func (c *delayedEchoConn) SetReadDeadline(t time.Time) error  { return nil }
+func (c *delayedEchoConn) Close() error { c.deadOnce.Do(func() { close(c.dead) }); return nil }
 
 func (c *delayedEchoConn) Read(p []byte) (int, error) {
 	select {

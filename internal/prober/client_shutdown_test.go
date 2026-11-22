@@ -11,6 +11,7 @@ import (
 )
 
 type blockingWriteCloseConn struct {
+	stubConn
 	closed    chan struct{}
 	closeOnce sync.Once
 	inWrite   chan struct{}
@@ -39,16 +40,12 @@ func (c *blockingWriteCloseConn) Close() error {
 	c.closeOnce.Do(func() { close(c.closed) })
 	return nil
 }
-func (c *blockingWriteCloseConn) LocalAddr() net.Addr              { return nil }
-func (c *blockingWriteCloseConn) RemoteAddr() net.Addr             { return nil }
-func (c *blockingWriteCloseConn) SetDeadline(time.Time) error      { return nil }
-func (c *blockingWriteCloseConn) SetReadDeadline(time.Time) error  { return nil }
-func (c *blockingWriteCloseConn) SetWriteDeadline(time.Time) error { return nil }
 
 // stubbornWriteConn ignores Close inside Write until release is closed,
 // simulating a kernel/socket stall that outlives tctx cancellation so stop()
 // would wait for stragglerStopTimeout unless ctx.Done() breaks the wait.
 type stubbornWriteConn struct {
+	stubConn
 	closed    chan struct{}
 	closeOnce sync.Once
 	inWrite   chan struct{}
@@ -79,11 +76,6 @@ func (c *stubbornWriteConn) Close() error {
 	c.closeOnce.Do(func() { close(c.closed) })
 	return nil
 }
-func (c *stubbornWriteConn) LocalAddr() net.Addr              { return nil }
-func (c *stubbornWriteConn) RemoteAddr() net.Addr             { return nil }
-func (c *stubbornWriteConn) SetDeadline(time.Time) error      { return nil }
-func (c *stubbornWriteConn) SetReadDeadline(time.Time) error  { return nil }
-func (c *stubbornWriteConn) SetWriteDeadline(time.Time) error { return nil }
 
 type dummyReloadSignal struct{}
 

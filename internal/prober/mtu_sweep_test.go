@@ -16,6 +16,7 @@ import (
 // reports a deadline error: the probe was written, but the read returned
 // because the sweep was cancelled, not because the path dropped the probe.
 type cancelOnReadConn struct {
+	stubConn
 	cancel context.CancelFunc
 	reads  atomic.Int64
 }
@@ -25,14 +26,6 @@ func (c *cancelOnReadConn) Read([]byte) (int, error) {
 	c.cancel()
 	return 0, os.ErrDeadlineExceeded
 }
-
-func (c *cancelOnReadConn) Write(p []byte) (int, error)      { return len(p), nil }
-func (c *cancelOnReadConn) Close() error                     { return nil }
-func (c *cancelOnReadConn) LocalAddr() net.Addr              { return nil }
-func (c *cancelOnReadConn) RemoteAddr() net.Addr             { return nil }
-func (c *cancelOnReadConn) SetDeadline(time.Time) error      { return nil }
-func (c *cancelOnReadConn) SetReadDeadline(time.Time) error  { return nil }
-func (c *cancelOnReadConn) SetWriteDeadline(time.Time) error { return nil }
 
 // TestMTUSweep_CancelledProbeIsNotLost pins the guard at mtu.go's waitEcho:
 // a sweep cancelled by reload/shutdown must NOT count the probe in
@@ -71,6 +64,7 @@ func TestMTUSweep_CancelledProbeIsNotLost(t *testing.T) {
 // does when the local send buffer is saturated. It lets the test drive the
 // send-side cancellation path that the read-only test above cannot reach.
 type mtuBlockingSendConn struct {
+	stubConn
 	closed     chan struct{}
 	closeOnce  sync.Once
 	written    chan struct{}
@@ -96,11 +90,6 @@ func (c *mtuBlockingSendConn) Close() error {
 	c.closeOnce.Do(func() { close(c.closed) })
 	return nil
 }
-func (c *mtuBlockingSendConn) LocalAddr() net.Addr              { return nil }
-func (c *mtuBlockingSendConn) RemoteAddr() net.Addr             { return nil }
-func (c *mtuBlockingSendConn) SetDeadline(time.Time) error      { return nil }
-func (c *mtuBlockingSendConn) SetReadDeadline(time.Time) error  { return nil }
-func (c *mtuBlockingSendConn) SetWriteDeadline(time.Time) error { return nil }
 
 // TestMTUSweep_CancelledSendIsNotLost pins the send-side twin of the guard
 // above: when the sweep is cancelled while a DF write is blocked in the
@@ -145,6 +134,7 @@ func TestMTUSweep_CancelledSendIsNotLost(t *testing.T) {
 }
 
 type cancelOnFinalStepConn struct {
+	stubConn
 	cancel  context.CancelFunc
 	header  int
 	writes  int
@@ -178,13 +168,6 @@ func (c *cancelOnFinalStepConn) Read(p []byte) (int, error) {
 	}
 	return 0, os.ErrDeadlineExceeded
 }
-
-func (c *cancelOnFinalStepConn) Close() error                     { return nil }
-func (c *cancelOnFinalStepConn) LocalAddr() net.Addr              { return nil }
-func (c *cancelOnFinalStepConn) RemoteAddr() net.Addr             { return nil }
-func (c *cancelOnFinalStepConn) SetDeadline(time.Time) error      { return nil }
-func (c *cancelOnFinalStepConn) SetReadDeadline(time.Time) error  { return nil }
-func (c *cancelOnFinalStepConn) SetWriteDeadline(time.Time) error { return nil }
 
 // TestMTUSweep_CancelOnFinalStepDoesNotPublishPartialMTU pins that cancelling
 // during the last binary-search iteration returns ok=false instead of publishing

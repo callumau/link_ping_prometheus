@@ -17,8 +17,8 @@ import (
 // it skips unless SOAK_SECONDS or SOAK_TARGETS is set, so the default
 // suite stays fast. Examples:
 //
-//	SOAK_SECONDS=600 go test -count=1 -run TestSoakMemory -v ./test/   # 10 min soak
-//	SOAK_TARGETS=300 SOAK_SECONDS=60 go test -count=1 -run TestSoakMemory -v ./test/
+//	SOAK_SECONDS=600 go test -count=1 -run TestSoakMemory -v ./internal/prober/   # 10 min soak
+//	SOAK_TARGETS=300 SOAK_SECONDS=60 go test -count=1 -run TestSoakMemory -v ./internal/prober/
 func TestSoakMemory(t *testing.T) {
 	if testing.Short() {
 		t.Skip("soak test skipped in -short mode")
