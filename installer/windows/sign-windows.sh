@@ -116,11 +116,17 @@ sign_one() {
 
     tmp="$file.signed"
     rm -f "$tmp"
+    passfile=""
+    if [ "$pfx_configured" -eq 1 ] && [ -n "${WINDOWS_SIGN_PFX_PASS:-}" ]; then
+        passfile=$(umask 077 && mktemp)
+        trap 'rm -f "$passfile"' EXIT
+        printf '%s' "$WINDOWS_SIGN_PFX_PASS" > "$passfile"
+    fi
     set -- sign -h sha256 -n "$desc" -i "$url" -in "$file" -out "$tmp"
     if [ "$pfx_configured" -eq 1 ]; then
         set -- "$@" -pkcs12 "$WINDOWS_SIGN_PFX"
-        if [ -n "${WINDOWS_SIGN_PFX_PASS:-}" ]; then
-            set -- "$@" -pass "$WINDOWS_SIGN_PFX_PASS"
+        if [ -n "$passfile" ]; then
+            set -- "$@" -readpass "$passfile"
         fi
     else
         set -- "$@" -certs "$WINDOWS_SIGN_CERT" -key "$WINDOWS_SIGN_KEY"
@@ -130,9 +136,14 @@ sign_one() {
     fi
 
     if ! osslsigncode "$@"; then
+        [ -n "$passfile" ] && rm -f "$passfile"
         rm -f "$tmp"
         echo "sign-windows: signing failed for $file" >&2
         exit 1
+    fi
+    if [ -n "$passfile" ]; then
+        rm -f "$passfile"
+        trap - EXIT
     fi
     if ! verify_signed "$tmp"; then
         rm -f "$tmp"

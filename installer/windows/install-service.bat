@@ -126,6 +126,11 @@ echo.
 :wiz_mode
 set "RUN_MODE="
 set /p "RUN_MODE=Mode - server, client, or both [both]: "
+call :RejectQuoteAmp RUN_MODE
+if errorlevel 1 (
+    echo   ERROR: mode cannot contain a double-quote or ampersand.
+    goto :wiz_mode
+)
 if "%RUN_MODE%"=="" set "RUN_MODE=both"
 if /i "%RUN_MODE%"=="server" goto :mode_ok
 if /i "%RUN_MODE%"=="client" goto :mode_ok
@@ -157,7 +162,13 @@ set "SINGLE_TARGET="
 echo What should the client half probe?
 echo   [1] A targets JSON file (multiple targets, name+address pairs)
 echo   [2] A single host:port endpoint
+set "TGT_CHOICE="
 set /p "TGT_CHOICE=Choice [1]: "
+call :RejectQuoteAmp TGT_CHOICE
+if errorlevel 1 (
+    echo   ERROR: choice cannot contain a double-quote or ampersand.
+    goto :wiz_targets
+)
 if "%TGT_CHOICE%"=="" set "TGT_CHOICE=1"
 if /i "%TGT_CHOICE%"=="2" goto :wiz_single
 
@@ -256,6 +267,163 @@ REM the start below now reports that failure non-zero.
 REM Passwordless identities (LocalSystem/LocalService/NetworkService/gMSA)
 REM only.
 
+:wiz_tls
+set "TLS_CERT="
+set "TLS_KEY="
+set "ALLOW_INSECURE="
+echo.
+echo Optional metrics TLS pair (recommended when enabling Basic auth; Enter to skip).
+set /p "TLS_CERT=Metrics TLS certificate path [skip]: "
+call :RejectQuoteAmp TLS_CERT
+if errorlevel 1 (
+    echo   ERROR: the path cannot contain a double-quote or ampersand.
+    goto :wiz_tls
+)
+if "%TLS_CERT%"=="" goto :wiz_allow_insecure
+if "%TLS_CERT:~-1%"=="\" set "TLS_CERT=%TLS_CERT:~0,-1%"
+if not exist "%TLS_CERT%" (
+    echo   File not found: "%TLS_CERT%"
+    goto :wiz_tls
+)
+:wiz_tls_key
+set "TLS_KEY="
+set /p "TLS_KEY=Metrics TLS private key path (REQUIRED with certificate): "
+call :RejectQuoteAmp TLS_KEY
+if errorlevel 1 (
+    echo   ERROR: the path cannot contain a double-quote or ampersand.
+    goto :wiz_tls_key
+)
+if "%TLS_KEY%"=="" (
+    echo   REQUIRED: -metrics-tls-cert requires -metrics-tls-key.
+    goto :wiz_tls
+)
+if "%TLS_KEY:~-1%"=="\" set "TLS_KEY=%TLS_KEY:~0,-1%"
+if not exist "%TLS_KEY%" (
+    echo   File not found: "%TLS_KEY%"
+    goto :wiz_tls_key
+)
+goto :wiz_creds_start
+
+:wiz_allow_insecure
+set /p "ALLOW_INSECURE=Allow Basic auth over plaintext HTTP (-metrics-allow-insecure)? [y/N]: "
+call :RejectQuoteAmp ALLOW_INSECURE
+if errorlevel 1 (
+    echo   ERROR: choice cannot contain a double-quote or ampersand.
+    goto :wiz_allow_insecure
+)
+
+:wiz_creds_start
+:: Credential environment variables (optional) ----------------------------------
+:: The service reads LINK_PING_METRICS_USER/PASS, LINK_PING_ECHO_SECRET and
+:: LINK_PING_ECHO_SECRET_OLD (rotation window) from its process environment. The
+:: SCM builds that environment from the REG_MULTI_SZ VALUE named Environment on
+:: the service key (a same-named SUBKEY is ignored), and the key is protected
+:: before the value is written. Press Enter to skip any value you do not need.
+echo.
+echo === Optional credential environment variables (Enter to skip) ===
+
+:wiz_muser
+set "MUser="
+set /p "MUser=Metrics basic-auth user: "
+call :RejectQuoteAmp MUser
+if errorlevel 1 (
+    echo   ERROR: the value cannot contain a double-quote or ampersand -
+    echo   those characters cannot be delivered safely through quoting below.
+    goto :wiz_muser
+)
+powershell -NoProfile -Command "if ($env:MUser -match ':') { exit 1 } else { exit 0 }" >nul 2>&1
+if errorlevel 1 (
+    echo   ERROR: the metrics username cannot contain a colon - HTTP Basic
+    echo   authentication splits user:pass at the first colon, so the agent
+    echo   rejects it at startup and the service would exit 1 on every start.
+    goto :wiz_muser
+)
+if "%MUser%"=="" goto :wiz_mpass
+:wiz_mpass
+set "MPass="
+set /p "MPass=Metrics basic-auth password: "
+call :RejectQuoteAmp MPass
+if errorlevel 1 (
+    echo   ERROR: the value cannot contain a double-quote or ampersand -
+    echo   those characters cannot be delivered safely through quoting below.
+    goto :wiz_mpass
+)
+if "%MUser%"=="" if not "%MPass%"=="" (
+    echo   ERROR: password without a username is a half-pair - the binary
+    echo   requires BOTH metrics credentials or NEITHER. Starting over:
+    echo   press Enter at the username prompt to skip metrics auth.
+    goto :wiz_muser
+)
+if "%MUser%"=="" if "%MPass%"=="" goto :wiz_esecret
+if not "%MPass%"=="" goto :wiz_esecret
+echo   The password is required together with the username. Re-enter both:
+echo   press Enter at the username prompt to skip metrics auth.
+goto :wiz_muser
+:wiz_esecret
+set "ESecret="
+set /p "ESecret=Echo HMAC secret: "
+call :RejectQuoteAmp ESecret
+if errorlevel 1 (
+    echo   ERROR: the value cannot contain a double-quote or ampersand -
+    echo   those characters cannot be delivered safely through quoting below.
+    goto :wiz_esecret
+)
+if "%ESecret%"=="" goto :wiz_esecretold
+call :CheckSecretLength ESecret
+if not errorlevel 1 goto :wiz_esecretold
+echo   ERROR: the echo HMAC secret must be at least 16 characters - it is
+echo   the key material for HMAC-SHA256 probe authentication, and a short
+echo   value is brute-forceable. Generate one with:
+echo     powershell -NoProfile -Command "-join ((48..57)+(97..122) | Get-Random -Count 32 | %% {[char]$_}^)"
+goto :wiz_esecret
+:wiz_esecretold
+set "ESecretOld="
+set /p "ESecretOld=Echo HMAC secret (previous, for rotation; Enter to skip): "
+call :RejectQuoteAmp ESecretOld
+if errorlevel 1 (
+    echo   ERROR: the value cannot contain a double-quote or ampersand -
+    echo   those characters cannot be delivered safely through quoting below.
+    goto :wiz_esecretold
+)
+if "%ESecretOld%"=="" goto :wiz_creds_done
+if "%ESecret%"=="" if not "%ESecretOld%"=="" (
+    echo   ERROR: a previous secret without a current one is invalid - the
+    echo   binary's rotation guard refuses it and the service would exit at
+    echo   startup. Re-enter the current secret, or press Enter at both
+    echo   secret prompts to skip HMAC authentication.
+    goto :wiz_esecret
+)
+call :CheckSecretLength ESecretOld
+if errorlevel 1 (
+    echo   ERROR: the previous echo HMAC secret must also be at least 16 characters.
+    goto :wiz_esecretold
+)
+:wiz_creds_done
+
+:: Render INSTALL_ARGS and validate transport pairing BEFORE touching disk or SCM.
+set "INSTALL_ARGS=-mode=%RUN_MODE% -metrics="%METRICS_ADDR%""
+if not "%TARGETS_FILE%"==""   set "INSTALL_ARGS=%INSTALL_ARGS% -targets="%TARGETS_FILE%""
+if not "%SINGLE_TARGET%"==""  set "INSTALL_ARGS=%INSTALL_ARGS% -target="%SINGLE_TARGET%""
+if not "%ALLOW_LIST%"==""     set "INSTALL_ARGS=%INSTALL_ARGS% -allow="%ALLOW_LIST%""
+if not "%TLS_CERT%"==""       set "INSTALL_ARGS=%INSTALL_ARGS% -metrics-tls-cert="%TLS_CERT%" -metrics-tls-key="%TLS_KEY%""
+if /i "%ALLOW_INSECURE%"=="y" set "INSTALL_ARGS=%INSTALL_ARGS% -metrics-allow-insecure"
+set "INSTALL_ARGS=%INSTALL_ARGS% -log-file="%LOG_DIR%\service.log""
+
+set "METRICS_TRANSPORT_OK="
+powershell -NoProfile -Command "$a=$env:INSTALL_ARGS; $hasCert=($a -match '(?i)(?:^|\s)--?metrics-tls-cert(?:=|\s|$)'); $hasKey=($a -match '(?i)(?:^|\s)--?metrics-tls-key(?:=|\s|$)'); $hasIns=($a -match '(?i)(?:^|\s)--?metrics-allow-insecure(?:=(?:true|1|t))?(?:\s|$)'); if (($hasCert -and $hasKey) -or $hasIns) { exit 0 } else { exit 1 }" >nul 2>&1
+if not errorlevel 1 set "METRICS_TRANSPORT_OK=1"
+if not "%MUser%"=="" if not "%MPass%"=="" if not defined METRICS_TRANSPORT_OK (
+    echo.
+    echo ERROR: metrics basic-auth credentials were entered, but the service arguments include
+    echo        neither -metrics-tls-cert/-metrics-tls-key nor -metrics-allow-insecure.
+    echo        The agent refuses Basic auth over plaintext HTTP, so the service would exit 1
+    echo        on every start and the SCM restart ladder would loop.
+    echo.
+    echo        Re-run the installer and configure the TLS certificate/key pair or allow plaintext HTTP.
+    echo        No credential was written and nothing was installed.
+    exit /b 1
+)
+
 echo.
 echo === Summary ================================================================
 echo   Mode           : %RUN_MODE%
@@ -266,6 +434,8 @@ if not "%TARGETS_FILE%"=="" echo   Targets file   : "%TARGETS_FILE%"
 if not "%SINGLE_TARGET%"=="" echo   Single target  : "%SINGLE_TARGET%"
 if not "%ALLOW_LIST%"==""   echo   Allow list     : "%ALLOW_LIST%"
 echo   Metrics address: "%METRICS_ADDR%"
+if not "%TLS_CERT%"=="" echo   Metrics TLS    : "%TLS_CERT%" / "%TLS_KEY%"
+if /i "%ALLOW_INSECURE%"=="y" echo   Plaintext auth : -metrics-allow-insecure
 echo   Log directory  : "%LOG_DIR%"
 if "%SERVICE_ACCOUNT%"=="" (echo   Service account: LocalSystem ^(default^)) else (echo   Service account: "%SERVICE_ACCOUNT%")
 echo   Binary         : %INSTALLED_EXE%
@@ -273,6 +443,11 @@ echo ===========================================================================
 :wiz_confirm
 set "CONFIRM="
 set /p "CONFIRM=Install with these settings? [y/N]: "
+call :RejectQuoteAmp CONFIRM
+if errorlevel 1 (
+    echo Cancelled - nothing was installed.
+    exit /b 1
+)
 if /i "%CONFIRM%"=="y" goto :confirmed
 echo Cancelled - nothing was installed.
 exit /b 1
@@ -289,14 +464,7 @@ copy /y "%EXE_PATH%" "%INSTALLED_EXE%" >nul || (
     echo ERROR: could not copy binary to "%INSTALL_DIR%"
     exit /b 1
 )
-:: The copy is a separate path operation from any earlier hash comparison, so
-:: verify the bytes that actually landed in Program Files and print their
-:: SHA-256. This is not provenance (no Authenticode or release-checksum binding
-:: happens here - docs/windows-service.md tells the operator to run cosign
-:: verify-blob + sha256sum on the download first), but it does prove the
-:: installed binary is the file the wizard hashed and gives the operator the
-:: digest to compare against checksums.txt.
-powershell -NoProfile -Command "$a=(Get-FileHash -LiteralPath '%EXE_PATH%' -Algorithm SHA256).Hash; $b=(Get-FileHash -LiteralPath '%INSTALLED_EXE%' -Algorithm SHA256).Hash; if ($a -ne $b) { Write-Host "source  $a"; Write-Host "install $b"; exit 1 }; Write-Host "SHA256 $b"" || (
+powershell -NoProfile -Command "$a=(Get-FileHash -LiteralPath $env:EXE_PATH -Algorithm SHA256).Hash; $b=(Get-FileHash -LiteralPath $env:INSTALLED_EXE -Algorithm SHA256).Hash; if ($a -ne $b) { Write-Host ('source  ' + $a); Write-Host ('install ' + $b); exit 1 }; Write-Host ('SHA256 ' + $b)" || (
     echo ERROR: "%INSTALLED_EXE%" does not match "%EXE_PATH%" after the copy - the source changed during install.
     echo        Re-download the release and verify it with cosign before re-running.
     exit /b 1
@@ -317,15 +485,20 @@ echo === Installing %SERVICE_NAME% from "%EXE_PATH%" ===
 :: is left alone here: its own ACL is applied below and the installer must not
 :: seize an unrelated parent directory.
 if /i "%LOG_DIR%"=="%DEF_LOG_DIR%" call :HardenDataDir
+if errorlevel 1 exit /b 1
 if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
 :: A reparse point (junction/symlink) at the log directory would redirect the
 :: ACL rewrite and every topology-bearing log line to a target the user chose.
-:: Refuse it before icacls touches either object.
-powershell -NoProfile -Command "$p='%LOG_DIR%'; if (Test-Path -LiteralPath $p) { $i=Get-Item -LiteralPath $p -Force; if ($i.Attributes -band [IO.FileAttributes]::ReparsePoint) { exit 1 } }; exit 0" >nul 2>&1
+:: Refuse it before takeown/icacls touches either object.
+powershell -NoProfile -Command "$p=$env:LOG_DIR; if (Test-Path -LiteralPath $p) { $i=Get-Item -LiteralPath $p -Force; if ($i.Attributes -band [IO.FileAttributes]::ReparsePoint) { exit 1 } }; exit 0" >nul 2>&1
 if errorlevel 1 (
     echo ERROR: "%LOG_DIR%" is a reparse point ^(junction/symlink^).
     echo        Refusing to rewrite the ACL of whatever it points at. Remove it
     echo        and rerun the installer, or choose a real log directory.
+    exit /b 1
+)
+takeown /f "%LOG_DIR%" /a >nul || (
+    echo ERROR: could not take ownership of "%LOG_DIR%"
     exit /b 1
 )
 :: SIDs (*S-1-5-18 = SYSTEM, *S-1-5-32-544 = Administrators), never the
@@ -338,19 +511,6 @@ icacls "%LOG_DIR%" /inheritance:r /grant "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(O
 )
 
 :: Install (arguments are snapshotted at install time) --------------------------
-:: Every value that can contain a space is quoted: the wizard invites an
-:: allowlist written as "10.0.0.1, 10.0.0.2" and paths under Program Files,
-:: and an unquoted space splits the argument list -- Go's flag parser then
-:: stops at the stray token, -svc=install is never seen and this script waits
-:: forever on a foreground agent instead of installing the service.
-REM (-mode is a validated literal; -metrics is free-text user input and is
-REM quoted like the other space-capable values.)
-set "INSTALL_ARGS=-mode=%RUN_MODE% -metrics="%METRICS_ADDR%""
-if not "%TARGETS_FILE%"==""  set "INSTALL_ARGS=%INSTALL_ARGS% -targets="%TARGETS_FILE%""
-if not "%SINGLE_TARGET%"=="" set "INSTALL_ARGS=%INSTALL_ARGS% -target="%SINGLE_TARGET%""
-if not "%ALLOW_LIST%"==""    set "INSTALL_ARGS=%INSTALL_ARGS% -allow="%ALLOW_LIST%""
-set "INSTALL_ARGS=%INSTALL_ARGS% -log-file="%LOG_DIR%\service.log""
-
 "%EXE_PATH%" %INSTALL_ARGS% -svc=install
 if errorlevel 1 (
     echo ERROR: service installation failed.
@@ -395,143 +555,6 @@ if not "%SERVICE_ACCOUNT%"=="" (
     rem (the log dir is already writable by SYSTEM, Administrators and the
     rem per-service SID).
     del /f /q "%LOG_DIR%\service.log" >nul 2>&1
-)
-
-:: Credential environment variables (optional) ----------------------------------
-:: The service reads LINK_PING_METRICS_USER/PASS, LINK_PING_ECHO_SECRET and
-:: LINK_PING_ECHO_SECRET_OLD (rotation window) from its process environment. The
-:: SCM builds that environment from the REG_MULTI_SZ VALUE named Environment on
-:: the service key (a same-named SUBKEY is ignored), and the key is protected
-:: before the value is written. Press Enter to skip any value you do not need.
-echo.
-echo === Optional credential environment variables (Enter to skip) ===
-
-:wiz_muser
-set "MUser="
-set /p "MUser=Metrics basic-auth user: "
-call :RejectQuoteAmp MUser
-if errorlevel 1 (
-    echo   ERROR: the value cannot contain a double-quote or ampersand -
-    echo   those characters cannot be delivered safely through quoting below.
-    goto :wiz_muser
-)
-:: resolveMetricsAuth rejects a colon in the username: HTTP Basic auth splits
-:: user:pass at the FIRST colon, so such a user is unreachable and the binary
-:: exits at startup. A wizard-accepted value would install "successfully" and
-:: then crash-loop under the SCM with stdout discarded. Mirror the rule here.
-powershell -NoProfile -Command "if ($env:MUser -match ':') { exit 1 } else { exit 0 }" >nul 2>&1
-if errorlevel 1 (
-    echo   ERROR: the metrics username cannot contain a colon - HTTP Basic
-    echo   authentication splits user:pass at the first colon, so the agent
-    echo   rejects it at startup and the service would exit 1 on every start.
-    goto :wiz_muser
-)
-if "%MUser%"=="" goto :wiz_mpass
-:wiz_mpass
-set "MPass="
-set /p "MPass=Metrics basic-auth password: "
-call :RejectQuoteAmp MPass
-if errorlevel 1 (
-    echo   ERROR: the value cannot contain a double-quote or ampersand -
-    echo   those characters cannot be delivered safely through quoting below.
-    goto :wiz_mpass
-)
-:: Pair rule mirrors resolveMetricsAuth in main.go: a half-pair (user
-:: without password or the reverse) makes the binary exit at startup and
-:: loops the SCM restart ladder, so refuse it at install time. Redirecting
-:: to :wiz_muser also lets the operator abandon metrics auth entirely:
-:: an empty username followed by an empty password stores neither.
-if "%MUser%"=="" if not "%MPass%"=="" (
-    echo   ERROR: password without a username is a half-pair - the binary
-    echo   requires BOTH metrics credentials or NEITHER. Starting over:
-    echo   press Enter at the username prompt to skip metrics auth.
-    goto :wiz_muser
-)
-if "%MUser%"=="" if "%MPass%"=="" goto :wiz_esecret
-if not "%MPass%"=="" goto :wiz_esecret
-echo   The password is required together with the username. Re-enter both:
-echo   press Enter at the username prompt to skip metrics auth.
-goto :wiz_muser
-:wiz_esecret
-set "ESecret="
-set /p "ESecret=Echo HMAC secret: "
-call :RejectQuoteAmp ESecret
-if errorlevel 1 (
-    echo   ERROR: the value cannot contain a double-quote or ampersand -
-    echo   those characters cannot be delivered safely through quoting below.
-    goto :wiz_esecret
-)
-if "%ESecret%"=="" goto :wiz_esecretold
-call :CheckSecretLength ESecret
-if not errorlevel 1 goto :wiz_esecretold
-REM Block-free error handling: the generation hint below contains parentheses,
-REM which must not sit inside a parenthesized if-block (a ")" at parse time
-REM would close the block early - the same class of hazard as a ")" in a
-REM user-typed password, which is why the ACL step below is also block-free).
-echo   ERROR: the echo HMAC secret must be at least 16 characters - it is
-echo   the key material for HMAC-SHA256 probe authentication, and a short
-echo   value is brute-forceable. Generate one with:
-echo     powershell -NoProfile -Command "-join ((48..57)+(97..122) | Get-Random -Count 32 | %% {[char]$_}^)"
-goto :wiz_esecret
-:wiz_esecretold
-set "ESecretOld="
-set /p "ESecretOld=Echo HMAC secret (previous, for rotation; Enter to skip): "
-call :RejectQuoteAmp ESecretOld
-if errorlevel 1 (
-    echo   ERROR: the value cannot contain a double-quote or ampersand -
-    echo   those characters cannot be delivered safely through quoting below.
-    goto :wiz_esecretold
-)
-if "%ESecretOld%"=="" goto :wiz_creds_done
-:: Rotation pair: the binary rejects a previous secret WITHOUT a current one
-:: (run()'s rotation guard) and the service would crash-loop the restart
-:: ladder, so refuse the half-pair at install time. Re-entering from
-:: :wiz_esecret lets the operator skip rotation entirely with Enter.
-if "%ESecret%"=="" if not "%ESecretOld%"=="" (
-    echo   ERROR: a previous secret without a current one is invalid - the
-    echo   binary's rotation guard refuses it and the service would exit at
-    echo   startup. Re-enter the current secret, or press Enter at both
-    echo   secret prompts to skip HMAC authentication.
-    goto :wiz_esecret
-)
-call :CheckSecretLength ESecretOld
-if errorlevel 1 (
-    echo   ERROR: the previous echo HMAC secret must also be at least 16 characters.
-    goto :wiz_esecretold
-)
-:wiz_creds_done
-:: A trailing backslash in a credential value would escape the closing
-:: quote of the quoted /d argument below at reg.exe's CommandLineToArgvW
-:: parse, silently mangling the stored secret while the install still
-:: reports success. Same rationale as the TARGETS_FILE/LOG_DIR strips
-:: above; a credential has no legitimate trailing backslash.
-if "%MUser:~-1%"=="\" set "MUser=%MUser:~0,-1%"
-if "%MPass:~-1%"=="\" set "MPass=%MPass:~0,-1%"
-if "%ESecret:~-1%"=="\" set "ESecret=%ESecret:~0,-1%"
-if "%ESecretOld:~-1%"=="\" set "ESecretOld=%ESecretOld:~0,-1%"
-:: The binary refuses plaintext metrics basic auth without TLS certificates or
-:: -metrics-allow-insecure. Those flags are not among the values this wizard
-:: renders into INSTALL_ARGS, so credentials entered here would make the service
-:: exit 1 on every start and the SCM restart ladder would loop forever with no
-:: log. Refuse BEFORE writing any value or starting the service: the operator
-:: then re-runs with -metrics-tls-cert/-metrics-tls-key (or an explicit
-:: -metrics-allow-insecure) in the extra arguments.
-set "METRICS_TRANSPORT_OK="
-echo "%INSTALL_ARGS%" | findstr /i /c:"-metrics-tls-cert" >nul && set "METRICS_TRANSPORT_OK=1"
-echo "%INSTALL_ARGS%" | findstr /i /c:"-metrics-tls-key" >nul && set "METRICS_TRANSPORT_OK=1"
-echo "%INSTALL_ARGS%" | findstr /i /c:"-metrics-allow-insecure" >nul && set "METRICS_TRANSPORT_OK=1"
-if not "%MUser%"=="" if not "%MPass%"=="" if not defined METRICS_TRANSPORT_OK (
-    echo.
-    echo ERROR: metrics basic-auth credentials were entered, but the service arguments include
-    echo        neither -metrics-tls-cert/-metrics-tls-key nor -metrics-allow-insecure.
-    echo        The agent refuses Basic auth over plaintext HTTP, so the service would exit 1
-    echo        on every start and the SCM restart ladder would loop.
-    echo.
-    echo        Re-run the installer with the TLS pair in the extra arguments, for example:
-    echo          -metrics-tls-cert=C:\ProgramData\link_ping_prometheus\metrics.crt -metrics-tls-key=C:\ProgramData\link_ping_prometheus\metrics.key
-    echo        or accept plaintext HTTP explicitly with -metrics-allow-insecure.
-    echo        No credential was written and the service was not started.
-    exit /b 1
 )
 
 :: Credentials go into the SCM's per-service environment ---------------------
@@ -648,7 +671,7 @@ if not exist "%DATA_DIR%" mkdir "%DATA_DIR%"
 :: takeown /a and icacls operate on the TARGET of a reparse point, so a local
 :: user who pre-created this path as a junction to another directory could
 :: make an elevated install seize and rewrite that directory's ACL. Refuse.
-powershell -NoProfile -Command "$p='%DATA_DIR%'; $i=Get-Item -LiteralPath $p -Force; if ($i.Attributes -band [IO.FileAttributes]::ReparsePoint) { exit 1 }; exit 0" >nul 2>&1
+powershell -NoProfile -Command "$p=$env:DATA_DIR; $i=Get-Item -LiteralPath $p -Force; if ($i.Attributes -band [IO.FileAttributes]::ReparsePoint) { exit 1 }; exit 0" >nul 2>&1
 if errorlevel 1 (
     echo ERROR: "%DATA_DIR%" is a reparse point ^(junction/symlink^).
     echo        Refusing to take ownership of an unrelated target. Remove it and rerun.

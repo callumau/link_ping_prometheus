@@ -62,8 +62,8 @@ dockers_v2:
     platforms:
       - linux/amd64
       - linux/arm64
-    # SBOM/SLSA provenance enabled for supply-chain audit via
-    # ghcr attestation; verify via gh attestation verify + cosign.
+    # SBOM attached to the container image; release checksums.txt is signed
+    # with cosign and attested via SLSA provenance (gh attestation verify).
     sbom: true
     flags:
       - "--label=org.opencontainers.image.source={{ .GitURL }}"

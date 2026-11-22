@@ -2736,7 +2736,7 @@
                       "type": "value"
                     }
                   ],
-                  "max": 1,
+                  "max": 3,
                   "min": 0,
                   "thresholds": {
                     "mode": "absolute",
@@ -2892,7 +2892,7 @@
                   {
                     "matcher": {
                       "id": "byRegexp",
-                      "options": "Sent$",
+                      "options": "sent$",
                       "scope": "series"
                     },
                     "properties": [
@@ -2908,7 +2908,7 @@
                   {
                     "matcher": {
                       "id": "byRegexp",
-                      "options": "Timeout$",
+                      "options": "timeout$",
                       "scope": "series"
                     },
                     "properties": [

@@ -12,4 +12,5 @@
 
 /.github/workflows/release.yml @callumau
 /.goreleaser.yaml @callumau
+/.signpath/artifact-configuration.xml @callumau
 /installer/ @callumau

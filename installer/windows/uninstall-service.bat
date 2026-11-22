@@ -92,22 +92,8 @@ if exist "%INSTALLED_EXE%" (
 :: default-path behavior below.
 :cleanup_custom
 if not "%SVC_LOG_DIR%"=="" if /i not "%SVC_LOG_DIR%"=="%LOG_DIR%" (
-    echo === Removing custom log directory "%SVC_LOG_DIR%" ===
-    :: No icacls /reset: it cannot help deletion (Administrators already hold
-    :: full control) and it would replace the directory's protected DACL with
-    :: the inherited, Users-readable one before the delete is attempted.
-    :: rmdir /s on a junction deletes the TARGET's contents on some Windows
-    :: versions, so refuse a reparse point before the recursive delete. The
-    :: check lives in a subroutine: a PowerShell one-liner inside this
-    :: parenthesized block would put ')' characters through cmd's block
-    :: parser.
-    call :RefuseReparse "%SVC_LOG_DIR%" || exit /b 1
-    rmdir /s /q "%SVC_LOG_DIR%" >nul 2>&1
-    if exist "%SVC_LOG_DIR%" (
-        echo ERROR: could not remove "%SVC_LOG_DIR%" - close anything using it and rerun.
-        echo        The directory and its topology-bearing logs are still on disk.
-        exit /b 1
-    )
+    call :cleanup_one_custom
+    if errorlevel 1 exit /b 1
 )
 
 :: Credential scrub runs while the key still exists: a failed delete left it
@@ -130,8 +116,10 @@ if exist "%INSTALL_DIR%" (
 
 :: === Optional: remove ProgramData logs =======================================
 echo.
+set "DEL_LOGS="
 set /p "DEL_LOGS=Delete log directory %DATA_DIR%? [y/N]: "
-if /i not "%DEL_LOGS%"=="y" goto :done
+powershell -NoProfile -Command "if ($env:DEL_LOGS -match '^(?i)y$') { exit 0 } else { exit 1 }" >nul 2>&1
+if errorlevel 1 goto :done
 
 echo === Removing "%DATA_DIR%" ===
 :: No icacls /reset here. It was unnecessary for deletion (the installer
@@ -157,6 +145,26 @@ echo Logs deleted.
 echo.
 echo Uninstall complete.
 endlocal
+exit /b 0
+
+:cleanup_one_custom
+call :RefuseReparse "%SVC_LOG_DIR%" || exit /b 1
+set "DEL_CUSTOM_DIR="
+set /p "DEL_CUSTOM_DIR=Delete entire custom log directory "%SVC_LOG_DIR%" (y=rmdir /s, N=service.log* only)? [y/N]: "
+powershell -NoProfile -Command "if ($env:DEL_CUSTOM_DIR -match '^(?i)y$') { exit 0 } else { exit 1 }" >nul 2>&1
+if errorlevel 1 (
+    echo === Removing "%SVC_LOG_DIR%\service.log*" only ===
+    del /f /q "%SVC_LOG_DIR%\service.log*" >nul 2>&1
+    exit /b 0
+)
+echo === Removing custom log directory "%SVC_LOG_DIR%" ===
+rmdir /s /q "%SVC_LOG_DIR%" >nul 2>&1
+if exist "%SVC_LOG_DIR%" (
+    echo ERROR: could not remove "%SVC_LOG_DIR%" - close anything using it and rerun.
+    echo        The directory and its topology-bearing logs are still on disk.
+    exit /b 1
+)
+exit /b 0
 
 :RefuseReparse
 :: %1 is a path. Exit 1 when it exists and is a reparse point (junction or
@@ -187,7 +195,7 @@ REM The result is captured via a temp file, not for /f: nesting this command
 REM inside for /f's IN(...) clause re-enters cmd quoting for the caret and the
 REM single quotes, which is exactly the fragile layering the installer avoids
 REM elsewhere (flat lines, no parenthesized blocks around user-derived text).
-set "SVC_QC_TMP=%TEMP%\lpp_svc_qc.txt"
+set "SVC_QC_TMP=%TEMP%\lpp_svc_qc_%RANDOM%_%RANDOM%.txt"
 powershell -NoProfile -Command "$bp=((sc.exe qc '%SERVICE_NAME%' 2>$null) -join ' '); if ($bp -match '-log-file=(?:\x22([^\x22]+)\x22|(\S+))') { if ($Matches[1]) { Split-Path ($Matches[1]) -Parent } else { Split-Path ($Matches[2]) -Parent } }" > "%SVC_QC_TMP%" 2>nul
 set /p SVC_LOG_DIR=<"%SVC_QC_TMP%"
 del "%SVC_QC_TMP%" >nul 2>&1

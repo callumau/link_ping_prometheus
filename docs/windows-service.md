@@ -190,9 +190,8 @@ directory, and an optional service account, then shows a summary.
    - Restrict who can create `v*` tags with a GitHub Ruleset: the release
      build reads the tag for `link_ping_build_info` and mints a sigstore
      signing identity, so tag creation is release-authoring permission.
-     `.github/CODEOWNERS` lists the release paths — replace its placeholder
-     team first (an unresolved handle matches nobody, so a required-review
-     ruleset on it is never satisfiable).
+     `.github/CODEOWNERS` lists the release paths so PRs touching them
+     require maintainer review.
    - Pin the WinRM CA per host in the Ansible inventory
      (`deploy/ansible/inventory.example.yml`); an unpinned `winrm`
      connection trusts whatever CA answers first.
