@@ -220,17 +220,6 @@ const mtuMaxReadErrors = 3
 // mtuReadArm bounds a single MTU-sweep read arm so cancellation is honored promptly.
 const mtuReadArm = 500 * time.Millisecond
 
-// probeHeaderSize is the frame header length: 32 bytes when an HMAC tag is
-// present, 24 otherwise. One spelling for the sweep's buffer/write length
-// and the path-MTU frame size; buildProbeFrame derives the same value from
-// its MACer, which is created under the identical condition.
-func probeHeaderSize(echoSecret string) int {
-	if echoSecret != "" {
-		return PayloadSizeWithHMAC
-	}
-	return PayloadSize
-}
-
 // sweepOnce binary-searches [0, MaxPayloadBytes] for the largest payload
 // that echoes back on the DF socket. A failed size is retried once
 // before it counts as "does not survive": a single dropped probe on a

@@ -425,6 +425,396 @@ func RunServer(ctx context.Context, addr string, source string, allowed *Allowli
 	return nil
 }
 
+type clientHandles struct {
+	recv prometheus.Counter
+	skew prometheus.Gauge
+	// key is the {client} label value (the canonical address string).
+	key string
+	// lastSeen ages dynamic entries out (DynClientTTL); unused for
+	// pre-resolved exact-IP handles, which are never evicted.
+	lastSeen time.Time
+}
+
+type serverDropCounters struct {
+	invalidAddr    prometheus.Counter
+	allowlist      prometheus.Counter
+	rateIP         prometheus.Counter
+	rateGlobal     prometheus.Counter
+	size           prometheus.Counter
+	magic          prometheus.Counter
+	clientOverflow prometheus.Counter
+	hmac           prometheus.Counter
+	replay         prometheus.Counter
+	dup            prometheus.Counter
+}
+
+func newServerDropCounters(source string) serverDropCounters {
+	// Pre-resolve the fixed set of drop reasons once, so a dropped
+	// datagram (the flood case) costs no label-map hashing. If a new drop
+	// reason is added, add a field here and to the Help text in metrics.go.
+	return serverDropCounters{
+		invalidAddr:    ServerProbesDropped.WithLabelValues(source, "invalid_addr"),
+		allowlist:      ServerProbesDropped.WithLabelValues(source, "allowlist"),
+		rateIP:         ServerProbesDropped.WithLabelValues(source, "rate_ip"),
+		rateGlobal:     ServerProbesDropped.WithLabelValues(source, "rate_global"),
+		size:           ServerProbesDropped.WithLabelValues(source, "size"),
+		magic:          ServerProbesDropped.WithLabelValues(source, "magic"),
+		clientOverflow: ServerProbesDropped.WithLabelValues(source, "client_overflow"),
+		hmac:           ServerProbesDropped.WithLabelValues(source, "hmac"),
+		replay:         ServerProbesDropped.WithLabelValues(source, "replay"),
+		dup:            ServerProbesDropped.WithLabelValues(source, "dup"),
+	}
+}
+
+type dynClientCache struct {
+	source    string
+	mu        sync.Mutex
+	entries   map[netip.Addr]clientHandles
+	lastSweep time.Time
+}
+
+func newDynClientCache(source string) *dynClientCache {
+	return &dynClientCache{
+		source:  source,
+		entries: make(map[netip.Addr]clientHandles),
+	}
+}
+
+// sweepExpired drops clients idle for DynClientTTL. Caller must hold
+// c.mu. Both the map entry AND the Prometheus series are removed —
+// the vecs retain a series per label set forever otherwise, so
+// lifetime cardinality would still grow without bound.
+func (c *dynClientCache) sweepExpired(now time.Time) {
+	for ip, eh := range c.entries {
+		if now.Sub(eh.lastSeen) >= DynClientTTL {
+			ServerProbesReceived.DeleteLabelValues(c.source, eh.key)
+			ServerClockSkew.DeleteLabelValues(c.source, eh.key)
+			delete(c.entries, ip)
+		}
+	}
+}
+
+func (c *dynClientCache) resolve(ip netip.Addr) (clientHandles, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now()
+	// Sweep on every resolve, not only under MaxClientSeries pressure:
+	// below the cap an expired client's series would otherwise be
+	// exported forever at its last value (a frozen link_server_clock_skew
+	// alert that can never resolve). Time-gated because the walk is
+	// O(len(entries)) under the lock; a live client refreshes lastSeen on
+	// each resolve, so it is never evicted.
+	if now.Sub(c.lastSweep) >= dynSweepInterval {
+		c.lastSweep = now
+		c.sweepExpired(now)
+	}
+	if h, ok := c.entries[ip]; ok {
+		h.lastSeen = now
+		c.entries[ip] = h
+		return h, true
+	}
+	// No extra sweep under pressure. This branch used to call
+	// sweepExpired on every frame from a new CIDR source while the map
+	// was full, i.e. a full MaxClientSeries walk per packet (~10.6us at
+	// 1024 entries), even though the gate above and the dedicated 1s
+	// sweeper already evict idle clients. A spoofed flood can now hold
+	// the map at its cap for at most one sweep interval; after that the
+	// sleeper releases the TTL-expired slots exactly as before, without
+	// the per-packet O(n).
+	if len(c.entries) >= MaxClientSeries {
+		return clientHandles{}, false
+	}
+	key := ip.String()
+	h := clientHandles{
+		recv:     ServerProbesReceived.WithLabelValues(c.source, key),
+		skew:     ServerClockSkew.WithLabelValues(c.source, key),
+		key:      key,
+		lastSeen: now,
+	}
+	c.entries[ip] = h
+	return h, true
+}
+
+// startSweeper starts a dedicated ticker that evicts idle dynamic clients
+// regardless of incoming traffic, and returns a stop function that joins it.
+func (c *dynClientCache) startSweeper(ctx context.Context) func() {
+	dynStop := make(chan struct{})
+	dynDone := make(chan struct{})
+	go func() {
+		defer close(dynDone)
+		ticker := time.NewTicker(dynSweepInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-dynStop:
+				return
+			case now := <-ticker.C:
+				c.mu.Lock()
+				// Record the sweep time so resolve()'s once-per-second gate
+				// does not walk the map a second time on the next probe.
+				c.lastSweep = now
+				c.sweepExpired(now)
+				c.mu.Unlock()
+			}
+		}
+	}()
+	return func() {
+		close(dynStop)
+		<-dynDone
+	}
+}
+
+type udpServer struct {
+	ctx              context.Context
+	pc               net.PacketConn
+	allowed          *Allowlist
+	echoSecret       string
+	expectedSize     int
+	rl               *rateLimiter
+	guard            *echoDupGuard
+	curMAC           *probeMACer
+	oldMAC           *probeMACer
+	handles          map[netip.Addr]clientHandles
+	dyn              *dynClientCache
+	drops            serverDropCounters
+	echoErrors       prometheus.Counter
+	unauthHMACFrames prometheus.Counter
+
+	lastWriteLog         time.Time
+	lastReplayLog        time.Time
+	consecutiveReadFails int
+	warnedReadErrors     bool
+}
+
+func newUDPServer(ctx context.Context, pc net.PacketConn, source string, allowed *Allowlist, echoSecret string, echoSecretOld ...string) *udpServer {
+	// Pre-resolve per-client metric handles for exact allowlist IPs once:
+	// only allowlisted IPs reach these metrics, so the set is bounded by
+	// the exact allowlist (max 256). Avoids the per-packet WithLabelValues
+	// hash+lookup on the hot path — the same resolve-once convention the
+	// client probe loop uses. Prefix-matched clients resolve their handles
+	// on demand under MaxClientSeries.
+	handles := make(map[netip.Addr]clientHandles, len(allowed.exact))
+	for ip := range allowed.exact {
+		key := ip.String()
+		handles[ip] = clientHandles{
+			recv: ServerProbesReceived.WithLabelValues(source, key),
+			skew: ServerClockSkew.WithLabelValues(source, key),
+			key:  key,
+		}
+	}
+
+	// Reusable HMAC states for the read loop's verify chain (single
+	// goroutine, so one state per secret; crypto/hmac is not concurrent-
+	// safe). Built once instead of the previous 2-4 hmac.New per frame.
+	var curMAC, oldMAC *probeMACer
+	expectedSize := PayloadSize
+	if echoSecret != "" {
+		expectedSize = PayloadSizeWithHMAC
+		curMAC = newProbeMACer(echoSecret)
+		// The EMPTY old secret must be rejected here, not tolerated
+		// downstream: main passes the (usually empty) -echo-secret-old as a
+		// one-element variadic, and a zero-length key is a perfectly valid
+		// HMAC key — newProbeMACer("") would silently install a verifier for
+		// HMAC-SHA256(key ""), so any off-path host could tag its own frames
+		// and get them echoed (reflection, plus the victim's per-IP budget
+		// burned) while the server looks correctly configured.
+		if len(echoSecretOld) > 0 && echoSecretOld[0] != "" {
+			oldMAC = newProbeMACer(echoSecretOld[0])
+		}
+	}
+
+	return &udpServer{
+		ctx:              ctx,
+		pc:               pc,
+		allowed:          allowed,
+		echoSecret:       echoSecret,
+		expectedSize:     expectedSize,
+		rl:               newRateLimiter(MaxPktsPerIP, MaxPktsGlobal),
+		guard:            newEchoDupGuard(),
+		curMAC:           curMAC,
+		oldMAC:           oldMAC,
+		handles:          handles,
+		dyn:              newDynClientCache(source),
+		drops:            newServerDropCounters(source),
+		echoErrors:       ServerEchoErrors.WithLabelValues(source),
+		unauthHMACFrames: ServerUnauthHMACFrames.WithLabelValues(source),
+	}
+}
+
+func (s *udpServer) handleReadError(err error) bool {
+	if s.ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+		return false
+	}
+	if isPeerUnreachable(err) {
+		// A client (or a spoofed source inside an allowlisted CIDR)
+		// is unreachable: normal, and no reason to count toward the
+		// failure bound. Same classification as the client's reader.
+		s.consecutiveReadFails = 0
+		slog.Debug("UDP read error (peer unreachable)", "err", err)
+		return true
+	}
+	// Unexpected read errors on an unconnected UDP socket are
+	// transient; the loop survives them, but bounded so a socket that
+	// fails persistently cannot peg a core at Debug level.
+	s.consecutiveReadFails++
+	if s.consecutiveReadFails >= maxConsecutiveServerReadFails {
+		if !s.warnedReadErrors {
+			s.warnedReadErrors = true
+			slog.Error("Persistent UDP read errors; backing off (echo service degraded)",
+				"consecutive_failures", s.consecutiveReadFails, "err", err)
+		}
+		select {
+		case <-s.ctx.Done():
+			return false
+		case <-time.After(serverReadErrorBackoff):
+		}
+		return true
+	}
+	slog.Debug("UDP read error", "err", err)
+	return true
+}
+
+func (s *udpServer) handlePacket(buf []byte, n int, raddr net.Addr) {
+	// Cheap untrusted-source rejection MUST stay ahead of crypto
+	// work: any internet host must not be able to buy HMAC-SHA256
+	// CPU per flood packet on a latency-measuring box. The echo
+	// responder is UDP-only, so ReadFrom yields a *net.UDPAddr whose
+	// IP converts to a netip.Addr with no allocation and no string
+	// round-trip: the string form is materialised only when a log line
+	// or a new metric series actually needs it.
+	ua, ok := raddr.(*net.UDPAddr)
+	if !ok {
+		s.drops.invalidAddr.Inc()
+		return
+	}
+	na, ok := netip.AddrFromSlice(ua.IP)
+	if !ok {
+		s.drops.invalidAddr.Inc()
+		return
+	}
+	na = na.Unmap()
+	if !s.allowed.Contains(na) {
+		s.drops.allowlist.Inc()
+		return
+	}
+	// Deliberate invariant: the global budget is charged pre-validation
+	// so total work in this loop, HMAC-SHA256 included, is bounded by
+	// MaxPktsGlobal; the per-IP budget is charged post-validation so
+	// only frames that actually authenticate can spend a legit
+	// client's allowance (spoofed junk inside an allowed CIDR must not
+	// fake 100% loss for that client).
+	if reason := s.rl.chargeGlobal(); reason != "" {
+		s.drops.rateGlobal.Inc()
+		return
+	}
+
+	// Accept header plus bounded payload; reject oversized reflector attempts.
+	if n < s.expectedSize || n > s.expectedSize+MaxPayloadBytes {
+		s.drops.size.Inc()
+		return
+	}
+	if string(buf[0:8]) != MagicBytes {
+		s.drops.magic.Inc()
+		return
+	}
+	// Count bare 32B frames received without -echo-secret as half-configured HMAC.
+	// Larger 32B+payload frames are indistinguishable from valid -payload probes.
+	if s.echoSecret == "" && n == PayloadSizeWithHMAC {
+		s.unauthHMACFrames.Inc()
+	}
+	// Authenticate and check replay window BEFORE handle resolution so unauthenticated
+	// sources cannot consume MaxClientSeries slots or inflate label cardinality.
+	var skew time.Duration
+	if s.echoSecret != "" {
+		seq := binary.LittleEndian.Uint64(buf[8:16])
+		ts := binary.LittleEndian.Uint64(buf[16:24])
+		// Accept either header-only (v0.7) or full-frame (v0.8+) tags on payload frames.
+		if !macAny(s.curMAC, s.oldMAC, seq, ts, buf[24:32]) {
+			if n == s.expectedSize || !fullFrameAny(s.curMAC, s.oldMAC, buf[:n]) {
+				s.drops.hmac.Inc()
+				return
+			}
+		}
+		skew = time.Since(time.Unix(0, int64(ts)))
+		if skewReplayed(skew) {
+			s.drops.replay.Inc()
+			if s.lastReplayLog.IsZero() || time.Since(s.lastReplayLog) >= time.Minute {
+				slog.Warn("replayed or stale probe timestamp rejected (check NTP/clock sync)", "addr", na.String(), "skew", skew, "window", maxReplayWindow)
+				s.lastReplayLog = time.Now()
+			}
+			return
+		}
+	}
+	// Echo-loop guard: a frame identical to one recently echoed (same
+	// source, seq, timestamp) is a bounce off another responder (or an
+	// in-window replay), not a live probe — echoing it again would
+	// sustain the loop forever. Runs BEFORE per-IP charge and BEFORE handle
+	// resolution so a dup never spends budget or allocates a series.
+	key := echoFrameKey(na, buf)
+	if _, dup := s.guard.seen[key]; dup {
+		s.drops.dup.Inc()
+		return
+	}
+	// Per-IP budget is charged here, after authentication (or, with no
+	// secret, after size/magic) and after the dup guard.
+	if reason := s.rl.chargeIP(na); reason != "" {
+		s.drops.rateIP.Inc()
+		return
+	}
+	// Resolve the per-client metric handles last: exact allowlist IPs hit
+	// the pre-resolved map with no lock, while prefix matches go through
+	// the capped dynamic map (H1 cardinality guard).
+	h, pre := s.handles[na]
+	if !pre {
+		res, resOK := s.dyn.resolve(na)
+		if !resOK {
+			s.drops.clientOverflow.Inc()
+			return
+		}
+		h = res
+	}
+	if s.echoSecret != "" {
+		// The gauge is set only for in-window frames: a single replayed
+		// authenticated frame would otherwise peg the skew gauge at
+		// hours and trip the ClockSkewApproaching alert.
+		h.skew.Set(skew.Seconds())
+	}
+
+	h.recv.Inc()
+	// Record the identity immediately BEFORE the echo write, not after
+	// a successful write: the check→record window must not include the
+	// write syscall, and in secret-less mode a registered-but-unechoed
+	// identity merely loses that one frame instead of opening a race window.
+	s.guard.record(key)
+	if nw, err := s.pc.WriteTo(buf[:n], raddr); err != nil {
+		if s.ctx.Err() == nil {
+			s.echoErrors.Inc()
+			if s.lastWriteLog.IsZero() || time.Since(s.lastWriteLog) >= time.Minute {
+				slog.Warn("UDP echo write failed (further failures logged at most once per minute)", "addr", raddr, "bytes", nw, "err", err)
+				s.lastWriteLog = time.Now()
+			}
+		}
+	}
+}
+
+func (s *udpServer) serve() error {
+	buf := make([]byte, MaxDatagramSize)
+	for {
+		n, raddr, err := s.pc.ReadFrom(buf)
+		if err != nil {
+			if !s.handleReadError(err) {
+				return nil
+			}
+			continue
+		}
+		s.consecutiveReadFails = 0
+		s.warnedReadErrors = false
+		s.handlePacket(buf, n, raddr)
+	}
+}
+
 // ServePacketConn runs the UDP echo loop on pc. Datagrams whose size is
 // the expected header (PayloadSize, or PayloadSizeWithHMAC when a secret
 // is set) plus a bounded payload extension, with a valid magic header
@@ -459,371 +849,8 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 			slog.Error("panic in echo server", "panic", r)
 		}
 	}()
-	buf := make([]byte, MaxDatagramSize)
-	rl := newRateLimiter(MaxPktsPerIP, MaxPktsGlobal)
-	// Bounded echo-loop guard: the identity of every echoed frame is
-	// remembered for the last dupRingSize echoes.
-	guard := newEchoDupGuard()
-	var lastWriteLog time.Time
-	var lastReplayLog time.Time
-	// concurrent-read-failure state (see the read-error branch below).
-	consecutiveReadFails := 0
-	warnedReadErrors := false
-	// Pre-resolve the echo-failure counter once: a label lookup per write
-	// error would be pointless work on the hot path.
-	echoErrors := ServerEchoErrors.WithLabelValues(source)
-	// Half-configured-HMAC observability handle (see the increment site
-	// below): resolved once like echoErrors; the vec is keyed by {source} only.
-	unauthHMACFrames := ServerUnauthHMACFrames.WithLabelValues(source)
-
-	// Pre-resolve the fixed set of drop reasons once, so a dropped
-	// datagram (the flood case) costs no label-map hashing. If a new drop
-	// reason is added, add a field here and to the Help text in metrics.go.
-	drops := struct {
-		invalidAddr, allowlist, rateIP, rateGlobal, size, magic, clientOverflow, hmac, replay, dup prometheus.Counter
-	}{
-		invalidAddr:    ServerProbesDropped.WithLabelValues(source, "invalid_addr"),
-		allowlist:      ServerProbesDropped.WithLabelValues(source, "allowlist"),
-		rateIP:         ServerProbesDropped.WithLabelValues(source, "rate_ip"),
-		rateGlobal:     ServerProbesDropped.WithLabelValues(source, "rate_global"),
-		size:           ServerProbesDropped.WithLabelValues(source, "size"),
-		magic:          ServerProbesDropped.WithLabelValues(source, "magic"),
-		clientOverflow: ServerProbesDropped.WithLabelValues(source, "client_overflow"),
-		hmac:           ServerProbesDropped.WithLabelValues(source, "hmac"),
-		replay:         ServerProbesDropped.WithLabelValues(source, "replay"),
-		dup:            ServerProbesDropped.WithLabelValues(source, "dup"),
-	}
-
-	// Pre-resolve per-client metric handles for exact allowlist IPs once:
-	// only allowlisted IPs reach these metrics, so the set is bounded by
-	// the exact allowlist (max 256). Avoids the per-packet WithLabelValues
-	// hash+lookup on the hot path — the same resolve-once convention the
-	// client probe loop uses. Prefix-matched clients resolve their handles
-	// on demand under MaxClientSeries (see resolve below).
-	//
-	// keyed by netip.Addr: the datagram path looks up the unmapped source
-	// address directly, with no string allocation. key is the label value,
-	// materialised once per client (when its series is created).
-	type clientHandles struct {
-		recv prometheus.Counter
-		skew prometheus.Gauge
-		// key is the {client} label value (the canonical address string).
-		key string
-		// lastSeen ages dynamic entries out (DynClientTTL); unused for
-		// pre-resolved exact-IP handles, which are never evicted.
-		lastSeen time.Time
-	}
-	handles := make(map[netip.Addr]clientHandles, len(allowed.exact))
-	// Reusable HMAC states for the read loop's verify chain (single
-	// goroutine, so one state per secret; crypto/hmac is not concurrent-
-	// safe). Built once instead of the previous 2-4 hmac.New per frame.
-	var curMAC, oldMAC *probeMACer
-	if echoSecret != "" {
-		curMAC = newProbeMACer(echoSecret)
-		// The EMPTY old secret must be rejected here, not tolerated
-		// downstream: main passes the (usually empty) -echo-secret-old as a
-		// one-element variadic, and a zero-length key is a perfectly valid
-		// HMAC key — newProbeMACer("") would silently install a verifier for
-		// HMAC-SHA256(key ""), so any off-path host could tag its own frames
-		// and get them echoed (reflection, plus the victim's per-IP budget
-		// burned) while the server looks correctly configured.
-		if len(echoSecretOld) > 0 && echoSecretOld[0] != "" {
-			oldMAC = newProbeMACer(echoSecretOld[0])
-		}
-	}
-	for ip := range allowed.exact {
-		key := ip.String()
-		handles[ip] = clientHandles{
-			recv: ServerProbesReceived.WithLabelValues(source, key),
-			skew: ServerClockSkew.WithLabelValues(source, key),
-			key:  key,
-		}
-	}
-	var dynMu sync.Mutex
-	dyn := make(map[netip.Addr]clientHandles)
-	var lastSweep time.Time
-	// sweepExpired drops clients idle for DynClientTTL. Caller must hold
-	// dynMu. Both the map entry AND the Prometheus series are removed —
-	// the vecs retain a series per label set forever otherwise, so
-	// lifetime cardinality would still grow without bound.
-	sweepExpired := func(now time.Time) {
-		for ip, eh := range dyn {
-			if now.Sub(eh.lastSeen) >= DynClientTTL {
-				ServerProbesReceived.DeleteLabelValues(source, eh.key)
-				ServerClockSkew.DeleteLabelValues(source, eh.key)
-				delete(dyn, ip)
-			}
-		}
-	}
-	resolve := func(ip netip.Addr) (clientHandles, bool) {
-		dynMu.Lock()
-		defer dynMu.Unlock()
-		now := time.Now()
-		// Sweep on every resolve, not only under MaxClientSeries pressure:
-		// below the cap an expired client's series would otherwise be
-		// exported forever at its last value (a frozen link_server_clock_skew
-		// alert that can never resolve). Time-gated because the walk is
-		// O(len(dyn)) under the lock; a live client refreshes lastSeen on
-		// each resolve, so it is never evicted.
-		if now.Sub(lastSweep) >= dynSweepInterval {
-			lastSweep = now
-			sweepExpired(now)
-		}
-		if h, ok := dyn[ip]; ok {
-			h.lastSeen = now
-			dyn[ip] = h
-			return h, true
-		}
-		// No extra sweep under pressure. This branch used to call
-		// sweepExpired on every frame from a new CIDR source while the map
-		// was full, i.e. a full MaxClientSeries walk per packet (~10.6us at
-		// 1024 entries), even though the gate above and the dedicated 1s
-		// sweeper already evict idle clients. A spoofed flood can now hold
-		// the map at its cap for at most one sweep interval; after that the
-		// sleeper releases the TTL-expired slots exactly as before, without
-		// the per-packet O(n).
-		if len(dyn) >= MaxClientSeries {
-			return clientHandles{}, false
-		}
-		key := ip.String()
-		h := clientHandles{
-			recv:     ServerProbesReceived.WithLabelValues(source, key),
-			skew:     ServerClockSkew.WithLabelValues(source, key),
-			key:      key,
-			lastSeen: now,
-		}
-		dyn[ip] = h
-		return h, true
-	}
-
-	// A dedicated sweeper ticks regardless of traffic: resolve()'s gate
-	// only runs when another prefix-matched probe arrives, so a lone CIDR
-	// client that disappears would otherwise keep its series (and a frozen
-	// link_server_clock_skew alert) forever. The stop channel is closed by
-	// the defer below once the read loop returns; ctx cancellation alone
-	// closes pc and lets the read loop exit, after which this join runs, so
-	// ServePacketConn never leaks the goroutine into a later test.
-	dynStop := make(chan struct{})
-	dynDone := make(chan struct{})
-	defer func() {
-		close(dynStop)
-		<-dynDone
-	}()
-	go func() {
-		defer close(dynDone)
-		ticker := time.NewTicker(dynSweepInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-dynStop:
-				return
-			case now := <-ticker.C:
-				dynMu.Lock()
-				// Record the sweep time so resolve()'s once-per-second gate
-				// does not walk the map a second time on the next probe.
-				lastSweep = now
-				sweepExpired(now)
-				dynMu.Unlock()
-			}
-		}
-	}()
-
-	// Frame shape constants: constant for the loop's lifetime (they depend
-	// only on configuration captured above).
-	expectedSize := PayloadSize
-	if echoSecret != "" {
-		expectedSize = PayloadSizeWithHMAC
-	}
-
-	for {
-		n, raddr, err := pc.ReadFrom(buf)
-		if err != nil {
-			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
-				return nil
-			}
-			if isPeerUnreachable(err) {
-				// A client (or a spoofed source inside an allowlisted CIDR)
-				// is unreachable: normal, and no reason to count toward the
-				// failure bound. Same classification as the client's reader.
-				consecutiveReadFails = 0
-				slog.Debug("UDP read error (peer unreachable)", "err", err)
-				continue
-			}
-			// Unexpected read errors on an unconnected UDP socket are
-			// transient; the loop survives them, but bounded so a socket that
-			// fails persistently cannot peg a core at Debug level.
-			consecutiveReadFails++
-			if consecutiveReadFails >= maxConsecutiveServerReadFails {
-				if !warnedReadErrors {
-					warnedReadErrors = true
-					slog.Error("Persistent UDP read errors; backing off (echo service degraded)",
-						"consecutive_failures", consecutiveReadFails, "err", err)
-				}
-				select {
-				case <-ctx.Done():
-					return nil
-				case <-time.After(serverReadErrorBackoff):
-				}
-				continue
-			}
-			slog.Debug("UDP read error", "err", err)
-			continue
-		}
-		consecutiveReadFails = 0
-		warnedReadErrors = false
-		// Cheap untrusted-source rejection MUST stay ahead of crypto
-		// work: any internet host must not be able to buy HMAC-SHA256
-		// CPU per flood packet on a latency-measuring box. The echo
-		// responder is UDP-only, so ReadFrom yields a *net.UDPAddr whose
-		// IP converts to a netip.Addr with no allocation and no string
-		// round-trip: the string form is materialised only when a log line
-		// or a new metric series actually needs it.
-		ua, ok := raddr.(*net.UDPAddr)
-		if !ok {
-			drops.invalidAddr.Inc()
-			continue
-		}
-		na, ok := netip.AddrFromSlice(ua.IP)
-		if !ok {
-			drops.invalidAddr.Inc()
-			continue
-		}
-		na = na.Unmap()
-		if !allowed.Contains(na) {
-			drops.allowlist.Inc()
-			continue
-		}
-		// Deliberate invariant: the global budget is charged pre-validation
-		// so total work in this loop, HMAC-SHA256 included, is bounded by
-		// MaxPktsGlobal; the per-IP budget is charged post-validation so
-		// only frames that actually authenticate can spend a legit
-		// client's allowance (spoofed junk inside an allowed CIDR must not
-		// fake 100% loss for that client).
-		if reason := rl.chargeGlobal(); reason != "" {
-			drops.rateGlobal.Inc()
-			continue
-		}
-
-		// Accept the header frame plus any bounded payload extension:
-		// Accept header plus bounded payload; reject oversized reflector attempts.
-		if n < expectedSize || n > expectedSize+MaxPayloadBytes {
-			drops.size.Inc()
-			continue
-		}
-		if string(buf[0:8]) != MagicBytes {
-			drops.magic.Inc()
-			continue
-		}
-		// Count bare 32B frames received without -echo-secret as half-configured HMAC.
-		// Larger 32B+payload frames are indistinguishable from valid -payload probes.
-		if echoSecret == "" && n == PayloadSizeWithHMAC {
-			unauthHMACFrames.Inc()
-		}
-		// Authenticate and check replay window BEFORE handle resolution so unauthenticated
-		// sources cannot consume MaxClientSeries slots or inflate label cardinality.
-		var skew time.Duration
-		if echoSecret != "" {
-			seq := binary.LittleEndian.Uint64(buf[8:16])
-			ts := binary.LittleEndian.Uint64(buf[16:24])
-			// Accept either header-only (v0.7) or full-frame (v0.8+) tags on payload frames.
-			if !macAny(curMAC, oldMAC, seq, ts, buf[24:32]) {
-				if n == expectedSize || !fullFrameAny(curMAC, oldMAC, buf[:n]) {
-					drops.hmac.Inc()
-					continue
-				}
-			}
-			skew = time.Since(time.Unix(0, int64(ts)))
-			if skewReplayed(skew) {
-				drops.replay.Inc()
-				if lastReplayLog.IsZero() || time.Since(lastReplayLog) >= time.Minute {
-					slog.Warn("replayed or stale probe timestamp rejected (check NTP/clock sync)", "addr", na.String(), "skew", skew, "window", maxReplayWindow)
-					lastReplayLog = time.Now()
-				}
-				continue
-			}
-		}
-		// Echo-loop guard: a frame identical to one recently echoed (same
-		// source, seq, timestamp) is a bounce off another responder (or an
-		// in-window replay), not a live probe — echoing it again would
-		// sustain the loop forever. Legit clients never repeat an identity:
-		// seq increments per successful write, ts is time.Now().UnixNano()
-		// per send, and the MTU sweep regenerates both on every attempt
-		// including its single retry. The check runs BEFORE the per-IP charge
-		// (a replay must not spend the victim's allowance: one captured frame
-		// replayed at its source IP would otherwise fabricate 100% loss for
-		// the rest of the window) and BEFORE handle resolution, so a dup
-		// never allocates a series or a MaxClientSeries slot either.
-		key := echoFrameKey(na, buf)
-		if _, dup := guard.seen[key]; dup {
-			drops.dup.Inc()
-			continue
-		}
-		// Per-IP budget is charged here, after authentication (or, with no
-		// secret, after size/magic) and after the dup guard, so only frames
-		// that authenticate and are not replays can consume the source's
-		// allowance.
-		if reason := rl.chargeIP(na); reason != "" {
-			drops.rateIP.Inc()
-			continue
-		}
-		// Record the identity IMMEDIATELY on acceptance, before the echo
-		// write (previously only after a successful write): the ring records
-		// per frame, so under a spoofed flood of near-identical identities
-		// the check→write→record window was wide enough for an attacker to
-		// slide a legitimate client's identity out of the 8192-slot ring
-		// faster than its echo could be re-checked — in secret-less mode
-		// this guard is the ONLY reflection-loop defense, so the window
-		// must not exist. The record call itself sits AFTER handle resolution,
-		// right before the echo write: recording a frame that resolve()
-		// rejects as client_overflow would ring-poison the source's own
-		// identity and dup-drop its legitimate retry once TTL frees a slot
-		// (seen in TestServer_DynamicClientEviction). A flood of
-		// near-identical identities from another source cannot land between
-		// this check and the record — the read loop is single-threaded, so
-		// only one frame is processed at a time.
-		// Resolve the per-client metric handles last: exact allowlist IPs hit
-		// the pre-resolved map with no lock, while prefix matches go through
-		// the capped dynamic map (H1 cardinality guard), and a frame dropped
-		// above for rate/HMAC/replay/dup never allocates a series at all.
-		h, pre := handles[na]
-		if !pre {
-			res, resOK := resolve(na)
-			if !resOK {
-				drops.clientOverflow.Inc()
-				continue
-			}
-			h = res
-		}
-		if echoSecret != "" {
-			// The gauge is set only for in-window frames: a single replayed
-			// authenticated frame would otherwise peg the skew gauge at
-			// hours and trip the ClockSkewApproaching alert.
-			h.skew.Set(skew.Seconds())
-		}
-
-		h.recv.Inc()
-		// Record the identity immediately BEFORE the echo write, not after
-		// a successful write: the check→record window must not include the
-		// write syscall, and — in secret-less mode, where this guard is the
-		// ONLY reflection-loop defense — a registered-but-unechoed identity
-		// (the local write failed) merely loses that one echoed frame, which
-		// the client already counts as ordinary loss; there is no loop to
-		// break because the frame did not reflect.
-		guard.record(key)
-		if nw, err := pc.WriteTo(buf[:n], raddr); err != nil {
-			if ctx.Err() == nil {
-				// A failed echo is our fault, not the network's: count it so the
-				// client's loss can be attributed correctly. Warn (throttled to
-				// once per minute, as client.go's dial loop does) rather than
-				// Debug-per-packet, which default verbosity would hide entirely.
-				echoErrors.Inc()
-				if lastWriteLog.IsZero() || time.Since(lastWriteLog) >= time.Minute {
-					slog.Warn("UDP echo write failed (further failures logged at most once per minute)", "addr", raddr, "bytes", nw, "err", err)
-					lastWriteLog = time.Now()
-				}
-			}
-		}
-	}
+	s := newUDPServer(ctx, pc, source, allowed, echoSecret, echoSecretOld...)
+	stopSweeper := s.dyn.startSweeper(ctx)
+	defer stopSweeper()
+	return s.serve()
 }

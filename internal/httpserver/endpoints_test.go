@@ -1,0 +1,804 @@
+package httpserver
+
+import (
+	"bytes"
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"log/slog"
+	"math/big"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	dto "github.com/prometheus/client_model/go"
+
+	"link_ping_prometheus/internal/prober"
+)
+
+// chanHandler forwards log records to a channel so tests can observe log output
+// without racing on a shared buffer.
+type chanHandler struct{ ch chan string }
+
+func (h chanHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h chanHandler) Handle(_ context.Context, r slog.Record) error {
+	select {
+	case h.ch <- r.Message:
+	default:
+	}
+	return nil
+}
+
+func (h chanHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+
+func (h chanHandler) WithGroup(string) slog.Handler { return h }
+
+// captureWarns swaps the default slog logger for a buffered text handler so
+// tests can assert startup warnings fired. Restores the previous default on
+// cleanup.
+func captureWarns(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return &buf
+}
+
+// blockingGatherer parks every Gather until release is closed, making the
+// MaxRequestsInFlight cap deterministic.
+type blockingGatherer struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (g *blockingGatherer) Gather() ([]*dto.MetricFamily, error) {
+	select {
+	case g.entered <- struct{}{}:
+	default:
+	}
+	<-g.release
+	return nil, nil
+}
+
+// blockingStatusHandler parks every request until release is closed, making
+// the /status concurrency cap deterministic.
+type blockingStatusHandler struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (h *blockingStatusHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	select {
+	case h.entered <- struct{}{}:
+	default:
+	}
+	<-h.release
+}
+
+// TestReadyzSemantics pins the liveness/readiness split: /healthz stays
+// always-200, while /readyz must report 503 for a client-side agent that has
+// never held a working socket (DNS outage, firewall) - alive but probing
+// nothing is exactly the failure mode an orchestrator must be able to see.
+// socket_age_seconds is set only after a successful dial, so it is the signal
+// the gate reads.
+func TestReadyzSemantics(t *testing.T) {
+	// A target still in the dial-retry loop publishes a target entry with
+	// socket_age_seconds == 0; one with a live socket publishes > 0.
+	dialStuck := []prober.TargetStatus{{Name: "a"}}
+	working := []prober.TargetStatus{{Name: "a"}, {Name: "b", SocketAgeSeconds: 12.5}}
+
+	tests := []struct {
+		name    string
+		mode    string
+		targets []prober.TargetStatus
+		want    int
+	}{
+		{"server mode is ready without targets", "server", nil, http.StatusOK},
+		{"client with an empty registry is not ready", "client", nil, http.StatusServiceUnavailable},
+		{"client still dialing is not ready", "client", dialStuck, http.StatusServiceUnavailable},
+		{"client with one working socket is ready", "client", working, http.StatusOK},
+		{"both mode with one working socket is ready", "both", working, http.StatusOK},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := prober.NewStatusRegistry()
+			for _, s := range tc.targets {
+				reg.Update(s)
+			}
+			rec := httptest.NewRecorder()
+			readinessHandler(tc.mode, reg).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+			if rec.Code != tc.want {
+				t.Errorf("/readyz in mode %s = %d, want %d (body %q)", tc.mode, rec.Code, tc.want, rec.Body.String())
+			}
+		})
+	}
+}
+
+// TestStartMetricsServerTimeouts pins the HTTP timeouts: a multi-megabyte
+// scrape over a slow link needs more than 10s to write, and a truncated
+// response reads as the monitor itself being down. Reads stay short so a slow
+// client still cannot hold a connection.
+func TestStartMetricsServerTimeouts(t *testing.T) {
+	srv, done, err := Start("127.0.0.1:0", "", "", "", "", prober.NewStatusRegistry(), false, "client")
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = srv.Close()
+		<-done
+	})
+	if srv.WriteTimeout != 30*time.Second {
+		t.Errorf("WriteTimeout = %v, want 30s (10s truncates large scrapes)", srv.WriteTimeout)
+	}
+	if srv.ReadTimeout != 10*time.Second || srv.ReadHeaderTimeout != 10*time.Second {
+		t.Errorf("ReadTimeout/ReadHeaderTimeout = %v/%v, want 10s/10s", srv.ReadTimeout, srv.ReadHeaderTimeout)
+	}
+}
+
+// TestConcurrencyCapReturns503 pins both wirings of the scrape cap: /metrics
+// applies it inside metricsHandlerFor, /status wraps limitConcurrent around
+// the status handler. Excess requests get 503 and must never reach the inner
+// handler; after the burst every slot must be reusable.
+func TestConcurrencyCapReturns503(t *testing.T) {
+	cases := []struct {
+		name      string
+		path      string
+		postBurst int
+		handler   func(entered, release chan struct{}) http.Handler
+	}{
+		{
+			name: "/metrics", path: "/metrics", postBurst: 1,
+			handler: func(entered, release chan struct{}) http.Handler {
+				return metricsHandlerFor(&blockingGatherer{entered: entered, release: release}, false)
+			},
+		},
+		{
+			name: "/status", path: "/status", postBurst: 10,
+			handler: func(entered, release chan struct{}) http.Handler {
+				return limitConcurrent(maxConcurrentScrapes, &blockingStatusHandler{entered: entered, release: release})
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			prober.InitMetrics()
+			entered := make(chan struct{}, 8)
+			release := make(chan struct{})
+			h := tc.handler(entered, release)
+
+			recs := make([]*httptest.ResponseRecorder, maxConcurrentScrapes)
+			done := make([]chan struct{}, len(recs))
+			for i := range recs {
+				recs[i] = httptest.NewRecorder()
+				done[i] = make(chan struct{})
+				go func(i int) {
+					defer close(done[i])
+					h.ServeHTTP(recs[i], httptest.NewRequest(http.MethodGet, tc.path, nil))
+				}(i)
+			}
+			for range maxConcurrentScrapes {
+				select {
+				case <-entered:
+				case <-time.After(5 * time.Second):
+					t.Fatal("requests never reached the inner handler (cap not applied?)")
+				}
+			}
+
+			// The next request arrives while all slots are held: 503, and it
+			// must never reach the inner handler. Served from a goroutine with
+			// a bound so a regression that removes the cap fails fast instead
+			// of hanging until the package timeout.
+			third := make(chan int, 1)
+			go func() {
+				rec := httptest.NewRecorder()
+				h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tc.path, nil))
+				third <- rec.Code
+			}()
+			select {
+			case got := <-third:
+				if got != http.StatusServiceUnavailable {
+					t.Errorf("a request beyond the %d-slot cap must get 503, got %d", maxConcurrentScrapes, got)
+				}
+			case <-entered:
+				t.Error("the concurrency cap is not applied: a further request reached the inner handler")
+				close(release)
+				<-third
+				return
+			case <-time.After(5 * time.Second):
+				t.Fatal("the excess request neither returned nor reached the inner handler")
+			}
+
+			close(release)
+			for i := range recs {
+				select {
+				case <-done[i]:
+				case <-time.After(5 * time.Second):
+					t.Fatalf("request %d did not finish after release", i)
+				}
+				if recs[i].Code != http.StatusOK {
+					t.Errorf("in-flight request %d must complete with 200, got %d", i, recs[i].Code)
+				}
+			}
+
+			// Slots must be reusable after the burst. /status runs ten
+			// sequential requests because its release path must not leak a
+			// slot across a run (including the panic path); /metrics only
+			// needs one to prove the cap fell back to zero.
+			for range tc.postBurst {
+				rec := httptest.NewRecorder()
+				h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tc.path, nil))
+				if rec.Code != http.StatusOK {
+					t.Errorf("cap must release after the burst, got %d", rec.Code)
+				}
+			}
+		})
+	}
+}
+
+// TestStatusHandler_CapReleasesOnPanic pins that a panicking request still
+// frees its semaphore slot: the cap wraps arbitrary handlers and a leaked
+// slot would eventually 503 every /status request forever. The wrapper lets
+// the panic propagate to net/http's server-side recovery, so the test
+// mirrors that by recovering it itself. The inner handler panics exactly
+// once, so the request after the panic also proves the freed slot serves.
+func TestStatusHandler_CapReleasesOnPanic(t *testing.T) {
+	var panicked bool
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !panicked {
+			panicked = true
+			panic("boom")
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	h := limitConcurrent(1, inner)
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				return
+			}
+		}()
+		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/status", nil))
+	}()
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
+	if rec.Code != http.StatusOK {
+		t.Errorf("slot leaked after a panicking request: recovery request got %d, want 200", rec.Code)
+	}
+}
+
+// TestStatusEndpointIsGatedLikeMetrics: /status exposes live link state and
+// peer addresses, so it must carry the same Basic auth as /metrics; /healthz
+// and /readyz stay open for orchestrators. Pins the wiring in Start, not
+// just the MetricsAuth handler in isolation.
+func TestStatusEndpointIsGatedLikeMetrics(t *testing.T) {
+	prober.InitMetrics()
+	reg := prober.NewStatusRegistry()
+	reg.Update(prober.TargetStatus{Name: "t", Address: "127.0.0.1:4000"})
+	srv, done, err := Start("127.0.0.1:0", "alice", "s3cret", "", "", reg, false, "client")
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = srv.Close()
+		<-done
+	})
+	if srv.Addr == "" {
+		t.Fatal("Start must publish the bound address for callers/tests")
+	}
+	get := func(path string, user, pass string) int {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodGet, "http://"+srv.Addr+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if user != "" {
+			req.SetBasicAuth(user, pass)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if got := get("/status", "", ""); got != http.StatusUnauthorized {
+		t.Errorf("/status without credentials = %d, want 401 (it exposes peer addresses and link state)", got)
+	}
+	if got := get("/status", "alice", "s3cret"); got != http.StatusOK {
+		t.Errorf("/status with credentials = %d, want 200", got)
+	}
+	if got := get("/healthz", "", ""); got != http.StatusOK {
+		t.Errorf("/healthz must stay unauthenticated, got %d", got)
+	}
+	if got := get("/readyz", "", ""); got == http.StatusUnauthorized {
+		t.Error("/readyz must stay unauthenticated (orchestrators cannot send credentials)")
+	}
+}
+
+// TestMetricsServerErrorLogReachesSlog pins two coupled facts: the metrics
+// server has an ErrorLog at all, and net/http's own failures (TLS handshake
+// errors, accept errors, recovered handler panics) reach slog instead of the
+// std log package's os.Stderr — which is DISCARDED under the Windows service, so
+// a handshake that fails on a fleet node left no trace anywhere. The producer is
+// a real failing handshake (plaintext on the TLS port), not a synthetic logf
+// call, so the wiring into net/http is what is exercised.
+func TestMetricsServerErrorLogReachesSlog(t *testing.T) {
+	prober.InitMetrics()
+	dir := t.TempDir()
+	certPath, keyPath := filepath.Join(dir, "cert.crt"), filepath.Join(dir, "cert.key")
+	writeTestCert(t, certPath, keyPath, "metrics-server", 1)
+	logs := captureLogs(t)
+
+	srv, done, err := Start("127.0.0.1:0", "", "", certPath, keyPath, prober.NewStatusRegistry(), false, "server")
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = srv.Close()
+		<-done
+	})
+	if srv.ErrorLog == nil {
+		t.Fatal("metricsSrv.ErrorLog is nil: net/http would write its failures to os.Stderr, which the SCM discards")
+	}
+
+	conn, err := net.Dial("tcp", srv.Addr)
+	if err != nil {
+		t.Fatalf("dial %s: %v", srv.Addr, err)
+	}
+	// Plaintext bytes on a TLS port fail the handshake inside net/http, which
+	// reports it through srv.ErrorLog.
+	_, _ = conn.Write([]byte("GET /metrics HTTP/1.1\r\nHost: metrics\r\n\r\n"))
+	_ = conn.Close()
+
+	waitForLog(t, logs, "TLS handshake error")
+}
+
+// TestMetricsServerCertReloadWithoutRestart pins the hot reload: a renewed
+// certificate pair must be served by the NEXT handshake, with no restart. A
+// 90-day certificate on a service that is never restarted otherwise becomes a
+// silent scrape blackout on expiry. The two certificates differ in CN length on
+// purpose, so the (mtime, size) fingerprint the reloader keys on changes even on
+// a filesystem with coarse timestamps.
+func TestMetricsServerCertReloadWithoutRestart(t *testing.T) {
+	prober.InitMetrics()
+	dir := t.TempDir()
+	certPath, keyPath := filepath.Join(dir, "cert.crt"), filepath.Join(dir, "cert.key")
+	writeTestCert(t, certPath, keyPath, "cert-one", 101)
+
+	srv, done, err := Start("127.0.0.1:0", "", "", certPath, keyPath, prober.NewStatusRegistry(), false, "server")
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = srv.Close()
+		<-done
+	})
+	if got := servedCert(t, srv.Addr); got.SerialNumber.Int64() != 101 || got.Subject.CommonName != "cert-one" {
+		t.Fatalf("startup certificate = serial %d cn %q, want 101/cert-one", got.SerialNumber.Int64(), got.Subject.CommonName)
+	}
+
+	writeTestCert(t, certPath, keyPath, "cert-two-renewed-longer", 202)
+
+	got := servedCert(t, srv.Addr)
+	if got.SerialNumber.Int64() != 202 || got.Subject.CommonName != "cert-two-renewed-longer" {
+		t.Errorf("after renewal the handshake served serial %d cn %q, want 202/cert-two-renewed-longer (no restart, no reload)",
+			got.SerialNumber.Int64(), got.Subject.CommonName)
+	}
+}
+
+// TestMetricsServerCertReloadFailureKeepsPrevious pins the degraded path: an
+// unreadable or half-written replacement must NOT break scraping. The previously
+// loaded certificate keeps being served, the failure is reported exactly once
+// for that file pair — a Warn per handshake would flood the log the reload
+// exists to make visible, and failing the handshake would black out /metrics for
+// the duration of a transient write — AND the pair is retried after
+// certReloadRetryCooldown. The retry is what makes an in-place repair
+// observable: the repair below restores the finished bytes under the broken
+// pair's own mtime and size, so the (mtime, size) fingerprint never changes and
+// a pure "already tried" memo would serve the expired certificate forever.
+func TestMetricsServerCertReloadFailureKeepsPrevious(t *testing.T) {
+	origCooldown := certReloadRetryCooldown
+	// 2s, not 200ms: the "still inside the cooldown" assertion spans two TLS
+	// handshakes, and a loaded CI runner can stall longer than a few hundred
+	// milliseconds between them. That flaked as "served serial 202, want the
+	// cached 101" — the test measuring the scheduler, not the reloader.
+	certReloadRetryCooldown = 2 * time.Second
+	t.Cleanup(func() { certReloadRetryCooldown = origCooldown })
+
+	prober.InitMetrics()
+	dir := t.TempDir()
+	certPath, keyPath := filepath.Join(dir, "cert.crt"), filepath.Join(dir, "cert.key")
+	writeTestCert(t, certPath, keyPath, "cert-one", 101)
+	logs := captureLogs(t)
+
+	// The renewal is generated up front so the broken replacement written
+	// later can carry exactly its byte counts: the repair writes these bytes
+	// back under the broken pair's mtime, leaving the fingerprint untouched.
+	renewedCertPath, renewedKeyPath := filepath.Join(dir, "renewed.crt"), filepath.Join(dir, "renewed.key")
+	writeTestCert(t, renewedCertPath, renewedKeyPath, "cert-two-renewed-longer", 202)
+	renewedCert, err := os.ReadFile(renewedCertPath)
+	if err != nil {
+		t.Fatalf("read renewed certificate: %v", err)
+	}
+	renewedKey, err := os.ReadFile(renewedKeyPath)
+	if err != nil {
+		t.Fatalf("read renewed key: %v", err)
+	}
+
+	srv, done, err := Start("127.0.0.1:0", "", "", certPath, keyPath, prober.NewStatusRegistry(), false, "server")
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = srv.Close()
+		<-done
+	})
+
+	// A half-written renewal: no PEM data at all, but the same sizes as the
+	// finished pair. The (mtime, size) it lands on is the fingerprint the
+	// failed load is recorded under.
+	if err := os.WriteFile(certPath, []byte(strings.Repeat("x", len(renewedCert))), 0o600); err != nil {
+		t.Fatalf("replace certificate with garbage: %v", err)
+	}
+	if err := os.WriteFile(keyPath, []byte(strings.Repeat("x", len(renewedKey))), 0o600); err != nil {
+		t.Fatalf("replace key with garbage: %v", err)
+	}
+	brokenCertInfo, err := os.Stat(certPath)
+	if err != nil {
+		t.Fatalf("stat broken certificate: %v", err)
+	}
+	brokenKeyInfo, err := os.Stat(keyPath)
+	if err != nil {
+		t.Fatalf("stat broken key: %v", err)
+	}
+	if got := servedCert(t, srv.Addr); got.SerialNumber.Int64() != 101 {
+		t.Fatalf("a failed reload must keep serving the previous certificate, got serial %d", got.SerialNumber.Int64())
+	}
+
+	// Repair in place without touching (mtime, size): put the finished bytes
+	// back and restore the timestamps the broken pair was recorded under.
+	if err := os.WriteFile(certPath, renewedCert, 0o600); err != nil {
+		t.Fatalf("restore certificate: %v", err)
+	}
+	if err := os.WriteFile(keyPath, renewedKey, 0o600); err != nil {
+		t.Fatalf("restore key: %v", err)
+	}
+	if err := os.Chtimes(certPath, brokenCertInfo.ModTime(), brokenCertInfo.ModTime()); err != nil {
+		t.Fatalf("restore certificate mtime: %v", err)
+	}
+	if err := os.Chtimes(keyPath, brokenKeyInfo.ModTime(), brokenKeyInfo.ModTime()); err != nil {
+		t.Fatalf("restore key mtime: %v", err)
+	}
+	if repaired, err := os.Stat(certPath); err != nil {
+		t.Fatalf("stat repaired certificate: %v", err)
+	} else if repaired.Size() != brokenCertInfo.Size() || !repaired.ModTime().Equal(brokenCertInfo.ModTime()) {
+		t.Fatalf("the in-place repair changed the fingerprint (size %d->%d, mtime %v->%v): it no longer exercises the cooldown retry",
+			brokenCertInfo.Size(), repaired.Size(), brokenCertInfo.ModTime(), repaired.ModTime())
+	}
+
+	// Still inside the cooldown: the repaired pair must not be re-read yet, so
+	// a broken renewal does not cost a file read (and a Warn) per handshake.
+	if got := servedCert(t, srv.Addr); got.SerialNumber.Int64() != 101 {
+		t.Errorf("within the retry cooldown the handshake served serial %d, want the cached 101", got.SerialNumber.Int64())
+	}
+	if n := countLogs(logs, "keeping the previously loaded certificate", 300*time.Millisecond); n != 1 {
+		t.Errorf("a failed reload logged %d times for one file pair, want exactly 1", n)
+	}
+
+	// Past the cooldown the unchanged fingerprint is retried, so the repaired
+	// pair takes effect with no restart and no (mtime, size) change.
+	time.Sleep(certReloadRetryCooldown)
+	got := servedCert(t, srv.Addr)
+	if got.SerialNumber.Int64() != 202 || got.Subject.CommonName != "cert-two-renewed-longer" {
+		t.Errorf("after the retry cooldown the handshake served serial %d cn %q, want 202/cert-two-renewed-longer",
+			got.SerialNumber.Int64(), got.Subject.CommonName)
+	}
+	if n := countLogs(logs, "reloaded", 300*time.Millisecond); n != 1 {
+		t.Errorf("the repaired pair was reloaded %d times, want exactly 1", n)
+	}
+}
+
+// TestWarnUnauthenticatedMetricsBind pins the exposure warning: the listener
+// defaults to localhost, so widening -metrics without credentials is otherwise a
+// silent decision to publish the probe topology, peer IPs and per-link RTT/loss
+// to every host that can reach the port.
+func TestWarnUnauthenticatedMetricsBind(t *testing.T) {
+	for _, tc := range []struct {
+		name, addr, user string
+		wantWarn         bool
+	}{
+		{"loopback without auth", "127.0.0.1:2112", "", false},
+		{"loopback v6 without auth", "[::1]:2112", "", false},
+		{"wildcard v4 without auth", "0.0.0.0:2112", "", true},
+		{"wildcard v6 without auth", "[::]:2112", "", true},
+		{"routable without auth", "192.0.2.5:2112", "", true},
+		{"wildcard with auth", "0.0.0.0:2112", "alice", false},
+		{"routable with auth", "192.0.2.5:2112", "alice", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tcpAddr, err := net.ResolveTCPAddr("tcp", tc.addr)
+			if err != nil {
+				t.Fatalf("resolve %q: %v", tc.addr, err)
+			}
+			buf := captureWarns(t)
+			warnUnauthenticatedMetricsBind(tcpAddr, tc.user)
+			got := strings.Contains(buf.String(), "WITHOUT authentication")
+			if got != tc.wantWarn {
+				t.Errorf("warnUnauthenticatedMetricsBind(%s, user=%q) warned = %v, want %v (log: %s)",
+					tc.addr, tc.user, got, tc.wantWarn, buf.String())
+			}
+		})
+	}
+}
+
+// writeTestCert generates a self-signed server certificate for cn and writes the
+// pair to certPath/keyPath. Certificates are generated rather than checked in:
+// the reloader keys on (mtime, size), so the test has to control exactly when
+// the bytes on disk are replaced.
+func writeTestCert(t *testing.T, certPath, keyPath, cn string, serial int64) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(serial),
+		Subject:               pkix.Name{CommonName: cn},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create certificate: %v", err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatalf("marshal private key: %v", err)
+	}
+	if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatalf("write certificate: %v", err)
+	}
+	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
+		t.Fatalf("write key: %v", err)
+	}
+}
+
+// servedCert dials addr and returns the certificate the server presented. No
+// ServerName is set (the client dials an IP literal), which is the scrape shape
+// crypto/tls serves only through GetCertificate.
+func servedCert(t *testing.T, addr string) *x509.Certificate {
+	t.Helper()
+	conn, err := tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true})
+	if err != nil {
+		t.Fatalf("TLS dial %s: %v", addr, err)
+	}
+	defer conn.Close()
+	certs := conn.ConnectionState().PeerCertificates
+	if len(certs) == 0 {
+		t.Fatalf("no peer certificate from %s", addr)
+	}
+	return certs[0]
+}
+
+// captureLogs installs a channel-backed slog handler for the test and returns
+// the channel. A bytes.Buffer would be written by the serve/handshake goroutines
+// while the test reads it, which is a data race — and the traffic here is
+// produced by another goroutine by construction.
+func captureLogs(t *testing.T) <-chan string {
+	t.Helper()
+	prev := slog.Default()
+	ch := make(chan string, 128)
+	slog.SetDefault(slog.New(chanHandler{ch: ch}))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return ch
+}
+
+// waitForLog drains ch until a record whose message contains want arrives.
+func waitForLog(t *testing.T, ch <-chan string, want string) {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case msg := <-ch:
+			if strings.Contains(msg, want) {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("no log record containing %q within 5s", want)
+		}
+	}
+}
+
+// countLogs counts records whose message contains want, draining ch for window.
+// The caller has already provoked them; the window only bounds the wait.
+func countLogs(ch <-chan string, want string, window time.Duration) int {
+	deadline := time.After(window)
+	n := 0
+	for {
+		select {
+		case msg := <-ch:
+			if strings.Contains(msg, want) {
+				n++
+			}
+		case <-deadline:
+			return n
+		}
+	}
+}
+
+// TestLimitListenerCapsAcceptedConnections pins the pre-auth connection bound:
+// the listener must stop accepting once the cap is reached, so an
+// unauthenticated client cannot hold unbounded goroutines and buffers on a
+// process whose job is measuring RTT.
+func TestLimitListenerCapsAcceptedConnections(t *testing.T) {
+	inner, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inner.Close()
+	ln := limitListenerFor(inner, 1)
+	defer ln.Close()
+
+	accepted := make(chan net.Conn, 2)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			accepted <- c
+		}
+	}()
+
+	dial := func() net.Conn {
+		c, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	first := dial()
+	defer first.Close()
+	var firstServer net.Conn
+	select {
+	case firstServer = <-accepted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first connection was not accepted")
+	}
+
+	// At the cap: a second connection may complete its TCP handshake in the
+	// kernel backlog but must not be handed to the server.
+	second := dial()
+	defer second.Close()
+	select {
+	case <-accepted:
+		t.Fatal("listener accepted a second connection while the cap was 1")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// Releasing the first slot unblocks the next accept.
+	firstServer.Close()
+	select {
+	case c := <-accepted:
+		c.Close()
+	case <-time.After(2 * time.Second):
+		t.Fatal("closing a connection did not release the accept slot")
+	}
+}
+
+// TestRateLimitedLogWriterThrottles pins the handshake-log fix: net/http
+// reports every failed TLS handshake, so an unauthenticated client could emit
+// one line per connection and rotate the auth-failure evidence out of the
+// retained window.
+func TestRateLimitedLogWriterThrottles(t *testing.T) {
+	orig := handshakeLogInterval
+	handshakeLogInterval = time.Hour
+	defer func() { handshakeLogInterval = orig }()
+
+	var mu sync.Mutex
+	var got []string
+	w := &rateLimitedLogWriter{forward: func(msg string) {
+		mu.Lock()
+		got = append(got, msg)
+		mu.Unlock()
+	}}
+	for i := 0; i < 50; i++ {
+		if _, err := w.Write([]byte("TLS handshake error from 192.0.2.1: broken")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// One forwarded immediately; the rest are suppressed.
+	if len(got) != 1 {
+		t.Fatalf("forwarded %d messages while throttled, want 1", len(got))
+	}
+	w.last = time.Time{} // force the window open
+	if _, err := w.Write([]byte("TLS handshake error from 192.0.2.2: broken")); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || !strings.Contains(got[1], "49 similar messages suppressed") {
+		t.Fatalf("suppressed count not reported: %v", got)
+	}
+}
+
+// TestLimitListenerShutdownDoesNotDeadlockWhenSaturated pins that saturating
+// all connection slots on limitListener (e.g. idle keep-alives) does not block
+// http.Server.Shutdown indefinitely waiting on Accept's semaphore.
+func TestLimitListenerShutdownDoesNotDeadlockWhenSaturated(t *testing.T) {
+	rawLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln := limitListenerFor(rawLn, 2)
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}),
+		IdleTimeout: 60 * time.Second,
+	}
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- srv.Serve(ln)
+	}()
+
+	addr := rawLn.Addr().String()
+	// Hold 2 idle keep-alive connections open to saturate cap=2.
+	c1, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c1.Close()
+	c2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+	// Send one request on each so Accept hands them off and slots stay held.
+	for _, c := range []net.Conn{c1, c2} {
+		if _, err := c.Write([]byte("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")); err != nil {
+			t.Fatal(err)
+		}
+		buf := make([]byte, 512)
+		if _, err := c.Read(buf); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	shutDone := make(chan error, 1)
+	go func() {
+		shutDone <- srv.Shutdown(ctx)
+	}()
+
+	select {
+	case err := <-shutDone:
+		if err != nil {
+			t.Fatalf("Shutdown failed while limitListener saturated: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Shutdown deadlocked while limitListener was saturated")
+	}
+	select {
+	case <-serveDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve did not return after Shutdown")
+	}
+}
