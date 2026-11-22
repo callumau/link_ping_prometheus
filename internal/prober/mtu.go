@@ -44,14 +44,8 @@ func runMTUSweep(ctx context.Context, t Target, cfg Config, m targetMetrics, sta
 		}
 		conn, err := dialUDP(ctx, "udp", t.Address)
 		if err != nil {
-			// Transient dial failure: the main loop's handling governs
-			// link_up; the sweep just waits for the next tick.
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
+			// Transient dial failure: the main loop governs link_up; just wait for next tick.
+			stopDrain(timer)
 			timer.Reset(cfg.MTUSweep)
 			continue
 		}

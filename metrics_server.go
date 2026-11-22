@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"link_ping_prometheus/internal/filetrust"
 	"link_ping_prometheus/internal/prober"
 	"log"
 	"log/slog"
@@ -278,12 +279,8 @@ func loadMetricsPair(certPath, keyPath string) (tls.Certificate, error) {
 }
 
 func readTrustedPairFile(path string, secret bool) ([]byte, error) {
-	// The key is secret material (no foreign read, no foreign write); a
-	// certificate is public but replacing it still impersonates the endpoint,
-	// so it only needs the write rule. On Windows these become DACL rules;
-	// the mode check below is the unix half.
-	opts := prober.TrustOptions{DenyForeignWrite: true, DenyForeignRead: secret}
-	data, fi, err := prober.ReadTrustedFileWith(path, maxTLSFileSize, opts)
+	opts := filetrust.TrustOptions{DenyForeignWrite: true, DenyForeignRead: secret}
+	data, fi, err := filetrust.ReadFileWith(path, maxTLSFileSize, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -338,20 +335,27 @@ func newMetricsCertReloader(certPath, keyPath string) (*metricsCertReloader, err
 	return &metricsCertReloader{certPath: certPath, keyPath: keyPath, cert: &cert, loaded: fp, attempted: fp}, nil
 }
 
+// cachedIfFresh returns the cached certificate if fp matches the currently
+// loaded pair or a recently failed reload inside certReloadRetryCooldown.
+func (r *metricsCertReloader) cachedIfFresh(fp certFingerprint) (*tls.Certificate, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if fp == r.loaded || (fp == r.attempted && time.Since(r.attemptedAt) < certReloadRetryCooldown) {
+		return r.cert, true
+	}
+	return r.cert, false
+}
+
 // GetCertificate implements tls.Config.GetCertificate.
 func (r *metricsCertReloader) GetCertificate(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 	r.mu.Lock()
 	cachedCert := r.cert
-	loaded := r.loaded
-	attempted := r.attempted
-	attemptedAt := r.attemptedAt
 	wasStatFailed := r.statFailed
 	r.mu.Unlock()
 
 	fp, err := fingerprintCertPair(r.certPath, r.keyPath)
 	if err != nil {
-		// Unstattable (a rename-in-progress, a rotated-away inode): keep serving
-		// the cached pair rather than failing every handshake on the way past.
+		// Keep serving the cached pair during transient rename/stat gaps.
 		if !wasStatFailed {
 			r.mu.Lock()
 			first := !r.statFailed
@@ -370,33 +374,22 @@ func (r *metricsCertReloader) GetCertificate(*tls.ClientHelloInfo) (*tls.Certifi
 		r.statFailed = false
 		r.mu.Unlock()
 	}
-	if fp == loaded {
-		return cachedCert, nil
-	}
-	if fp == attempted && time.Since(attemptedAt) < certReloadRetryCooldown {
-		return cachedCert, nil
+	if cert, ok := r.cachedIfFresh(fp); ok {
+		return cert, nil
 	}
 
 	r.reloadMu.Lock()
 	defer r.reloadMu.Unlock()
 
-	// Re-check under reloadMu in case another handshake already reloaded it.
-	r.mu.Lock()
-	cachedCert = r.cert
-	loaded = r.loaded
-	attempted = r.attempted
-	attemptedAt = r.attemptedAt
-	r.mu.Unlock()
-
 	fp, err = fingerprintCertPair(r.certPath, r.keyPath)
 	if err != nil {
+		r.mu.Lock()
+		cachedCert = r.cert
+		r.mu.Unlock()
 		return cachedCert, nil
 	}
-	if fp == loaded {
-		return cachedCert, nil
-	}
-	if fp == attempted && time.Since(attemptedAt) < certReloadRetryCooldown {
-		return cachedCert, nil
+	if cert, ok := r.cachedIfFresh(fp); ok {
+		return cert, nil
 	}
 
 	cert, err := loadMetricsPair(r.certPath, r.keyPath)

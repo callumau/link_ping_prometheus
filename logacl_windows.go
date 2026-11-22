@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"link_ping_prometheus/internal/filetrust"
 	"log/slog"
 	"os"
 	"time"
@@ -98,62 +99,34 @@ type logACEKey struct {
 	mask windows.ACCESS_MASK
 }
 
-// reapplyLogDACL re-restricts the CURRENT live log file's DACL.
-// restrictLogDACL runs once at startup against the file that exists
-// then; after the first rotation the fresh live file inherits the
-// parent directory DACL briefly or if created externally. Called from a
-// fixed ticker so a manual install into a wide directory regains the
-// "never world-readable" invariant.
-// A file that does not exist right now (mid-rotation gap) is skipped;
-// the next tick covers it once the rotator recreates it.
-func reapplyLogDACL(path string) error {
-	if path == "" {
-		return nil
-	}
-	li, err := os.Lstat(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("log DACL recheck: stat %q: %w", path, err)
-	}
-	if li.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("log DACL recheck: refusing symlinked log path %q", path)
-	}
-	if !li.Mode().IsRegular() {
-		return fmt.Errorf("log DACL recheck: refusing non-regular log path %q (%s)", path, li.Mode().Type())
-	}
-	// Open with FILE_SHARE_DELETE and FILE_FLAG_OPEN_REPARSE_POINT so we
-	// never follow a raced-in reparse point and never block rotation.
+func openLogFileForWriteDAC(path string) (*os.File, error) {
 	name, err := windows.UTF16PtrFromString(path)
 	if err != nil {
-		return fmt.Errorf("log DACL recheck: path %q: %w", path, err)
+		return nil, err
 	}
 	h, err := windows.CreateFile(name, windows.READ_CONTROL|windows.WRITE_DAC,
 		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
 		nil, windows.OPEN_EXISTING,
 		windows.FILE_ATTRIBUTE_NORMAL|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
 	if err != nil {
+		return nil, err
+	}
+	return os.NewFile(uintptr(h), path), nil
+}
+
+// reapplyLogDACL re-restricts the live log file's DACL if it drifted.
+func reapplyLogDACL(path string) error {
+	if path == "" {
+		return nil
+	}
+	f, _, err := filetrust.VerifyExistingRegular(path, 0, openLogFileForWriteDAC)
+	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
-		return fmt.Errorf("log DACL recheck: open %q: %w", path, err)
+		return fmt.Errorf("log DACL recheck: %w", err)
 	}
-	f := os.NewFile(uintptr(h), path)
 	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil {
-		return fmt.Errorf("log DACL recheck: fstat %q: %w", path, err)
-	}
-	if !fi.Mode().IsRegular() {
-		return fmt.Errorf("log DACL recheck: refusing non-regular log path %q (%s)", path, fi.Mode().Type())
-	}
-	if !os.SameFile(li, fi) {
-		return fmt.Errorf("log DACL recheck: %q changed between check and open", path)
-	}
-	if err := checkLogFileOwner(f); err != nil {
-		return fmt.Errorf("log DACL recheck %q: %w", path, err)
-	}
 	changed, err := restrictLogDACLOnHandle(f, true)
 	if err != nil {
 		return fmt.Errorf("log DACL recheck %q: %w", path, err)
@@ -186,20 +159,13 @@ func startLogDACLRecheck(ctx context.Context, path string) {
 	}()
 }
 
-// Static restricted-set ACEs and the raw SIDs they name. The builder
-// compares the token user against raw SIDs because windows.SID.String()
-// returns raw-SID form, never an SDDL alias.
-const (
-	logACLSystemSID         = "S-1-5-18"     // SYSTEM ("SY")
-	logACLAdministratorsSID = "S-1-5-32-544" // builtin Administrators ("BA")
-	logACLStaticACEs        = "(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
-)
+const logACLStaticACEs = "(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
 
 // logACLSDDL builds the restricted DACL (SYSTEM + Administrators + current process SID).
 // Deduplicating the token user against SY/BA ensures sameLogDACL converges.
 func logACLSDDL(userSID string) string {
 	sddl := "D:P" + logACLStaticACEs
-	if userSID != logACLSystemSID && userSID != logACLAdministratorsSID {
+	if userSID != filetrust.SystemSID && userSID != filetrust.AdministratorsSID {
 		sddl += "(A;OICI;FA;;;" + userSID + ")"
 	}
 	return sddl

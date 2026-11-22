@@ -1,4 +1,4 @@
-package prober
+package filetrust
 
 import (
 	"strings"
@@ -12,14 +12,11 @@ const (
 )
 
 var daclTrusted = map[string]bool{
-	trustedSystemSID:         true,
-	trustedAdministratorsSID: true,
-	"S-1-5-21-1-2-3-1001":    true,
+	SystemSID:             true,
+	AdministratorsSID:     true,
+	"S-1-5-21-1-2-3-1001": true,
 }
 
-// TestTrustedDACLViolation pins the Windows trust rule without a Windows host:
-// the policy projection is platform-neutral so the decision itself is testable
-// here, while only the ACE extraction is Windows-only.
 func TestTrustedDACLViolation(t *testing.T) {
 	const (
 		usersSID   = "S-1-5-32-545"
@@ -38,8 +35,8 @@ func TestTrustedDACLViolation(t *testing.T) {
 	}{
 		{name: "no policy accepts anything", aces: []daclACE{{SID: usersSID, Mask: genericAll, Type: aceAllow}}},
 		{name: "trusted principals may write", opts: write, aces: []daclACE{
-			{SID: trustedSystemSID, Mask: genericAll, Type: aceAllow},
-			{SID: trustedAdministratorsSID, Mask: genericAll, Type: aceAllow},
+			{SID: SystemSID, Mask: genericAll, Type: aceAllow},
+			{SID: AdministratorsSID, Mask: genericAll, Type: aceAllow},
 			{SID: "S-1-5-21-1-2-3-1001", Mask: genericAll, Type: aceAllow},
 		}},
 		{name: "foreign read is fine for the targets rule", opts: write, aces: []daclACE{
@@ -82,10 +79,6 @@ func TestTrustedDACLViolation(t *testing.T) {
 	}
 }
 
-// TestTrustedDACLViolation_ExtendedGrantACETypes pins that Windows compound,
-// callback/conditional, and unknown ACE types fail closed as grants rather than
-// being skipped, while deny/audit/mandatory-label ACEs do not trigger false
-// positives.
 func TestTrustedDACLViolation_ExtendedGrantACETypes(t *testing.T) {
 	const (
 		fileRead         = 0x0001

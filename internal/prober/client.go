@@ -18,6 +18,8 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+
+	"link_ping_prometheus/internal/filetrust"
 )
 
 // Target identifies a single probe destination.
@@ -163,12 +165,7 @@ func FilterSelfTargets(targets []Target, source string) []Target {
 // lets any local user make that decision. Lstat, not Stat: following a symlink
 // is exactly what a local attacker would rely on.
 func LoadTargets(path string) ([]Target, error) {
-	// Read from a verified descriptor rather than re-opening by path: the
-	// check and the read must resolve to the same object, or a directory
-	// writer can swap a symlink/FIFO in after the Lstat (the log sink and the
-	// metrics TLS pair use the same rule). A FIFO also used to block the
-	// reload supervisor inside os.ReadFile with no timeout.
-	data, info, err := ReadTrustedFileWith(path, MaxTargetsFileSize, TrustOptions{DenyForeignWrite: true})
+	data, info, err := filetrust.ReadFileWith(path, MaxTargetsFileSize, filetrust.TrustOptions{DenyForeignWrite: true})
 	if err != nil {
 		return nil, fmt.Errorf("read targets file: %w", err)
 	}

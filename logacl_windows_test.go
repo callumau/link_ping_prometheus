@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"link_ping_prometheus/internal/filetrust"
 	"os"
 	"path/filepath"
 	"testing"
@@ -31,9 +32,9 @@ func TestLogACLSDDL(t *testing.T) {
 		userSID string
 		want    []string
 	}{
-		{"SYSTEM is already a static trustee", logACLSystemSID, []string{logACLSystemSID, logACLAdministratorsSID}},
-		{"Administrators is already a static trustee", logACLAdministratorsSID, []string{logACLSystemSID, logACLAdministratorsSID}},
-		{"ordinary user gets its own ACE", normalUserSID, []string{logACLSystemSID, logACLAdministratorsSID, normalUserSID}},
+		{"SYSTEM is already a static trustee", filetrust.SystemSID, []string{filetrust.SystemSID, filetrust.AdministratorsSID}},
+		{"Administrators is already a static trustee", filetrust.AdministratorsSID, []string{filetrust.SystemSID, filetrust.AdministratorsSID}},
+		{"ordinary user gets its own ACE", normalUserSID, []string{filetrust.SystemSID, filetrust.AdministratorsSID, normalUserSID}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -77,10 +78,10 @@ func TestLogACLSDDL(t *testing.T) {
 	// Pin the exact static shape separately: protection bit, FA masks and
 	// object+container inheritance are the security properties the builder
 	// must not lose while deduplicating.
-	if got := logACLSDDL(logACLSystemSID); got != staticSDDL {
+	if got := logACLSDDL(filetrust.SystemSID); got != staticSDDL {
 		t.Errorf("SYSTEM SDDL = %q, want %q", got, staticSDDL)
 	}
-	if got := logACLSDDL(logACLAdministratorsSID); got != staticSDDL {
+	if got := logACLSDDL(filetrust.AdministratorsSID); got != staticSDDL {
 		t.Errorf("Administrators SDDL = %q, want %q", got, staticSDDL)
 	}
 	if got, want := logACLSDDL(normalUserSID), staticSDDL+"(A;OICI;FA;;;"+normalUserSID+")"; got != want {
@@ -94,7 +95,7 @@ func TestLogACLSDDL(t *testing.T) {
 // same table sameLogDACL compares against. Before the dedupe the builder
 // wanted SY+BA+SY, Windows stored SY+BA, and the recheck re-applied forever.
 func TestLogACLSDDL_SystemFixedPoint(t *testing.T) {
-	sd, err := windows.SecurityDescriptorFromString(logACLSDDL(logACLSystemSID))
+	sd, err := windows.SecurityDescriptorFromString(logACLSDDL(filetrust.SystemSID))
 	if err != nil {
 		t.Fatalf("build SYSTEM descriptor: %v", err)
 	}

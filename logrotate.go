@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"link_ping_prometheus/internal/filetrust"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -229,17 +230,29 @@ func (r *logRotator) pruneLocked(clock time.Time) {
 // creating it 0600 (and DACL-restricted on Windows) when absent.
 func openOrCreateLogFile(path string) (*os.File, int64, bool, error) {
 	for attempt := 0; attempt < 4; attempt++ {
-		li, err := os.Lstat(path)
+		f, fi, err := filetrust.VerifyExistingRegular(path, 0, openLogFileForRepair)
 		if err == nil {
-			return openVerifiedLogFile(path, li)
+			changed := false
+			if runtime.GOOS == "windows" {
+				if changed, err = restrictLogDACL(f); err != nil {
+					f.Close()
+					return nil, 0, false, err
+				}
+			} else if fi.Mode().Perm() != 0o600 {
+				if err := f.Chmod(0o600); err != nil {
+					f.Close()
+					return nil, 0, false, err
+				}
+				changed = true
+			}
+			return f, fi.Size(), changed, nil
 		}
 		if !errors.Is(err, os.ErrNotExist) {
 			return nil, 0, false, err
 		}
-		f, err := createLogFile(path)
+		f, err = createLogFile(path)
 		if errors.Is(err, os.ErrExist) {
-			// Raced with another creator: retry via the existing-file path
-			// so its type/owner/DACL checks decide, never this branch.
+			// Raced with another creator: retry via VerifyExistingRegular.
 			continue
 		}
 		if err != nil {
@@ -252,7 +265,7 @@ func openOrCreateLogFile(path string) (*os.File, int64, bool, error) {
 				return nil, 0, false, err
 			}
 		}
-		fi, err := f.Stat()
+		fi, err = f.Stat()
 		if err != nil {
 			f.Close()
 			return nil, 0, false, err
@@ -260,53 +273,4 @@ func openOrCreateLogFile(path string) (*os.File, int64, bool, error) {
 		return f, fi.Size(), changed, nil
 	}
 	return nil, 0, false, fmt.Errorf("log file %q changed concurrently during open", path)
-}
-
-// openVerifiedLogFile binds the provenance decision to the descriptor the
-// caller will write through, and repairs its permissions.
-func openVerifiedLogFile(path string, li os.FileInfo) (*os.File, int64, bool, error) {
-	if li.Mode()&os.ModeSymlink != 0 {
-		return nil, 0, false, fmt.Errorf("refusing symlinked log path %q: a symlink can redirect topology-bearing log lines into another local user's file; create the log path directly", path)
-	}
-	// Refuse every other non-regular object BEFORE open(2): a FIFO with no
-	// reader blocks a plain open forever, so a post-open check would never
-	// run.
-	if !li.Mode().IsRegular() {
-		return nil, 0, false, fmt.Errorf("refusing non-regular log path %q (%s): only a regular file may receive topology-bearing logs", path, li.Mode().Type())
-	}
-	f, err := openLogFileForRepair(path)
-	if err != nil {
-		return nil, 0, false, err
-	}
-	fi, err := f.Stat()
-	if err != nil {
-		f.Close()
-		return nil, 0, false, err
-	}
-	if !fi.Mode().IsRegular() {
-		f.Close()
-		return nil, 0, false, fmt.Errorf("refusing non-regular log path %q (%s): only a regular file may receive topology-bearing logs", path, fi.Mode().Type())
-	}
-	if !os.SameFile(li, fi) {
-		f.Close()
-		return nil, 0, false, fmt.Errorf("log path %q changed between check and open; refusing", path)
-	}
-	if err := checkLogFileOwner(f); err != nil {
-		f.Close()
-		return nil, 0, false, err
-	}
-	changed := false
-	if runtime.GOOS == "windows" {
-		if changed, err = restrictLogDACL(f); err != nil {
-			f.Close()
-			return nil, 0, false, err
-		}
-	} else if fi.Mode().Perm() != 0o600 {
-		if err := f.Chmod(0o600); err != nil {
-			f.Close()
-			return nil, 0, false, err
-		}
-		changed = true
-	}
-	return f, fi.Size(), changed, nil
 }

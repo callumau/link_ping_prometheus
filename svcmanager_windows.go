@@ -176,23 +176,28 @@ func platformInstallService(argv []string) error {
 	return nil
 }
 
-// platformUninstallService deletes the service and removes the
-// event-log source (kardianos removed it only on ITS uninstall path —
-// matched here so a deleted service never leaves an orphaned source).
-func platformUninstallService() error {
-	spec := serviceSpec()
+// withService connects to the SCM, opens the named service, and calls fn.
+func withService(name string, fn func(*mgr.Service) error) error {
 	m, err := openSCManager()
 	if err != nil {
 		return err
 	}
 	defer m.Disconnect()
-	s, err := m.OpenService(spec.Name)
+	s, err := m.OpenService(name)
 	if err != nil {
-		return fmt.Errorf("service %q is not installed (or access denied): %w", spec.Name, err)
+		return err
 	}
 	defer s.Close()
-	if err := s.Delete(); err != nil {
-		return err
+	return fn(s)
+}
+
+// platformUninstallService deletes the service and removes the event-log source.
+func platformUninstallService() error {
+	spec := serviceSpec()
+	if err := withService(spec.Name, func(s *mgr.Service) error {
+		return s.Delete()
+	}); err != nil {
+		return fmt.Errorf("service %q uninstall: %w", spec.Name, err)
 	}
 	if el, lerr := eventlog.Open(spec.Name); lerr == nil {
 		el.Close()
@@ -201,10 +206,7 @@ func platformUninstallService() error {
 	return nil
 }
 
-// removeEventLogSource deletes the installed event-log source registry
-// key, mirroring what kardianos's uninstall used to do (best-effort:
-// a source left behind has no functional impact other than a stale
-// event-class name in the Application log filter UI).
+// removeEventLogSource deletes the installed event-log source registry key (best-effort).
 func removeEventLogSource(source string) {
 	key := `SYSTEM\CurrentControlSet\Services\EventLog\Application\` + source
 	k, err := registry.OpenKey(registry.LOCAL_MACHINE, key, registry.SET_VALUE|registry.QUERY_VALUE)
@@ -222,49 +224,31 @@ func removeEventLogSource(source string) {
 	}
 }
 
-// platformStartService / platformStopService: direct SCM control with a
-// bounded stop wait (the batch installer wraps the same waits).
+// platformStartService starts the installed service via the SCM.
 func platformStartService() error {
-	spec := serviceSpec()
-	m, err := openSCManager()
-	if err != nil {
-		return err
-	}
-	defer m.Disconnect()
-	s, err := m.OpenService(spec.Name)
-	if err != nil {
-		return err
-	}
-	defer s.Close()
-	return s.Start()
+	return withService(serviceSpec().Name, func(s *mgr.Service) error {
+		return s.Start()
+	})
 }
 
+// platformStopService requests service stop and polls until STOPPED or svcStopDeadline.
 func platformStopService() error {
-	spec := serviceSpec()
-	m, err := openSCManager()
-	if err != nil {
-		return err
-	}
-	defer m.Disconnect()
-	s, err := m.OpenService(spec.Name)
-	if err != nil {
-		return err
-	}
-	defer s.Close()
-	status, err := s.Control(svc.Stop)
-	if err != nil {
-		return fmt.Errorf("send stop control: %w", err)
-	}
-	deadline := time.Now().Add(svcStopDeadline)
-	for status.State != svc.Stopped {
-		if time.Now().After(deadline) {
-			return fmt.Errorf("service did not reach STOPPED within %v (STOP_PENDING may be stuck)", svcStopDeadline)
-		}
-		time.Sleep(500 * time.Millisecond)
-		status, err = s.Query()
+	return withService(serviceSpec().Name, func(s *mgr.Service) error {
+		status, err := s.Control(svc.Stop)
 		if err != nil {
-			return fmt.Errorf("poll service status: %w", err)
+			return fmt.Errorf("send stop control: %w", err)
 		}
-	}
-	return nil
+		deadline := time.Now().Add(svcStopDeadline)
+		for status.State != svc.Stopped {
+			if time.Now().After(deadline) {
+				return fmt.Errorf("service did not reach STOPPED within %v (STOP_PENDING may be stuck)", svcStopDeadline)
+			}
+			time.Sleep(500 * time.Millisecond)
+			status, err = s.Query()
+			if err != nil {
+				return fmt.Errorf("poll service status: %w", err)
+			}
+		}
+		return nil
+	})
 }

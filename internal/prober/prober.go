@@ -181,43 +181,39 @@ func validatePendingWindow(baseInterval, baseTimeout time.Duration, targets []Ta
 	return nil
 }
 
+// validateDurationBounds validates a probe interval or timeout value.
+func validateDurationBounds(label string, d time.Duration, allowZero bool) error {
+	if allowZero && d == 0 {
+		return nil
+	}
+	if d <= 0 {
+		return fmt.Errorf("%s must be positive, got %v", label, d)
+	}
+	if d < minProbeInterval {
+		return fmt.Errorf("%s must be at least %v, got %v", label, minProbeInterval, d)
+	}
+	if d > maxProbeTimeout {
+		return fmt.Errorf("%s must be at most %v, got %v", label, maxProbeTimeout, d)
+	}
+	return nil
+}
+
 // Validate checks that at least one target is present and that all
 // target addresses are well-formed.
 func (c Config) Validate() error {
 	if len(c.Targets) == 0 {
 		return errors.New("no targets specified")
 	}
-	if c.BaseInterval <= 0 {
-		return fmt.Errorf("probe interval must be positive, got %v", c.BaseInterval)
+	if err := validateDurationBounds("probe interval (-interval)", c.BaseInterval, false); err != nil {
+		return err
 	}
-	if c.BaseInterval < minProbeInterval {
-		return fmt.Errorf("probe interval (-interval) must be at least %v, got %v", minProbeInterval, c.BaseInterval)
-	}
-	if c.BaseInterval > maxProbeTimeout {
-		return fmt.Errorf("probe interval (-interval) must be at most %v, got %v", maxProbeTimeout, c.BaseInterval)
-	}
-	if c.BaseTimeout <= 0 {
-		return fmt.Errorf("probe timeout must be positive, got %v", c.BaseTimeout)
-	}
-	if c.BaseTimeout < minProbeInterval {
-		return fmt.Errorf("probe timeout (-timeout) must be at least %v, got %v", minProbeInterval, c.BaseTimeout)
-	}
-	if c.BaseTimeout > maxProbeTimeout {
-		// No probe can meaningfully wait a day; the bound also keeps the
-		// applied RTO (and the adaptive seconds -> Duration conversion) far
-		// away from the int64 nanosecond overflow.
-		return fmt.Errorf("probe timeout (-timeout) must be at most %v, got %v", maxProbeTimeout, c.BaseTimeout)
+	if err := validateDurationBounds("probe timeout (-timeout)", c.BaseTimeout, false); err != nil {
+		return err
 	}
 	if c.ReconnectInterval < 0 {
 		return fmt.Errorf("reconnect interval must be >= 0, got %v", c.ReconnectInterval)
 	}
 	if c.ReloadInterval < 0 {
-		// A negative -targets-reload-interval silently DISABLED hot reload
-		// (ticker construction is gated on > 0), reading to the operator
-		// as configured reloading that never fires — on a Windows service
-		// there is no SIGHUP fallback, so the targets file would never
-		// be re-read for the life of the process. Reject instead; 0 is the
-		// documented way to disable the timer.
 		return fmt.Errorf("targets reload interval must be >= 0, got %v", c.ReloadInterval)
 	}
 	if c.DSCP < 0 || c.DSCP > 63 {
@@ -230,8 +226,6 @@ func (c Config) Validate() error {
 		return fmt.Errorf("mtu sweep interval must be >= 0, got %v", c.MTUSweep)
 	}
 	if c.HmacCoverage != HMACHeaderCoverage && c.HmacCoverage != HMACFullFrameCoverage {
-		// An out-of-range value used to behave silently as header-only: the
-		// operator asked for payload coverage and got the v0.7 check.
 		return fmt.Errorf("hmac coverage must be header or full-frame, got %d", c.HmacCoverage)
 	}
 	if c.ReconnectInterval != 0 && c.ReconnectInterval < c.BaseInterval {
@@ -244,9 +238,7 @@ func (c Config) Validate() error {
 }
 
 // validateTargets checks each target's address and name and rejects
-// duplicate names (target names are Prometheus label values, so
-// duplicates would produce ambiguous metric series). Shared by
-// Config.Validate and LoadTargets.
+// duplicate names (target names are Prometheus label values).
 func validateTargets(targets []Target) error {
 	seen := make(map[string]struct{}, len(targets))
 	for _, t := range targets {
@@ -256,26 +248,11 @@ func validateTargets(targets []Target) error {
 		if err := ValidateTargetName(t.Name); err != nil {
 			return fmt.Errorf("target %q: %w", t.Name, err)
 		}
-		if t.Interval < 0 {
-			return fmt.Errorf("target %q: interval must be >= 0, got %v", t.Name, t.Interval)
+		if err := validateDurationBounds("interval", t.Interval, true); err != nil {
+			return fmt.Errorf("target %q: %w", t.Name, err)
 		}
-		if t.Interval != 0 && t.Interval < minProbeInterval {
-			return fmt.Errorf("target %q: interval must be at least %v, got %v", t.Name, minProbeInterval, t.Interval)
-		}
-		if t.Interval > maxProbeTimeout {
-			return fmt.Errorf("target %q: interval must be at most %v, got %v", t.Name, maxProbeTimeout, t.Interval)
-		}
-		if t.Timeout < 0 {
-			return fmt.Errorf("target %q: timeout must be >= 0, got %v", t.Name, t.Timeout)
-		}
-		if t.Timeout > maxProbeTimeout {
-			return fmt.Errorf("target %q: timeout must be at most %v, got %v", t.Name, maxProbeTimeout, t.Timeout)
-		}
-		if t.Timeout != 0 && t.Timeout < minProbeInterval {
-			// A per-target override bypasses the global floor otherwise: a
-			// sub-millisecond timeout timeouts every probe and reads as 100%
-			// loss on the link it was supposed to measure.
-			return fmt.Errorf("target %q: timeout must be at least %v, got %v", t.Name, minProbeInterval, t.Timeout)
+		if err := validateDurationBounds("timeout", t.Timeout, true); err != nil {
+			return fmt.Errorf("target %q: %w", t.Name, err)
 		}
 		if _, dup := seen[t.Name]; dup {
 			return fmt.Errorf("duplicate target name %q: metric labels would be ambiguous", t.Name)

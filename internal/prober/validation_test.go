@@ -272,3 +272,10 @@ func TestTargetUnmarshalJSON_RejectsUnknownFields(t *testing.T) {
 		t.Fatal("expected LoadTargets to reject unknown JSON field 'timout'")
 	}
 }
+
+func TestLoadTargetsRejectsNull(t *testing.T) {
+	p := writeTempTargets(t, "null")
+	if _, err := LoadTargets(p); err == nil {
+		t.Fatal("LoadTargets accepted a null document as an empty target set")
+	}
+}
