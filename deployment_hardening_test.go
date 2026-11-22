@@ -94,11 +94,16 @@ func TestWindowsInstallerUsesTheSCMEnvironmentValue(t *testing.T) {
 // preserved, cleared variables REMOVED from it. The old win_regedit loop wrote
 // a subkey the SCM ignores.
 func TestAnsibleReconcilesTheSCMEnvironmentValue(t *testing.T) {
+	winSvcPath := "deploy/ansible/tasks/windows_service.yml"
+	winSvc := readDeploymentFile(t, winSvcPath)
+	mustContain(t, winSvcPath, winSvc, "PropertyType MultiString", "the SCM reads a REG_MULTI_SZ value")
+	mustContain(t, winSvcPath, winSvc, "$m.Remove($p[0])", "a cleared variable must be removed, not left installed")
+	mustContain(t, winSvcPath, winSvc, "SetSecurityDescriptorSddlForm", "the service key must be protected")
+	mustNotContain(t, winSvcPath, winSvc, "ansible.windows.win_regedit", "a win_regedit subkey is ignored by the SCM")
+
 	for _, path := range []string{"deploy/ansible/playbook.yml", "deploy/ansible/mesh.yml"} {
 		body := readDeploymentFile(t, path)
-		mustContain(t, path, body, "PropertyType MultiString", "the SCM reads a REG_MULTI_SZ value")
-		mustContain(t, path, body, "$m.Remove($p[0])", "a cleared variable must be removed, not left installed")
-		mustContain(t, path, body, "SetSecurityDescriptorSddlForm", "the service key must be protected")
+		mustContain(t, path, body, "tasks/windows_service.yml", "Windows play must include shared SCM service tasks")
 		mustNotContain(t, path, body, "ansible.windows.win_regedit", "a win_regedit subkey is ignored by the SCM")
 	}
 }
@@ -107,32 +112,48 @@ func TestAnsibleReconcilesTheSCMEnvironmentValue(t *testing.T) {
 // --name=value, so a one-dash regex let --metrics/--allow/--mode override the
 // templated flags after the guardrails had approved the variables.
 func TestAnsibleOwnedFlagGuardRejectsGNUFlags(t *testing.T) {
-	for _, path := range []string{"deploy/ansible/playbook.yml", "deploy/ansible/mesh.yml"} {
-		body := readDeploymentFile(t, path)
-		mustContain(t, path, body, `'^--?(metrics|mode|allow`, "both -flag and --flag must be rejected")
-		// The four credential flags are env-delivered only (README:
-		// "never as service arguments"), and the mesh play templates
-		// -allow-from-targets. A token naming any of them must be rejected
-		// before it is rendered: Go keeps the LAST value, so a rendered
-		// -echo-secret pins a retired secret and -allow-from-targets=false
-		// disables the derived fail-closed allowlist.
-		for _, owned := range []string{"echo-secret|", "echo-secret-old", "metrics-user", "metrics-pass", "allow-from-targets"} {
-			mustContain(t, path, body, owned, "owned-flag guard must cover "+owned)
-		}
-		if strings.Contains(body, `select('match', '^-(metrics|mode|allow`) {
-			t.Errorf("%s: a one-dash-only owned-flag regex lets --flag tokens through", path)
-		}
+	guardPath := "deploy/ansible/tasks/guardrails.yml"
+	guard := readDeploymentFile(t, guardPath)
+	mustContain(t, guardPath, guard, `'^--?(`, "both -flag and --flag must be rejected")
+	mustContain(t, guardPath, guard, `metrics|mode|allow`, "default owned-flag pattern must cover core flags")
+	// The four credential flags are env-delivered only (README:
+	// "never as service arguments"), and the mesh play templates
+	// -allow-from-targets. A token naming any of them must be rejected
+	// before it is rendered: Go keeps the LAST value, so a rendered
+	// -echo-secret pins a retired secret and -allow-from-targets=false
+	// disables the derived fail-closed allowlist.
+	for _, owned := range []string{"echo-secret|", "echo-secret-old", "metrics-user", "metrics-pass", "allow-from-targets"} {
+		mustContain(t, guardPath, guard, owned, "owned-flag guard must cover "+owned)
 	}
+	if strings.Contains(guard, `select('match', '^-(metrics|mode|allow`) || strings.Contains(guard, `select('match', '^-(`) {
+		t.Errorf("%s: a one-dash-only owned-flag regex lets --flag tokens through", guardPath)
+	}
+
+	pb := readDeploymentFile(t, "deploy/ansible/playbook.yml")
+	mustContain(t, "deploy/ansible/playbook.yml", pb, "tasks/guardrails.yml", "playbook must include shared guardrails")
+
+	mesh := readDeploymentFile(t, "deploy/ansible/mesh.yml")
+	mustContain(t, "deploy/ansible/mesh.yml", mesh, "tasks/guardrails.yml", "mesh playbook must include shared guardrails")
+	mustContain(t, "deploy/ansible/mesh.yml", mesh, "source|targets|targets-reload-interval", "mesh playbook must extend owned flags with mesh-templated flags")
+	mustContain(t, "deploy/ansible/mesh.yml", mesh, "log-file", "mesh Windows play must also guard -log-file")
 }
 
 // TestAnsibleMetricsGuardrailDoesNotAcceptTLSForAuth pins the exposure fix: TLS
 // authenticates the server, not the scraper, so a wildcard listener with no
 // credentials must be refused even when a certificate is configured.
 func TestAnsibleMetricsGuardrailDoesNotAcceptTLSForAuth(t *testing.T) {
-	for _, path := range []string{"deploy/ansible/playbook.yml", "deploy/ansible/mesh.yml"} {
+	for _, path := range []string{
+		"deploy/ansible/tasks/guardrails.yml",
+		"deploy/ansible/playbook.yml",
+		"deploy/ansible/mesh.yml",
+	} {
 		body := readDeploymentFile(t, path)
 		mustNotContain(t, path, body, "and not (link_ping_metrics_tls | bool)",
 			"TLS must not substitute for Basic auth in the exposure guardrail")
+	}
+	for _, path := range []string{"deploy/ansible/playbook.yml", "deploy/ansible/mesh.yml"} {
+		body := readDeploymentFile(t, path)
+		mustContain(t, path, body, "tasks/guardrails.yml", "playbook must include shared guardrails")
 	}
 }
 
@@ -143,16 +164,22 @@ func TestAnsibleMetricsGuardrailDoesNotAcceptTLSForAuth(t *testing.T) {
 // start. The Windows play is the worst case: -svc=install runs before the
 // credentials exist in the environment, so only the play can catch it.
 func TestAnsibleRefusesMetricsCredentialsWithoutTLS(t *testing.T) {
+	guardPath := "deploy/ansible/tasks/guardrails.yml"
+	guard := readDeploymentFile(t, guardPath)
+	if got := strings.Count(guard, "Refuse metrics credentials without TLS"); got != 1 {
+		t.Errorf("%s: found %d pairing guards, want 1", guardPath, got)
+	}
+	mustContain(t, guardPath, guard, "link_ping_metrics_allow_insecure | bool",
+		"the guard must accept an explicit plaintext opt-in")
+	mustContain(t, guardPath, guard, "^--?metrics-allow-insecure(=([Tt][Rr][Uu][Ee]|1|[Tt]))?$",
+		"the allow-insecure check must match an affirmative flag token rather than substring")
+	mustContain(t, guardPath, guard, "not (link_ping_metrics_auth | bool)", "the guard must key on the credential pair")
+
 	for _, path := range []string{"deploy/ansible/playbook.yml", "deploy/ansible/mesh.yml"} {
 		body := readDeploymentFile(t, path)
-		if got := strings.Count(body, "Refuse metrics credentials without TLS"); got != 2 {
-			t.Errorf("%s: found %d pairing guards, want one in each play", path, got)
+		if got := strings.Count(body, "tasks/guardrails.yml"); got != 2 {
+			t.Errorf("%s: includes tasks/guardrails.yml %d times, want 2 (once per play)", path, got)
 		}
-		mustContain(t, path, body, "link_ping_metrics_allow_insecure | bool",
-			"the guard must accept an explicit plaintext opt-in")
-		mustContain(t, path, body, "^--?metrics-allow-insecure(=([Tt][Rr][Uu][Ee]|1|[Tt]))?$",
-			"the allow-insecure check must match an affirmative flag token rather than substring")
-		mustContain(t, path, body, "not (link_ping_metrics_auth | bool)", "the guard must key on the credential pair")
 	}
 }
 
@@ -188,16 +215,27 @@ func TestPullScriptHooksPathIsUnpredictable(t *testing.T) {
 // SYSTEM service or scheduled task writes to or executes from is re-owned
 // before use, in both Windows plays.
 func TestAnsibleOwnsTheWindowsServiceDirectories(t *testing.T) {
+	hdPath := "deploy/ansible/tasks/windows_harden_dir.yml"
+	hd := readDeploymentFile(t, hdPath)
+	mustContain(t, hdPath, hd, `takeown.exe /f "$d" /a`, "the directory must be re-owned")
+	mustContain(t, hdPath, hd, "[System.IO.FileAttributes]::ReparsePoint", "reparse points must be refused")
+	mustContain(t, hdPath, hd, `icacls.exe "$d" /inheritance:r`, "inherited ACEs must be dropped")
+	mustNotContain(t, hdPath, hd, `takeown.exe /f "$d" /a /d Y`, "takeown /d Y without /r is invalid Windows syntax")
+
 	pb := readDeploymentFile(t, "deploy/ansible/playbook.yml")
-	mustContain(t, "deploy/ansible/playbook.yml", pb, "takeown.exe /f \"$d\" /a", "the container must be re-owned")
+	mustContain(t, "deploy/ansible/playbook.yml", pb, "tasks/windows_harden_dir.yml", "playbook must include shared directory hardening")
 	mustContain(t, "deploy/ansible/playbook.yml", pb, "link_ping_win_data_dir", "the container needs its own variable")
+	mustContain(t, "deploy/ansible/playbook.yml", pb, "link_ping_win_log_dir", "the log directory must be hardened")
 	mustContain(t, "deploy/ansible/playbook.yml", pb, `-targets="{{ link_ping_win_targets_path }}"`, "Windows -targets path must be quoted for Program Files spaces")
 	mustNotContain(t, "deploy/ansible/playbook.yml", pb, `takeown.exe /f "$d" /a /d Y`, "takeown /d Y without /r is invalid Windows syntax")
 
 	m := readDeploymentFile(t, "deploy/ansible/mesh.yml")
+	mustContain(t, "deploy/ansible/mesh.yml", m, "tasks/windows_harden_dir.yml", "mesh playbook must include shared directory hardening")
+	mustContain(t, "deploy/ansible/mesh.yml", m, "link_ping_win_data_dir", "the container needs its own variable")
+	mustContain(t, "deploy/ansible/mesh.yml", m, "link_ping_win_log_dir", "the log directory must be hardened")
 	mustContain(t, "deploy/ansible/mesh.yml", m, "link_ping_win_pull_work", "the pull work directory must be created")
-	if strings.Count(m, "takeown.exe /f \"$d\" /a") < 3 {
-		t.Errorf("deploy/ansible/mesh.yml: container, pull directory and pull work directory must all be re-owned")
+	if strings.Count(m, `takeown.exe /f "$d" /a`) < 2 {
+		t.Errorf("deploy/ansible/mesh.yml: pull directory and pull work directory must both be recursively re-owned")
 	}
 	mustNotContain(t, "deploy/ansible/mesh.yml", m, `takeown.exe /f "$d" /a /d Y`, "non-recursive takeown must not pass /d Y")
 }

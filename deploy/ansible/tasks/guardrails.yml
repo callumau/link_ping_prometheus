@@ -1,0 +1,168 @@
+---
+# Pre-flight guardrails shared across Linux and Windows plays in
+# playbook.yml and mesh.yml. Callers may override:
+#   link_ping_allow_from_targets: bool (default false)
+#   link_ping_owned_flags_regex: regex alternation of owned flag names
+#   link_ping_check_site_name_whitespace: bool (default false)
+
+# -metrics is the management plane - /metrics AND /status carry the whole
+# probe topology (target addresses, packet counts, build info). A wildcard
+# bind with no credentials and no TLS hands that to every host that can
+# route to the box, so refuse the install instead of shipping it silently.
+# The host part is everything before the LAST colon: ":2112" -> "" and
+# "[::]:2112" -> "[::]" are wildcards, "127.0.0.1:2112" -> "127.0.0.1" is not.
+- name: Classify the metrics listener exposure
+  ansible.builtin.set_fact:
+    link_ping_metrics_host: >-
+      {{ link_ping_metrics_listen.split(':')[:-1] | join(':') }}
+    # Both halves or none: the binary refuses a half-configured pair
+    # (config.ResolveMetricsAuth), so one empty var means auth off.
+    link_ping_metrics_auth: >-
+      {{ (link_ping_metrics_user | length > 0)
+         and (link_ping_metrics_pass | length > 0) }}
+    link_ping_metrics_tls_cert: >-
+      {{ (link_ping_extra_args.split()
+          | select('match', '^--?metrics-tls-cert(=|$)')
+          | list | length) > 0 }}
+    link_ping_metrics_tls_key: >-
+      {{ (link_ping_extra_args.split()
+          | select('match', '^--?metrics-tls-key(=|$)')
+          | list | length) > 0 }}
+    link_ping_metrics_allow_insecure: >-
+      {{ (link_ping_extra_args.split()
+          | select('match',
+            '^--?metrics-allow-insecure(=([Tt][Rr][Uu][Ee]|1|[Tt]))?$')
+          | list | length) > 0 }}
+
+# Evaluate TLS pairing after the two token facts above are set.
+- name: Classify TLS pairing
+  ansible.builtin.set_fact:
+    link_ping_metrics_tls: >-
+      {{ (link_ping_metrics_tls_cert | bool)
+         and (link_ping_metrics_tls_key | bool) }}
+
+- name: Refuse an unauthenticated all-interfaces metrics listener
+  ansible.builtin.assert:
+    that: >-
+      not (link_ping_metrics_host in ['', '0.0.0.0', '::', '[::]', '*']
+           and not (link_ping_metrics_auth | bool))
+    fail_msg: >-
+      link_ping_metrics_listen={{ link_ping_metrics_listen }} publishes
+      /metrics and /status on every interface with no Basic auth. TLS
+      alone does not fix this: it authenticates the server, not the
+      scraper, and /metrics and /status answer any client that completes
+      the handshake with the whole probe topology (target addresses,
+      peer IPs, packet counts, build info). Pick one: (1) bind
+      127.0.0.1:2112 and scrape through a tunnel/agent; (2) set
+      link_ping_metrics_user and link_ping_metrics_pass (the binary then
+      also requires TLS unless you pass -metrics-allow-insecure, which
+      plaintext HTTP needs); (3) firewall TCP 2112 to the monitoring
+      hosts only. See deploy/ansible/README.md.
+    # Silent when safe: the guardrail must not add noise to the normal
+    # localhost default.
+    quiet: true
+
+- name: Require a client allowlist in server/both mode
+  # The binary refuses server/both mode with an empty -allow list
+  # (fail-closed) unless -allow-from-targets derives one from the targets
+  # file, so the service restart policy would otherwise crash-loop it
+  # every 5s — fail here with the fix instead.
+  ansible.builtin.assert:
+    that: >-
+      link_ping_mode not in ['server', 'both']
+      or (link_ping_allow | length > 0)
+      or (link_ping_allow_from_targets | default(false) | bool)
+    fail_msg: >-
+      link_ping_mode={{ link_ping_mode }} with an empty link_ping_allow
+      cannot start: the binary refuses server/both mode without -allow
+      (fail-closed client allowlist), so the service restart policy would
+      crash-loop the service every 5s. Set link_ping_allow in
+      group_vars to the comma-separated client IPs or CIDR prefixes
+      allowed to echo (e.g. "203.0.113.5,10.0.0.0/24"), or enable
+      link_ping_allow_from_targets in mesh mode. See
+      deploy/ansible/README.md.
+    quiet: true
+
+- name: Refuse half-paired credentials or TLS flags
+  ansible.builtin.assert:
+    that:
+      - (link_ping_metrics_user | length > 0) == (link_ping_metrics_pass | length > 0)
+      - (link_ping_metrics_tls_cert | bool) == (link_ping_metrics_tls_key | bool)
+      - (link_ping_echo_secret_old | length == 0) or (link_ping_echo_secret | length > 0)
+    fail_msg: >-
+      Half-configured credentials or TLS flags fail startup validation
+      and crash-loop the service: metrics user/pass must both be set or
+      both empty, -metrics-tls-cert and -metrics-tls-key must be paired,
+      and link_ping_echo_secret_old requires link_ping_echo_secret.
+    quiet: true
+
+- name: Refuse metrics credentials without TLS or explicit plaintext
+  # deploy/ansible/README.md states the rule; the binary enforces it at
+  # startup (config.ResolveMetricsAuth). Without this assert a play that
+  # sets only link_ping_metrics_user/pass installs "successfully" and then
+  # the service exits 1 on every start (SCM restart ladder / systemd
+  # Restart=on-failure), with stdout discarded.
+  ansible.builtin.assert:
+    that: >-
+      not (link_ping_metrics_auth | bool)
+      or (link_ping_metrics_tls | bool)
+      or (link_ping_metrics_allow_insecure | bool)
+    fail_msg: >-
+      link_ping_metrics_user/link_ping_metrics_pass are set, but
+      link_ping_extra_args carries neither the TLS certificate/key
+      flags nor -metrics-allow-insecure. The agent refuses Basic auth over
+      plaintext HTTP, so every service start would exit 1 in a restart
+      loop. Add the TLS pair, add -metrics-allow-insecure explicitly, or
+      bind the metrics listener to 127.0.0.1. See deploy/ansible/README.md.
+    quiet: true
+
+- name: Reject flag values that would corrupt the rendered flag list
+  # systemd word-splits the unquoted $OPTIONS expansion (and the Windows
+  # service command line is rendered into one win_shell invocation), so a
+  # space inside a flag value silently truncates the flag list.
+  # Between-flag spaces are fine; every whitespace-separated token in
+  # link_ping_extra_args must therefore be one complete -flag=value.
+  #
+  # link_ping_extra_args is rendered AFTER the templated flags, and Go's
+  # flag package keeps the LAST value, so a token overriding a variable-owned
+  # flag (both -flag and --flag forms) must be rejected before rendering.
+  vars:
+    link_ping_bad_extra_args: >-
+      {{ link_ping_extra_args.split()
+         | reject('match', '^-\S+$') | list }}
+    link_ping_owned_flags_pattern: >-
+      {{ link_ping_owned_flags_regex
+         | default('metrics|mode|allow|echo-secret|echo-secret-old'
+                   ~ '|metrics-user|metrics-pass|allow-from-targets') }}
+    link_ping_owned_extra_args: >-
+      {{ link_ping_extra_args.split()
+         | select('match',
+           '^--?(' ~ link_ping_owned_flags_pattern ~ ')(=|$)')
+         | list }}
+  ansible.builtin.assert:
+    that:
+      - link_ping_allow is not search('\s')
+      - link_ping_metrics_listen is not search('\s')
+      - >-
+        not (link_ping_check_site_name_whitespace | default(false) | bool)
+        or ((link_ping_site_name | default('')) is not search('\s'))
+      - link_ping_bad_extra_args | length == 0
+      - link_ping_owned_extra_args | length == 0
+    fail_msg: >-
+      Whitespace inside a flag value splits the rendered command line,
+      silently truncating the flag list, and a flag templated from a
+      variable that is repeated in link_ping_extra_args is applied twice
+      with the LAST value winning. Offending value(s):
+      link_ping_allow='{{ link_ping_allow }}',
+      link_ping_metrics_listen='{{ link_ping_metrics_listen }}',
+      {{ ("link_ping_site_name='" ~ (link_ping_site_name | default('')) ~ "', ")
+         if (link_ping_check_site_name_whitespace | default(false) | bool)
+         else '' }}link_ping_extra_args token(s) without a leading '-':
+      {{ link_ping_bad_extra_args }},
+      link_ping_extra_args token(s) overriding a templated flag:
+      {{ link_ping_owned_extra_args }}. Fix in group_vars:
+      separate multiple allowlist entries with commas, never spaces,
+      keep every -flag=value token in link_ping_extra_args free of
+      spaces, and set owned flags with their own variables instead.
+      See deploy/ansible/README.md.
+    quiet: true

@@ -1,0 +1,50 @@
+---
+# Render credential env lines, install /etc/link_ping_prometheus.env,
+# install the systemd unit, and enable/start the service.
+# Expects link_ping_options and a "Restart link ping" handler in the play.
+
+- name: Render credential env lines
+  # no_log: the rendered lines contain the metrics password and HMAC
+  # secret; without it they appear in `-v` task output and `--diff`.
+  no_log: true
+  ansible.builtin.set_fact:
+    link_ping_env_lines: >-
+      {{ []
+      + (['LINK_PING_ECHO_SECRET=' ~ link_ping_echo_secret]
+         if link_ping_echo_secret | length > 0 else [])
+      + (['LINK_PING_ECHO_SECRET_OLD=' ~ link_ping_echo_secret_old]
+         if link_ping_echo_secret_old | length > 0 else [])
+      + (['LINK_PING_METRICS_USER=' ~ link_ping_metrics_user]
+         if link_ping_metrics_user | length > 0 else [])
+      + (['LINK_PING_METRICS_PASS=' ~ link_ping_metrics_pass]
+         if link_ping_metrics_pass | length > 0 else []) }}
+
+- name: Install environment file (OPTIONS plus credentials)
+  # no_log: the rendered file body contains the credentials; without it
+  # `--diff` prints the plaintext secret to the console / CI log.
+  no_log: true
+  ansible.builtin.copy:
+    # Written unconditionally: the unit runs `link_ping_prometheus
+    # $OPTIONS`, and an empty expansion starts the binary on fail-closed
+    # defaults (-mode=server, no -allow), so Restart=on-failure
+    # crash-loops it. Credentials stay env vars, never CLI flags.
+    content: >-
+      {{ ((['OPTIONS="' ~ (link_ping_options | trim) ~ '"']
+           + link_ping_env_lines) | join('\n')) ~ '\n' }}
+    dest: /etc/link_ping_prometheus.env
+    mode: "0600"
+  notify: Restart link ping
+
+- name: Install systemd unit
+  ansible.builtin.copy:
+    src: ../../installer/linux/link_ping_prometheus.service
+    dest: /etc/systemd/system/link_ping_prometheus.service
+    mode: "0644"
+  notify: Restart link ping
+
+- name: Enable and start service
+  ansible.builtin.systemd:
+    name: link_ping_prometheus
+    daemon_reload: true
+    enabled: true
+    state: started

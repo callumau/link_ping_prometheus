@@ -125,7 +125,14 @@ jobs:
               for play_idx, play in enumerate(plays):
                   guard_tasks = []
                   for task in play["tasks"]:
-                      if "ansible.builtin.file" in task or "ansible.windows.win_file" in task or "ansible.builtin.copy" in task:
+                      inc = task.get("ansible.builtin.include_tasks") or task.get("include_tasks")
+                      inc_file = inc.get("file") if isinstance(inc, dict) else inc
+                      if (
+                          "ansible.builtin.file" in task
+                          or "ansible.windows.win_file" in task
+                          or "ansible.builtin.copy" in task
+                          or (inc is not None and inc_file != "tasks/guardrails.yml")
+                      ):
                           break
                       guard_tasks.append(task)
                   for cname, expect_ok, overrides in cases:
@@ -151,7 +158,13 @@ jobs:
                           "vars": base_vars,
                           "tasks": guard_tasks,
                       }]
-                      with tempfile.NamedTemporaryFile("w", suffix=".yml", delete=False) as tf:
+                      with tempfile.NamedTemporaryFile(
+                          "w",
+                          dir="deploy/ansible",
+                          prefix=".ci-guard-",
+                          suffix=".yml",
+                          delete=False,
+                      ) as tf:
                           yaml.safe_dump(test_play, tf)
                           tpath = tf.name
                       try:
