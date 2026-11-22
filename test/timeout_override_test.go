@@ -33,7 +33,6 @@ func TestPerTargetTimeoutDrivesProbeDeadline(t *testing.T) {
 	slowAddr := validatedEcho(t, ctx, func(buf []byte, w func([]byte)) {
 		// > probe interval, so the probe is timed out at the 500ms tick
 		// before this reply lands (see the test docstring).
-		// pi-lens-ignore: go-time-sleep-test
 		time.Sleep(700 * time.Millisecond)
 		w(buf)
 	})

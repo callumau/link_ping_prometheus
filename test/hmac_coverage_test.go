@@ -192,7 +192,6 @@ func TestClient_HMACCoverageWireBytes(t *testing.T) {
 			}
 			cfg.Targets = []prober.Target{{Name: name, Address: addr}}
 			runClientAsync(t, ctx, cancel, cfg)
-			// pi-lens-ignore: go-time-sleep-test
 			time.Sleep(400 * time.Millisecond)
 
 			capMu.Lock()
@@ -263,7 +262,6 @@ func TestClient_HMACFullFrameRejectsTamperedEcho(t *testing.T) {
 	}
 	cfg.Targets = []prober.Target{{Name: name, Address: addr}}
 	runClientAsync(t, ctx, cancel, cfg)
-	// pi-lens-ignore: go-time-sleep-test
 	time.Sleep(600 * time.Millisecond)
 
 	if rtt := getHistogramCount(prober.RTTSeconds, name, addr); rtt != 0 {

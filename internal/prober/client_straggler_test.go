@@ -29,7 +29,6 @@ type blockingWriteConn struct {
 func (c *blockingWriteConn) Write(b []byte) (int, error) {
 	c.once.Do(func() {
 		close(c.started)
-		// pi-lens-ignore: go-time-sleep-test
 		time.Sleep(c.delay)
 	})
 	return c.Conn.Write(b)

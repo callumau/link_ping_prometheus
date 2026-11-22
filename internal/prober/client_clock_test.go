@@ -9,7 +9,6 @@ import (
 // TestRTTSeconds_Positive: the normal path — both instants carry the
 // monotonic reading, so the RTT is their difference and no QPC source is
 // available (unix) or needed.
-// pi-lens-ignore: go-test-functions
 func TestRTTSeconds_Positive(t *testing.T) {
 	sentAt := time.Now()
 	recvAt := sentAt.Add(37 * time.Millisecond)
@@ -84,7 +83,6 @@ func TestRTTSeconds_QPCPreferred(t *testing.T) {
 // step leaves in the pending map; the old `nowNS-st.sentNS > timeout` test never
 // matched it, so those entries accumulated until maxPendingWindow throttled
 // every send (nothing probed while link_up stayed 1).
-// pi-lens-ignore: go-test-functions
 func TestProbeExpired(t *testing.T) {
 	now := time.Now()
 	timeout := 300 * time.Millisecond

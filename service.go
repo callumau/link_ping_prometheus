@@ -91,7 +91,6 @@ func absolutizeFlagValue(name, value string) string {
 // helpers, so install and run cannot drift.
 func installServiceArgs() ([]string, error) {
 	// Both results are validation-only here; run() consumes the values.
-	// pi-lens-ignore: go-ignored-call-result
 	if _, err := checkStartupFlags(); err != nil {
 		return nil, err
 	}
@@ -123,7 +122,6 @@ func installServiceArgs() ([]string, error) {
 			return nil, fmt.Errorf("invalid -listen address: %w", err)
 		}
 	}
-	// pi-lens-ignore: go-ignored-call-result
 	if _, err := resolveAllowlist(mode, cfg); err != nil {
 		return nil, err
 	}
@@ -253,7 +251,7 @@ func handleService(action string, logSink *countedWriter) {
 	}
 }
 
-// program implements service.Interface for kardianos/service.
+// program implements the service lifecycle for Windows SCM and foreground runs.
 type program struct {
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -285,7 +283,6 @@ func (p *program) Start(sysLog eventlogSink) error {
 	if sysLog != nil {
 		sysLog.Info(fmt.Sprintf("link_ping_prometheus service starting (version %s)", version))
 	}
-	// pi-lens-ignore: go-context-background-handler
 	p.ctx, p.cancel = context.WithCancel(context.Background())
 	p.wg.Add(1)
 	go func() {
@@ -349,14 +346,8 @@ func (p *program) Stop(_ eventlogSink) error {
 	case <-done:
 		return nil
 	case <-time.After(svcStopDeadline):
-		// The drain missed the deadline, but this is an OPERATOR-requested
-		// stop, not a crash: returning an error makes kardianos report
-		// STOPPED with a service-specific exit code, which the SCM counts
-		// as a FAILURE and answers with the OnFailure restart ladder — the
-		// service the operator just stopped comes back up mid-maintenance.
-		// The process exits either way; clean-stop classification is the
-		// honest one. (The os.Exit(1) path in Start is the deliberate
-		// opposite: a genuine run failure WANTS the restart to fire.)
+		// Returning an error makes the SCM treat the stop as a failure and fire
+		// the OnFailure restart ladder mid-maintenance. Classify operator stop as clean.
 		slog.Error("Service stop deadline exceeded")
 		return nil
 	}
@@ -378,11 +369,3 @@ func svcTraceMarker(tag string) {
 	}
 	slog.Info(fmt.Sprintf("svc-trace[%s]", tag))
 }
-
-// readyToProbe reports whether a running agent can actually do its job, i.e.
-// /readyz's notion of readiness as opposed to /healthz's liveness.
-// SocketAgeSeconds is nonzero only while the target currently holds a socket:
-// the dial-retry path publishes 0 and a failed re-dial resets it, so this is
-// "can probe right now", not "has ever probed". An agent stuck resolving DNS or
-// blocked by a firewall is alive but useless, and an orchestrator must see that.
-// Reads the registry in place (see StatusRegistry.AnyReady) rather than

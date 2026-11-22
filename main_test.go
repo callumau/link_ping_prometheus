@@ -27,7 +27,6 @@ func (h chanHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
 
 func (h chanHandler) WithGroup(string) slog.Handler { return h }
 
-// pi-lens-ignore: go-test-functions
 
 // saveFlags restores all mutated global flags after the test.
 func saveFlags(t *testing.T) {
@@ -63,7 +62,6 @@ func saveFlags(t *testing.T) {
 	})
 }
 
-// pi-lens-ignore: go-test-functions
 
 // captureWarns swaps the default slog logger for a buffered text handler so
 // tests can assert startup warnings fired. Restores the previous default on

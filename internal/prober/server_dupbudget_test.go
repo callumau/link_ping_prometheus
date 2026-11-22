@@ -56,7 +56,6 @@ func TestServer_ReplayedFrameDoesNotSpendPerIPBudget(t *testing.T) {
 	// than assuming the server has drained them all.
 	deadline := time.Now().Add(2 * time.Second)
 	for dupDrops() < float64(replays) && time.Now().Before(deadline) {
-		// pi-lens-ignore: go-time-sleep-test
 		time.Sleep(5 * time.Millisecond)
 	}
 	if got := dupDrops(); got != float64(replays) {

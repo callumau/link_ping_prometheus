@@ -108,12 +108,12 @@ func TestE2EWindowsCredentialEnvDelivery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SCM connect after install: %v", err)
 	}
-	defer m.Disconnect() // pi-lens-ignore: go-ignored-call-result
+	defer m.Disconnect()
 	s, err := m.OpenService(svcName)
 	if err != nil {
 		t.Fatalf("service not found after -svc=install: %v", err)
 	}
-	defer s.Close() // pi-lens-ignore: go-ignored-call-result
+	defer s.Close()
 	waitServiceState(t, s, svc.Running, 20*time.Second)
 
 	base := fmt.Sprintf("http://127.0.0.1:%d/metrics", metricsP)
@@ -180,7 +180,7 @@ func httpGetBasic(t *testing.T, url, user, pass string) (int, string) {
 	if err != nil {
 		return 0, ""
 	}
-	defer resp.Body.Close() // pi-lens-ignore: go-ignored-call-result
+	defer resp.Body.Close()
 	body := make([]byte, 0, 4096)
 	buf := make([]byte, 4096)
 	for {

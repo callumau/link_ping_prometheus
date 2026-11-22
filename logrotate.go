@@ -134,7 +134,6 @@ func (r *logRotator) rotateLocked() error {
 	if rename == nil {
 		rename = os.Rename
 	}
-	// pi-lens-ignore: go-path-traversal (operator-supplied -log-file path)
 	if err := rename(r.path, backup); err != nil {
 		// Reopen the existing verified file so logging survives a transient
 		// rename failure (e.g., Windows ERROR_SHARING_VIOLATION).
@@ -221,7 +220,6 @@ func (r *logRotator) pruneLocked(clock time.Time) {
 		tooMany := r.maxBackups > 0 && i >= r.maxBackups
 		tooOld := r.maxAge > 0 && clock.Sub(b.ts) > r.maxAge
 		if tooMany || tooOld {
-			// pi-lens-ignore: go-ignored-call-result
 			_ = os.Remove(filepath.Join(dir, b.name))
 		}
 	}
@@ -238,7 +236,6 @@ func openOrCreateLogFile(path string) (*os.File, int64, bool, error) {
 		if !errors.Is(err, os.ErrNotExist) {
 			return nil, 0, false, err
 		}
-		// pi-lens-ignore: go-path-traversal (operator-supplied -log-file path)
 		f, err := createLogFile(path)
 		if errors.Is(err, os.ErrExist) {
 			// Raced with another creator: retry via the existing-file path
@@ -277,7 +274,6 @@ func openVerifiedLogFile(path string, li os.FileInfo) (*os.File, int64, bool, er
 	if !li.Mode().IsRegular() {
 		return nil, 0, false, fmt.Errorf("refusing non-regular log path %q (%s): only a regular file may receive topology-bearing logs", path, li.Mode().Type())
 	}
-	// pi-lens-ignore: go-path-traversal (operator-supplied -log-file path)
 	f, err := openLogFileForRepair(path)
 	if err != nil {
 		return nil, 0, false, err

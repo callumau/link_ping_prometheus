@@ -30,7 +30,6 @@ func TestMultiTargetProbing(t *testing.T) {
 	cfg := cfgWith(false, 50*time.Millisecond, 500*time.Millisecond, targets...)
 	go prober.RunClient(ctx, cfg)
 
-	// pi-lens-ignore: go-time-sleep-test
 	time.Sleep(time.Second)
 
 	for _, tg := range targets {
@@ -69,11 +68,9 @@ func TestServerDropout(t *testing.T) {
 	go prober.RunClient(ctx, cfg)
 
 	// Let the link establish, then stop echoing.
-	// pi-lens-ignore: go-time-sleep-test
 	time.Sleep(200 * time.Millisecond)
 	echoOn.Store(false)
 	// Probes now go unanswered and must time out after the 300ms RTO.
-	// pi-lens-ignore: go-time-sleep-test
 	time.Sleep(500 * time.Millisecond)
 
 	finalTimeouts := getCounterValue(prober.ProbesTimedOut, targetName, addr)

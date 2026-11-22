@@ -67,7 +67,6 @@ func TestOutage_NaturalLoss(t *testing.T) {
 	// -count>1 runs in the same process: read baselines, never absolute
 	// counter values, or repeated runs accumulate on the same series.
 	addr := "127.0.0.1:1" // nothing listening: datagrams vanish
-	// pi-lens-ignore: go-context-background-handler
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -78,7 +77,6 @@ func TestOutage_NaturalLoss(t *testing.T) {
 
 	runClientFor(ctx, cfg, 500*time.Millisecond)
 	cancel()
-	// pi-lens-ignore: go-time-sleep-test
 	time.Sleep(200 * time.Millisecond)
 
 	sent := getCounterValue(prober.ProbesSent, "outage_test", addr) - startSent
@@ -108,7 +106,6 @@ func TestOutage_NaturalLoss(t *testing.T) {
 
 func TestAccuracy_PacketLoss(t *testing.T) {
 	prober.InitMetrics()
-	// pi-lens-ignore: go-context-background-handler
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -128,7 +125,6 @@ func TestAccuracy_PacketLoss(t *testing.T) {
 	runClientFor(ctx, cfg, time.Duration(totalPackets+2)*50*time.Millisecond)
 	cancel()
 
-	// pi-lens-ignore: go-time-sleep-test
 
 	time.Sleep(200 * time.Millisecond)
 
@@ -154,14 +150,12 @@ func TestAccuracy_PacketLoss(t *testing.T) {
 
 func TestAccuracy_HighLatency(t *testing.T) {
 	prober.InitMetrics()
-	// pi-lens-ignore: go-context-background-handler
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	delay := 150 * time.Millisecond
 
 	addr := validatedEcho(t, ctx, func(buf []byte, w func([]byte)) {
-		// pi-lens-ignore: go-time-sleep-test
 		time.Sleep(delay)
 		w(buf)
 	})
@@ -177,10 +171,8 @@ func TestAccuracy_HighLatency(t *testing.T) {
 	}
 }
 
-// pi-lens-ignore: jscpd:duplicate
 func TestRobustness_CorruptSeq(t *testing.T) {
 	prober.InitMetrics()
-	// pi-lens-ignore: go-context-background-handler
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -196,7 +188,6 @@ func TestRobustness_CorruptSeq(t *testing.T) {
 		w(corrupt)
 	})
 
-	// pi-lens-ignore: jscpd:duplicate
 	targetName, cfg := namedCfg("corrupt_test", addr, 50*time.Millisecond, 100*time.Millisecond)
 
 	startRecv, startTimeout := recvTimeoutCounters(targetName, addr)
@@ -215,7 +206,6 @@ func TestRobustness_CorruptSeq(t *testing.T) {
 
 func TestRobustness_StalledServer(t *testing.T) {
 	prober.InitMetrics()
-	// pi-lens-ignore: go-context-background-handler
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -227,7 +217,6 @@ func TestRobustness_StalledServer(t *testing.T) {
 	startTimeout := getCounterValue(prober.ProbesTimedOut, targetName, addr)
 	runClientFor(ctx, cfg, 500*time.Millisecond)
 	cancel()
-	// pi-lens-ignore: go-time-sleep-test
 	time.Sleep(100 * time.Millisecond)
 
 	endTimeout := getCounterValue(prober.ProbesTimedOut, targetName, addr)
@@ -238,7 +227,6 @@ func TestRobustness_StalledServer(t *testing.T) {
 
 func TestAccuracy_KnownLatencyAndLoss(t *testing.T) {
 	prober.InitMetrics()
-	// pi-lens-ignore: go-context-background-handler
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -256,7 +244,6 @@ func TestAccuracy_KnownLatencyAndLoss(t *testing.T) {
 		if count <= dropWindow && count%dropMod == 0 {
 			return
 		}
-		// pi-lens-ignore: go-time-sleep-test
 		time.Sleep(delay)
 		w(buf)
 	})
@@ -270,7 +257,6 @@ func TestAccuracy_KnownLatencyAndLoss(t *testing.T) {
 	// 2.5s leaves ample margin under CI load.
 	runClientFor(ctx, cfg, 2500*time.Millisecond)
 	cancel()
-	// pi-lens-ignore: go-time-sleep-test
 	time.Sleep(200 * time.Millisecond)
 
 	endSent := getCounterValue(prober.ProbesSent, targetName, addr)
@@ -306,11 +292,8 @@ func maxRTT(delay time.Duration) time.Duration {
 	return delay + 15*time.Millisecond
 }
 
-// pi-lens-ignore: jscpd:duplicate
 func TestDuplicateResponse(t *testing.T) {
-	// pi-lens-ignore: jscpd:duplicate
 	prober.InitMetrics()
-	// pi-lens-ignore: go-context-background-handler
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -344,10 +327,8 @@ func TestDuplicateResponse(t *testing.T) {
 // TestRobustness_TimestampSpoof: responses with a valid seq but a tampered
 // payload timestamp must be rejected (left to time out as loss), guarding
 // RTT samples against corruption/replay/spoofing.
-// pi-lens-ignore: jscpd:duplicate
 func TestRobustness_TimestampSpoof(t *testing.T) {
 	prober.InitMetrics()
-	// pi-lens-ignore: go-context-background-handler
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -357,7 +338,6 @@ func TestRobustness_TimestampSpoof(t *testing.T) {
 		w(tampered)
 	})
 
-	// pi-lens-ignore: jscpd:duplicate
 	targetName, cfg := namedCfg("spoof_ts_test", addr, 50*time.Millisecond, 100*time.Millisecond)
 
 	startRecv, startTimeout := recvTimeoutCounters(targetName, addr)
@@ -380,7 +360,6 @@ func TestRobustness_TimestampSpoof(t *testing.T) {
 // counted once, and no timeouts may be attributed to reordering.
 func TestRobustness_OutOfOrderResponses(t *testing.T) {
 	prober.InitMetrics()
-	// pi-lens-ignore: go-context-background-handler
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -420,11 +399,8 @@ func TestRobustness_OutOfOrderResponses(t *testing.T) {
 // immediately by a copy with a tampered timestamp must count exactly
 // once — the second copy must be rejected, not double-counted or
 // counted as a different response.
-// pi-lens-ignore: jscpd:duplicate
 func TestRobustness_DuplicateWithTamperedCopy(t *testing.T) {
-	// pi-lens-ignore: jscpd:duplicate
 	prober.InitMetrics()
-	// pi-lens-ignore: go-context-background-handler
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -435,7 +411,6 @@ func TestRobustness_DuplicateWithTamperedCopy(t *testing.T) {
 		w(tampered)
 	})
 
-	// pi-lens-ignore: jscpd:duplicate
 	targetName, cfg := namedCfg("dup_tamper_test", addr, 50*time.Millisecond, 300*time.Millisecond)
 
 	startRecv, startSent := recvSentCounters(targetName, addr)
@@ -465,13 +440,11 @@ func TestRobustness_DuplicateWithTamperedCopy(t *testing.T) {
 // received, never disrupting the probe loop.
 func TestRobustness_LateResponsesIgnored(t *testing.T) {
 	prober.InitMetrics()
-	// pi-lens-ignore: go-context-background-handler
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	// Echo everything, but 250ms late — beyond the 100ms client timeout.
 	addr := validatedEcho(t, ctx, func(buf []byte, w func([]byte)) {
-		// pi-lens-ignore: go-time-sleep-test
 		time.Sleep(250 * time.Millisecond)
 		w(buf)
 	})
@@ -503,10 +476,8 @@ func TestRobustness_LateResponsesIgnored(t *testing.T) {
 // TestRobustness_SpuriousValidFrames: frames with a valid magic header
 // but a sequence number the client never sent must be ignored — they
 // must not inflate the received counter or disturb in-flight probes.
-// pi-lens-ignore: jscpd:duplicate
 func TestRobustness_SpuriousValidFrames(t *testing.T) {
 	prober.InitMetrics()
-	// pi-lens-ignore: go-context-background-handler
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -519,7 +490,6 @@ func TestRobustness_SpuriousValidFrames(t *testing.T) {
 		w(spurious)
 	})
 
-	// pi-lens-ignore: jscpd:duplicate
 	targetName, cfg := namedCfg("spurious_test", addr, 50*time.Millisecond, 300*time.Millisecond)
 
 	startRecv, startSent := recvSentCounters(targetName, addr)
@@ -554,7 +524,6 @@ func TestRobustness_SpuriousValidFrames(t *testing.T) {
 // accumulates natural timeouts.
 func TestIsolation_BrokenTargetDoesNotAffectHealthy(t *testing.T) {
 	prober.InitMetrics()
-	// pi-lens-ignore: go-context-background-handler
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -586,7 +555,6 @@ func TestIsolation_BrokenTargetDoesNotAffectHealthy(t *testing.T) {
 // return to zero on cancellation, clean or otherwise.
 func TestInflight_ClimbsOnStallThenDrains(t *testing.T) {
 	prober.InitMetrics()
-	// pi-lens-ignore: go-context-background-handler
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Read but never respond.
@@ -603,7 +571,6 @@ func TestInflight_ClimbsOnStallThenDrains(t *testing.T) {
 	}
 
 	cancel()
-	// pi-lens-ignore: go-time-sleep-test
 	time.Sleep(300 * time.Millisecond)
 
 	if got := getGaugeValue(prober.ProbesInflight, targetName, addr); got != 0 {
@@ -616,13 +583,11 @@ func TestInflight_ClimbsOnStallThenDrains(t *testing.T) {
 // every deploy/restart injects phantom packet loss.
 func TestGracefulShutdown_NoPhantomTimeouts(t *testing.T) {
 	prober.InitMetrics()
-	// pi-lens-ignore: go-context-background-handler
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Echo only after 1s — far beyond the test window — so probes stay
 	// in flight at cancel time without ever timing out (client timeout 5s).
 	addr := validatedEcho(t, ctx, func(buf []byte, w func([]byte)) {
-		// pi-lens-ignore: go-time-sleep-test
 		time.Sleep(1 * time.Second)
 		w(buf)
 	})
@@ -634,7 +599,6 @@ func TestGracefulShutdown_NoPhantomTimeouts(t *testing.T) {
 
 	runClientFor(ctx, cfg, 300*time.Millisecond)
 	cancel()
-	// pi-lens-ignore: go-time-sleep-test
 	time.Sleep(300 * time.Millisecond)
 
 	endSent := getCounterValue(prober.ProbesSent, targetName, addr)
@@ -654,7 +618,6 @@ func TestGracefulShutdown_NoPhantomTimeouts(t *testing.T) {
 // time out (enterprise health-check convention).
 func TestLinkUp_RequiresThreeMisses(t *testing.T) {
 	prober.InitMetrics()
-	// pi-lens-ignore: go-context-background-handler
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -694,7 +657,6 @@ func TestLinkUp_RequiresThreeMisses(t *testing.T) {
 		if up := getGaugeValue(prober.LinkUp, targetName, addr); up == 0 {
 			break
 		}
-		// pi-lens-ignore: go-time-sleep-test
 		time.Sleep(50 * time.Millisecond)
 	}
 	if up := getGaugeValue(prober.LinkUp, targetName, addr); up != 0 {
@@ -716,12 +678,10 @@ func dropEvery(count *int, n int, buf []byte, w func([]byte)) {
 // loss ratio must track the server's drop rate. The server reads every
 // probe but echoes only a fraction (dropping every 3rd), so no TCP
 // retransmission is involved — this isolates the client's counter
-// pi-lens-ignore: typos, typos:unknown
 // accounting. Adaptive RTO changes when timeouts are detected, not the
 // total count, so the ratio must converge to the injected drop rate.
 func TestAccuracy_PacketLoss10s(t *testing.T) {
 	prober.InitMetrics()
-	// pi-lens-ignore: go-context-background-handler
 	ctx, cancel := context.WithCancel(context.Background())
 
 	count := 0
@@ -733,7 +693,6 @@ func TestAccuracy_PacketLoss10s(t *testing.T) {
 	cfg := cfgWith(true, 100*time.Millisecond, 400*time.Millisecond, prober.Target{Name: targetName, Address: addr})
 	runClientFor(ctx, cfg, 12*time.Second)
 	cancel()
-	// pi-lens-ignore: go-time-sleep-test
 	time.Sleep(200 * time.Millisecond)
 
 	sent := getCounterValue(prober.ProbesSent, targetName, addr)
@@ -765,7 +724,6 @@ func TestAccuracy_PacketLoss10s(t *testing.T) {
 // once, and sent/rtt/timedout/inflight stays balanced through the storm.
 func TestRobustness_DuplicateStormBalance(t *testing.T) {
 	prober.InitMetrics()
-	// pi-lens-ignore: go-context-background-handler
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -825,7 +783,6 @@ func TestRobustness_DuplicateStormBalance(t *testing.T) {
 func TestReconnect_KeepsProbingAndBalance(t *testing.T) {
 	prober.InitMetrics()
 
-	// pi-lens-ignore: go-context-background-handler
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -840,10 +797,8 @@ func TestReconnect_KeepsProbingAndBalance(t *testing.T) {
 
 	go prober.RunClient(ctx, cfg)
 	// Span several reconnect cycles (200ms each).
-	// pi-lens-ignore: go-time-sleep-test
 	time.Sleep(1500 * time.Millisecond)
 	cancel()
-	// pi-lens-ignore: go-time-sleep-test
 	time.Sleep(200 * time.Millisecond)
 
 	sent := getCounterValue(prober.ProbesSent, targetName, addr)

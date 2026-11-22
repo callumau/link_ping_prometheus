@@ -126,7 +126,6 @@ func (c *deadlineFailConn) SetDeadline(time.Time) error {
 func (c *deadlineFailConn) SetReadDeadline(time.Time) error {
 	// Deliberate delay: see the type comment. Keeps the reader alive long
 	// enough for probes to be in flight when it dies.
-	// pi-lens-ignore: go-time-sleep-test
 	time.Sleep(15 * time.Millisecond)
 	return errors.New("injected SetReadDeadline failure")
 }
@@ -184,7 +183,6 @@ func (s *scriptedConn) Write(b []byte) (int, error) {
 		if panicNow {
 			// Deliberate injection: the panic-recovery contract is what
 			// this test verifies.
-			// pi-lens-ignore: go-direct-panic
 			panic("injected write panic")
 		}
 		if fail {
@@ -227,7 +225,6 @@ func wbEchoServer(t *testing.T, ctx context.Context, onFrame func(buf []byte)) s
 // probes still in flight, those probes can never match on this socket —
 // they must be counted as timed out AND removed from inflight so the
 // balance sent = rtt_count + timed_out + inflight survives the restart.
-// pi-lens-ignore: go-test-functions
 func TestEchoLoop_PanicFlushCountsTimeouts(t *testing.T) {
 	InitMetrics()
 
@@ -346,7 +343,6 @@ func TestEchoLoop_PanicFlushRestartNoDoubleCount(t *testing.T) {
 // exit must drain it as an RTT sample rather than charge it as loss via the
 // flush. Falsification: drop the drainResponses() call before flushPending()
 // in the readerDone case and this test sees rtt=0 with timed_out=1.
-// pi-lens-ignore: go-test-functions
 func TestEchoLoop_ReaderDeathDrainsReceivedEcho(t *testing.T) {
 	InitMetrics()
 
@@ -386,7 +382,6 @@ func TestEchoLoop_ReaderDeathDrainsReceivedEcho(t *testing.T) {
 // stale age — AnyReady (and thus /readyz) is built on SocketAgeSeconds > 0,
 // so a stale age would keep the agent "ready" through the 1s re-dial pause
 // while no echo can be read at all.
-// pi-lens-ignore: go-test-functions
 func TestEchoLoop_ReaderDeathStatusNotReady(t *testing.T) {
 	InitMetrics()
 
@@ -432,7 +427,6 @@ func TestEchoLoop_ReaderDeathStatusNotReady(t *testing.T) {
 // gauge is 0 is the frozen-green bug. The link is first proven UP through
 // real echoes (so state.linkUp is genuinely true), then writes are failed;
 // the interval is long so the stale window is wide enough to detect.
-// pi-lens-ignore: go-test-functions
 func TestEchoLoop_WriteFailureRefreshStatus(t *testing.T) {
 	InitMetrics()
 
@@ -464,7 +458,6 @@ func TestEchoLoop_WriteFailureRefreshStatus(t *testing.T) {
 	// Phase 1: the link genuinely comes up through real echoes.
 	upDeadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(upDeadline) && wbGauge(LinkUp, src, name, addr) != 1 {
-		// pi-lens-ignore: go-time-sleep-test
 		time.Sleep(5 * time.Millisecond)
 	}
 	if wbGauge(LinkUp, src, name, addr) != 1 {
@@ -485,7 +478,6 @@ func TestEchoLoop_WriteFailureRefreshStatus(t *testing.T) {
 				upStatus = true
 			}
 		}
-		// pi-lens-ignore: go-time-sleep-test
 		time.Sleep(5 * time.Millisecond)
 	}
 	if !upStatus {
@@ -497,7 +489,6 @@ func TestEchoLoop_WriteFailureRefreshStatus(t *testing.T) {
 	failWrites.Store(true)
 	dropDeadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(dropDeadline) && wbGauge(LinkUp, src, name, addr) != 0 {
-		// pi-lens-ignore: go-time-sleep-test
 		time.Sleep(5 * time.Millisecond)
 	}
 	if wbGauge(LinkUp, src, name, addr) != 0 {
@@ -514,7 +505,6 @@ func TestEchoLoop_WriteFailureRefreshStatus(t *testing.T) {
 				agree = true
 			}
 		}
-		// pi-lens-ignore: go-time-sleep-test
 		time.Sleep(2 * time.Millisecond)
 	}
 	if !agree {
@@ -535,7 +525,6 @@ func TestEchoLoop_WriteFailureRefreshStatus(t *testing.T) {
 // maxConsecutiveWriteFails consecutive local send errors, link_up must
 // drop to 0 — a frozen link_up=1 while nothing is being probed is the
 // worst failure mode for a monitor.
-// pi-lens-ignore: go-test-functions
 func TestEchoLoop_LinkDownOnSustainedWriteFailures(t *testing.T) {
 	InitMetrics()
 
@@ -592,7 +581,6 @@ func TestEchoLoop_LinkDownOnSustainedWriteFailures(t *testing.T) {
 // transition (whose one-shot drop can be undone by an unconditional
 // link_up re-arm on echo) and this test ends at link_up=1 with nothing that
 // can ever drop it again.
-// pi-lens-ignore: go-test-functions
 func TestEchoLoop_LateEchoCannotFreezeLinkUp(t *testing.T) {
 	InitMetrics()
 
@@ -605,7 +593,6 @@ func TestEchoLoop_LateEchoCannotFreezeLinkUp(t *testing.T) {
 	// loaded box: under a stall that pushed the streak past the echoes, the old
 	// code would drop the gauge afterwards anyway and pass.
 	addr := wbEchoServer(t, ctx, func([]byte) {
-		// pi-lens-ignore: go-time-sleep-test
 		time.Sleep(300 * time.Millisecond)
 	})
 	realConn, err := dialUDP(ctx, "udp", addr)
@@ -630,7 +617,6 @@ func TestEchoLoop_LateEchoCannotFreezeLinkUp(t *testing.T) {
 	// Long enough for the streak to drop the gauge (~200ms), for both
 	// delayed echoes to be drained (>=350ms) and for further failing
 	// writes to prove the gauge stays down.
-	// pi-lens-ignore: go-time-sleep-test
 	time.Sleep(900 * time.Millisecond)
 
 	// Non-vacuous guard: the delayed echoes really were matched, so the
@@ -662,7 +648,6 @@ func TestEchoLoop_LateEchoCannotFreezeLinkUp(t *testing.T) {
 // datagram on the wire, so it must not consume a sequence number — the
 // server must observe contiguous seqs, and the RFC 3550 jitter estimate
 // must not reset from the phantom gap.
-// pi-lens-ignore: go-test-functions
 func TestEchoLoop_WriteFailureDoesNotBurnSeq(t *testing.T) {
 	InitMetrics()
 
@@ -724,7 +709,6 @@ func TestEchoLoop_WriteFailureDoesNotBurnSeq(t *testing.T) {
 // pairs (always fewer than maxConsecutiveWriteFails consecutive) are
 // transient: link_up must stay 1, sends must resume after each failure,
 // and the balance invariant must hold exactly at quiescence.
-// pi-lens-ignore: go-test-functions
 func TestEchoLoop_TransientWriteFailuresKeepLinkUp(t *testing.T) {
 	InitMetrics()
 
@@ -789,7 +773,6 @@ func TestEchoLoop_TransientWriteFailuresKeepLinkUp(t *testing.T) {
 // cycles of the echo loop (via probeTarget's own recovery path) must
 // leave the balance invariant exact — every abandoned probe becomes a
 // counted loss, never a silent drop, no matter how many cycles run.
-// pi-lens-ignore: go-test-functions
 func TestProbeTarget_PanicRestartCyclesKeepBalance(t *testing.T) {
 	InitMetrics()
 
@@ -894,7 +877,6 @@ func TestProbeTarget_PanicRestartCyclesKeepBalance(t *testing.T) {
 // failed reconnect indefinitely — no probes are sent while dialing, so
 // consecutiveMisses never advances to drop it — and step (2) would see a
 // frozen link_up=1.
-// pi-lens-ignore: go-test-functions
 func TestProbeTarget_DialRetryMarksLinkDown(t *testing.T) {
 	InitMetrics()
 
@@ -983,7 +965,6 @@ func TestProbeTarget_DialRetryMarksLinkDown(t *testing.T) {
 // timeouts (link_probes_inflight drains to 0), the reason is recorded in
 // link_prober_internal_errors_total, link_up is 0, and cancellation stops
 // the loop cleanly with the sent balance exact.
-// pi-lens-ignore: go-test-functions
 func TestProbeTarget_ReaderDeathRedials(t *testing.T) {
 	InitMetrics()
 
@@ -1124,7 +1105,6 @@ func TestProbeTarget_ReaderDeathRedials(t *testing.T) {
 // TestProbeTarget_BoundedReadErrorsRedial: a reader whose Read keeps
 // returning a persistent non-timeout error must exit after the bounded
 // maxConsecutiveReadFails count (no busy-spin) and the loop must re-dial.
-// pi-lens-ignore: go-test-functions
 func TestProbeTarget_BoundedReadErrorsRedial(t *testing.T) {
 	InitMetrics()
 
@@ -1264,7 +1244,6 @@ func TestEchoLoop_ExitDrainsLateEchoAsRTT(t *testing.T) {
 	logger := slog.Default()
 
 	conn := newDelayedEchoConn(0)
-	// pi-lens-ignore: go-context-background-handler
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- runEchoLoop(ctx, conn, cfg, stats, m, state, logger) }()

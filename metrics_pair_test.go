@@ -37,7 +37,6 @@ func TestLoadMetricsPairRefusesExposedKey(t *testing.T) {
 	cert := filepath.Join(dir, "tls.crt")
 	key := filepath.Join(dir, "tls.key")
 	writeTestCert(t, cert, key, "exposed-metrics", 2)
-	// pi-lens-ignore: go-path-traversal
 	if err := os.Chmod(key, 0o644); err != nil {
 		t.Fatal(err)
 	}

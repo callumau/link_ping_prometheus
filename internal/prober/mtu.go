@@ -76,12 +76,8 @@ func runMTUSweep(ctx context.Context, t Target, cfg Config, m targetMetrics, sta
 				}
 			}
 		}
-		// Cancellation must be able to interrupt a DF send, not only a read:
-		// a UDP write blocks when the local send buffer is saturated, and
-		// sweepOnce's own write deadline is the full probe deadline. Closing
-		// the socket on cancellation unblocks that syscall so probeTarget's
-		// tracked join stays inside stragglerStopTimeout; the cancelled probe
-		// is then not charged as lost (see send).
+		// Interrupt a blocked DF send on ctx cancellation so probeTarget's tracked
+		// join stays inside stragglerStopTimeout.
 		sweepDone := make(chan struct{})
 		go func(c net.Conn) {
 			select {
@@ -106,15 +102,8 @@ func runMTUSweep(ctx context.Context, t Target, cfg Config, m targetMetrics, sta
 	}
 }
 
-// mtuDeadline is the wait a single DF probe gets: the timeout the main loop is
-// currently applying. In adaptive mode that is the smoothed RTO, NOT the
-// configured -timeout — on a link whose RTT exceeds -timeout (the long-haul
-// case the dynamic RTO floor exists for) a static deadline would make every DF
-// probe time out, so the sweep could never discover anything and
-// MtuSweepUnresolved would blame DF blocking for a path that carries
-// full-size frames fine. The main loop publishes the applied timeout into
-// state.rtoNs after each tick (atomic); it is 0 before the first tick, which
-// falls back to cfg.BaseTimeout.
+// mtuDeadline returns the applied timeout for a DF probe (max of BaseTimeout
+// and the main loop's current adaptive RTO).
 func mtuDeadline(cfg Config, state *probeLoopState) time.Duration {
 	deadline := cfg.BaseTimeout
 	if ns := state.rtoNs.Load(); ns > 0 {
@@ -125,29 +114,8 @@ func mtuDeadline(cfg Config, state *probeLoopState) time.Duration {
 	return deadline
 }
 
-// readEcho waits for an echo of exactly size bytes whose sequence is one of
-// seqs, whose timestamp byte-equals the ts this sweep sent for that sequence
-// (sent maps seq -> ts), and — when the sweep runs with -echo-secret — whose
-// tag authenticates under the coverage the sweep sent with: coverage selects
-// between the header tag (v0.7 layout) and the full-frame tag over
-// header+payload with the tag slot skipped (digestFrame; for the
-// header-only probe the two coverages coincide byte-for-byte, so the header
-// check is the same check), compared constant-time (verifyHeader /
-// verifyFullFrame). The main reader applies the same identity checks to
-// its responses; without them a peer able to inject into the connected DF
-// socket could fabricate an echo for the currently probed size (sequence
-// numbers are deterministic) and steer the binary search.
-// Foreign datagrams and echoes of another size are SKIPPED rather than
-// taken as this probe's answer: one socket serves the whole sweep, so a late
-// echo of a larger size would otherwise be consumed as a failure of a smaller
-// size that may well survive, stepping the binary search below the real MTU.
-// Forged or stale frames are skipped the same way, and the deadline is
-// absolute, so skipping cannot extend the wait (and a stream of foreign
-// datagrams cannot spin the loop past it).
-// mtuMaxReadErrors bounds consecutive non-timeout read errors tolerated while
-// waiting for one sweep echo (see the loop in readEcho).
-const mtuMaxReadErrors = 3
-
+// readEcho waits until deadline for an echo of size bytes matching one of seqs
+// and its sent timestamp/HMAC tag. Foreign or other-size datagrams are skipped.
 func readEcho(ctx context.Context, conn net.Conn, buf []byte, size int, seqs []uint64, sent map[uint64]uint64, secret string, coverage HmacCoverage, deadline time.Time) error {
 	var verifyMac *probeMACer
 	if secret != "" {
@@ -155,17 +123,8 @@ func readEcho(ctx context.Context, conn net.Conn, buf []byte, size int, seqs []u
 	}
 	readErrs := 0
 	for {
-		// The absolute probe deadline is SLICED into bounded re-arms: a
-		// mid-wait cancellation (reload stop, process shutdown) unblocks
-		// the sweep within one arm instead of stranding it for a whole
-		// applied RTO — the adaptive 2*SRTT floor is unbounded above, so
-		// the un-sliced wait could outlive the sweep's target loop by
-		// seconds (duplicate sweep traffic, stale link_path_mtu_bytes
-		// overwrite on kept-series restarts). The arm is clamped to the
-		// absolute deadline and never extends it, so the original
-		// contract — foreign datagrams cannot spin the loop past the
-		// deadline — is preserved; the ctx check between arms is bounded
-		// by the same constant as the main reader's cancellation check.
+		// Slice the read deadline into mtuReadArm increments so cancellation
+		// interrupts a long adaptive RTO wait promptly without extending deadline.
 		arm := deadline
 		if d := time.Until(deadline); d > mtuReadArm {
 			arm = time.Now().Add(mtuReadArm)
@@ -262,10 +221,9 @@ func readEcho(ctx context.Context, conn net.Conn, buf []byte, size int, seqs []u
 	}
 }
 
-// mtuReadArm bounds a single MTU-sweep read arm: the sweep's absolute
-// probe deadline is re-armed in slices of this length so a cancellation
-// is honored within one arm instead of after a full applied RTO. Same
-// value the main UDP reader uses as its periodic ctx checkpoint.
+const mtuMaxReadErrors = 3
+
+// mtuReadArm bounds a single MTU-sweep read arm so cancellation is honored promptly.
 const mtuReadArm = 500 * time.Millisecond
 
 // probeHeaderSize is the frame header length: 32 bytes when an HMAC tag is
@@ -333,7 +291,6 @@ func sweepOnce(ctx context.Context, conn net.Conn, cfg Config, m targetMetrics, 
 		if cd, ok := ctx.Deadline(); ok && cd.Before(writeDeadline) {
 			writeDeadline = cd
 		}
-		// pi-lens-ignore: go-ignored-call-result
 		_ = conn.SetWriteDeadline(writeDeadline)
 		if _, err := conn.Write(buf[:headerSize+payload]); err != nil {
 			// A cancelled probe is not a sent or lost probe. This is the

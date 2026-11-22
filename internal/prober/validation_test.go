@@ -17,7 +17,6 @@ import (
 // would NXDOMAIN into a permanent dial-retry loop. Only whole-string
 // IP-ish literals are tightened: a dotted name with labels, such as
 // 10.0.0.1.example.com, stays a legal DNS name.
-// pi-lens-ignore: go-test-functions
 func TestValidateTarget_IPishHosts(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -62,7 +61,6 @@ func TestValidateTarget_IPishHosts(t *testing.T) {
 // a core; below the timeout floor every probe expires before an echo can return
 // over a real link, so the link reads as 100% loss that never happened. Both
 // errors must name the offending flag so the operator knows what to change.
-// pi-lens-ignore: go-test-functions
 func TestConfigValidate_MinProbeInterval(t *testing.T) {
 	cases := []struct {
 		name    string

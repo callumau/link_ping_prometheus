@@ -24,12 +24,10 @@ func TestAdaptive_RespondsToJitter(t *testing.T) {
 	var delay atomic.Int64
 	delay.Store(int64(10 * time.Millisecond))
 
-	// pi-lens-ignore: go-context-background-handler
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	addr := validatedEcho(t, ctx, func(buf []byte, w func([]byte)) {
-		// pi-lens-ignore: go-time-sleep-test
 		time.Sleep(time.Duration(delay.Load()))
 		w(buf)
 	})
@@ -42,7 +40,6 @@ func TestAdaptive_RespondsToJitter(t *testing.T) {
 	// Low-latency phase: RTO settles on the 200ms floor. If the probes
 	// were not being echoed (the old broken state), the RTO would instead
 	// have backed off to 2s+ here — the assertion below catches that.
-	// pi-lens-ignore: go-time-sleep-test
 	time.Sleep(1500 * time.Millisecond)
 	rtoLow := getGaugeValue(prober.RTOEstimate, "adaptive_jitter", addr)
 
@@ -51,7 +48,6 @@ func TestAdaptive_RespondsToJitter(t *testing.T) {
 	// interval: enough samples for the floor to rise above the settled
 	// 200ms value, which is all the assertions below need.
 	delay.Store(int64(150 * time.Millisecond))
-	// pi-lens-ignore: go-time-sleep-test
 	time.Sleep(1500 * time.Millisecond)
 	rtoHigh := getGaugeValue(prober.RTOEstimate, "adaptive_jitter", addr)
 

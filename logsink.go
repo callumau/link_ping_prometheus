@@ -78,7 +78,6 @@ func watchLogSink(ctx context.Context, sysLog eventlogSink, sink *countedWriter,
 			case <-ticker.C:
 			}
 			if n := sink.drainFailures(); n > 0 {
-				// pi-lens-ignore: go-no-fmt-println
 				msg := fmt.Sprintf("log sink write failures: %d writes failed since the last check; the log file may be full, missing, or access-denied", n)
 				if sysLog != nil {
 					sysLog.Error(msg)

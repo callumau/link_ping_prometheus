@@ -228,7 +228,6 @@ func verifyLogDACLRestricted(t *testing.T, path string) {
 // gap), and an empty path is a no-op.
 func TestReapplyLogDACL(t *testing.T) {
 	t.Run("restricts a fresh wide file", func(t *testing.T) {
-		// pi-lens-ignore: go-path-traversal
 		path := t.TempDir() + `\agent.log`
 		if err := os.WriteFile(path, []byte("x"), 0o666); err != nil {
 			t.Fatal(err)
@@ -239,7 +238,6 @@ func TestReapplyLogDACL(t *testing.T) {
 		verifyLogDACLRestricted(t, path)
 	})
 	t.Run("missing file is skipped silently", func(t *testing.T) {
-		// pi-lens-ignore: go-path-traversal
 		if err := reapplyLogDACL(t.TempDir() + `\does-not-exist.log`); err != nil {
 			t.Fatalf("missing file must be skipped (rotation gap), got %v", err)
 		}
@@ -260,7 +258,6 @@ func TestReapplyLogDACL(t *testing.T) {
 func TestReapplyLogDACL_AfterRotation(t *testing.T) {
 	dir := t.TempDir()
 	path := dir + `\agent.log`
-	// pi-lens-ignore: go-path-traversal
 	rotated := dir + `\agent.rot`
 	if _, err := hardenLogSink(path); err != nil {
 		t.Fatal(err)
@@ -289,7 +286,6 @@ func TestStartLogDACLRecheck_ReappliesAfterRotation(t *testing.T) {
 
 	dir := t.TempDir()
 	path := dir + `\agent.log`
-	// pi-lens-ignore: go-context-background-handler
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	startLogDACLRecheck(ctx, path)
@@ -311,7 +307,6 @@ func TestStartLogDACLRecheck_ReappliesAfterRotation(t *testing.T) {
 
 	// Then: simulate a rotation (fresh wide live file) and verify the
 	// ticker repairs it too.
-	// pi-lens-ignore: go-path-traversal
 	rotated := path + ".rot"
 	if err := os.Rename(path, rotated); err != nil {
 		t.Fatal(err)

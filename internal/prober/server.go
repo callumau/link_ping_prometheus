@@ -662,7 +662,6 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 						"consecutive_failures", consecutiveReadFails, "err", err)
 				}
 				select {
-				// pi-lens-ignore: waitgroup-done-scope
 				case <-ctx.Done():
 					return nil
 				case <-time.After(serverReadErrorBackoff):
@@ -708,10 +707,7 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 		}
 
 		// Accept the header frame plus any bounded payload extension:
-		// clients can probe with a payload (MTU/data-path corruption
-		// detection) without coordinating server-side config. Reflection
-		// stays 1:1 and bounded well below MaxDatagramSize; anything
-		// larger is an arbitrary-payload reflector attempt.
+		// Accept header plus bounded payload; reject oversized reflector attempts.
 		if n < expectedSize || n > expectedSize+MaxPayloadBytes {
 			drops.size.Inc()
 			continue
@@ -720,67 +716,27 @@ func ServePacketConn(ctx context.Context, pc net.PacketConn, source string, allo
 			drops.magic.Inc()
 			continue
 		}
-		// Half-configured-HMAC detection, purely observational: a server
-		// WITHOUT a secret accepts an authenticated client's 32-byte frame as
-		// an ordinary bounded payload probe and echoes it. Acceptance is
-		// deliberately unchanged, so the drop path stays silent for this
-		// pairing; this counter is what makes the mismatch (secret on clients,
-		// absent here) metric-visible. Only the BARE 32-byte frame is counted —
-		// the one unambiguous shape. A 32B+payload frame is byte-for-byte a
-		// secret-less 24-byte header plus 8+ payload bytes, i.e. exactly what a
-		// documented -payload deployment sends, so counting it left every such
-		// deployment permanently in LinkMonitorReflectorUnauthenticated; the
-		// price (stated in the Help text and in rules/link-monitor.yml) is that
-		// on a -payload deployment this alert cannot see a half-configured
-		// fleet and the allowlist is the only reflector control. A secret-less
-		// header plus exactly 8 payload bytes stays ambiguous and is counted.
+		// Count bare 32B frames received without -echo-secret as half-configured HMAC.
+		// Larger 32B+payload frames are indistinguishable from valid -payload probes.
 		if echoSecret == "" && n == PayloadSizeWithHMAC {
 			unauthHMACFrames.Inc()
 		}
-		// Authentication and the replay guard run BEFORE per-client handle
-		// resolution. resolve() allocates a {source,client} series pair and
-		// consumes one of the MaxClientSeries slots, so resolving first let
-		// unauthenticated frames from inside an allowlisted CIDR grow the
-		// label space and pin every slot, blacking out real clients as
-		// client_overflow (manufactured 100% loss) and inflating /metrics.
-		// Only a frame that authenticated — or, with no secret configured,
-		// one that already passed the cheap size/magic checks — may create a
-		// series.
+		// Authenticate and check replay window BEFORE handle resolution so unauthenticated
+		// sources cannot consume MaxClientSeries slots or inflate label cardinality.
 		var skew time.Duration
 		if echoSecret != "" {
 			seq := binary.LittleEndian.Uint64(buf[8:16])
 			ts := binary.LittleEndian.Uint64(buf[16:24])
-			// Payload frames are accepted under EITHER tag coverage: the
-			// header tag (v0.7 clients) or the full-frame tag over
-			// header+payload with the tag slot skipped (clients running
-			// -hmac-coverage=full-frame), so an upgraded client mixes freely
-			// with this server. Header-only is tried first — it matches bare
-			// 32-byte frames and old clients exactly — then full-frame. There
-			// is deliberately NO new drop reason: a drop is a drop, the two
-			// coverages fail together on a wrong secret, and splitting the
-			// reason would fragment the hmac/replay misconfig alerting in
-			// rules/link-monitor.yml for a distinction the operator cannot
-			// act on.
+			// Accept either header-only (v0.7) or full-frame (v0.8+) tags on payload frames.
 			if !macAny(curMAC, oldMAC, seq, ts, buf[24:32]) {
-				// Bare 32-byte frames (n == expectedSize) skip the second
-				// attempt: the two coverages coincide byte-for-byte there
-				// (pinned by TestHMACCoverageZeroPayloadEquivalence), so the
-				// extra HMAC-SHA256 could never change the outcome.
 				if n == expectedSize || !fullFrameAny(curMAC, oldMAC, buf[:n]) {
 					drops.hmac.Inc()
 					continue
 				}
 			}
-			// Replay guard: an authenticated frame older or newer than
-			// the window is a capture-replay, not a live probe. Clocks
-			// between nodes must be approximately synchronized (NTP).
 			skew = time.Since(time.Unix(0, int64(ts)))
 			if skewReplayed(skew) {
 				drops.replay.Inc()
-				// Throttled like the write-error warning: a captured frame
-				// replayed at the per-IP cap — or a client with a large clock
-				// skew — must not be able to flood the log. The counter still
-				// records every rejection, so nothing is lost for alerting.
 				if lastReplayLog.IsZero() || time.Since(lastReplayLog) >= time.Minute {
 					slog.Warn("replayed or stale probe timestamp rejected (check NTP/clock sync)", "addr", na.String(), "skew", skew, "window", maxReplayWindow)
 					lastReplayLog = time.Now()

@@ -316,12 +316,8 @@ type startupFlags struct {
 	metricsCert, metricsKey   string
 }
 
-// checkStartupFlags runs the mode/auth/TLS checks that must fail BEFORE a port
-// is bound or an SCM entry is written. One helper, used by both run() and the
-// -svc=install path, so install can never freeze a command line that run() will
-// refuse: that mismatch produced an install that started cleanly and then
-// exited 1 every five seconds from the SCM OnFailure ladder, with no log at all
-// when -log-file was unset.
+// checkStartupFlags validates mode, auth, and TLS flags before binding ports
+// or registering an SCM service entry.
 func checkStartupFlags() (startupFlags, error) {
 	// A bad -mode should never open ports or start servers.
 	switch mode := *flMode; mode {
@@ -358,7 +354,6 @@ func checkStartupFlags() (startupFlags, error) {
 		// seeds its reload cache with it. Same provenance rule as the
 		// listener: a symlink, a non-regular object, a foreign owner or a
 		// group/world-readable key is refused before anything binds.
-		// pi-lens-ignore: go-ignored-call-result
 		if _, err := loadMetricsPair(sf.metricsCert, sf.metricsKey); err != nil {
 			return startupFlags{}, fmt.Errorf("metrics TLS: %w", err)
 		}
@@ -414,17 +409,3 @@ func resolveAllowlist(mode string, cfg prober.Config) (*prober.Allowlist, error)
 	}
 	return allow, nil
 }
-
-// serviceConfig returns the base Windows/SCM service configuration.
-// Enterprise hardening baked in at install time:
-//   - OnFailure restart (5s delay): a crash or non-zero exit is restarted
-//     by the Service Control Manager instead of staying stopped forever.
-//   - DelayedAutoStart: avoids racing network-stack availability at boot
-//     (a metrics bind failure would otherwise be fatal with no recovery).
-//   - Dependencies on Tcpip (sockets) and W32Time (the HMAC replay window
-//     requires roughly NTP-synchronized clocks between nodes).
-//
-// The description deliberately omits the version string: it is frozen at
-// install time and goes stale on in-place upgrades — runtime truth lives
-// in the link_ping_build_info metric instead.
-// snapshotting it: /readyz is unauthenticated and uncapped.

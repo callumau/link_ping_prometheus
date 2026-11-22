@@ -551,18 +551,9 @@ func RunClient(ctx context.Context, cfg Config) error {
 		apply(targets)
 	}
 
-	// drainLive waits for every live probe loop to exit, then gives any
-	// straggler one final bounded wait (stragglerStopTimeout). The BOUND on
-	// both joins matters: the per-loop cancels make every loop exit promptly
-	// in the normal case, but a wedged socket op (a UDP write with no
-	// deadline) would otherwise block shutdown forever — SIGTERM ignored, no
-	// log line saying why, until the process is killed. Each probe loop joins
-	// its own MTU sweep before returning, so a sweep cannot outlive this drain
-	// by more than one sliced read arm (mtuReadArm).
-	//
-	// One timer covers both joins: a single shutdown budget is what the
-	// service manager gives us anyway. Names are logged at Warn so a target
-	// that never joined is visible instead of silently abandoned.
+	// Bounded drain: wait for every live loop and any straggler up to stragglerStopTimeout
+	// so a wedged socket op cannot hang SIGTERM/Stop indefinitely. Each loop joins its
+	// own MTU sweep before returning.
 	type joinTarget struct {
 		name string
 		done chan struct{}
@@ -625,17 +616,7 @@ func RunClient(ctx context.Context, cfg Config) error {
 	defer stragglerReLog.Stop()
 
 	if cfg.ReloadSignal == nil && (cfg.ReloadInterval <= 0 || cfg.TargetsPath == "") {
-		// No reload path: block until shutdown, which is the only thing that
-		// ends a probe loop (probeTarget restarts itself on every internal
-		// failure, so a loop's done channel closes only on cancellation).
-		//
-		// Do NOT call drainLive() here: its join is deliberately BOUNDED
-		// (stragglerStopTimeout) so a wedged socket op cannot hang Stop, and
-		// using it as the steady-state wait made a plain client run return
-		// after five seconds — run() then took modeDone, shut the metrics
-		// server down and exited, i.e. every deployment without -targets died
-		// five seconds after start while looking healthy. Wait on ctx
-		// explicitly; the bounded drain belongs to shutdown.
+		// Wait on ctx explicitly; drainLive uses a bounded timer and belongs only to shutdown.
 		<-ctx.Done()
 		drainLive()
 		return nil
@@ -822,7 +803,6 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	t := time.NewTimer(d)
 	defer t.Stop()
 	select {
-	// pi-lens-ignore: waitgroup-done-scope
 	case <-ctx.Done():
 		return false
 	case <-t.C:
@@ -1074,18 +1054,9 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 	}
 }
 
-// rttSeconds computes one RTT sample from a matched send/receive pair, and
-// reports ok=false when the instants are out of order. A negative sample must
-// never be published: link_rtt_seconds_sum is a Prometheus sum, so observing
-// one DECREASES it (rate() reads negative), and AdaptiveStats feeds the value
-// into SRTT/RTTVAR, collapsing the RTO floor to its minimum and fabricating
-// loss on a link that answered. Both instants come from time.Now() and
-// therefore carry the monotonic reading, so time.Time.Sub is immune to a wall
-// clock step — the UnixNano subtraction this replaces was not. QPC wins when
-// both sides carry a counter reading: Go's time.Now() is interrupt-time
-// quantized on Windows (sub-quantum RTTs compute as exactly 0 there, pinning
-// SRTT to 0 and the RTO to its floor), while the counter pair restores ~100ns
-// fidelity.
+// rttSeconds computes one RTT sample from a matched send/receive pair, returning
+// ok=false if timestamps are out of order. Uses monotonic time.Time.Sub (or
+// Windows QPC when available to avoid interrupt-time quantization).
 func rttSeconds(sentAt, recvAt time.Time, sentQPC, recvQPC uint64) (float64, bool) {
 	if sentQPC != 0 && recvQPC != 0 && recvQPC >= sentQPC {
 		return qpcSeconds(recvQPC - sentQPC), true
@@ -1097,22 +1068,9 @@ func rttSeconds(sentAt, recvAt time.Time, sentQPC, recvQPC uint64) (float64, boo
 	return delta.Seconds(), true
 }
 
-// probeExpired reports whether an in-flight probe has used up its timeout.
-// A sentAt in the FUTURE counts as EXPIRED. Both instants are time.Time carrying
-// the monotonic reading, so a wall clock step (VM snapshot restore, chrony/NTP
-// step, manual `date`) can no longer move sentAt or now — this check is
-// defensive, not the load-bearing guard it was for the old UnixNano arithmetic.
-// It stays because the failure it prevents is catastrophic: entries stuck in
-// the future never retire, they accumulate until maxPendingWindow throttles
-// every send, and nothing is probed while link_up stays 1 — the worst failure
-// mode for a monitor. If it ever DOES fire, the observable effect is a single
-// tick that sweeps the whole pending set: link_probes_timed_out_total jumps by
-// N, consecutiveMisses can cross LinkUpMissThreshold (one interval of
-// link_up=0) and the loss ratio reads elevated for one window. The balance
-// stays exact because the sweep is a normal pending exit (timed_out + inflight).
-// The comparison is strictly greater: a probe exactly at its timeout is retired
-// by the next tick, which is the documented loss deadline (the first probe tick
-// AFTER the RTO expires).
+// probeExpired reports whether an in-flight probe has exceeded its timeout.
+// A sentAt in the future is defensively treated as expired so entries can never get stuck.
+// Strictly greater: a probe at exact timeout retires on the next tick.
 func probeExpired(now, sentAt time.Time, timeout time.Duration) bool {
 	if now.Before(sentAt) {
 		return true
@@ -1140,7 +1098,6 @@ func probeExpired(now, sentAt time.Time, timeout time.Duration) bool {
 // single target's failure can never kill its probe loop (or the process).
 //
 // Loss is exact: UDP has no retransmission, so a probe without an echo
-// pi-lens-ignore: typos, typos:unknown
 // within the RTO is genuinely lost on the wire.
 func runEchoLoop(
 	ctx context.Context,
@@ -1496,7 +1453,6 @@ func runEchoLoop(
 				m.jitter.Set(state.jitter)
 
 				if cfg.Adaptive {
-					// pi-lens-ignore: gorm-n-plus-one
 					stats.Update(rttSec)
 					m.srtt.Set(stats.SRTT().Seconds())
 				}
@@ -1529,29 +1485,16 @@ func runEchoLoop(
 		// and BEFORE drainResponses() runs.
 		close(loopDone)
 		close(done)
-		// pi-lens-ignore: go-ignored-call-result
 		_ = conn.Close()
 		select {
 		case <-readerDone:
 		case <-time.After(mtuReadArm):
 		}
+		// On panic: drain buffered echoes first, then flush remaining in-flight probes
+		// as timedOut and clear pending so the non-shutdown tail below does not double-count.
 		if r := recover(); r != nil {
 			logger.Error("Panic in echo loop; continuing", "panic", r)
 			retErr = fmt.Errorf("panic in echo loop: %v", r)
-			// Drain any echo already received before flushing: it was
-			// delivered, not lost, and charging it as a timeout would
-			// fabricate loss. The remaining abandoned probes can never match
-			// on this socket, so they are counted as timed out to keep
-			// sent = rtt_count + timed_out + inflight balancing across the
-			// restart (same treatment as the reconnect flush). The flush is
-			// UNCONDITIONAL — a panicking loop is never a process shutdown
-			// (shutdown cancels the context; the loop returns normally), the
-			// supervisor restarts it, and its series stay exported — and it
-			// clears pending: the tail below would otherwise re-run its own
-			// accounting (a RunClient-managed restart exits with the root
-			// context still alive, so runClientShuttingDown is false and the
-			// tail re-adds) and every abandoned probe would be counted
-			// twice, over-reporting loss through the balance invariant.
 			drainResponses()
 			if n := len(pending); n > 0 {
 				m.timedOut.Add(float64(n))
@@ -1559,23 +1502,9 @@ func runEchoLoop(
 				pending = make(map[uint64]sentStamp)
 			}
 		}
-		// Probes still in flight die with the loop on cancellation. Whether
-		// they must also be counted as timed out depends on whether the
-		// series stays exported after this exit:
-		// - Process shutdown (the RunClient root context is done): every
-		//   series stops being exported, so counting them would fabricate
-		//   loss — inflight-only accounting (pinned by
-		//   TestGracefulShutdown_NoPhantomTimeouts).
-		// - A restart (reload keep-restart, straggler replacement, removal,
-		//   address change): the series either stays attached — the balance
-		//   must hold on the live series, so drain delivered echoes (they
-		//   count as RTT, not loss) and count the remaining abandoned probes
-		//   as timed out (the reconnect-flush convention) — or was just
-		//   withdrawn (detached children make the count invisible).
-		// The straggler case exits on its own with the root still alive and
-		// gets the same treatment; releaseStraggler decides keep-or-purge
-		// afterwards, and a purged series only detaches the (invisible)
-		// children.
+		// On process shutdown, only decrement inflight (all series stop exporting).
+		// On target restart/reload, drain delivered echoes and count remaining probes
+		// as timed out so the sent = rtt + timed_out + inflight balance stays intact.
 		if !runClientShuttingDown(ctx) {
 			drainResponses()
 			if n := len(pending); n > 0 {
@@ -1615,11 +1544,9 @@ func runEchoLoop(
 		interval := cfg.BaseInterval
 		timeout := cfg.BaseTimeout
 		if cfg.Adaptive {
-			// pi-lens-ignore: typos, typos:unknown
 			timeout = stats.CurrentRTO()
 		}
 
-		// pi-lens-ignore: typos, typos:unknown
 		m.rto.Set(timeout.Seconds())
 		// Publish the applied timeout for the MTU sweep's probe deadline (see
 		// mtuDeadline): on an adaptive link the RTO can be well above
@@ -1641,7 +1568,6 @@ func runEchoLoop(
 		intervalTimer.Reset(delay)
 
 		select {
-		// pi-lens-ignore: waitgroup-done-scope
 		case <-ctx.Done():
 			return nil
 		case <-readerDone:
@@ -1753,18 +1679,9 @@ func runEchoLoop(
 			return errReconnect
 		}
 
-		// Pending-window send throttle: the static interval/timeout pair is
-		// validated at startup and reload (validatePendingWindow), but with
-		// -adaptive the applied timeout is the RFC 6298 RTO, whose floor
-		// max(200ms, 2*SRTT) is unbounded above — a large-SRTT link with a
-		// fast interval would otherwise grow `pending` past the cap and
-		// sweep all of it on every tick. When the window is at the cap, SKIP
-		// the send for this tick: no frame is built, nothing reaches the
-		// wire, and neither sent nor inflight moves — the balance invariant
-		// is untouched because the probe never existed (this is NOT a
-		// pending exit path). The skip is a measured probe-rate reduction,
-		// not loss; it is counted in link_probes_throttled_total, which
-		// stays outside the balance by design (like send errors).
+		// Enforce maxPendingWindow at the send site too: under -adaptive the 2*SRTT
+		// floor is unbounded above. Skipped sends never reach the wire and are
+		// counted in link_probes_throttled_total (outside the balance).
 		if len(pending) >= maxPendingWindow {
 			m.throttled.Inc()
 			if !warnedThrottle {
@@ -1810,7 +1727,6 @@ func runEchoLoop(
 		if cd, ok := ctx.Deadline(); ok && cd.Before(writeDeadline) {
 			writeDeadline = cd
 		}
-		// pi-lens-ignore: go-ignored-call-result
 		_ = conn.SetWriteDeadline(writeDeadline)
 		if _, err := conn.Write(buf); err != nil {
 			writeFails++

@@ -13,7 +13,6 @@ import (
 // has not yet returned to the OS. The trigger used Sys-HeapReleased, which
 // covers the whole process and is therefore always above the threshold, so the
 // documented "skip an already-lean process" guard never fired.
-// pi-lens-ignore: go-test-functions
 func TestReleasableHeap(t *testing.T) {
 	tests := []struct {
 		name string
@@ -51,9 +50,7 @@ func TestReleasableHeap(t *testing.T) {
 	}
 }
 
-// pi-lens-ignore: go-test-functions
 
-// pi-lens-ignore: go-test-functions
 func TestShouldScavenge(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -81,22 +78,17 @@ func TestShouldScavenge(t *testing.T) {
 // chanHandler forwards log records to a channel so the scavenger test can
 // observe a tick without sleeping for a real interval.
 
-// pi-lens-ignore: go-test-functions
 func TestStartHeapScavengerDisabled(t *testing.T) {
 	before := runtime.NumGoroutine()
 	// every <= 0 must not spawn anything at all.
-	// pi-lens-ignore: go-context-background-handler
 	startHeapScavenger(context.Background(), 0, minScavengeUnreleased, slog.Default())
 	if after := runtime.NumGoroutine(); after > before {
 		t.Errorf("every=0 must not spawn a goroutine, count went %d -> %d", before, after)
 	}
 }
 
-// pi-lens-ignore: go-test-functions
 
-// pi-lens-ignore: go-test-functions
 func TestStartHeapScavengerTicksThenStopsOnCancel(t *testing.T) {
-	// pi-lens-ignore: go-context-background-handler
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	ch := make(chan string, 1)
@@ -117,7 +109,6 @@ func TestStartHeapScavengerTicksThenStopsOnCancel(t *testing.T) {
 	cancel()
 	deadline := time.Now().Add(5 * time.Second)
 	for runtime.NumGoroutine() > before && time.Now().Before(deadline) {
-		// pi-lens-ignore: go-time-sleep-test
 		time.Sleep(2 * time.Millisecond)
 	}
 	if n := runtime.NumGoroutine(); n > before {

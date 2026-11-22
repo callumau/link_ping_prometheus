@@ -130,7 +130,6 @@ func freePort(t *testing.T) int {
 	if err != nil {
 		t.Fatalf("freePort: %v", err)
 	}
-	// pi-lens-ignore: go-ignored-call-result
 	defer l.Close()
 	return l.Addr().(*net.TCPAddr).Port
 }
@@ -143,7 +142,6 @@ func httpGetIf(t *testing.T, url string) (int, string) {
 	if err != nil {
 		return 0, ""
 	}
-	// pi-lens-ignore: go-ignored-call-result
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {

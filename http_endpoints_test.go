@@ -79,7 +79,6 @@ func TestStartMetricsServerTimeouts(t *testing.T) {
 		t.Fatalf("startMetricsServer: %v", err)
 	}
 	t.Cleanup(func() {
-		// pi-lens-ignore: go-ignored-call-result
 		_ = srv.Close()
 		<-done
 	})
@@ -243,7 +242,6 @@ func TestStatusEndpointIsGatedLikeMetrics(t *testing.T) {
 		t.Fatalf("startMetricsServer: %v", err)
 	}
 	t.Cleanup(func() {
-		// pi-lens-ignore: go-ignored-call-result
 		_ = srv.Close()
 		<-done
 	})
@@ -288,7 +286,6 @@ func TestStatusEndpointIsGatedLikeMetrics(t *testing.T) {
 // (or one of the histogram suffixes the client library appends). promtool in CI
 // would validate PromQL syntax, but not this, and the repo's suite needs nothing
 // beyond go test.
-// pi-lens-ignore: go-test-functions
 
 // TestMetricsServerErrorLogReachesSlog pins two coupled facts: the metrics
 // server has an ErrorLog at all, and net/http's own failures (TLS handshake
@@ -310,7 +307,6 @@ func TestMetricsServerErrorLogReachesSlog(t *testing.T) {
 		t.Fatalf("startMetricsServer: %v", err)
 	}
 	t.Cleanup(func() {
-		// pi-lens-ignore: go-ignored-call-result
 		_ = srv.Close()
 		<-done
 	})
@@ -324,9 +320,7 @@ func TestMetricsServerErrorLogReachesSlog(t *testing.T) {
 	}
 	// Plaintext bytes on a TLS port fail the handshake inside net/http, which
 	// reports it through srv.ErrorLog.
-	// pi-lens-ignore: go-ignored-call-result
 	_, _ = conn.Write([]byte("GET /metrics HTTP/1.1\r\nHost: metrics\r\n\r\n"))
-	// pi-lens-ignore: go-ignored-call-result
 	_ = conn.Close()
 
 	waitForLog(t, logs, "TLS handshake error")
@@ -350,7 +344,6 @@ func TestMetricsServerCertReloadWithoutRestart(t *testing.T) {
 		t.Fatalf("startMetricsServer: %v", err)
 	}
 	t.Cleanup(func() {
-		// pi-lens-ignore: go-ignored-call-result
 		_ = srv.Close()
 		<-done
 	})
@@ -412,7 +405,6 @@ func TestMetricsServerCertReloadFailureKeepsPrevious(t *testing.T) {
 		t.Fatalf("startMetricsServer: %v", err)
 	}
 	t.Cleanup(func() {
-		// pi-lens-ignore: go-ignored-call-result
 		_ = srv.Close()
 		<-done
 	})
@@ -420,11 +412,9 @@ func TestMetricsServerCertReloadFailureKeepsPrevious(t *testing.T) {
 	// A half-written renewal: no PEM data at all, but the same sizes as the
 	// finished pair. The (mtime, size) it lands on is the fingerprint the
 	// failed load is recorded under.
-	// pi-lens-ignore: go-path-traversal (t.TempDir)
 	if err := os.WriteFile(certPath, []byte(strings.Repeat("x", len(renewedCert))), 0o600); err != nil {
 		t.Fatalf("replace certificate with garbage: %v", err)
 	}
-	// pi-lens-ignore: go-path-traversal (t.TempDir)
 	if err := os.WriteFile(keyPath, []byte(strings.Repeat("x", len(renewedKey))), 0o600); err != nil {
 		t.Fatalf("replace key with garbage: %v", err)
 	}
@@ -442,19 +432,15 @@ func TestMetricsServerCertReloadFailureKeepsPrevious(t *testing.T) {
 
 	// Repair in place without touching (mtime, size): put the finished bytes
 	// back and restore the timestamps the broken pair was recorded under.
-	// pi-lens-ignore: go-path-traversal (t.TempDir)
 	if err := os.WriteFile(certPath, renewedCert, 0o600); err != nil {
 		t.Fatalf("restore certificate: %v", err)
 	}
-	// pi-lens-ignore: go-path-traversal (t.TempDir)
 	if err := os.WriteFile(keyPath, renewedKey, 0o600); err != nil {
 		t.Fatalf("restore key: %v", err)
 	}
-	// pi-lens-ignore: go-path-traversal (t.TempDir)
 	if err := os.Chtimes(certPath, brokenCertInfo.ModTime(), brokenCertInfo.ModTime()); err != nil {
 		t.Fatalf("restore certificate mtime: %v", err)
 	}
-	// pi-lens-ignore: go-path-traversal (t.TempDir)
 	if err := os.Chtimes(keyPath, brokenKeyInfo.ModTime(), brokenKeyInfo.ModTime()); err != nil {
 		t.Fatalf("restore key mtime: %v", err)
 	}
@@ -476,7 +462,6 @@ func TestMetricsServerCertReloadFailureKeepsPrevious(t *testing.T) {
 
 	// Past the cooldown the unchanged fingerprint is retried, so the repaired
 	// pair takes effect with no restart and no (mtime, size) change.
-	// pi-lens-ignore: go-time-sleep-test
 	time.Sleep(certReloadRetryCooldown)
 	got := servedCert(t, srv.Addr)
 	if got.SerialNumber.Int64() != 202 || got.Subject.CommonName != "cert-two-renewed-longer" {
@@ -549,11 +534,9 @@ func writeTestCert(t *testing.T, certPath, keyPath, cn string, serial int64) {
 	if err != nil {
 		t.Fatalf("marshal private key: %v", err)
 	}
-	// pi-lens-ignore: go-path-traversal (t.TempDir)
 	if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
 		t.Fatalf("write certificate: %v", err)
 	}
-	// pi-lens-ignore: go-path-traversal (t.TempDir)
 	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
 		t.Fatalf("write key: %v", err)
 	}
@@ -564,7 +547,6 @@ func writeTestCert(t *testing.T, certPath, keyPath, cn string, serial int64) {
 // crypto/tls serves only through GetCertificate.
 func servedCert(t *testing.T, addr string) *x509.Certificate {
 	t.Helper()
-	// pi-lens-ignore: go-insecure-skip-verify (self-signed test certificate)
 	conn, err := tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true})
 	if err != nil {
 		t.Fatalf("TLS dial %s: %v", addr, err)

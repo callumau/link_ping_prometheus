@@ -6,7 +6,6 @@
 //   - client: sends periodic probes to targets, recording RTT and loss.
 //   - both: runs server and client simultaneously.
 //
-// pi-lens-ignore: typos, typos:unknown
 // Adaptive RTO (RFC 6298) adjusts timeouts based on measured link
 // quality when -adaptive is enabled (default). UDP has no
 // retransmission, so the loss ratio is true network loss.
@@ -200,7 +199,6 @@ func main() {
 		return
 	}
 
-	// pi-lens-ignore: go-context-background-handler
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
@@ -214,11 +212,7 @@ func main() {
 	}
 }
 
-// meshAllowFromTargets reports whether -allow-from-targets applies. The
-// derived allowlist is a server control, so the flag needs the echo responder
-// (server/both mode); in client mode it is ignored (warnIgnoredFlags says so)
-// and no target is skipped. One spelling of the condition, used by both the
-// config builder and the startup allowlist derivation so they cannot drift.
+// run initializes metrics, starts the HTTP server, and dispatches to the selected mode.
 func (p *program) run() error {
 	prober.InitMetrics()
 	prober.BuildInfo.WithLabelValues(version).Set(1)
@@ -334,10 +328,8 @@ func (p *program) run() error {
 	// metricsDone path the server is already gone and Shutdown is a no-op;
 	// on a normal mode exit it stops the listener and unblocks the select's
 	// second case only if it had not fired yet.
-	// pi-lens-ignore: go-context-background-handler
 	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	// pi-lens-ignore: go-ignored-call-result
 	_ = metricsSrv.Shutdown(shutCtx)
 	// Bounded join: a scrape mid-write holds Serve open up to the 30s
 	// WriteTimeout, which exceeds the service Stop deadline (20s) - waiting

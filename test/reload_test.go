@@ -24,7 +24,6 @@ import (
 // metric series DELETED (Prometheus staleness; see deleteTargetSeries) and
 // are dropped from /status, a merely-CHANGED target keeps its series and
 // keeps probing, and a broken file mid-edit keeps the previous set probing.
-// pi-lens-ignore: go-test-functions
 func TestRunClient_ReloadAddsRemovesTargets(t *testing.T) {
 	prober.InitMetrics()
 
@@ -350,7 +349,6 @@ func TestBalanceHoldsAcrossKeptSeriesRestart(t *testing.T) {
 			if time.Now().After(deadline) {
 				t.Fatalf("%s: balance never reconciled to 0 across 3s of sampling: %s — an exit path must be resolving probes into the wrong bucket (or not at all)", stage, strings.Join(drifts, ", "))
 			}
-			// pi-lens-ignore: go-time-sleep-test — deadline-bounded poll, not an arbitrary sleep
 			time.Sleep(2 * time.Millisecond)
 		}
 	}
@@ -370,7 +368,6 @@ func TestBalanceHoldsAcrossKeptSeriesRestart(t *testing.T) {
 			skipIfRTTNearTimeout(t, target, addr, cfg.BaseTimeout)
 			t.Fatalf("probes did not settle: sent=%f timed_out=%f", sent, timedOut)
 		}
-		// pi-lens-ignore: go-time-sleep-test — deadline-bounded poll, not an arbitrary sleep
 		time.Sleep(20 * time.Millisecond)
 	}
 	waitForBalance("pre-restart control")
@@ -393,7 +390,6 @@ func TestBalanceHoldsAcrossKeptSeriesRestart(t *testing.T) {
 			skipIfRTTNearTimeout(t, target, addr, cfg.BaseTimeout)
 			t.Fatalf("restart did not produce enough post-restart probes: sent=%f (pre=%f)", getCounterValue(prober.ProbesSent, target, addr), preSent)
 		}
-		// pi-lens-ignore: go-time-sleep-test — deadline-bounded poll, not an arbitrary sleep
 		time.Sleep(50 * time.Millisecond)
 		if getCounterValue(prober.ProbesSent, target, addr)-preSent >= 15 {
 			break

@@ -27,7 +27,7 @@ func svcHasAdmin(t *testing.T) bool {
 	if err != nil {
 		return false
 	}
-	defer m.Disconnect() // pi-lens-ignore: go-ignored-call-result
+	defer m.Disconnect()
 	return true
 }
 
@@ -75,7 +75,7 @@ func TestE2EWindowsServiceLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SCM connect after install: %v", err)
 	}
-	defer m.Disconnect() // pi-lens-ignore: go-ignored-call-result
+	defer m.Disconnect()
 	s, err := m.OpenService(svcName)
 	if err != nil {
 		t.Fatalf("service not found after -svc=install: %v", err)

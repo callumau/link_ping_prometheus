@@ -41,7 +41,6 @@ func mainBalanceGap(name, addr string) float64 {
 // to header+MaxPayloadBytes and surfaces in /status. MTU counters move
 // independently of the main loss counters (deliberately outside the
 // sent/rtt/timed_out/corrupted balance).
-// pi-lens-ignore: go-test-functions
 func TestMTUSweep_FullSizeSurvives(t *testing.T) {
 	prober.InitMetrics()
 
@@ -120,7 +119,6 @@ func TestMTUSweep_FullSizeSurvives(t *testing.T) {
 // than a bound (MTU-restricted path) makes the sweep settle on the
 // largest surviving size — lost probes counted separately, link_up
 // unaffected (small probes keep flowing).
-// pi-lens-ignore: go-test-functions
 func TestMTUSweep_FindsLimit(t *testing.T) {
 	prober.InitMetrics()
 
@@ -165,7 +163,6 @@ func TestMTUSweep_FindsLimit(t *testing.T) {
 // converge to and stay at the real MTU, lost must count that single dropped
 // ATTEMPT (a probe rate, not a distinct-size rate), and the retry's extra
 // attempt must appear in sent.
-// pi-lens-ignore: go-test-functions
 func TestMTUSweep_SingleLossDoesNotFlapGauge(t *testing.T) {
 	prober.InitMetrics()
 
@@ -236,7 +233,6 @@ func TestMTUSweep_SingleLossDoesNotFlapGauge(t *testing.T) {
 // TestMTUSweep_DeadLinkKeepsLastValue: when even the header-only DF
 // probe dies (link down / DF-blocked path), the sweep aborts early and
 // never fabricates a path MTU — the gauge keeps its last known value.
-// pi-lens-ignore: go-test-functions
 func TestMTUSweep_DeadLinkKeepsLastValue(t *testing.T) {
 	prober.InitMetrics()
 

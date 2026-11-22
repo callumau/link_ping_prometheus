@@ -17,7 +17,6 @@ import (
 // it keeps retrying until the context is cancelled. Uses the dialUDP seam
 // instead of an unresolvable hostname so the test is deterministic and
 // has no dependency on the local resolver.
-// pi-lens-ignore: go-test-functions
 func TestProbeTargetRetriesOnDialFailure(t *testing.T) {
 	InitMetrics()
 
@@ -70,7 +69,6 @@ func TestProbeTargetRetriesOnDialFailure(t *testing.T) {
 type failingConn struct{}
 
 func (failingConn) Read([]byte) (int, error) {
-	// pi-lens-ignore: go-time-sleep-test
 	time.Sleep(5 * time.Millisecond)
 	return 0, os.ErrDeadlineExceeded
 }
@@ -87,7 +85,6 @@ func (failingConn) SetWriteDeadline(time.Time) error { return nil }
 // TestProbeTargetCountsSendErrors: persistent UDP write failures are
 // counted per attempt (never as sent) and drop link_up after the third
 // consecutive failure — send errors are a local fault, not network loss.
-// pi-lens-ignore: go-test-functions
 func TestProbeTargetCountsSendErrors(t *testing.T) {
 	InitMetrics()
 

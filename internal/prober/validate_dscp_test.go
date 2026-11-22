@@ -9,7 +9,6 @@ import (
 // flag wiring. Untagged, unlike dscp_test.go's socket-marking test:
 // DSCP validation is pure config parsing and must be covered on every
 // platform (the marking itself is Linux-only, the bound is not).
-// pi-lens-ignore: go-test-functions
 func TestConfigValidate_DSCPRange(t *testing.T) {
 	base := func() Config {
 		return Config{

@@ -28,7 +28,6 @@ func payloadPattern(buf []byte, seq, ts uint64) {
 // TestPayload_HealthyEcho: with -payload enabled, pattern-filled probes
 // echo intact, RTT is observed, corrupted stays 0, and the extended
 // balance invariant holds: sent = rtt + timed_out + corrupted + inflight.
-// pi-lens-ignore: go-test-functions
 func TestPayload_HealthyEcho(t *testing.T) {
 	prober.InitMetrics()
 
@@ -91,7 +90,6 @@ func TestPayload_HealthyEcho(t *testing.T) {
 // bytes were altered in flight counts in link_probes_corrupted_total —
 // NOT in RTT and NOT as loss — while the link stays up (the round trip
 // demonstrably completed).
-// pi-lens-ignore: go-test-functions
 func TestPayload_CorruptionCountedSeparately(t *testing.T) {
 	prober.InitMetrics()
 

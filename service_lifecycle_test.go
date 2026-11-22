@@ -57,7 +57,6 @@ func TestServiceConfigHardening(t *testing.T) {
 // has not yet returned to the OS. The trigger used Sys-HeapReleased, which
 // covers the whole process and is therefore always above the threshold, so the
 // documented "skip an already-lean process" guard never fired.
-// pi-lens-ignore: go-test-functions
 
 // TestRunRejectsInvalidConfiguration folds the four startup-refusal tests into
 // one table. Every row must fail run() BEFORE anything is bound, and the error
@@ -258,14 +257,12 @@ func TestRunRejectsInvalidConfiguration(t *testing.T) {
 			tc.setup()
 			if tc.targetsBody != "" {
 				path := filepath.Join(t.TempDir(), "targets.json")
-				// pi-lens-ignore: go-path-traversal
 				if err := os.WriteFile(path, []byte(tc.targetsBody), 0o600); err != nil {
 					t.Fatal(err)
 				}
 				*flTargets = path
 			}
 
-			// pi-lens-ignore: go-context-background-handler
 			prg := &program{ctx: context.Background()}
 			err := prg.run()
 			if err == nil {
@@ -425,7 +422,6 @@ func TestWarnIgnoredFlags(t *testing.T) {
 // handle; srv.Close() terminates Serve and closes metricsDone
 // deterministically. Falsification: remove the "case <-metricsDone" arm
 // of the run() select and this test times out at the runErr guard.
-// pi-lens-ignore: go-test-functions
 
 // TestRun_MetricsServerDeathIsFatal pins the round-2 hardening: when the
 // metrics serve goroutine dies MID-RUN (anything that terminates Serve
@@ -439,7 +435,6 @@ func TestWarnIgnoredFlags(t *testing.T) {
 // handle; srv.Close() terminates Serve and closes metricsDone
 // deterministically. Falsification: remove the "case <-metricsDone" arm
 // of the run() select and this test times out at the runErr guard.
-// pi-lens-ignore: go-test-functions
 func TestRun_MetricsServerDeathIsFatal(t *testing.T) {
 	saveFlags(t)
 	t.Setenv("LINK_PING_METRICS_USER", "")
@@ -455,7 +450,6 @@ func TestRun_MetricsServerDeathIsFatal(t *testing.T) {
 	*flTarget = "127.0.0.1:1" // nothing listening: client just reconnect-loops
 	*flAllow = "127.0.0.1"
 
-	// pi-lens-ignore: go-context-background-handler
 	rootCtx, rootCancel := context.WithCancel(context.Background())
 	defer rootCancel()
 	prg := &program{ctx: rootCtx, cancel: rootCancel}
@@ -483,7 +477,6 @@ func TestRun_MetricsServerDeathIsFatal(t *testing.T) {
 	}
 	// Let run() settle into its select before killing the listener, so
 	// the close cannot be mistaken for a startup-order artifact.
-	// pi-lens-ignore: go-time-sleep-test
 	time.Sleep(200 * time.Millisecond)
 
 	// Kill the serve goroutine mid-run: Close tears down the listener and
@@ -533,7 +526,6 @@ func TestProgramStartStopBothMode(t *testing.T) {
 	if err := prg.Start(nil); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	// pi-lens-ignore: go-time-sleep-test
 	time.Sleep(200 * time.Millisecond)
 
 	done := make(chan struct{})
@@ -637,7 +629,6 @@ func TestInstallRejectsConfigThatCannotStart(t *testing.T) {
 	t.Run("warns when -targets cannot be reloaded under the SCM", func(t *testing.T) {
 		saveFlags(t)
 		path := filepath.Join(t.TempDir(), "targets.json")
-		// pi-lens-ignore: go-path-traversal
 		if err := os.WriteFile(path, []byte(`[{"name":"peer","address":"192.0.2.10:4000"}]`), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -746,7 +737,6 @@ func captureStdout(t *testing.T, fn func()) string {
 	os.Stdout = w
 	defer func() { os.Stdout = orig }()
 	fn()
-	// pi-lens-ignore: go-ignored-call-result
 	_ = w.Close()
 	out, err := io.ReadAll(r)
 	if err != nil {

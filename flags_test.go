@@ -12,7 +12,6 @@ import (
 	"link_ping_prometheus/internal/prober"
 )
 
-// pi-lens-ignore: go-test-functions
 func TestResolveMetricsAuth(t *testing.T) {
 	saveFlags(t)
 	// Isolate from any real environment.
@@ -117,7 +116,6 @@ func TestResolveMetricsAuthRejectsColonInUser(t *testing.T) {
 // must log a one-line slog.Warn at startup, and must NOT warn in the modes
 // where the flags are actually consumed.
 
-// pi-lens-ignore: go-test-functions
 // TestFlagWasSet pins the single "was this flag explicitly set" primitive.
 // The process-wide FlagSet's "was set" bookkeeping cannot be undone, so the
 // test drives the setFlagNames seam rather than flag.Set.
@@ -436,7 +434,6 @@ func TestValidateScavengeInterval(t *testing.T) {
 // Prometheus label values and are case-sensitive, so a case variant is a
 // different series and must be kept. In client mode the flag is ignored
 // wholesale (warnIgnoredFlags says so), so the self entry stays.
-// pi-lens-ignore: go-test-functions
 func TestBuildConfigMeshSelfSkip(t *testing.T) {
 	saveFlags(t)
 	t.Setenv("LINK_PING_ECHO_SECRET", "")
@@ -446,7 +443,6 @@ func TestBuildConfigMeshSelfSkip(t *testing.T) {
 		{"name": "fra", "address": "192.0.2.11:4000"},
 		{"name": "SYD", "address": "192.0.2.12:4000"}
 	]`
-	// pi-lens-ignore: go-path-traversal
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}

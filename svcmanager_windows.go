@@ -216,7 +216,7 @@ func removeEventLogSource(source string) {
 	if err != nil {
 		return
 	}
-	defer parent.Close() // pi-lens-ignore: go-ignored-call-result
+	defer parent.Close()
 	if derr := registry.DeleteKey(parent, source); derr != nil {
 		slog.Warn("Event-log source removal failed", "source", source, "err", derr)
 	}

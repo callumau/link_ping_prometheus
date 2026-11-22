@@ -71,23 +71,9 @@ func logDACLTable(sd *windows.SECURITY_DESCRIPTOR) (protected bool, aces []logAC
 }
 
 // sameLogDACL reports whether the two DACL ACE tables are semantically
-// equal — the same multiset of allow ACEs, with ACE flags compared only
-// on the inheritance bits the template controls (other flag bits, e.g.
-// INHERITED_ACE canonicalization added by the security layer on
-// read-back, are not part of the restricted set). The protection bit is
-// checked by the caller, which runs both tables through logDACLTable.
-// sameLogDACL reports whether the two DACL ACE tables are semantically
 // equal: the same multiset of allow ACEs by trustee (raw SID string) and
-// access mask. ACE inheritance flags are deliberately NOT compared: the
-// target path is a FILE (no child objects to inherit into), and Windows
-// strips the object-inheritance bits from file ACEs (observed on
-// windows-latest: every template ACE applied with OI|CI reads back flags
-// 0x0), so a flags-aware comparison is a fixed point that never
-// converges - and the 5-minute recheck would re-apply and Warn forever.
-// The stripped form ("applies to the object only") is the semantically
-// correct state for the restricted set's purpose. (logACE.flags is kept
-// in the struct because the test helper still surfaces it for
-// diagnostics.)
+// access mask. Inheritance flags are excluded because Windows strips OI|CI
+// from file ACEs on read-back.
 func sameLogDACL(want, cur []logACE) bool {
 	if len(want) != len(cur) {
 		return false
@@ -139,7 +125,6 @@ func reapplyLogDACL(path string) error {
 	}
 	// Open with FILE_SHARE_DELETE and FILE_FLAG_OPEN_REPARSE_POINT so we
 	// never follow a raced-in reparse point and never block rotation.
-	// pi-lens-ignore: go-path-traversal
 	name, err := windows.UTF16PtrFromString(path)
 	if err != nil {
 		return fmt.Errorf("log DACL recheck: path %q: %w", path, err)
@@ -210,28 +195,8 @@ const (
 	logACLStaticACEs        = "(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
 )
 
-// logACLSDDL builds the DACL applied to the log sink:
-//
-//	"SY"  SYSTEM                 full control
-//	"BA"  builtin Administrators full control
-//	%s    the account the agent runs as — full control, so the process
-//	      keeps write access to its own log; the set cannot be static
-//	      because a manually installed agent may run as LocalSystem,
-//	      LocalService, NetworkService or an operator account
-//
-// The token-user ACE is added ONLY when that SID is not already one of the
-// static trustees. That dedupe is load-bearing, not cosmetic: LocalSystem
-// (S-1-5-18) is the default service account, and an SDDL carrying a second
-// S-1-5-18 ACE is not a converged state. The security layer canonicalizes
-// an applied DACL by merging duplicate-trustee ACEs, so the live file reads
-// back as SY+BA while a naive builder keeps expecting SY+BA+SY. The
-// multiset comparison in sameLogDACL then fails forever, and the periodic
-// recheck re-applies the DACL and logs a Warning on every tick.
-//
-// File-all-access ("FA") with object+container inheritance keeps every entry
-// self-contained, and the "P" flag protects the DACL from parent-directory
-// inheritance, so wherever -log-file happens to point, its wide directory
-// entries cannot re-leak the file.
+// logACLSDDL builds the restricted DACL (SYSTEM + Administrators + current process SID).
+// Deduplicating the token user against SY/BA ensures sameLogDACL converges.
 func logACLSDDL(userSID string) string {
 	sddl := "D:P" + logACLStaticACEs
 	if userSID != logACLSystemSID && userSID != logACLAdministratorsSID {
@@ -240,24 +205,8 @@ func logACLSDDL(userSID string) string {
 	return sddl
 }
 
-// restrictLogDACL enforces log confidentiality on Windows, where the POSIX
-// mode-bit repair in hardenLogSink is a no-op: os.OpenFile's 0600 mode has no
-// DACL effect, os.Stat always reports 0666 and f.Chmod only toggles the
-// read-only attribute. Manual installs can point -log-file into a
-// Users-writable directory, so both hardenLogSink paths (create and repair)
-// get their file's DACL compared against the restricted set above and
-// replaced only when it differs (idempotent: a compliant file is not
-// rewritten and restrictLogDACL reports false).
-//
-// The current DACL is read from the OPEN descriptor (the O_WRONLY handle
-// carries READ_CONTROL via STANDARD_RIGHTS_WRITE), so the comparison is
-// pinned to the exact file hardenLogSink verified. The replacement itself
-// goes through SetNamedSecurityInfo because that open write handle does not
-// carry WRITE_DAC: the named call re-opens the file under the caller's
-// token, where the object owner's implicit WRITE_DAC applies. If the agent
-// runs to neither owner nor a WRITE_DAC grantee, the call fails and the
-// caller exits non-zero — fail-closed, exactly like the symlink refusal and
-// the unix chmod repair.
+// restrictLogDACL ensures the open log file's DACL restricts access to SYSTEM,
+// Administrators, and the current process account (idempotent).
 func restrictLogDACL(f *os.File) (changed bool, err error) {
 	return restrictLogDACLOnHandle(f, false)
 }

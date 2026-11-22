@@ -247,7 +247,6 @@ func TestServer_PerIPRateLimit(t *testing.T) {
 
 // TestServer_ProbeCounterIgnoresInvalid: link_server_probes_received_total
 // must count only validated probes — garbage datagrams must not inflate it.
-// pi-lens-ignore: jscpd:duplicate
 func TestServer_ProbeCounterIgnoresInvalid(t *testing.T) {
 	prober.InitMetrics()
 	ctx := t.Context()
@@ -335,7 +334,6 @@ func TestServer_NoEchoAfterShutdown(t *testing.T) {
 // TestServer_AllowlistDropsUnlisted: a valid probe from a source not in
 // the fail-closed allowlist must be neither echoed nor counted (fixes
 // the reflector and the metric-label-cardinality DoS).
-// pi-lens-ignore: jscpd:duplicate
 func TestServer_AllowlistDropsUnlisted(t *testing.T) {
 	prober.InitMetrics()
 	ctx := t.Context()
@@ -476,7 +474,6 @@ func TestServer_HMACAuth(t *testing.T) {
 // TestServer_HMACRotation: during a zero-downtime rotation the server
 // accepts frames authenticated under either the new or the previous
 // secret; an unknown secret is still dropped.
-// pi-lens-ignore: go-test-functions
 func TestServer_HMACRotation(t *testing.T) {
 	prober.InitMetrics()
 	ctx := t.Context()
@@ -1263,7 +1260,6 @@ func TestServer_WarnsWhenEchoSecretUnset(t *testing.T) {
 	for range 3 {
 		conn.Write(buildHMACFrame("any", 1, uint64(time.Now().UnixNano())))
 	}
-	// pi-lens-ignore: go-time-sleep-test
 	time.Sleep(200 * time.Millisecond)
 	if got := capture.count("set -echo-secret on BOTH ends"); got != 1 {
 		t.Errorf("the unset-secret warning must fire once at startup, not per datagram, got %d", got)
@@ -1277,7 +1273,6 @@ func TestServer_WarnsWhenEchoSecretUnset(t *testing.T) {
 // produce a large sent-count gap. The ratio is 4 in a quiet run; asserting
 // >= 1.5 leaves room for scheduler jitter under load while still failing if
 // the override were ignored (ratio would be 1.0).
-// pi-lens-ignore: go-test-functions
 func TestServer_PerTargetIntervalOverride(t *testing.T) {
 	prober.InitMetrics()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1473,7 +1468,6 @@ func TestServer_DynamicClientSeriesExpiresBelowCap(t *testing.T) {
 // plus any bounded payload extension (clients can probe with a payload
 // without coordinating server config) but still rejects oversized
 // arbitrary-payload reflection attempts.
-// pi-lens-ignore: go-test-functions
 func TestServer_BoundedPayloadSizeRange(t *testing.T) {
 	prober.InitMetrics()
 	ctx, cancel := context.WithCancel(context.Background())

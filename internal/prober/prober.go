@@ -134,44 +134,22 @@ type Config struct {
 	ReloadInterval time.Duration
 }
 
-// minProbeInterval is the smallest accepted probe interval, and the smallest
-// accepted probe timeout. Below it the in-flight set grows to ~RTO/interval
-// entries and every tick sweeps O(len(pending)) timeouts, pegging a core — and
-// the loss ratio becomes meaningless. The same floor on the timeout is a
-// correctness bound, not a cost one: a sub-millisecond timeout expires before
-// any echo can return over a real link, so every probe reads as loss (fabricated
-// 100% loss). Rejected at config load with an error naming the flag.
+// minProbeInterval is the smallest accepted probe interval and timeout.
 const minProbeInterval = time.Millisecond
 
-// maxPendingWindow caps the effective timeout/interval ratio, i.e. how many
-// probes may be in flight per target at once. minProbeInterval bounds the
-// denominator; this bounds the numerator, which was unlimited: a 1ms interval
-// with a 1m timeout built a ~60k-entry pending map per target and swept all of
-// it on every tick (a pegged core, and hundreds of MB with a full targets
-// file). The cap matches the reader channel's own 1000-response ceiling, so a
-// config inside the limit cannot outrun the drain either.
+// maxPendingWindow caps timeout/interval per target to bound the in-flight map
+// and the matching reader response channel capacity.
 const maxPendingWindow = 1000
 
-// maxProbeTimeout bounds the configured probe timeout. A day is already far
-// beyond any link this tool measures; the bound keeps the adaptive RTO (and
-// its float64 seconds -> Duration conversion) away from int64 overflow.
+// maxProbeTimeout bounds configured probe timeouts within safe int64 Duration math.
 const maxProbeTimeout = 24 * time.Hour
 
-// checkPendingWindow rejects an effective interval/timeout pair whose in-flight
-// window would be unbounded (see maxPendingWindow). The error names the flags
-// so the operator knows what to change: the timeout is what must come down.
+// checkPendingWindow rejects an interval/timeout pair whose in-flight window exceeds maxPendingWindow.
 func checkPendingWindow(interval, timeout time.Duration) error {
-	// Non-positive values are Config.Validate's business (they fail there with
-	// their own errors); the window check passes them, as it always did.
 	if interval <= 0 || timeout <= 0 {
 		return nil
 	}
-	// Compare by division, never by maxPendingWindow*interval: that product
-	// overflows int64 once interval passes ~106 days (1000 × 292 years of
-	// nanoseconds), and a wrapped product is a nonsense bound — it rejected
-	// absurd-but-flag-supported intervals that were in fact fine. The
-	// quotient/remainder form is exactly equivalent to
-	// "timeout > maxPendingWindow*interval" without the overflow.
+	// Compare by division to avoid int64 overflow in maxPendingWindow*interval.
 	quotient, remainder := timeout/interval, timeout%interval
 	if quotient < maxPendingWindow || (quotient == maxPendingWindow && remainder == 0) {
 		return nil

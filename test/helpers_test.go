@@ -113,7 +113,6 @@ func pollUntil(t *testing.T, timeout, sleep time.Duration, cond func() bool) boo
 		if cond() {
 			return true
 		}
-		// pi-lens-ignore: go-time-sleep-test
 		time.Sleep(sleep)
 	}
 	return false
@@ -157,7 +156,6 @@ func cfgWith(adaptive bool, interval, timeout time.Duration, targets ...prober.T
 // probe for d. Tests then read end-state counters.
 func runClientFor(ctx context.Context, cfg prober.Config, d time.Duration) {
 	go prober.RunClient(ctx, cfg)
-	// pi-lens-ignore: go-time-sleep-test
 	time.Sleep(d)
 }
 
@@ -166,10 +164,8 @@ func runClientFor(ctx context.Context, cfg prober.Config, d time.Duration) {
 // read.
 func runClientSettle(ctx context.Context, cancel context.CancelFunc, cfg prober.Config, run time.Duration) {
 	go prober.RunClient(ctx, cfg)
-	// pi-lens-ignore: go-time-sleep-test
 	time.Sleep(run)
 	cancel()
-	// pi-lens-ignore: go-time-sleep-test
 	time.Sleep(100 * time.Millisecond)
 }
 

@@ -179,12 +179,10 @@ func readinessHandler(mode string, statusReg *prober.StatusRegistry) http.Handle
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		if !readyToProbe(mode, statusReg) {
 			w.WriteHeader(http.StatusServiceUnavailable)
-			// pi-lens-ignore: go-ignored-call-result
 			_, _ = w.Write([]byte("not ready: no target has ever had a working socket\n"))
 			return
 		}
 		w.WriteHeader(http.StatusOK)
-		// pi-lens-ignore: go-ignored-call-result
 		_, _ = w.Write([]byte("ok\n"))
 	})
 }
@@ -475,7 +473,6 @@ func (p *program) startMetricsServer(addr, user, pass, cert, key string, statusR
 	healthzHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
-		// pi-lens-ignore: go-ignored-call-result
 		_, _ = w.Write([]byte("ok\n"))
 	})
 	// /healthz and /readyz are deliberately unauthenticated: they are
@@ -536,15 +533,8 @@ func (p *program) startMetricsServer(addr, user, pass, cert, key string, statusR
 		if tlsCfg == nil {
 			serveErr = metricsSrv.Serve(metricsLn)
 		} else {
-			// Empty cert/key paths on purpose: ServeTLS only skips its own
-			// tls.LoadX509KeyPair when the config already carries a certificate
-			// source, and it is the pair loaded into TLSConfig.Certificates that
-			// would freeze the renewal. crypto/tls consults GetCertificate only
-			// while that slice is empty (or the client sent SNI), so a scraper
-			// dialing an IP literal would otherwise keep being served the startup
-			// copy. ServeTLS (unlike a hand-rolled tls.NewListener) still owns the
-			// HTTP/2 ALPN setup. The reloader already loaded and validated the
-			// pair when it was constructed.
+			// Empty cert/key paths keep TLSConfig.Certificates nil so GetCertificate
+			// is consulted on every handshake (including IP-literal scrapes without SNI).
 			serveErr = metricsSrv.ServeTLS(metricsLn, "", "")
 		}
 		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
@@ -553,6 +543,3 @@ func (p *program) startMetricsServer(addr, user, pass, cert, key string, statusR
 	}()
 	return metricsSrv, metricsDone, nil
 }
-
-// run initialises metrics, starts the Prometheus HTTP server, and
-// dispatches to the selected mode (server, client, or both).
