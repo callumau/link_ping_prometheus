@@ -56,7 +56,7 @@
     # published targets directory, /run/lock for its flock file, and the git
     # scratch checkout. The generated unit's ReadWritePaths is exactly this.
     link_ping_pull_rw_paths: >-
-      {{ link_ping_config_dest }} /run/lock {{ link_ping_pull_work | dirname }}
+      {{ link_ping_config_dest }} {{ link_ping_pull_work | dirname }}
   tasks:
     # Pre-flight guardrail: -metrics is the management plane - /metrics AND
     # /status carry the whole probe topology (target addresses, packet
@@ -74,9 +74,25 @@
         link_ping_metrics_auth: >-
           {{ (link_ping_metrics_user | length > 0)
              and (link_ping_metrics_pass | length > 0) }}
+        link_ping_metrics_tls_cert: >-
+          {{ (link_ping_extra_args.split()
+              | select('match', '^--?metrics-tls-cert(=|$)')
+              | list | length) > 0 }}
+        link_ping_metrics_tls_key: >-
+          {{ (link_ping_extra_args.split()
+              | select('match', '^--?metrics-tls-key(=|$)')
+              | list | length) > 0 }}
+        link_ping_metrics_allow_insecure: >-
+          {{ (link_ping_extra_args.split()
+              | select('match',
+                '^--?metrics-allow-insecure(=([Tt][Rr][Uu][Ee]|1|[Tt]))?$')
+              | list | length) > 0 }}
+
+    - name: Classify TLS pairing
+      ansible.builtin.set_fact:
         link_ping_metrics_tls: >-
-          {{ ('-metrics-tls-cert' in link_ping_extra_args)
-             or ('-metrics-tls-key' in link_ping_extra_args) }}
+          {{ (link_ping_metrics_tls_cert | bool)
+             and (link_ping_metrics_tls_key | bool) }}
 
     - name: Refuse an unauthenticated all-interfaces metrics listener
       ansible.builtin.assert:
@@ -129,6 +145,19 @@
           never loads the targets file and cannot derive the allowlist.
         quiet: true
 
+    - name: Refuse half-paired credentials or TLS flags
+      ansible.builtin.assert:
+        that:
+          - (link_ping_metrics_user | length > 0) == (link_ping_metrics_pass | length > 0)
+          - (link_ping_metrics_tls_cert | bool) == (link_ping_metrics_tls_key | bool)
+          - (link_ping_echo_secret_old | length == 0) or (link_ping_echo_secret | length > 0)
+        fail_msg: >-
+          Half-configured credentials or TLS flags fail startup validation
+          and crash-loop the service: metrics user/pass must both be set or
+          both empty, -metrics-tls-cert and -metrics-tls-key must be paired,
+          and link_ping_echo_secret_old requires link_ping_echo_secret.
+        quiet: true
+
     - name: Refuse metrics credentials without TLS or explicit plaintext
       # deploy/ansible/README.md states the rule; the binary enforces it at
       # startup (config.go resolveMetricsAuth). Without this assert a play that
@@ -139,7 +168,7 @@
         that: >-
           not (link_ping_metrics_auth | bool)
           or (link_ping_metrics_tls | bool)
-          or ('-metrics-allow-insecure' in link_ping_extra_args)
+          or (link_ping_metrics_allow_insecure | bool)
         fail_msg: >-
           link_ping_metrics_user/link_ping_metrics_pass are set, but
           link_ping_extra_args carries neither the TLS certificate/key
@@ -175,8 +204,9 @@
         link_ping_owned_extra_args: >-
           {{ link_ping_extra_args.split()
              | select('match',
-               '^--?(metrics|mode|allow|source|echo-secret|echo-secret-old'
-               ~ '|metrics-user|metrics-pass|allow-from-targets)(=|$)')
+               '^--?(metrics|mode|allow|source|targets|targets-reload-interval'
+               ~ '|echo-secret|echo-secret-old|metrics-user|metrics-pass'
+               ~ '|allow-from-targets)(=|$)')
              | list }}
       ansible.builtin.assert:
         that:
@@ -484,6 +514,7 @@
           PrivateTmp=yes
           ProtectSystem=strict
           ProtectHome=yes
+          UMask=0077
           ReadWritePaths={{ link_ping_pull_rw_paths }}
         dest: /etc/systemd/system/link_ping_pull_config.service
         mode: "0644"
@@ -582,9 +613,25 @@
         link_ping_metrics_auth: >-
           {{ (link_ping_metrics_user | length > 0)
              and (link_ping_metrics_pass | length > 0) }}
+        link_ping_metrics_tls_cert: >-
+          {{ (link_ping_extra_args.split()
+              | select('match', '^--?metrics-tls-cert(=|$)')
+              | list | length) > 0 }}
+        link_ping_metrics_tls_key: >-
+          {{ (link_ping_extra_args.split()
+              | select('match', '^--?metrics-tls-key(=|$)')
+              | list | length) > 0 }}
+        link_ping_metrics_allow_insecure: >-
+          {{ (link_ping_extra_args.split()
+              | select('match',
+                '^--?metrics-allow-insecure(=([Tt][Rr][Uu][Ee]|1|[Tt]))?$')
+              | list | length) > 0 }}
+
+    - name: Classify TLS pairing
+      ansible.builtin.set_fact:
         link_ping_metrics_tls: >-
-          {{ ('-metrics-tls-cert' in link_ping_extra_args)
-             or ('-metrics-tls-key' in link_ping_extra_args) }}
+          {{ (link_ping_metrics_tls_cert | bool)
+             and (link_ping_metrics_tls_key | bool) }}
 
     - name: Refuse an unauthenticated all-interfaces metrics listener
       ansible.builtin.assert:
@@ -631,6 +678,19 @@
           never loads the targets file and cannot derive the allowlist.
         quiet: true
 
+    - name: Refuse half-paired credentials or TLS flags
+      ansible.builtin.assert:
+        that:
+          - (link_ping_metrics_user | length > 0) == (link_ping_metrics_pass | length > 0)
+          - (link_ping_metrics_tls_cert | bool) == (link_ping_metrics_tls_key | bool)
+          - (link_ping_echo_secret_old | length == 0) or (link_ping_echo_secret | length > 0)
+        fail_msg: >-
+          Half-configured credentials or TLS flags fail startup validation
+          and crash-loop the service: metrics user/pass must both be set or
+          both empty, -metrics-tls-cert and -metrics-tls-key must be paired,
+          and link_ping_echo_secret_old requires link_ping_echo_secret.
+        quiet: true
+
     - name: Refuse metrics credentials without TLS or explicit plaintext
       # deploy/ansible/README.md states the rule; the binary enforces it at
       # startup (config.go resolveMetricsAuth). Without this assert a play that
@@ -641,7 +701,7 @@
         that: >-
           not (link_ping_metrics_auth | bool)
           or (link_ping_metrics_tls | bool)
-          or ('-metrics-allow-insecure' in link_ping_extra_args)
+          or (link_ping_metrics_allow_insecure | bool)
         fail_msg: >-
           link_ping_metrics_user/link_ping_metrics_pass are set, but
           link_ping_extra_args carries neither the TLS certificate/key
@@ -676,8 +736,9 @@
         link_ping_owned_extra_args: >-
           {{ link_ping_extra_args.split()
              | select('match',
-               '^--?(metrics|mode|allow|source|echo-secret|echo-secret-old'
-               ~ '|metrics-user|metrics-pass|allow-from-targets)(=|$)')
+               '^--?(metrics|mode|allow|source|targets|targets-reload-interval'
+               ~ '|log-file|echo-secret|echo-secret-old|metrics-user'
+               ~ '|metrics-pass|allow-from-targets)(=|$)')
              | list }}
       ansible.builtin.assert:
         that:
@@ -806,27 +867,29 @@
                    "take ownership and rewrite the ACL of whatever it " +
                    "points at")
         }
-        takeown.exe /f "$d" /a /d Y | Out-Null
+        takeown.exe /f "$d" /a | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "takeown failed on $d ($LASTEXITCODE)" }
         icacls.exe "$d" /inheritance:r /grant "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "icacls failed on $d ($LASTEXITCODE)" }
       changed_when: false
 
-    - name: Create log directory
-      ansible.windows.win_file:
-        path: "{{ link_ping_win_log_dir }}"
-        state: directory
-
-    - name: Restrict log directory ACLs
-      # Same restriction as installer/windows/install-service.bat: drop the
-      # inherited ACEs and keep SYSTEM/Administrators. The service runs as
-      # LocalSystem, so no per-service-SID grant is needed. Principals are
-      # named by SID (*S-1-5-18, *S-1-5-32-544) because the account names are
-      # localized: icacls cannot resolve "Administrators" on a German host.
-      ansible.windows.win_shell: >-
-        icacls "{{ link_ping_win_log_dir }}"
-        /inheritance:r
-        /grant "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F"
+    - name: Create and restrict log directory
+      ansible.windows.win_shell: |
+        $ErrorActionPreference = 'Stop'
+        $d = '{{ link_ping_win_log_dir }}'
+        if (-not (Test-Path -LiteralPath $d)) {
+            New-Item -ItemType Directory -Path $d | Out-Null
+        }
+        $it = Get-Item -LiteralPath $d -Force
+        if ($it.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            throw ("$d is a reparse point (junction/symlink); refusing to " +
+                   "take ownership and rewrite the ACL of whatever it " +
+                   "points at")
+        }
+        takeown.exe /f "$d" /a | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "takeown failed on $d ($LASTEXITCODE)" }
+        icacls.exe "$d" /inheritance:r /grant "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "icacls failed on $d ($LASTEXITCODE)" }
       changed_when: false
 
     - name: Query service state
@@ -934,12 +997,18 @@
       notify: Restart link ping service (windows)
 
     - name: Open UDP echo port (server/both mode)
-      ansible.windows.win_shell: >-
-        netsh advfirewall firewall add rule
-        name="LinkPing UDP 4000" dir=in action=allow
-        protocol=UDP localport=4000
+      ansible.windows.win_shell: |
+        $ErrorActionPreference = 'Stop'
+        $port = '{{ link_ping_listen.split(":")[-1] }}'
+        if (-not ($port -match '^\d+$')) { throw "invalid listen port: $port" }
+        $name = "LinkPing UDP $port"
+        if (-not (Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue)) {
+            New-NetFirewallRule -DisplayName $name -Direction Inbound -Action Allow -Protocol UDP -LocalPort $port | Out-Null
+            Write-Output 'changed'
+        }
       when: link_ping_mode in ['server', 'both']
-      changed_when: false
+      register: link_ping_fw_rule
+      changed_when: "'changed' in link_ping_fw_rule.stdout"
 
     - name: Query service state after install
       ansible.windows.win_service_info:
@@ -984,9 +1053,15 @@
             throw ("$d is a reparse point (junction/symlink); refusing " +
                    "to take ownership and rewrite its ACL")
         }
-        takeown.exe /f "$d" /a /d Y | Out-Null
+        $bad = @(Get-ChildItem -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Attributes -band [System.IO.FileAttributes]::ReparsePoint })
+        if ($bad.Count -gt 0) {
+            throw ("reparse point found under $($d): $($bad[0].FullName)")
+        }
+        takeown.exe /f "$d" /a /r /d Y | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "takeown failed on $d ($LASTEXITCODE)" }
-        icacls.exe "$d" /inheritance:r /grant "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" | Out-Null
+        $grant = @('*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F')
+        icacls.exe "$d" /inheritance:r /grant $grant /T /C | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "icacls failed on $d ($LASTEXITCODE)" }
       when: link_ping_config_repo | length > 0
       changed_when: false
@@ -1009,7 +1084,12 @@
                    "take ownership and rewrite the ACL of whatever it " +
                    "points at")
         }
-        takeown.exe /f "$d" /a /d Y | Out-Null
+        $bad = @(Get-ChildItem -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Attributes -band [System.IO.FileAttributes]::ReparsePoint })
+        if ($bad.Count -gt 0) {
+            throw ("reparse point found under $($d): $($bad[0].FullName)")
+        }
+        takeown.exe /f "$d" /a /r /d Y | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "takeown failed on $d ($LASTEXITCODE)" }
         $grant = @('*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F')
         icacls.exe "$d" /inheritance:r /grant $grant /T /C | Out-Null

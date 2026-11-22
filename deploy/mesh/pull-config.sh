@@ -64,11 +64,15 @@ file=${LINK_PING_CONFIG_FILE:-targets.json}
 
 command -v git >/dev/null 2>&1 || die "git is not installed"
 
-# Serialise runs: a slow clone must not race the next timer tick. flock is
+# Serialise runs: a slow clone must not race the next scheduled tick. flock is
 # the only supported path - without it, skip the run rather than risk two
-# writers on the same live file.
+# writers on the same live file. Keep the lock inside a 0700 directory (never
+# world-writable /run/lock, where any local user can hold a read-open flock or
+# pre-create the file).
 command -v flock >/dev/null 2>&1 || die "flock (util-linux) is required to serialise runs"
-lock=/run/lock/link_ping_pull_config.lock
+umask 077
+lock=${LINK_PING_CONFIG_LOCK:-$(dirname "$work")/.link_ping_pull_config.lock}
+mkdir -p "$(dirname "$lock")" || die "cannot create lock directory for $lock"
 exec 9>"$lock" || die "cannot open lock file $lock"
 if ! flock -n 9; then
     log "another run holds $lock; skipping this tick"
@@ -108,10 +112,10 @@ export GIT_SSH_COMMAND
 
 # Repository-local configuration is executable content: core.fsmonitor is
 # spawned on fetch/reset and core.hooksPath selects hooks that run in the same
-# commands. The systemd oneshot runs as root and this play keeps the work
-# parent root:0700, so ownership is the primary control; these -c overrides
-# are defence in depth for a checkout that predates it.
-GIT_HARDENING="-c core.fsmonitor=false -c core.hooksPath=$work/.no-hooks"
+# commands. Never point core.hooksPath inside $work (a commit with
+# .no-hooks/post-checkout would execute during clone); generate an
+# unpredictable, non-existent path outside the checkout instead.
+no_hooks=$(mktemp -u "${TMPDIR:-/tmp}/link_ping_no_hooks.XXXXXXXXXX" 2>/dev/null || printf '%s/link_ping_no_hooks.%s.%s' "${TMPDIR:-/tmp}" "$$" "$(date +%s 2>/dev/null || echo 0)")
 
 if [ -d "$work/.git" ]; then
     # Refuse a checkout this run does not own: a foreign owner can rewrite
@@ -121,17 +125,14 @@ if [ -d "$work/.git" ]; then
     recorded=$(git -C "$work" config --get remote.origin.url 2>/dev/null || true)
     [ "$recorded" = "$repo" ] || die "$work fetches ${recorded:-<none>}, not $repo; move it aside and re-run"
     log "fetching $repo ($branch)"
-    # shellcheck disable=SC2086 # GIT_HARDENING is a deliberate word-split list.
-    git $GIT_HARDENING -C "$work" fetch --depth 1 origin "$branch" || die "git fetch failed"
-    # shellcheck disable=SC2086
-    git $GIT_HARDENING -C "$work" reset --hard "origin/$branch" || die "git reset failed"
+    git -c core.fsmonitor=false -c "core.hooksPath=$no_hooks" -C "$work" fetch --depth 1 origin "$branch" || die "git fetch failed"
+    git -c core.fsmonitor=false -c "core.hooksPath=$no_hooks" -C "$work" reset --hard "origin/$branch" || die "git reset failed"
 elif [ -e "$work" ]; then
     die "$work exists but is not a git checkout; move it aside and re-run"
 else
     log "cloning $repo ($branch) into $work"
     mkdir -p "$(dirname "$work")"
-    # shellcheck disable=SC2086
-    git $GIT_HARDENING clone --depth 1 --branch "$branch" "$repo" "$work" || die "git clone failed"
+    git -c core.fsmonitor=false -c "core.hooksPath=$no_hooks" clone --depth 1 --branch "$branch" "$repo" "$work" || die "git clone failed"
 fi
 
 src=$work/$file

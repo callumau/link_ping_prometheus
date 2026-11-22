@@ -35,9 +35,25 @@
         link_ping_metrics_auth: >-
           {{ (link_ping_metrics_user | length > 0)
              and (link_ping_metrics_pass | length > 0) }}
+        link_ping_metrics_tls_cert: >-
+          {{ (link_ping_extra_args.split()
+              | select('match', '^--?metrics-tls-cert(=|$)')
+              | list | length) > 0 }}
+        link_ping_metrics_tls_key: >-
+          {{ (link_ping_extra_args.split()
+              | select('match', '^--?metrics-tls-key(=|$)')
+              | list | length) > 0 }}
+        link_ping_metrics_allow_insecure: >-
+          {{ (link_ping_extra_args.split()
+              | select('match',
+                '^--?metrics-allow-insecure(=([Tt][Rr][Uu][Ee]|1|[Tt]))?$')
+              | list | length) > 0 }}
+      # Evaluate TLS pairing after the two token facts above are set.
+    - name: Classify TLS pairing
+      ansible.builtin.set_fact:
         link_ping_metrics_tls: >-
-          {{ ('-metrics-tls-cert' in link_ping_extra_args)
-             or ('-metrics-tls-key' in link_ping_extra_args) }}
+          {{ (link_ping_metrics_tls_cert | bool)
+             and (link_ping_metrics_tls_key | bool) }}
 
     - name: Refuse an unauthenticated all-interfaces metrics listener
       ansible.builtin.assert:
@@ -78,6 +94,19 @@
           deploy/ansible/README.md.
         quiet: true
 
+    - name: Refuse half-paired credentials or TLS flags
+      ansible.builtin.assert:
+        that:
+          - (link_ping_metrics_user | length > 0) == (link_ping_metrics_pass | length > 0)
+          - (link_ping_metrics_tls_cert | bool) == (link_ping_metrics_tls_key | bool)
+          - (link_ping_echo_secret_old | length == 0) or (link_ping_echo_secret | length > 0)
+        fail_msg: >-
+          Half-configured credentials or TLS flags fail startup validation
+          and crash-loop the service: metrics user/pass must both be set or
+          both empty, -metrics-tls-cert and -metrics-tls-key must be paired,
+          and link_ping_echo_secret_old requires link_ping_echo_secret.
+        quiet: true
+
     - name: Refuse metrics credentials without TLS or explicit plaintext
       # deploy/ansible/README.md states the rule; the binary enforces it at
       # startup (config.go resolveMetricsAuth). Without this assert a play that
@@ -88,7 +117,7 @@
         that: >-
           not (link_ping_metrics_auth | bool)
           or (link_ping_metrics_tls | bool)
-          or ('-metrics-allow-insecure' in link_ping_extra_args)
+          or (link_ping_metrics_allow_insecure | bool)
         fail_msg: >-
           link_ping_metrics_user/link_ping_metrics_pass are set, but
           link_ping_extra_args carries neither the TLS certificate/key
@@ -268,7 +297,7 @@
       -listen={{ link_ping_listen }}
       -allow={{ link_ping_allow }}
       -metrics={{ link_ping_metrics_listen }}
-      -log-file={{ link_ping_win_log_dir }}\service.log
+      -log-file="{{ link_ping_win_log_dir }}\service.log"
       {{ link_ping_extra_args }}
   tasks:
     # Same guardrail as the Linux play: plays share no vars, so it is
@@ -282,9 +311,25 @@
         link_ping_metrics_auth: >-
           {{ (link_ping_metrics_user | length > 0)
              and (link_ping_metrics_pass | length > 0) }}
+        link_ping_metrics_tls_cert: >-
+          {{ (link_ping_extra_args.split()
+              | select('match', '^--?metrics-tls-cert(=|$)')
+              | list | length) > 0 }}
+        link_ping_metrics_tls_key: >-
+          {{ (link_ping_extra_args.split()
+              | select('match', '^--?metrics-tls-key(=|$)')
+              | list | length) > 0 }}
+        link_ping_metrics_allow_insecure: >-
+          {{ (link_ping_extra_args.split()
+              | select('match',
+                '^--?metrics-allow-insecure(=([Tt][Rr][Uu][Ee]|1|[Tt]))?$')
+              | list | length) > 0 }}
+      # Evaluate TLS pairing after the two token facts above are set.
+    - name: Classify TLS pairing
+      ansible.builtin.set_fact:
         link_ping_metrics_tls: >-
-          {{ ('-metrics-tls-cert' in link_ping_extra_args)
-             or ('-metrics-tls-key' in link_ping_extra_args) }}
+          {{ (link_ping_metrics_tls_cert | bool)
+             and (link_ping_metrics_tls_key | bool) }}
 
     - name: Refuse an unauthenticated all-interfaces metrics listener
       ansible.builtin.assert:
@@ -305,6 +350,19 @@
           hosts only. See deploy/ansible/README.md.
         quiet: true
 
+    - name: Refuse half-paired credentials or TLS flags
+      ansible.builtin.assert:
+        that:
+          - (link_ping_metrics_user | length > 0) == (link_ping_metrics_pass | length > 0)
+          - (link_ping_metrics_tls_cert | bool) == (link_ping_metrics_tls_key | bool)
+          - (link_ping_echo_secret_old | length == 0) or (link_ping_echo_secret | length > 0)
+        fail_msg: >-
+          Half-configured credentials or TLS flags fail startup validation
+          and crash-loop the service: metrics user/pass must both be set or
+          both empty, -metrics-tls-cert and -metrics-tls-key must be paired,
+          and link_ping_echo_secret_old requires link_ping_echo_secret.
+        quiet: true
+
     - name: Refuse metrics credentials without TLS or explicit plaintext
       # Same guardrail as the Linux play: the binary refuses Basic auth over
       # plaintext HTTP at startup, so installing the pair without TLS (or an
@@ -313,7 +371,7 @@
         that: >-
           not (link_ping_metrics_auth | bool)
           or (link_ping_metrics_tls | bool)
-          or ('-metrics-allow-insecure' in link_ping_extra_args)
+          or (link_ping_metrics_allow_insecure | bool)
         fail_msg: >-
           link_ping_metrics_user/link_ping_metrics_pass are set, but
           link_ping_extra_args carries neither the TLS certificate/key
@@ -412,7 +470,7 @@
       ansible.builtin.set_fact:
         link_ping_win_options: >-
           {{ link_ping_win_options }}
-          -targets={{ link_ping_win_targets_path }}
+          -targets="{{ link_ping_win_targets_path }}"
       when: link_ping_targets_json | length > 0
 
     - name: Create and re-own the ProgramData container
@@ -435,27 +493,33 @@
                    "take ownership and rewrite the ACL of whatever it " +
                    "points at")
         }
-        takeown.exe /f "$d" /a /d Y | Out-Null
+        takeown.exe /f "$d" /a | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "takeown failed on $d ($LASTEXITCODE)" }
         icacls.exe "$d" /inheritance:r /grant "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "icacls failed on $d ($LASTEXITCODE)" }
       changed_when: false
 
-    - name: Create log directory
-      ansible.windows.win_file:
-        path: "{{ link_ping_win_log_dir }}"
-        state: directory
-
-    - name: Restrict log directory ACLs
-      # Same restriction as installer/windows/install-service.bat: drop the
-      # inherited ACEs and keep SYSTEM/Administrators. The service runs as
-      # LocalSystem, so no per-service-SID grant is needed. Principals are
-      # named by SID (*S-1-5-18, *S-1-5-32-544) because the account names are
-      # localized: icacls cannot resolve "Administrators" on a German host.
-      ansible.windows.win_shell: >-
-        icacls "{{ link_ping_win_log_dir }}"
-        /inheritance:r
-        /grant "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F"
+    - name: Create and restrict log directory
+      # Same ownership + reparse-point check as the container: a pre-created
+      # user-owned logs directory or junction would otherwise retain
+      # WRITE_DAC or redirect icacls. Principals are named by SID because the
+      # account names are localized.
+      ansible.windows.win_shell: |
+        $ErrorActionPreference = 'Stop'
+        $d = '{{ link_ping_win_log_dir }}'
+        if (-not (Test-Path -LiteralPath $d)) {
+            New-Item -ItemType Directory -Path $d | Out-Null
+        }
+        $it = Get-Item -LiteralPath $d -Force
+        if ($it.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            throw ("$d is a reparse point (junction/symlink); refusing to " +
+                   "take ownership and rewrite the ACL of whatever it " +
+                   "points at")
+        }
+        takeown.exe /f "$d" /a | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "takeown failed on $d ($LASTEXITCODE)" }
+        icacls.exe "$d" /inheritance:r /grant "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "icacls failed on $d ($LASTEXITCODE)" }
       changed_when: false
 
     - name: Query service state
@@ -561,12 +625,18 @@
       notify: Restart link ping service (windows)
 
     - name: Open UDP echo port (server/both mode)
-      ansible.windows.win_shell: >-
-        netsh advfirewall firewall add rule
-        name="LinkPing UDP 4000" dir=in action=allow
-        protocol=UDP localport=4000
+      ansible.windows.win_shell: |
+        $ErrorActionPreference = 'Stop'
+        $port = '{{ link_ping_listen.split(":")[-1] }}'
+        if (-not ($port -match '^\d+$')) { throw "invalid listen port: $port" }
+        $name = "LinkPing UDP $port"
+        if (-not (Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue)) {
+            New-NetFirewallRule -DisplayName $name -Direction Inbound -Action Allow -Protocol UDP -LocalPort $port | Out-Null
+            Write-Output 'changed'
+        }
       when: link_ping_mode in ['server', 'both']
-      changed_when: false
+      register: link_ping_fw_rule
+      changed_when: "'changed' in link_ping_fw_rule.stdout"
 
     - name: Query service state after install
       # svc_info was captured BEFORE the install task ran, so a fresh host

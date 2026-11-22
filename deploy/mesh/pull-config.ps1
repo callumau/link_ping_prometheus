@@ -134,6 +134,9 @@ try {
     # happens to have. BatchMode keeps an unattended run from blocking on a
     # prompt. Passed per-invocation (-c) so nothing depends on the host's
     # global git config.
+    if ($Key -match '["$`]' -or $KnownHosts -match '["$`]') {
+        Fail "key and known_hosts paths must not contain quotes or shell-expansion characters"
+    }
     $sshCommand = 'ssh -i "{0}" -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="{1}" -o BatchMode=yes' -f $Key, $KnownHosts
 
     # Repository-local configuration is executable content: core.fsmonitor is
@@ -192,8 +195,21 @@ try {
     } else {
         Write-PullLog "cloning $Repo ($Branch) into $Work"
         $parent = Split-Path -Parent $Work
-        if ($parent -and -not (Test-Path -LiteralPath $parent)) {
-            New-Item -ItemType Directory -Path $parent -Force | Out-Null
+        if ($parent) {
+            if (Test-Path -LiteralPath $parent) {
+                $pit = Get-Item -LiteralPath $parent -Force
+                if ($pit.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+                    Fail "$parent is a reparse point; refusing to clone into it"
+                }
+            } else {
+                New-Item -ItemType Directory -Path $parent -Force | Out-Null
+            }
+        }
+        if (Test-Path -LiteralPath $Work) {
+            $wit = Get-Item -LiteralPath $Work -Force
+            if ($wit.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+                Fail "$Work is a reparse point; refusing to clone into it"
+            }
         }
         & git @gitHardening -c "core.sshCommand=$sshCommand" clone --depth 1 --branch $Branch $Repo $Work
         if ($LASTEXITCODE -ne 0) { Fail "git clone failed (exit $LASTEXITCODE)" }
@@ -203,16 +219,18 @@ try {
     if (-not (Test-Path -LiteralPath $src -PathType Leaf)) { Fail "$File not found in the repository (looked at $src)" }
 
     # Validate BEFORE touching the live file, so a truncated pull (or a bad
-    # branch) leaves the current topology running.
+    # branch) leaves the current topology running. Note: Windows PowerShell 5.1
+    # ConvertFrom-Json unrolls a 1-element JSON array into a scalar object, so
+    # verify top-level array syntax on the raw JSON text after ConvertFrom-Json
+    # confirms syntactic validity.
     try {
-        $parsed = Get-Content -LiteralPath $src -Raw | ConvertFrom-Json
+        $rawSrc = Get-Content -LiteralPath $src -Raw
+        if ([string]::IsNullOrWhiteSpace($rawSrc)) { throw "empty JSON" }
+        $null = $rawSrc | ConvertFrom-Json
     } catch {
         Fail "$src is not valid JSON; keeping the previous $File"
     }
-    # The agent expects a JSON array of target objects. An empty array is
-    # accepted by the binary (it warns that all probing stopped), but a
-    # non-array document would be rejected on reload - catch it here.
-    if ($null -ne $parsed -and $parsed -isnot [System.Array]) {
+    if (-not $rawSrc.TrimStart().StartsWith('[')) {
         Fail "$src is not a JSON array of targets; keeping the previous $File"
     }
 
@@ -226,10 +244,14 @@ try {
     $tmp = Join-Path $Dest ('.' + $File + '.tmp.' + $PID)
     $live = Join-Path $Dest $File
     Copy-Item -LiteralPath $src -Destination $tmp -Force
-    if ((Test-Path -LiteralPath $live) -and -not (Compare-Object (Get-Content -LiteralPath $live -Raw) (Get-Content -LiteralPath $tmp -Raw))) {
-        Remove-Item -LiteralPath $tmp -Force
-        Write-PullLog "$File unchanged"
-        exit 0
+    if (Test-Path -LiteralPath $live) {
+        $liveRaw = Get-Content -LiteralPath $live -Raw
+        $tmpRaw = Get-Content -LiteralPath $tmp -Raw
+        if ($null -ne $liveRaw -and $liveRaw -ceq $tmpRaw) {
+            Remove-Item -LiteralPath $tmp -Force
+            Write-PullLog "$File unchanged"
+            exit 0
+        }
     }
     Move-Item -LiteralPath $tmp -Destination $live -Force
     Write-PullLog "installed $live from $Repo@$Branch"

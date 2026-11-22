@@ -148,8 +148,10 @@ func TestAnsibleRefusesMetricsCredentialsWithoutTLS(t *testing.T) {
 		if got := strings.Count(body, "Refuse metrics credentials without TLS"); got != 2 {
 			t.Errorf("%s: found %d pairing guards, want one in each play", path, got)
 		}
-		mustContain(t, path, body, `'-metrics-allow-insecure' in link_ping_extra_args`,
+		mustContain(t, path, body, "link_ping_metrics_allow_insecure | bool",
 			"the guard must accept an explicit plaintext opt-in")
+		mustContain(t, path, body, "^--?metrics-allow-insecure(=([Tt][Rr][Uu][Ee]|1|[Tt]))?$",
+			"the allow-insecure check must match an affirmative flag token rather than substring")
 		mustContain(t, path, body, "not (link_ping_metrics_auth | bool)", "the guard must key on the credential pair")
 	}
 }
@@ -189,12 +191,15 @@ func TestAnsibleOwnsTheWindowsServiceDirectories(t *testing.T) {
 	pb := readDeploymentFile(t, "deploy/ansible/playbook.yml")
 	mustContain(t, "deploy/ansible/playbook.yml", pb, "takeown.exe /f \"$d\" /a", "the container must be re-owned")
 	mustContain(t, "deploy/ansible/playbook.yml", pb, "link_ping_win_data_dir", "the container needs its own variable")
+	mustContain(t, "deploy/ansible/playbook.yml", pb, `-targets="{{ link_ping_win_targets_path }}"`, "Windows -targets path must be quoted for Program Files spaces")
+	mustNotContain(t, "deploy/ansible/playbook.yml", pb, `takeown.exe /f "$d" /a /d Y`, "takeown /d Y without /r is invalid Windows syntax")
 
 	m := readDeploymentFile(t, "deploy/ansible/mesh.yml")
 	mustContain(t, "deploy/ansible/mesh.yml", m, "link_ping_win_pull_work", "the pull work directory must be created")
 	if strings.Count(m, "takeown.exe /f \"$d\" /a") < 3 {
 		t.Errorf("deploy/ansible/mesh.yml: container, pull directory and pull work directory must all be re-owned")
 	}
+	mustNotContain(t, "deploy/ansible/mesh.yml", m, `takeown.exe /f "$d" /a /d Y`, "non-recursive takeown must not pass /d Y")
 }
 
 // TestPullScriptsNeutraliseRepoLocalGitConfig pins the code-execution fix:
