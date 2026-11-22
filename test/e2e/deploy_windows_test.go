@@ -3,15 +3,23 @@
 package e2e
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/windows/svc/mgr"
 )
+
+func runWithTimeout(timeout time.Duration, name string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return exec.CommandContext(ctx, name, args...).CombinedOutput()
+}
 
 func TestE2EWindowsTakeownAndReparseGuard(t *testing.T) {
 	if !svcHasAdmin(t) {
@@ -32,7 +40,7 @@ if ($LASTEXITCODE -ne 0) { throw "takeown failed on $d ($LASTEXITCODE)" }
 icacls.exe "$d" /inheritance:r /grant "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "icacls failed on $d ($LASTEXITCODE)" }
 `, singleDir)
-	if out, err := exec.Command("powershell.exe", "-NoProfile", "-Command", psSingle).CombinedOutput(); err != nil {
+	if out, err := runWithTimeout(60*time.Second, "powershell.exe", "-NoProfile", "-Command", psSingle); err != nil {
 		t.Fatalf("single-dir takeown/icacls failed: %v\n%s", err, out)
 	}
 
@@ -57,7 +65,7 @@ $grant = @('*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F')
 icacls.exe "$d" /inheritance:r /grant $grant /T /C | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "icacls /T failed on $d ($LASTEXITCODE)" }
 `, recDir)
-	if out, err := exec.Command("powershell.exe", "-NoProfile", "-Command", psRec).CombinedOutput(); err != nil {
+	if out, err := runWithTimeout(60*time.Second, "powershell.exe", "-NoProfile", "-Command", psRec); err != nil {
 		t.Fatalf("recursive takeown/icacls failed: %v\n%s", err, out)
 	}
 
@@ -67,7 +75,7 @@ if ($LASTEXITCODE -ne 0) { throw "icacls /T failed on $d ($LASTEXITCODE)" }
 	if err := os.MkdirAll(juncTarget, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("cmd.exe", "/c", "mklink", "/J", juncLink, juncTarget).CombinedOutput(); err != nil {
+	if out, err := runWithTimeout(60*time.Second, "cmd.exe", "/c", "mklink", "/J", juncLink, juncTarget); err != nil {
 		t.Fatalf("mklink /J failed: %v\n%s", err, out)
 	}
 	psJunc := fmt.Sprintf(`
@@ -76,7 +84,7 @@ $d = '%s'
 $it = Get-Item -LiteralPath $d -Force
 if ($it.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { throw 'reparse-refused' }
 `, juncLink)
-	if out, err := exec.Command("powershell.exe", "-NoProfile", "-Command", psJunc).CombinedOutput(); err == nil {
+	if out, err := runWithTimeout(60*time.Second, "powershell.exe", "-NoProfile", "-Command", psJunc); err == nil {
 		t.Fatalf("expected junction to be refused, got success:\n%s", out)
 	} else if !strings.Contains(string(out), "reparse-refused") {
 		t.Fatalf("unexpected error for junction: %v\n%s", err, out)
@@ -104,7 +112,7 @@ func TestE2EWindowsPullConfigPS1(t *testing.T) {
 	if err := os.WriteFile(key, []byte("dummy-key\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("icacls.exe", key, "/inheritance:r", "/grant", "*S-1-5-18:F", "*S-1-5-32-544:F").CombinedOutput(); err != nil {
+	if out, err := runWithTimeout(60*time.Second, "icacls.exe", key, "/inheritance:r", "/grant", "*S-1-5-18:F", "*S-1-5-32-544:F"); err != nil {
 		t.Fatalf("restrict key ACL: %v\n%s", err, out)
 	}
 	if err := os.WriteFile(knownHosts, []byte("example.invalid ssh-ed25519 AAAA\n"), 0o600); err != nil {
@@ -113,7 +121,9 @@ func TestE2EWindowsPullConfigPS1(t *testing.T) {
 
 	runGit := func(dir string, args ...string) {
 		t.Helper()
-		cmd := exec.Command("git", args...)
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "git", args...)
 		if dir != "" {
 			cmd.Dir = dir
 		}
@@ -147,9 +157,8 @@ func TestE2EWindowsPullConfigPS1(t *testing.T) {
 	runGit(seed, "push", "-u", "origin", "main")
 
 	runPS1 := func(workDir string) (string, error) {
-		cmd := exec.Command("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script,
+		out, err := runWithTimeout(60*time.Second, "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script,
 			"-Repo", bare, "-Branch", "main", "-Work", workDir, "-Dest", dest, "-Key", key, "-KnownHosts", knownHosts)
-		out, err := cmd.CombinedOutput()
 		return string(out), err
 	}
 
@@ -191,7 +200,7 @@ func TestE2EWindowsPullConfigPS1(t *testing.T) {
 	}
 
 	// Broad Users read ACE on deploy key must fail closed.
-	if out, err := exec.Command("icacls.exe", key, "/grant", "*S-1-5-32-545:R").CombinedOutput(); err != nil {
+	if out, err := runWithTimeout(60*time.Second, "icacls.exe", key, "/grant", "*S-1-5-32-545:R"); err != nil {
 		t.Fatalf("grant Users read on key: %v\n%s", err, out)
 	}
 	if out, err := runPS1(filepath.Join(tmp, "work-wide-key")); err == nil {
@@ -235,11 +244,13 @@ func TestE2EWindowsBatchInstallerGuards(t *testing.T) {
 	if err := os.MkdirAll(juncTarget, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("cmd.exe", "/c", "mklink", "/J", juncLink, juncTarget).CombinedOutput(); err != nil {
+	if out, err := runWithTimeout(60*time.Second, "cmd.exe", "/c", "mklink", "/J", juncLink, juncTarget); err != nil {
 		t.Fatalf("mklink /J: %v\n%s", err, out)
 	}
-	ucmd := exec.Command("cmd.exe", "/c", uninstallBat, juncLink)
-	ucmd.Stdin = strings.NewReader("n\n")
+	uctx, ucancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer ucancel()
+	ucmd := exec.CommandContext(uctx, "cmd.exe", "/c", uninstallBat, juncLink)
+	ucmd.Stdin = strings.NewReader("n\r\n")
 	if out, err := ucmd.CombinedOutput(); err != nil {
 		t.Fatalf("uninstall-service.bat fell through into RefuseReparse or failed: %v\n%s", err, out)
 	} else if strings.Contains(string(out), "is a reparse point") {
@@ -268,13 +279,12 @@ func TestE2EWindowsBatchInstallerGuards(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_ = exec.Command(binPath, "-svc=uninstall").Run()
+		_, _ = runWithTimeout(30*time.Second, binPath, "-svc=uninstall")
 	})
 
-	icmd := exec.Command("cmd.exe", "/c", stageBat)
-	// Mode=server, Metrics=127.0.0.1:2112, Allow=127.0.0.1, LogDir=stage\logs,
-	// Account=skip, TLS=skip, AllowInsecure=n, MUser=prom, MPass=prompass,
-	// ESecret=skip, ESecretOld=skip.
+	ictx, icancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer icancel()
+	icmd := exec.CommandContext(ictx, "cmd.exe", "/c", stageBat)
 	icmd.Stdin = strings.NewReader(strings.Join([]string{
 		"server",
 		"127.0.0.1:2112",
@@ -299,7 +309,9 @@ func TestE2EWindowsBatchInstallerGuards(t *testing.T) {
 	}
 
 	// 3. Verify install-service.bat refuses a junction at LOG_DIR and exits non-zero.
-	jcmd := exec.Command("cmd.exe", "/c", stageBat)
+	jctx, jcancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer jcancel()
+	jcmd := exec.CommandContext(jctx, "cmd.exe", "/c", stageBat)
 	jcmd.Stdin = strings.NewReader(strings.Join([]string{
 		"server",
 		"127.0.0.1:2112",
@@ -322,7 +334,9 @@ func TestE2EWindowsBatchInstallerGuards(t *testing.T) {
 		t.Fatalf("expected reparse-point refusal for junction LOG_DIR, got:\n%s", out)
 	}
 	// Clean up %ProgramFiles%\link_ping_prometheus copied before LOG_DIR check.
-	uclean := exec.Command("cmd.exe", "/c", uninstallBat)
-	uclean.Stdin = strings.NewReader("n\n")
+	cleanCtx, cleanCancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cleanCancel()
+	uclean := exec.CommandContext(cleanCtx, "cmd.exe", "/c", uninstallBat)
+	uclean.Stdin = strings.NewReader("n\r\n")
 	_ = uclean.Run()
 }

@@ -331,7 +331,7 @@ if errorlevel 1 (
     echo   those characters cannot be delivered safely through quoting below.
     goto :wiz_muser
 )
-powershell -NoProfile -Command "if ($env:MUser -match ':') { exit 1 } else { exit 0 }" >nul 2>&1
+powershell -NoProfile -Command "if ($env:MUser -match ':') { exit 1 } else { exit 0 }" <nul >nul 2>&1
 if errorlevel 1 (
     echo   ERROR: the metrics username cannot contain a colon - HTTP Basic
     echo   authentication splits user:pass at the first colon, so the agent
@@ -410,7 +410,7 @@ if /i "%ALLOW_INSECURE%"=="y" set "INSTALL_ARGS=%INSTALL_ARGS% -metrics-allow-in
 set "INSTALL_ARGS=%INSTALL_ARGS% -log-file="%LOG_DIR%\service.log""
 
 set "METRICS_TRANSPORT_OK="
-powershell -NoProfile -Command "$a=$env:INSTALL_ARGS; $hasCert=($a -match '(?i)(?:^|\s)--?metrics-tls-cert(?:=|\s|$)'); $hasKey=($a -match '(?i)(?:^|\s)--?metrics-tls-key(?:=|\s|$)'); $hasIns=($a -match '(?i)(?:^|\s)--?metrics-allow-insecure(?:=(?:true|1|t))?(?:\s|$)'); if (($hasCert -and $hasKey) -or $hasIns) { exit 0 } else { exit 1 }" >nul 2>&1
+powershell -NoProfile -Command "$a=$env:INSTALL_ARGS; $hasCert=($a -match '(?i)(?:^|\s)--?metrics-tls-cert(?:=|\s|$)'); $hasKey=($a -match '(?i)(?:^|\s)--?metrics-tls-key(?:=|\s|$)'); $hasIns=($a -match '(?i)(?:^|\s)--?metrics-allow-insecure(?:=(?:true|1|t))?(?:\s|$)'); if (($hasCert -and $hasKey) -or $hasIns) { exit 0 } else { exit 1 }" <nul >nul 2>&1
 if not errorlevel 1 set "METRICS_TRANSPORT_OK=1"
 if not "%MUser%"=="" if not "%MPass%"=="" if not defined METRICS_TRANSPORT_OK (
     echo.
@@ -464,7 +464,7 @@ copy /y "%EXE_PATH%" "%INSTALLED_EXE%" >nul || (
     echo ERROR: could not copy binary to "%INSTALL_DIR%"
     exit /b 1
 )
-powershell -NoProfile -Command "$a=(Get-FileHash -LiteralPath $env:EXE_PATH -Algorithm SHA256).Hash; $b=(Get-FileHash -LiteralPath $env:INSTALLED_EXE -Algorithm SHA256).Hash; if ($a -ne $b) { Write-Host ('source  ' + $a); Write-Host ('install ' + $b); exit 1 }; Write-Host ('SHA256 ' + $b)" || (
+powershell -NoProfile -Command "$a=(Get-FileHash -LiteralPath $env:EXE_PATH -Algorithm SHA256).Hash; $b=(Get-FileHash -LiteralPath $env:INSTALLED_EXE -Algorithm SHA256).Hash; if ($a -ne $b) { Write-Host ('source  ' + $a); Write-Host ('install ' + $b); exit 1 }; Write-Host ('SHA256 ' + $b)" <nul || (
     echo ERROR: "%INSTALLED_EXE%" does not match "%EXE_PATH%" after the copy - the source changed during install.
     echo        Re-download the release and verify it with cosign before re-running.
     exit /b 1
@@ -490,7 +490,7 @@ if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
 :: A reparse point (junction/symlink) at the log directory would redirect the
 :: ACL rewrite and every topology-bearing log line to a target the user chose.
 :: Refuse it before takeown/icacls touches either object.
-powershell -NoProfile -Command "$p=$env:LOG_DIR; if (Test-Path -LiteralPath $p) { $i=Get-Item -LiteralPath $p -Force; if ($i.Attributes -band [IO.FileAttributes]::ReparsePoint) { exit 1 } }; exit 0" >nul 2>&1
+powershell -NoProfile -Command "$p=$env:LOG_DIR; if (Test-Path -LiteralPath $p) { $i=Get-Item -LiteralPath $p -Force; if ($i.Attributes -band [IO.FileAttributes]::ReparsePoint) { exit 1 } }; exit 0" <nul >nul 2>&1
 if errorlevel 1 (
     echo ERROR: "%LOG_DIR%" is a reparse point ^(junction/symlink^).
     echo        Refusing to rewrite the ACL of whatever it points at. Remove it
@@ -579,7 +579,7 @@ if not "%SERVICE_ACCOUNT%"=="" (
 :: One physical line on purpose: a ^ inside the quoted -Command is a literal
 :: caret, not a line join, and a ")" in a typed password would close a block.
 :: The identities are SIDs because the account names are localized.
-powershell -NoProfile -Command "$ErrorActionPreference='Stop'; $k='HKLM:\SYSTEM\CurrentControlSet\Services\%SERVICE_NAME%'; $a=Get-Acl -LiteralPath $k; $a.SetSecurityDescriptorSddlForm('D:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)(A;;KA;;;SY)(A;;KA;;;BA)'); Set-Acl -LiteralPath $k -AclObject $a; $cur=(Get-ItemProperty -Path $k -Name Environment -ErrorAction SilentlyContinue).Environment; $m=[ordered]@{}; if($cur){ foreach($l in $cur){ $i=$l.IndexOf('='); if($i -gt 0){ $m[$l.Substring(0,$i)]=$l.Substring($i+1) } } }; foreach($p in @(@('LINK_PING_METRICS_USER',$env:MUser),@('LINK_PING_METRICS_PASS',$env:MPass),@('LINK_PING_ECHO_SECRET',$env:ESecret),@('LINK_PING_ECHO_SECRET_OLD',$env:ESecretOld))){ if([string]::IsNullOrEmpty($p[1])){ $m.Remove($p[0]) } else { $m[$p[0]]=$p[1] } }; if($m.Count -gt 0){ $v=@(); foreach($x in $m.Keys){ $v += ($x + '=' + $m[$x]) }; New-ItemProperty -Path $k -Name Environment -PropertyType MultiString -Value ([string[]]$v) -Force | Out-Null } else { Remove-ItemProperty -Path $k -Name Environment -ErrorAction SilentlyContinue }"
+powershell -NoProfile -Command "$ErrorActionPreference='Stop'; $k='HKLM:\SYSTEM\CurrentControlSet\Services\%SERVICE_NAME%'; $a=Get-Acl -LiteralPath $k; $a.SetSecurityDescriptorSddlForm('D:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)(A;;KA;;;SY)(A;;KA;;;BA)'); Set-Acl -LiteralPath $k -AclObject $a; $cur=(Get-ItemProperty -Path $k -Name Environment -ErrorAction SilentlyContinue).Environment; $m=[ordered]@{}; if($cur){ foreach($l in $cur){ $i=$l.IndexOf('='); if($i -gt 0){ $m[$l.Substring(0,$i)]=$l.Substring($i+1) } } }; foreach($p in @(@('LINK_PING_METRICS_USER',$env:MUser),@('LINK_PING_METRICS_PASS',$env:MPass),@('LINK_PING_ECHO_SECRET',$env:ESecret),@('LINK_PING_ECHO_SECRET_OLD',$env:ESecretOld))){ if([string]::IsNullOrEmpty($p[1])){ $m.Remove($p[0]) } else { $m[$p[0]]=$p[1] } }; if($m.Count -gt 0){ $v=@(); foreach($x in $m.Keys){ $v += ($x + '=' + $m[$x]) }; New-ItemProperty -Path $k -Name Environment -PropertyType MultiString -Value ([string[]]$v) -Force | Out-Null } else { Remove-ItemProperty -Path $k -Name Environment -ErrorAction SilentlyContinue }" <nul
 if errorlevel 1 (
     echo ERROR: could not store the credentials in the service Environment value,
     echo        or could not restrict the service key ACL.
@@ -646,7 +646,7 @@ goto %WAIT_RUN_RESUME%
 REM The regex is written as \x22/\x26 escape sequences: a raw " or & inside
 REM the cmd-quoted -Command region would toggle cmd quoting and turn the &
 REM into a command separator (the exact hazard this guard exists for).
-powershell -NoProfile -Command "if ($env:%~1 -match '\x22|\x26') { exit 1 } else { exit 0 }" >nul 2>&1
+powershell -NoProfile -Command "if ($env:%~1 -match '\x22|\x26') { exit 1 } else { exit 0 }" <nul >nul 2>&1
 exit /b %errorlevel%
 
 :: CheckSecretLength VALUEVAR
@@ -655,7 +655,7 @@ exit /b %errorlevel%
 ::   authentication; a short value is brute-forceable. PowerShell reads the
 ::   value from the environment for the same no-expansion reason as above.
 :CheckSecretLength
-powershell -NoProfile -Command "if ($env:%~1.Length -lt 16) { exit 1 } else { exit 0 }" >nul 2>&1
+powershell -NoProfile -Command "if ($env:%~1.Length -lt 16) { exit 1 } else { exit 0 }" <nul >nul 2>&1
 exit /b %errorlevel%
 
 :: HardenDataDir
@@ -671,7 +671,7 @@ if not exist "%DATA_DIR%" mkdir "%DATA_DIR%"
 :: takeown /a and icacls operate on the TARGET of a reparse point, so a local
 :: user who pre-created this path as a junction to another directory could
 :: make an elevated install seize and rewrite that directory's ACL. Refuse.
-powershell -NoProfile -Command "$p=$env:DATA_DIR; $i=Get-Item -LiteralPath $p -Force; if ($i.Attributes -band [IO.FileAttributes]::ReparsePoint) { exit 1 }; exit 0" >nul 2>&1
+powershell -NoProfile -Command "$p=$env:DATA_DIR; $i=Get-Item -LiteralPath $p -Force; if ($i.Attributes -band [IO.FileAttributes]::ReparsePoint) { exit 1 }; exit 0" <nul >nul 2>&1
 if errorlevel 1 (
     echo ERROR: "%DATA_DIR%" is a reparse point ^(junction/symlink^).
     echo        Refusing to take ownership of an unrelated target. Remove it and rerun.

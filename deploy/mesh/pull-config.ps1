@@ -58,7 +58,22 @@ param(
 )
 
 Set-StrictMode -Version Latest
+# Load Microsoft.PowerShell.Security before switching ErrorActionPreference to
+# Stop: Windows PowerShell 5.1 implicit module auto-loading can fail with
+# CouldNotAutoloadMatchingModule under Stop.
+Import-Module Microsoft.PowerShell.Security -ErrorAction SilentlyContinue
 $ErrorActionPreference = 'Stop'
+
+function Get-PathAcl {
+    param([string]$LiteralPath)
+    if (Get-Command Get-Acl -ErrorAction SilentlyContinue) {
+        return Get-Acl -LiteralPath $LiteralPath
+    }
+    if (Test-Path -LiteralPath $LiteralPath -PathType Container) {
+        return [System.IO.Directory]::GetAccessControl($LiteralPath)
+    }
+    return [System.IO.File]::GetAccessControl($LiteralPath)
+}
 
 $tag = 'link_ping_pull_config'
 
@@ -112,7 +127,7 @@ try {
         'S-1-5-32-546', # Guests
         'S-1-5-7'       # ANONYMOUS LOGON
     )
-    $wide = @((Get-Acl -LiteralPath $Key).Access | Where-Object {
+    $wide = @((Get-PathAcl -LiteralPath $Key).Access | Where-Object {
             if ($_.AccessControlType -ne 'Allow') { return $false }
             try {
                 $sid = $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
@@ -167,7 +182,7 @@ try {
             $ownerSid = $null
             try {
                 $ownerSid = (New-Object System.Security.Principal.NTAccount(
-                        (Get-Acl -LiteralPath $p).Owner)).Translate(
+                        (Get-PathAcl -LiteralPath $p).Owner)).Translate(
                     [System.Security.Principal.SecurityIdentifier]).Value
             } catch {
                 Fail "cannot resolve the owner of $p; refusing an unverified checkout"
