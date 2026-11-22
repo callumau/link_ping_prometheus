@@ -81,3 +81,41 @@ func TestTrustedDACLViolation(t *testing.T) {
 		})
 	}
 }
+
+// TestTrustedDACLViolation_ExtendedGrantACETypes pins that Windows compound,
+// callback/conditional, and unknown ACE types fail closed as grants rather than
+// being skipped, while deny/audit/mandatory-label ACEs do not trigger false
+// positives.
+func TestTrustedDACLViolation_ExtendedGrantACETypes(t *testing.T) {
+	const (
+		fileRead         = 0x0001
+		aceAllowCompound = 0x04
+		aceAllowCallback = 0x09
+		aceAllowCbObject = 0x0B
+		aceUnknown       = 0x7F
+		aceAudit         = 0x02
+		aceDenyCallback  = 0x0A
+		aceMandatoryLbl  = 0x11
+	)
+	read := TrustOptions{DenyForeignRead: true}
+	for _, tc := range []struct {
+		name    string
+		aceType uint8
+		wantErr bool
+	}{
+		{"compound allow fails closed", aceAllowCompound, true},
+		{"callback conditional allow fails closed", aceAllowCallback, true},
+		{"callback object allow fails closed", aceAllowCbObject, true},
+		{"unknown ACE type fails closed", aceUnknown, true},
+		{"system audit ignored", aceAudit, false},
+		{"callback deny ignored", aceDenyCallback, false},
+		{"mandatory label ignored", aceMandatoryLbl, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := trustedDACLViolation(false, []daclACE{{SID: "", Mask: fileRead, Type: tc.aceType}}, daclTrusted, read)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("aceType=%#x err=%v, wantErr=%v", tc.aceType, err, tc.wantErr)
+			}
+		})
+	}
+}

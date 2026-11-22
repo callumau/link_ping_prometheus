@@ -215,6 +215,9 @@ func (c Config) Validate() error {
 	if c.BaseInterval < minProbeInterval {
 		return fmt.Errorf("probe interval (-interval) must be at least %v, got %v", minProbeInterval, c.BaseInterval)
 	}
+	if c.BaseInterval > maxProbeTimeout {
+		return fmt.Errorf("probe interval (-interval) must be at most %v, got %v", maxProbeTimeout, c.BaseInterval)
+	}
 	if c.BaseTimeout <= 0 {
 		return fmt.Errorf("probe timeout must be positive, got %v", c.BaseTimeout)
 	}
@@ -280,6 +283,9 @@ func validateTargets(targets []Target) error {
 		}
 		if t.Interval != 0 && t.Interval < minProbeInterval {
 			return fmt.Errorf("target %q: interval must be at least %v, got %v", t.Name, minProbeInterval, t.Interval)
+		}
+		if t.Interval > maxProbeTimeout {
+			return fmt.Errorf("target %q: interval must be at most %v, got %v", t.Name, maxProbeTimeout, t.Interval)
 		}
 		if t.Timeout < 0 {
 			return fmt.Errorf("target %q: timeout must be >= 0, got %v", t.Name, t.Timeout)

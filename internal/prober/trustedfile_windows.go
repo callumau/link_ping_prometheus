@@ -81,14 +81,14 @@ func checkTrustedOwner(f *os.File) error {
 		return fmt.Errorf("read owner: %w", err)
 	}
 	if sd == nil {
-		return nil
+		return fmt.Errorf("security descriptor is nil")
 	}
 	owner, _, err := sd.Owner()
 	if err != nil {
 		return fmt.Errorf("decode owner: %w", err)
 	}
 	if owner == nil {
-		return nil
+		return fmt.Errorf("file has no owner")
 	}
 	switch owner.String() {
 	case trustedSystemSID, trustedAdministratorsSID, user.User.Sid.String():

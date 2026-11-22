@@ -1,8 +1,14 @@
 package prober
 
 import (
+	"bytes"
+	"context"
 	"encoding/binary"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 )
@@ -110,5 +116,67 @@ func TestSkewReplayedBoundary(t *testing.T) {
 	}
 	if skewReplayed(0) {
 		t.Fatal("zero skew must never replay")
+	}
+}
+
+// TestMetricsAuth_RateLimitsFailuresWhileAllowingValid pins that repeated
+// failed Basic Auth attempts from the same IP are throttled with 429 while
+// valid credentials still succeed immediately.
+func TestMetricsAuth_RateLimitsFailuresWhileAllowingValid(t *testing.T) {
+	InitMetrics()
+	h := MetricsAuth("prom", "secret", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	for i := 0; i < 60; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+		req.RemoteAddr = "198.51.100.10:12345"
+		req.SetBasicAuth("prom", "wrong")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d status = %d, want 401", i+1, rec.Code)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	req.RemoteAddr = "198.51.100.10:12345"
+	req.SetBasicAuth("prom", "wrong")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("burst failure status = %d, want 429", rec.Code)
+	}
+
+	// Valid credentials from the same IP must still pass.
+	validReq := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	validReq.RemoteAddr = "198.51.100.10:12345"
+	validReq.SetBasicAuth("prom", "secret")
+	validRec := httptest.NewRecorder()
+	h.ServeHTTP(validRec, validReq)
+	if validRec.Code != http.StatusOK {
+		t.Fatalf("valid auth while throttled status = %d, want 200", validRec.Code)
+	}
+}
+
+// TestRunServer_WarnsOnIPv6Slash64WithoutSecret pins that an IPv6 /64 allowlist
+// without -echo-secret triggers the wide-prefix warning (a /64 covers 2^64
+// addresses vs MaxClientSeries=1024).
+func TestRunServer_WarnsOnIPv6Slash64WithoutSecret(t *testing.T) {
+	InitMetrics()
+	var buf bytes.Buffer
+	orig := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	defer slog.SetDefault(orig)
+
+	allow, err := ParseAllowlist("2001:db8:1:2::/64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_ = RunServer(ctx, "127.0.0.1:0", "test", allow, "")
+	if !strings.Contains(buf.String(), "wide client allowlist prefix without -echo-secret") {
+		t.Fatalf("expected wide-prefix warning for IPv6 /64 without secret, got logs: %s", buf.String())
 	}
 }

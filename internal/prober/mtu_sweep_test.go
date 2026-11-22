@@ -2,6 +2,8 @@ package prober
 
 import (
 	"context"
+	"encoding/binary"
+	"log/slog"
 	"net"
 	"os"
 	"sync"
@@ -139,5 +141,112 @@ func TestMTUSweep_CancelledSendIsNotLost(t *testing.T) {
 	}
 	if got := wbCounterLabels(MTUProbesLost, src, name, addr); got != 0 {
 		t.Fatalf("a cancelled send must not count a lost probe, lost=%v", got)
+	}
+}
+
+type cancelOnFinalStepConn struct {
+	cancel  context.CancelFunc
+	header  int
+	writes  int
+	seqs    []uint64
+	lastReq []byte
+}
+
+func (c *cancelOnFinalStepConn) Write(p []byte) (int, error) {
+	c.writes++
+	c.lastReq = append(c.lastReq[:0], p...)
+	c.seqs = append(c.seqs, binary.LittleEndian.Uint64(p[8:16]))
+	return len(p), nil
+}
+
+func (c *cancelOnFinalStepConn) Read(p []byte) (int, error) {
+	// Answer the MaxPayloadBytes check? No — fail it so binary search starts,
+	// answer payload=0 check, answer mid=MaxPayloadBytes/2, then cancel on
+	// the very last binary-search iteration (when payload == MaxPayloadBytes-1
+	// or once lo==hi is reached). Simplest: fail MaxPayloadBytes, pass 0,
+	// then pass every mid EXCEPT when payload == 1, where we cancel on read!
+	// Wait: with lo=1, hi=MaxPayloadBytes-1: if every mid fails, binary search
+	// steps down to lo=1, hi=1 -> mid=1. Cancelling when payload==1 cancels on
+	// the exact final iteration!
+	payload := len(c.lastReq) - c.header
+	if payload == 0 {
+		return copy(p, c.lastReq), nil
+	}
+	if payload == 1 {
+		c.cancel()
+		return 0, os.ErrDeadlineExceeded
+	}
+	return 0, os.ErrDeadlineExceeded
+}
+
+func (c *cancelOnFinalStepConn) Close() error                     { return nil }
+func (c *cancelOnFinalStepConn) LocalAddr() net.Addr              { return nil }
+func (c *cancelOnFinalStepConn) RemoteAddr() net.Addr             { return nil }
+func (c *cancelOnFinalStepConn) SetDeadline(time.Time) error      { return nil }
+func (c *cancelOnFinalStepConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *cancelOnFinalStepConn) SetWriteDeadline(time.Time) error { return nil }
+
+// TestMTUSweep_CancelOnFinalStepDoesNotPublishPartialMTU pins that cancelling
+// during the last binary-search iteration returns ok=false instead of publishing
+// an incomplete best payload size.
+func TestMTUSweep_CancelOnFinalStepDoesNotPublishPartialMTU(t *testing.T) {
+	InitMetrics()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	m := newTargetMetrics("test", Target{Name: "mtu_final_cancel", Address: "192.0.2.3:4000"})
+	conn := &cancelOnFinalStepConn{cancel: cancel, header: PayloadSize}
+	cfg := Config{BaseTimeout: 5 * time.Millisecond}
+
+	largest, ok := sweepOnce(ctx, conn, cfg, m, &probeLoopState{})
+	if ok || largest != -1 {
+		t.Fatalf("cancelled final-step sweep returned (%d, %v), want (-1, false)", largest, ok)
+	}
+}
+
+// TestMTUSweep_SeqDisjointFromMainLoop pins that MTU sweep sequences sit in the
+// upper half of uint64 so they never collide with runEchoLoop's 1..N sequences
+// in echoDupGuard on Windows's coarse clock tick.
+func TestMTUSweep_SeqDisjointFromMainLoop(t *testing.T) {
+	InitMetrics()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	m := newTargetMetrics("test", Target{Name: "mtu_seq_base", Address: "192.0.2.4:4000"})
+	conn := &cancelOnFinalStepConn{cancel: cancel, header: PayloadSize}
+	cfg := Config{BaseTimeout: 5 * time.Millisecond}
+
+	sweepOnce(ctx, conn, cfg, m, &probeLoopState{})
+	if len(conn.seqs) == 0 {
+		t.Fatal("expected at least one probe written")
+	}
+	for i, s := range conn.seqs {
+		if s < (1 << 63) {
+			t.Fatalf("MTU seq[%d] = %d overlaps low main-loop sequence space", i, s)
+		}
+	}
+}
+
+// TestMTUSweep_PanicIsolated verifies that a panic inside runMTUSweep is
+// recovered and recorded in ProberInternalErrors instead of crashing the agent.
+func TestMTUSweep_PanicIsolated(t *testing.T) {
+	InitMetrics()
+	origDial := dialUDP
+	dialUDP = func(context.Context, string, string) (net.Conn, error) {
+		panic("injected dial panic in mtu sweep")
+	}
+	defer func() { dialUDP = origDial }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tg := Target{Name: "mtu_panic", Address: "192.0.2.5:4000"}
+	m := newTargetMetrics("test", tg)
+	before := wbCounterLabels(ProberInternalErrors, "test", tg.Name, tg.Address, "panic")
+
+	runMTUSweep(ctx, tg, Config{Source: "test", BaseTimeout: time.Second, MTUSweep: time.Minute}, m, &probeLoopState{}, slog.Default())
+
+	after := wbCounterLabels(ProberInternalErrors, "test", tg.Name, tg.Address, "panic")
+	if after != before+1 {
+		t.Fatalf("internal panic counter = %v, want %v", after, before+1)
 	}
 }

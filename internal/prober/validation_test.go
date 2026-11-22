@@ -233,3 +233,44 @@ func TestConfigValidate_PendingWindow(t *testing.T) {
 		})
 	}
 }
+
+// TestValidateTarget_HexPrefixDNSNameAccepted pins that valid DNS names whose
+// first label happens to start with 0x are not misclassified as hex IP literals.
+func TestValidateTarget_HexPrefixDNSNameAccepted(t *testing.T) {
+	if err := ValidateTarget("0xdeadbeef.internal:4000"); err != nil {
+		t.Fatalf("valid DNS name starting with 0x rejected: %v", err)
+	}
+	if err := ValidateTarget("0xdeadbeef:4000"); err == nil {
+		t.Fatal("bare hex IP literal 0xdeadbeef:4000 must still be rejected")
+	}
+}
+
+// TestConfigValidate_MaxProbeInterval pins the upper bound on BaseInterval and
+// per-target Interval so absurd durations (e.g. 9999999h) are rejected at load.
+func TestConfigValidate_MaxProbeInterval(t *testing.T) {
+	base := Config{
+		Targets:      []Target{{Name: "a", Address: "127.0.0.1:4000"}},
+		BaseInterval: 25 * time.Hour,
+		BaseTimeout:  time.Second,
+	}
+	if err := base.Validate(); err == nil {
+		t.Fatal("BaseInterval > 24h must be rejected")
+	}
+	perTarget := Config{
+		Targets:      []Target{{Name: "a", Address: "127.0.0.1:4000", Interval: 25 * time.Hour}},
+		BaseInterval: time.Second,
+		BaseTimeout:  time.Second,
+	}
+	if err := perTarget.Validate(); err == nil {
+		t.Fatal("per-target Interval > 24h must be rejected")
+	}
+}
+
+// TestTargetUnmarshalJSON_RejectsUnknownFields pins that typos like "timout"
+// fail LoadTargets instead of silently falling back to global defaults.
+func TestTargetUnmarshalJSON_RejectsUnknownFields(t *testing.T) {
+	p := writeTempTargets(t, `[{"name":"a","address":"127.0.0.1:4000","timout":"5s"}]`)
+	if _, err := LoadTargets(p); err == nil {
+		t.Fatal("expected LoadTargets to reject unknown JSON field 'timout'")
+	}
+}

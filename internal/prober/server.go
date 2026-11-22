@@ -294,10 +294,11 @@ const (
 	fnvPrime64  = 1099511628211
 )
 
-// dupRingSize bounds the echo-loop guard's memory: a fixed 8192-entry
+// dupRingSize bounds the echo-loop guard's memory: a fixed 65536-entry
 // FIFO ring of 64-bit frame identities plus a membership map, so the
-// guard costs well under 1MB no matter how fast dup frames arrive.
-const dupRingSize = 8192
+// guard stays bounded (~2MB) while outlasting multi-second bursts even near
+// MaxPktsGlobal.
+const dupRingSize = 65536
 
 // echoDupGuard remembers the identities of recently echoed frames so the
 // responder can refuse to echo the same frame twice. Without it, one
@@ -392,7 +393,7 @@ func RunServer(ctx context.Context, addr string, source string, allowed *Allowli
 				if p.Bits() >= 24 {
 					continue
 				}
-			} else if p.Bits() >= 64 {
+			} else if p.Bits() > 64 {
 				continue
 			}
 			slog.Warn("wide client allowlist prefix without -echo-secret: anyone able to spoof a source inside it can reflect probes off this server; set -echo-secret", "prefix", p.String())

@@ -45,11 +45,40 @@ const (
 	daclReadBits  = 0x0001 | 0x0008 | 0x0080 | 0x00020000 | 0x80000000 | 0x10000000
 )
 
+// isNonGrantACEType reports Windows ACE types that only deny, audit, alarm, or
+// carry metadata labels rather than granting access. Every other ACE type —
+// including ACCESS_ALLOWED (0x00), ACCESS_ALLOWED_COMPOUND (0x04),
+// ACCESS_ALLOWED_OBJECT (0x05), ACCESS_ALLOWED_CALLBACK (0x09),
+// ACCESS_ALLOWED_CALLBACK_OBJECT (0x0B), and any unknown future ACE type — is
+// treated as a grant so the policy fails closed.
+func isNonGrantACEType(t uint8) bool {
+	switch t {
+	case 0x01, // ACCESS_DENIED_ACE_TYPE
+		0x02, // SYSTEM_AUDIT_ACE_TYPE
+		0x03, // SYSTEM_ALARM_ACE_TYPE
+		0x06, // ACCESS_DENIED_OBJECT_ACE_TYPE
+		0x07, // SYSTEM_AUDIT_OBJECT_ACE_TYPE
+		0x08, // SYSTEM_ALARM_OBJECT_ACE_TYPE
+		0x0A, // ACCESS_DENIED_CALLBACK_ACE_TYPE
+		0x0C, // ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE
+		0x0D, // SYSTEM_AUDIT_CALLBACK_ACE_TYPE
+		0x0E, // SYSTEM_ALARM_CALLBACK_ACE_TYPE
+		0x0F, // SYSTEM_AUDIT_CALLBACK_OBJECT_ACE_TYPE
+		0x10, // SYSTEM_ALARM_CALLBACK_OBJECT_ACE_TYPE
+		0x11, // SYSTEM_MANDATORY_LABEL_ACE_TYPE
+		0x12, // SYSTEM_RESOURCE_ATTRIBUTE_ACE_TYPE
+		0x13, // SYSTEM_SCOPED_POLICY_ID_ACE_TYPE
+		0x14, // SYSTEM_PROCESS_TRUST_LABEL_ACE_TYPE
+		0x15: // SYSTEM_ACCESS_FILTER_ACE_TYPE
+		return true
+	}
+	return false
+}
+
 // trustedDACLViolation evaluates the projected ACEs against the policy. A nil
 // DACL (no protection at all) is a violation whenever a rule is requested.
-// Unknown/deny-only ACEs are not treated as grants; an allow-type ACE that is
-// not the plain ACCESS_ALLOWED type still contributes its mask with an
-// unknown SID, so it fails closed rather than being skipped.
+// Non-grant ACEs (deny/audit/label) are ignored; every allow-type or unknown
+// ACE type is evaluated as a grant so it fails closed rather than being skipped.
 func trustedDACLViolation(NULLDACL bool, aces []daclACE, trusted map[string]bool, opts TrustOptions) error {
 	bits := uint32(0)
 	what := ""
@@ -68,9 +97,7 @@ func trustedDACLViolation(NULLDACL bool, aces []daclACE, trusted map[string]bool
 		return fmt.Errorf("has no DACL (every local user has full access); restrict it to SYSTEM, Administrators and this account")
 	}
 	for _, ace := range aces {
-		// 0x00 ACCESS_ALLOWED and 0x05 ACCESS_ALLOWED_OBJECT are grants.
-		// Deny (0x01) and audit (0x02) ACEs only reduce access.
-		if ace.Type != 0x00 && ace.Type != 0x05 {
+		if isNonGrantACEType(ace.Type) {
 			continue
 		}
 		if ace.Mask&bits == 0 {

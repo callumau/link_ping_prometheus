@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"log/slog"
+	"net"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -174,6 +175,18 @@ func MetricsAuth(user, pass string, next http.Handler) http.Handler {
 	// unauthenticated scanner must not be able to flood the log. The
 	// counter still records every failure.
 	var lastAuthLog atomic.Int64
+	const (
+		authFailWindow   = time.Minute
+		authFailBurstMax = 60
+		authFailTableCap = 1024
+	)
+	type failBucket struct {
+		windowStart int64
+		count       int
+	}
+	var failMu sync.Mutex
+	failMap := make(map[string]failBucket)
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		u, p, ok := r.BasicAuth()
 		// Hash before comparing: ConstantTimeCompare returns immediately on
@@ -184,6 +197,31 @@ func MetricsAuth(user, pass string, next http.Handler) http.Handler {
 			now := time.Now().UnixNano()
 			if last := lastAuthLog.Load(); now-last >= int64(time.Minute) && lastAuthLog.CompareAndSwap(last, now) {
 				slog.Warn("metrics auth failed (further failures logged at most once per minute)", "remote", r.RemoteAddr)
+			}
+			host := r.RemoteAddr
+			if h, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+				host = h
+			}
+			throttled := false
+			failMu.Lock()
+			b, exists := failMap[host]
+			if !exists && len(failMap) >= authFailTableCap {
+				clear(failMap)
+			}
+			if !exists || now-b.windowStart >= int64(authFailWindow) {
+				b = failBucket{windowStart: now, count: 1}
+			} else {
+				b.count++
+				if b.count > authFailBurstMax {
+					throttled = true
+				}
+			}
+			failMap[host] = b
+			failMu.Unlock()
+			if throttled {
+				w.Header().Set("Retry-After", "60")
+				http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+				return
 			}
 			w.Header().Set("WWW-Authenticate", `Basic realm="metrics"`)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)

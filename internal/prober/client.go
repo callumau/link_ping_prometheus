@@ -83,7 +83,9 @@ func (t *Target) UnmarshalJSON(data []byte) error {
 		Timeout  json.RawMessage `json:"timeout"`
 	}
 	var r raw
-	if err := json.Unmarshal(data, &r); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&r); err != nil {
 		return err
 	}
 	t.Name = r.Name
@@ -419,7 +421,9 @@ func RunClient(ctx context.Context, cfg Config) error {
 		delete(live, name)
 		r.cancel()
 		// Bounded join: probeTarget exits promptly on cancel (its own
-		// retry waits are at most 1s). A slow exit must not block a reload.
+		// retry waits are at most 1s). A slow exit must not block a reload,
+		// and a process shutdown (ctx.Done) must not wait sequentially per
+		// target.
 		select {
 		case <-r.done:
 			if purge {
@@ -427,6 +431,8 @@ func RunClient(ctx context.Context, cfg Config) error {
 				cfg.Status.Remove(name)
 			}
 			return true
+		case <-ctx.Done():
+			return false
 		case <-time.After(stragglerStopTimeout):
 			slog.Warn("Removed target probe loop did not stop in time", "target", name, "timeout", stragglerStopTimeout)
 			return false
@@ -439,18 +445,27 @@ func RunClient(ctx context.Context, cfg Config) error {
 	// them, still the same endpoint), new targets start fresh. targets must
 	// already be validated (LoadTargets and Config.Validate both do).
 	apply := func(targets []Target) {
+		if ctx.Err() != nil {
+			return
+		}
 		desired = targets
 		want := make(map[string]Target, len(targets))
 		for _, tg := range targets {
 			want[tg.Name] = tg
 		}
 		for name, r := range live {
+			if ctx.Err() != nil {
+				return
+			}
 			w, ok := want[name]
 			if ok && w.Address == r.tg.Address && w.Interval == r.tg.Interval && w.Timeout == r.tg.Timeout {
 				continue
 			}
 			// !ok means the target was removed from the file: purge it.
 			if !stop(name, !ok) {
+				if ctx.Err() != nil {
+					return
+				}
 				// The old loop did not join: it may still be alive on the same
 				// series, so a replacement must NOT be started for this name
 				// (two loops writing one target double-count sent and break the
@@ -476,6 +491,7 @@ func RunClient(ctx context.Context, cfg Config) error {
 				// exit accounting invisible, so no marker is needed there.
 				if r.tg.Address != w.Address {
 					deleteTargetSeries(cfg.Source, r.tg)
+					cfg.Status.Remove(name)
 				}
 				SeedMetrics(cfg.Source, []Target{w})
 				start(w)
@@ -632,6 +648,10 @@ func RunClient(ctx context.Context, cfg Config) error {
 		reloadTick = t.C
 	}
 	for {
+		if ctx.Err() != nil {
+			drainLive()
+			return nil
+		}
 		select {
 		case <-ctx.Done():
 			drainLive()
@@ -1044,7 +1064,9 @@ func probeTarget(ctx context.Context, t Target, cfg Config) {
 		state.linkUp = false
 		// Re-emit /status now that link_up dropped: the per-interval snapshot
 		// lives inside runEchoLoop, which just exited, so without this /status
-		// would keep reporting link_up:true through the restart pause.
+		// would keep reporting link_up:true through the restart pause. Also
+		// zero socketStart so /readyz does not stay ready during the pause.
+		state.socketStart = time.Time{}
 		emitTargetStatus(m, state, stats, stats.CurrentRTO(), 0, 0)
 		if !sleepCtx(ctx, time.Second) {
 			return
@@ -1162,19 +1184,27 @@ func runEchoLoop(
 	// window always fits by construction.
 	respCh := make(chan response, responseBufferCapacity(cfg))
 
-	// done unblocks the reader when the loop exits via panic recovery:
-	// conn.Close() frees a reader blocked on the socket, but a reader
-	// blocked pushing into a full respCh would otherwise leak until the
-	// process exits.
+	// done unblocks the reader when the loop exits (e.g. errReconnect or
+	// panic recovery) while respCh is full. Closed inside the cleanup defer
+	// BEFORE joining <-readerDone so the reader is guaranteed to exit before
+	// drainResponses() runs.
 	done := make(chan struct{})
-	defer close(done)
 
 	// readerDone is closed by the reader goroutine on ANY exit so the main
 	// loop can tell that responses are no longer being consumed and re-dial
 	// instead of probing into a void.
 	readerDone := make(chan struct{})
 
-	defer conn.Close()
+	// loopDone stops the cancel-watcher goroutine on normal exit; closing
+	// conn on ctx.Done() unblocks a stalled conn.Write immediately.
+	loopDone := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-loopDone:
+		}
+	}()
 
 	go func() {
 		defer close(readerDone)
@@ -1491,17 +1521,14 @@ func runEchoLoop(
 	}
 
 	defer func() {
-		// Close the socket FIRST and give the reader one bounded join
-		// before any accounting: the reader can be parked in its send-select
-		// or mid-parse of an already-read datagram, and an echo it pushes in
-		// AFTER the non-blocking drain below would be charged as a timeout
-		// on a probe the link actually answered — fabricated loss. conn
-		// Close unblocks its Read (net.ErrClosed), readerDone closes when
-		// the goroutine exits on any path, and the bound keeps a wedged
-		// reader from stretching any join deadline (Stop's 20s, a reload's
-		// 5s stragglerStopTimeout). The join cost is paid once per loop exit,
-		// never per event. (Deliberately also fixes the panic-recovery drain
-		// below, which runs inside this same defer.)
+		// Close the socket, stop the cancel watcher, and signal `done` FIRST,
+		// then give the reader one bounded join before any accounting: the
+		// reader can be parked in its send-select (when respCh is full) or
+		// mid-parse of an already-read datagram, and closing `done` here
+		// (instead of an outer LIFO defer) unblocks it BEFORE <-readerDone
+		// and BEFORE drainResponses() runs.
+		close(loopDone)
+		close(done)
 		// pi-lens-ignore: go-ignored-call-result
 		_ = conn.Close()
 		select {
@@ -1779,8 +1806,12 @@ func runEchoLoop(
 		// a UDP write can block when the local send buffer is saturated, and a
 		// wedged write would otherwise hang this loop — and therefore
 		// shutdown/reload — with no way out but SIGKILL.
+		writeDeadline := time.Now().Add(timeout)
+		if cd, ok := ctx.Deadline(); ok && cd.Before(writeDeadline) {
+			writeDeadline = cd
+		}
 		// pi-lens-ignore: go-ignored-call-result
-		_ = conn.SetWriteDeadline(time.Now().Add(timeout))
+		_ = conn.SetWriteDeadline(writeDeadline)
 		if _, err := conn.Write(buf); err != nil {
 			writeFails++
 			m.sendErr.Inc()

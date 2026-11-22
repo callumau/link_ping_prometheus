@@ -23,6 +23,12 @@ import (
 // connected socket on the same public frame layout, so an echo that the
 // prober did not send must not steer the search.
 func runMTUSweep(ctx context.Context, t Target, cfg Config, m targetMetrics, state *probeLoopState, logger *slog.Logger) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("Panic in MTU sweep; stopping sweep", "panic", r)
+			m.internalPanic.Inc()
+		}
+	}()
 	// NewTimer(0): the first sweep fires immediately so path_mtu_bytes
 	// is populated on startup instead of after the first full interval.
 	timer := time.NewTimer(0)
@@ -288,7 +294,11 @@ func sweepOnce(ctx context.Context, conn net.Conn, cfg Config, m targetMetrics, 
 	deadline := mtuDeadline(cfg, state)
 	headerSize := probeHeaderSize(cfg.EchoSecret)
 	buf := make([]byte, headerSize+MaxPayloadBytes)
-	var seq uint64
+	// Start in the upper half of uint64 so MTU sweep sequences never collide
+	// with runEchoLoop's 1..N sequences in echoDupGuard when both fire within
+	// the same Windows clock-quantization tick.
+	const mtuSeqBase uint64 = 1 << 63
+	seq := mtuSeqBase
 	// One reusable HMAC state for the sweep's own goroutine.
 	var mac *probeMACer
 	if cfg.EchoSecret != "" {
@@ -312,7 +322,6 @@ func sweepOnce(ctx context.Context, conn net.Conn, cfg Config, m targetMetrics, 
 		// One spelling of the wire layout, shared with the main prober:
 		// see buildProbeFrame.
 		buildProbeFrame(buf, seq, ts, payload, mac, cfg.HmacCoverage)
-		m.mtuSent.Inc()
 		// Bounded write, like every other socket-op in the sweep: a UDP
 		// send can block when the local send buffer is saturated (peer
 		// stopped reading), and the probe join at client.go's probeTarget
@@ -327,15 +336,17 @@ func sweepOnce(ctx context.Context, conn net.Conn, cfg Config, m targetMetrics, 
 		// pi-lens-ignore: go-ignored-call-result
 		_ = conn.SetWriteDeadline(writeDeadline)
 		if _, err := conn.Write(buf[:headerSize+payload]); err != nil {
-			// A cancelled probe is not a lost probe. This is the send-side
-			// twin of waitEcho's guard: counting a teardown here fabricated
-			// loss in link_mtu_probes_lost_total, the ratio operators alert
-			// on, on every mid-sweep reload.
+			// A cancelled probe is not a sent or lost probe. This is the
+			// send-side twin of waitEcho's guard: counting a teardown here
+			// fabricated loss in link_mtu_probes_lost_total, the ratio
+			// operators alert on, on every mid-sweep reload.
 			if ctx.Err() == nil {
+				m.mtuSent.Inc()
 				m.mtuLost.Inc()
 			}
 			return 0
 		}
+		m.mtuSent.Inc()
 		sent[seq] = ts
 		return seq
 	}
@@ -415,6 +426,9 @@ func sweepOnce(ctx context.Context, conn net.Conn, cfg Config, m targetMetrics, 
 		} else {
 			hi = mid - 1
 		}
+	}
+	if ctx.Err() != nil {
+		return -1, false
 	}
 	return best, true
 }
