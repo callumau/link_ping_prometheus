@@ -136,57 +136,45 @@ func main() {
 	}
 	logW := io.Writer(os.Stdout)
 	var logRepaired bool
-	if *flLogFile != "" {
-		// Enforce the 0600 invariant at the sink BEFORE either writer opens
-		// the file: O_CREATE applies the mode only at creation, the rotator
-		// re-opens pre-existing files with no mode check and copies the live
-		// file's mode onto every rotated artifact, and a symlink would
-		// redirect topology-bearing lines into another local user's file.
-		repaired, err := hardenLogSink(*flLogFile)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "harden log file %q: %v\n", *flLogFile, err)
-			os.Exit(1)
-		}
-		logRepaired = repaired
+	var logSink *countedWriter
+	// Only open/create/rotate -log-file for actual daemon/foreground runs.
+	// Service control actions (install/uninstall/start/stop) run under the
+	// caller's interactive token: opening -log-file during -svc=install
+	// creates a file owned by the installer instead of the service account,
+	// and -svc=start/stop would open the active log without FILE_SHARE_DELETE.
+	if *flLogFile != "" && (*flSvc == "" || *flSvc == "run") {
+		// Enforce the 0600 invariant at the sink and KEEP the verified
+		// descriptor/rotator directly rather than closing and re-opening by
+		// name (eliminating any TOCTOU window between check and open).
+		var fileSink io.Writer
 		if *flLogMaxSize == 0 {
-			// 0600 matches the rotator's mode: logs carry peer IPs and
-			// internal topology, so they are not world-readable. Open via the
-			// hardened helper so the sink re-checks the object it writes to
-			// (no O_NOFOLLOW-less path open, no blocking FIFO).
-			// pi-lens-ignore: go-path-traversal
-			f, err := openLogFileForRepair(*flLogFile)
+			f, _, repaired, err := openOrCreateLogFile(*flLogFile)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "open log file %q: %v\n", *flLogFile, err)
 				os.Exit(1)
 			}
 			defer f.Close()
-			// File FIRST: io.MultiWriter stops at the first error, and under
-			// the SCM the std handle can be invalid rather than a silent NUL
-			// sink — stdout-first then silently swallows every line before
-			// the file ever sees one, the exact total-log-loss the install
-			// warning exists to prevent. Console-first was only ever cosmetic.
-			logW = io.MultiWriter(f, os.Stdout)
+			logRepaired = repaired
+			fileSink = f
 		} else {
 			// Rotation is in-process (logrotate.go): every rotation re-runs
-			// the same verified open chain hardenLogSink used, so the
-			// rotation path is not a by-name reopen a log-directory writer
-			// can redirect. pi-lens-ignore: go-path-traversal
-			rot, err := newLogRotator(*flLogFile, *flLogMaxSize, *flLogMaxBackups, *flLogMaxAge)
+			// the same verified open chain, so the rotation path is not a
+			// by-name reopen a log-directory writer can redirect.
+			rot, repaired, err := newLogRotatorChecked(*flLogFile, *flLogMaxSize, *flLogMaxBackups, *flLogMaxAge)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "open log file %q: %v\n", *flLogFile, err)
 				os.Exit(1)
 			}
 			defer rot.Close()
-			logW = io.MultiWriter(rot, os.Stdout)
+			logRepaired = repaired
+			fileSink = rot
 		}
-	}
-	// Surface runtime sink failures (disk full, log dir removed): the
-	// wrapper counts write errors and run()'s watcher reports them to the
-	// event log / stderr. Wrapping once here covers both sink modes.
-	var logSink *countedWriter
-	if *flLogFile != "" {
-		logSink = newCountedWriter(logW)
-		logW = logSink
+		// Wrap ONLY the file sink before composing with os.Stdout: under the
+		// Windows SCM stdout can be an invalid handle, so wrapping the
+		// MultiWriter would count stdout errors as dead-log-file alerts.
+		// File FIRST: io.MultiWriter stops at the first error.
+		logSink = newCountedWriter(fileSink)
+		logW = io.MultiWriter(logSink, os.Stdout)
 	}
 	opts := &slog.HandlerOptions{Level: slog.LevelInfo}
 	if *flJSONLogs {

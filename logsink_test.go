@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"strings"
 	"testing"
@@ -51,6 +52,25 @@ func TestCountedWriterFailureStreak(t *testing.T) {
 	}
 	if n := sink.drainFailures(); n != 1 {
 		t.Fatalf("success must reset the streak; drain = %d, want 1", n)
+	}
+}
+
+// TestCountedWriterIsolatesFileSinkFromStdoutFailure pins that wrapping only
+// the file sink (as main.go now does) stops an invalid/closed stdout handle
+// under Windows SCM from triggering false log-sink failure alerts.
+func TestCountedWriterIsolatesFileSinkFromStdoutFailure(t *testing.T) {
+	fileSink := newCountedWriter(funcWriter(func(p []byte) (int, error) {
+		return len(p), nil
+	}))
+	badStdout := funcWriter(func(p []byte) (int, error) {
+		return 0, errors.New("invalid handle")
+	})
+	mw := io.MultiWriter(fileSink, badStdout)
+	if _, err := mw.Write([]byte("log line\n")); err == nil {
+		t.Fatal("expected MultiWriter to surface stdout error")
+	}
+	if n := fileSink.drainFailures(); n != 0 {
+		t.Fatalf("healthy file sink recorded %d failures due to stdout error, want 0", n)
 	}
 }
 

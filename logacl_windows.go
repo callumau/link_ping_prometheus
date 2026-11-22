@@ -114,33 +114,40 @@ type logACEKey struct {
 
 // reapplyLogDACL re-restricts the CURRENT live log file's DACL.
 // restrictLogDACL runs once at startup against the file that exists
-// then; after the first rotation the fresh live file is
-// created by the framework and inherits the (possibly wide) parent
-// directory DACL, silently regressing the restricted set. Called from a
+// then; after the first rotation the fresh live file inherits the
+// parent directory DACL briefly or if created externally. Called from a
 // fixed ticker so a manual install into a wide directory regains the
-// "never world-readable" invariant within one interval of each rotation.
+// "never world-readable" invariant.
 // A file that does not exist right now (mid-rotation gap) is skipped;
 // the next tick covers it once the rotator recreates it.
 func reapplyLogDACL(path string) error {
 	if path == "" {
 		return nil
 	}
-	// Open with FILE_SHARE_DELETE so the rotator can rename the
-	// live file while this short-lived recheck handle is open. os.OpenFile
-	// omits that share bit on Windows: a rename racing the recheck then
-	// fails with "process cannot access the file because it is being used
-	// by another process" (observed as a flaky rotation test, and a real
-	// window in which a rotation cannot complete). The handle needs only
-	// GENERIC_WRITE (which includes READ_CONTROL for GetSecurityInfo); the
-	// replacement itself goes through SetNamedSecurityInfo by name.
+	li, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("log DACL recheck: stat %q: %w", path, err)
+	}
+	if li.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("log DACL recheck: refusing symlinked log path %q", path)
+	}
+	if !li.Mode().IsRegular() {
+		return fmt.Errorf("log DACL recheck: refusing non-regular log path %q (%s)", path, li.Mode().Type())
+	}
+	// Open with FILE_SHARE_DELETE and FILE_FLAG_OPEN_REPARSE_POINT so we
+	// never follow a raced-in reparse point and never block rotation.
 	// pi-lens-ignore: go-path-traversal
 	name, err := windows.UTF16PtrFromString(path)
 	if err != nil {
 		return fmt.Errorf("log DACL recheck: path %q: %w", path, err)
 	}
-	h, err := windows.CreateFile(name, windows.GENERIC_WRITE,
+	h, err := windows.CreateFile(name, windows.READ_CONTROL|windows.WRITE_DAC,
 		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
-		nil, windows.OPEN_EXISTING, windows.FILE_ATTRIBUTE_NORMAL, 0)
+		nil, windows.OPEN_EXISTING,
+		windows.FILE_ATTRIBUTE_NORMAL|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -149,7 +156,20 @@ func reapplyLogDACL(path string) error {
 	}
 	f := os.NewFile(uintptr(h), path)
 	defer f.Close()
-	changed, err := restrictLogDACL(f)
+	fi, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("log DACL recheck: fstat %q: %w", path, err)
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("log DACL recheck: refusing non-regular log path %q (%s)", path, fi.Mode().Type())
+	}
+	if !os.SameFile(li, fi) {
+		return fmt.Errorf("log DACL recheck: %q changed between check and open", path)
+	}
+	if err := checkLogFileOwner(f); err != nil {
+		return fmt.Errorf("log DACL recheck %q: %w", path, err)
+	}
+	changed, err := restrictLogDACLOnHandle(f, true)
 	if err != nil {
 		return fmt.Errorf("log DACL recheck %q: %w", path, err)
 	}
@@ -239,6 +259,10 @@ func logACLSDDL(userSID string) string {
 // caller exits non-zero — fail-closed, exactly like the symlink refusal and
 // the unix chmod repair.
 func restrictLogDACL(f *os.File) (changed bool, err error) {
+	return restrictLogDACLOnHandle(f, false)
+}
+
+func restrictLogDACLOnHandle(f *os.File, hasWriteDAC bool) (changed bool, err error) {
 	user, err := windows.GetCurrentProcessToken().GetTokenUser()
 	if err != nil {
 		return false, fmt.Errorf("log DACL: read token user: %w", err)
@@ -272,7 +296,39 @@ func restrictLogDACL(f *os.File) (changed bool, err error) {
 	if err != nil {
 		return false, fmt.Errorf("log DACL: extract restricted ACL: %w", err)
 	}
-	if err := windows.SetNamedSecurityInfo(f.Name(), windows.SE_FILE_OBJECT,
+	targetHandle := windows.Handle(f.Fd())
+	if !hasWriteDAC {
+		// f was opened via os.OpenFile (O_WRONLY without WRITE_DAC). Open a
+		// WRITE_DAC handle with FILE_FLAG_OPEN_REPARSE_POINT and verify
+		// os.SameFile against f before mutating the DACL on the handle,
+		// avoiding a by-name SetNamedSecurityInfo race/reparse follow.
+		fi, serr := f.Stat()
+		if serr != nil {
+			return false, fmt.Errorf("log DACL: stat open file: %w", serr)
+		}
+		name, nerr := windows.UTF16PtrFromString(f.Name())
+		if nerr != nil {
+			return false, fmt.Errorf("log DACL: path %q: %w", f.Name(), nerr)
+		}
+		wh, werr := windows.CreateFile(name, windows.READ_CONTROL|windows.WRITE_DAC,
+			windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+			nil, windows.OPEN_EXISTING,
+			windows.FILE_ATTRIBUTE_NORMAL|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+		if werr != nil {
+			return false, fmt.Errorf("log DACL: open %q for WRITE_DAC: %w", f.Name(), werr)
+		}
+		wf := os.NewFile(uintptr(wh), f.Name())
+		defer wf.Close()
+		wfi, wserr := wf.Stat()
+		if wserr != nil {
+			return false, fmt.Errorf("log DACL: fstat %q: %w", f.Name(), wserr)
+		}
+		if !os.SameFile(fi, wfi) {
+			return false, fmt.Errorf("log DACL: %q changed before DACL write; refusing", f.Name())
+		}
+		targetHandle = windows.Handle(wf.Fd())
+	}
+	if err := windows.SetSecurityInfo(targetHandle, windows.SE_FILE_OBJECT,
 		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
 		nil, nil, dacl, nil); err != nil {
 		return false, fmt.Errorf("log DACL: apply restricted ACL to %q: %w", f.Name(), err)

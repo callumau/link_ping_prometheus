@@ -36,14 +36,14 @@ func checkLogFileOwner(f *os.File) error {
 		return fmt.Errorf("log owner: read owner: %w", err)
 	}
 	if sd == nil {
-		return nil
+		return fmt.Errorf("log owner: security descriptor is nil")
 	}
 	owner, _, err := sd.Owner()
 	if err != nil {
 		return fmt.Errorf("log owner: decode owner: %w", err)
 	}
 	if owner == nil {
-		return nil
+		return fmt.Errorf("log owner: file has no owner")
 	}
 	switch owner.String() {
 	case logACLSystemSID, logACLAdministratorsSID, user.User.Sid.String():

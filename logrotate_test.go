@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -111,5 +112,87 @@ func TestLogRotatorCloseIsIdempotent(t *testing.T) {
 	}
 	if _, err := r.Write([]byte("x")); err == nil {
 		t.Fatal("write after close must fail")
+	}
+}
+
+// TestLogRotatorRecoversAfterTransientRotationFailure pins that a transient
+// rename failure (such as Windows ERROR_SHARING_VIOLATION from an AV scanner
+// or log shipper) does not permanently close the log sink.
+func TestLogRotatorRecoversAfterTransientRotationFailure(t *testing.T) {
+	dir := t.TempDir()
+	r, path := newTestRotator(t, dir, 16, 2)
+	var failRename bool
+	r.renameFn = func(oldpath, newpath string) error {
+		if failRename {
+			return errors.New("simulated sharing violation")
+		}
+		return os.Rename(oldpath, newpath)
+	}
+
+	if _, err := r.Write([]byte("0123456789abcdef\n")); err != nil {
+		t.Fatalf("initial write: %v", err)
+	}
+	failRename = true
+	if _, err := r.Write([]byte("trigger-fail\n")); err == nil {
+		t.Fatal("expected rotation error when rename fails")
+	}
+	failRename = false
+	if _, err := r.Write([]byte("recovered-line\n")); err != nil {
+		t.Fatalf("write after transient rename failure failed: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read live log: %v", err)
+	}
+	if !strings.Contains(string(data), "recovered-line") {
+		t.Fatalf("live log missing recovered line: %q", data)
+	}
+}
+
+// TestLogRotatorSameMillisecondBackupsDoNotCollide pins that bursty rotations
+// within the same millisecond get distinct backup names instead of overwriting.
+func TestLogRotatorSameMillisecondBackupsDoNotCollide(t *testing.T) {
+	dir := t.TempDir()
+	r, path := newTestRotator(t, dir, 8, 10)
+	fixed := time.Date(2026, 2, 3, 4, 5, 6, 789_000_000, time.UTC)
+	r.now = func() time.Time { return fixed }
+
+	for i := 0; i < 4; i++ {
+		if _, err := r.Write([]byte("0123456789\n")); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+	if got := backupsFor(t, path); len(got) != 3 {
+		t.Fatalf("expected 3 distinct same-millisecond backups, got %d (%v)", len(got), got)
+	}
+}
+
+// TestLogRotatorPrunesByMaxAge pins age-based backup pruning (including
+// same-millisecond deduplicated backups).
+func TestLogRotatorPrunesByMaxAge(t *testing.T) {
+	dir := t.TempDir()
+	r, path := newTestRotator(t, dir, 8, 10)
+	r.maxAge = 24 * time.Hour
+
+	cur := time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)
+	r.now = func() time.Time { return cur }
+	if _, err := r.Write([]byte("first-line\n")); err != nil {
+		t.Fatal(err)
+	}
+	// Rotate at day 1 -> backup 1 (at cur=day 1).
+	if _, err := r.Write([]byte("second-line\n")); err != nil {
+		t.Fatal(err)
+	}
+	// Advance 3 days and rotate again -> backup 1 is now 3 days old (>24h) and must be pruned.
+	cur = cur.Add(72 * time.Hour)
+	if _, err := r.Write([]byte("third-line\n")); err != nil {
+		t.Fatal(err)
+	}
+	got := backupsFor(t, path)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 fresh backup after age prune, got %d (%v)", len(got), got)
+	}
+	if !strings.Contains(got[0], "2026-02-04") {
+		t.Fatalf("wrong backup survived age prune: %v", got)
 	}
 }

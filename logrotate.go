@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -35,16 +36,25 @@ type logRotator struct {
 	maxAge     time.Duration
 	f          *os.File
 	size       int64
-	// now is a seam for tests; zero means time.Now.
-	now func() time.Time
+	closed     bool
+	// now and renameFn are seams for tests; zero means time.Now / os.Rename.
+	now      func() time.Time
+	renameFn func(oldpath, newpath string) error
 }
 
 // newLogRotator opens (creating if needed) the log path with the verified
 // chain and returns a writer that rotates it.
 func newLogRotator(path string, maxMB, maxBackups, maxAgeDays int) (*logRotator, error) {
-	f, size, _, err := openOrCreateLogFile(path)
+	r, _, err := newLogRotatorChecked(path, maxMB, maxBackups, maxAgeDays)
+	return r, err
+}
+
+// newLogRotatorChecked opens (creating if needed) the log path with the
+// verified chain, reporting whether an existing file's permissions were repaired.
+func newLogRotatorChecked(path string, maxMB, maxBackups, maxAgeDays int) (*logRotator, bool, error) {
+	f, size, repaired, err := openOrCreateLogFile(path)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	r := &logRotator{
 		path:       path,
@@ -56,7 +66,7 @@ func newLogRotator(path string, maxMB, maxBackups, maxAgeDays int) (*logRotator,
 	if maxAgeDays > 0 {
 		r.maxAge = time.Duration(maxAgeDays) * 24 * time.Hour
 	}
-	return r, nil
+	return r, repaired, nil
 }
 
 func (r *logRotator) clock() time.Time {
@@ -72,8 +82,17 @@ func (r *logRotator) clock() time.Time {
 func (r *logRotator) Write(p []byte) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.f == nil {
+	if r.closed {
 		return 0, os.ErrClosed
+	}
+	if r.f == nil {
+		// Recover lazily from a previous transient rotation/reopen failure
+		// instead of leaving file logging dead for the rest of the process.
+		f, size, _, err := openOrCreateLogFile(r.path)
+		if err != nil {
+			return 0, err
+		}
+		r.f, r.size = f, size
 	}
 	if r.maxBytes > 0 && r.size > 0 && r.size+int64(len(p)) > r.maxBytes {
 		if err := r.rotateLocked(); err != nil {
@@ -88,6 +107,7 @@ func (r *logRotator) Write(p []byte) (int, error) {
 func (r *logRotator) Close() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.closed = true
 	if r.f == nil {
 		return nil
 	}
@@ -100,14 +120,27 @@ func (r *logRotator) Close() error {
 // The caller holds r.mu.
 func (r *logRotator) rotateLocked() error {
 	clock := r.clock()
-	if err := r.f.Close(); err != nil {
-		return fmt.Errorf("close log file before rotation: %w", err)
-	}
+	closeErr := r.f.Close()
 	r.f = nil
 	r.size = 0
-	backup := r.backupPath(clock)
+	if closeErr != nil {
+		if f, size, _, err := openOrCreateLogFile(r.path); err == nil {
+			r.f, r.size = f, size
+		}
+		return fmt.Errorf("close log file before rotation: %w", closeErr)
+	}
+	backup := r.uniqueBackupPath(clock)
+	rename := r.renameFn
+	if rename == nil {
+		rename = os.Rename
+	}
 	// pi-lens-ignore: go-path-traversal (operator-supplied -log-file path)
-	if err := os.Rename(r.path, backup); err != nil {
+	if err := rename(r.path, backup); err != nil {
+		// Reopen the existing verified file so logging survives a transient
+		// rename failure (e.g., Windows ERROR_SHARING_VIOLATION).
+		if f, size, _, rerr := openOrCreateLogFile(r.path); rerr == nil {
+			r.f, r.size = f, size
+		}
 		return fmt.Errorf("rotate log file: %w", err)
 	}
 	// O_EXCL: anything that appeared at the path between the rename and this
@@ -127,6 +160,34 @@ func (r *logRotator) backupPath(t time.Time) string {
 	return fmt.Sprintf("%s.%s", r.path, t.UTC().Format("2006-01-02T15-04-05.000"))
 }
 
+// uniqueBackupPath avoids overwriting an existing backup on bursty
+// same-millisecond rotations or backward wall-clock steps.
+func (r *logRotator) uniqueBackupPath(t time.Time) string {
+	base := r.backupPath(t)
+	if _, err := os.Lstat(base); errors.Is(err, os.ErrNotExist) {
+		return base
+	}
+	for i := 1; i <= 1000; i++ {
+		cand := fmt.Sprintf("%s.%d", base, i)
+		if _, err := os.Lstat(cand); errors.Is(err, os.ErrNotExist) {
+			return cand
+		}
+	}
+	return base
+}
+
+func parseBackupTimestamp(suffix string) (time.Time, error) {
+	if ts, err := time.ParseInLocation("2006-01-02T15-04-05.000", suffix, time.UTC); err == nil {
+		return ts, nil
+	}
+	if dot := strings.LastIndexByte(suffix, '.'); dot > 0 {
+		if n, err := strconv.Atoi(suffix[dot+1:]); err == nil && n > 0 {
+			return time.ParseInLocation("2006-01-02T15-04-05.000", suffix[:dot], time.UTC)
+		}
+	}
+	return time.Time{}, errors.New("not a backup timestamp")
+}
+
 // pruneLocked removes backups beyond -log-file-max-backups and older than
 // -log-file-max-age. Best effort: a failed prune must not break logging.
 func (r *logRotator) pruneLocked(clock time.Time) {
@@ -144,13 +205,18 @@ func (r *logRotator) pruneLocked(clock time.Time) {
 		if e.IsDir() || !strings.HasPrefix(e.Name(), base) {
 			continue
 		}
-		ts, err := time.ParseInLocation("2006-01-02T15-04-05.000", strings.TrimPrefix(e.Name(), base), time.UTC)
+		ts, err := parseBackupTimestamp(strings.TrimPrefix(e.Name(), base))
 		if err != nil {
 			continue // not one of ours
 		}
 		backups = append(backups, backup{name: e.Name(), ts: ts})
 	}
-	sort.Slice(backups, func(i, j int) bool { return backups[i].ts.After(backups[j].ts) })
+	sort.Slice(backups, func(i, j int) bool {
+		if !backups[i].ts.Equal(backups[j].ts) {
+			return backups[i].ts.After(backups[j].ts)
+		}
+		return backups[i].name > backups[j].name
+	})
 	for i, b := range backups {
 		tooMany := r.maxBackups > 0 && i >= r.maxBackups
 		tooOld := r.maxAge > 0 && clock.Sub(b.ts) > r.maxAge
@@ -164,17 +230,20 @@ func (r *logRotator) pruneLocked(clock time.Time) {
 // openOrCreateLogFile opens the configured path with the verified chain,
 // creating it 0600 (and DACL-restricted on Windows) when absent.
 func openOrCreateLogFile(path string) (*os.File, int64, bool, error) {
-	li, err := os.Lstat(path)
-	if err != nil {
+	for attempt := 0; attempt < 4; attempt++ {
+		li, err := os.Lstat(path)
+		if err == nil {
+			return openVerifiedLogFile(path, li)
+		}
 		if !errors.Is(err, os.ErrNotExist) {
 			return nil, 0, false, err
 		}
 		// pi-lens-ignore: go-path-traversal (operator-supplied -log-file path)
 		f, err := createLogFile(path)
 		if errors.Is(err, os.ErrExist) {
-			// Raced with another creator: fall back to the existing-file
-			// path so its type/owner/DACL checks decide, never this branch.
-			return openOrCreateLogFile(path)
+			// Raced with another creator: retry via the existing-file path
+			// so its type/owner/DACL checks decide, never this branch.
+			continue
 		}
 		if err != nil {
 			return nil, 0, false, err
@@ -193,7 +262,7 @@ func openOrCreateLogFile(path string) (*os.File, int64, bool, error) {
 		}
 		return f, fi.Size(), changed, nil
 	}
-	return openVerifiedLogFile(path, li)
+	return nil, 0, false, fmt.Errorf("log file %q changed concurrently during open", path)
 }
 
 // openVerifiedLogFile binds the provenance decision to the descriptor the
