@@ -57,11 +57,8 @@ WantedBy=multi-user.target
 		t.Fatalf("write unit: %v", err)
 	}
 	t.Cleanup(func() {
-		// pi-lens-ignore: go-ignored-call-result (teardown best-effort)
 		_, _ = sudo("", "systemctl", "stop", svcUnit)
-		// pi-lens-ignore: go-ignored-call-result (teardown best-effort)
 		_, _ = sudo("", "rm", "-f", unitPath)
-		// pi-lens-ignore: go-ignored-call-result (teardown best-effort)
 		_, _ = sudo("", "systemctl", "daemon-reload")
 	})
 

@@ -9,7 +9,6 @@ import (
 // In-package tests: they read the unexported srtt/rttvar/rto fields
 // directly, which is why the AdaptiveStats state has no accessor API.
 
-// pi-lens-ignore: go-test-functions
 func TestAdaptiveStats_Logic(t *testing.T) {
 	stats := NewAdaptiveStats(1 * time.Second)
 
@@ -44,7 +43,6 @@ func TestAdaptiveStats_Logic(t *testing.T) {
 // consecutive timeouts is the recovery mechanism that lets the RTO adapt
 // up when no successful measurements arrive (RFC 6298). It must double
 // only after the first timeout in a series and clamp at DefaultMaxRTO.
-// pi-lens-ignore: go-test-functions
 func TestAdaptiveStats_BackoffClampedAndConsecutive(t *testing.T) {
 	stats := NewAdaptiveStats(1 * time.Second)
 
@@ -89,7 +87,6 @@ func TestAdaptiveStats_BackoffClampedAndConsecutive(t *testing.T) {
 // RTT (2*SRTT, minimum 200ms) so a link whose RTT approaches a fixed
 // floor does not suffer spurious timeouts. A ~150ms link gets ~300ms RTO,
 // not 200ms; a quiet LAN stays at the 200ms minimum.
-// pi-lens-ignore: go-test-functions
 func TestAdaptiveStats_DynamicFloor(t *testing.T) {
 	stats := NewAdaptiveStats(10 * time.Millisecond)
 	if r := stats.CurrentRTO(); r != DefaultMinRTO {
@@ -98,7 +95,6 @@ func TestAdaptiveStats_DynamicFloor(t *testing.T) {
 
 	stats.Update(0.150)
 	for range 25 {
-		// pi-lens-ignore: gorm-n-plus-one
 		stats.Update(0.150)
 	}
 	if r := stats.CurrentRTO(); r < 300*time.Millisecond {
@@ -110,7 +106,6 @@ func TestAdaptiveStats_DynamicFloor(t *testing.T) {
 
 	stats.Update(0.010)
 	for range 25 {
-		// pi-lens-ignore: gorm-n-plus-one
 		stats.Update(0.010)
 	}
 	if r := stats.CurrentRTO(); r != DefaultMinRTO {
@@ -149,7 +144,6 @@ func TestAdaptiveStats_ConvergenceTracksTrueMeanAndFloorHoldsEveryStep(t *testin
 	}
 }
 
-// pi-lens-ignore: go-test-functions
 func TestAdaptiveStats_RTOFloorAndGranularity(t *testing.T) {
 	// Hard floor: even a tiny base timeout must clamp to 200ms.
 	stats := NewAdaptiveStats(10 * time.Millisecond)
@@ -161,7 +155,6 @@ func TestAdaptiveStats_RTOFloorAndGranularity(t *testing.T) {
 	// RTTVAR decays below G/4, so the clock granularity term takes over.
 	stats.Update(0.050)
 	for range 25 {
-		// pi-lens-ignore: gorm-n-plus-one
 		stats.Update(0.050)
 	}
 	wantG := 0.050 + DefaultClockGranularity.Seconds()
@@ -183,7 +176,6 @@ func TestAdaptiveStats_RTOFloorAndGranularity(t *testing.T) {
 // forever after a 0s reading, so every later estimate was computed with
 // the first-sample formula against a bogus baseline. Pinned via
 // haveSample.
-// pi-lens-ignore: go-test-functions
 func TestAdaptiveStats_ZeroRTTSampleUsesSmoothing(t *testing.T) {
 	stats := NewAdaptiveStats(time.Second)
 	stats.Update(0) // first real sample is 0s
@@ -202,7 +194,6 @@ func TestAdaptiveStats_ZeroRTTSampleUsesSmoothing(t *testing.T) {
 	}
 }
 
-// pi-lens-ignore: go-test-functions
 func TestAdaptiveStats_SRTTAccessor(t *testing.T) {
 	// SRTT is 0 before the first measurement, then follows the EWMA.
 	stats := NewAdaptiveStats(time.Second)

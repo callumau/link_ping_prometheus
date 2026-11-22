@@ -438,7 +438,7 @@ groups:
         expr: >-
           (increase(link_server_probes_dropped_total{reason="replay"}[10m])
               > 0)
-          and on (source) (link_up == 1)
+          and on (source) (max by (source) (link_up) == 1)
         for: 5m
         labels:
           severity: warning

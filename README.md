@@ -63,6 +63,19 @@ Every option runs the same binary and flags;
 [deployment](docs/deployment.md) covers choosing one. Synchronize clocks on
 every node: the HMAC replay window is ±30s.
 
+## Code signing policy
+
+**Free code signing provided by [SignPath.io](https://about.signpath.io),
+certificate by [SignPath Foundation](https://signpath.org).**
+
+Windows releases are Authenticode-signed once the project's SignPath
+application is approved; before that they are unsigned. Linux and macOS
+releases are covered by the keyless cosign signature and SLSA attestation over
+`checksums.txt`. Signing scope, team roles, the build process and the privacy
+policy are in [CODE_SIGNING_POLICY.md](CODE_SIGNING_POLICY.md); the technical
+options and how to verify a signature are in
+[release signing](docs/release-signing.md).
+
 ## Usage
 
 ```sh

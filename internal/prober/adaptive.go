@@ -11,19 +11,9 @@ type AdaptiveStats struct {
 	rttvar              float64
 	rto                 float64
 	consecutiveTimeouts int
-	// seed is the operator's configured timeout (-timeout, or the
-	// per-target override) this estimator started from. It is the floor of
-	// the backoff CEILING: DefaultMaxRTO caps the growth of a normal link,
-	// but it must never cap the configured timeout itself. NewAdaptiveStats
-	// used to be clamped at 3s by the very first CurrentRTO() call, so on a
-	// path whose real RTT exceeds 3s no first sample could ever arrive —
-	// SRTT stayed 0, RTO stayed 3s, every probe read as loss forever, and
-	// no warning fired (the only one requires !Adaptive).
+	// seed is the configured -timeout; DefaultMaxRTO caps backoff growth, never the seed itself.
 	seed time.Duration
-	// haveSample distinguishes "no RTT measurement yet" from a real 0s
-	// sample. The old srtt==0 sentinel made a legitimate sub-nanosecond
-	// loopback RTT re-enter the first-sample branch on every Update,
-	// pinning SRTT/RTTVAR to the first-sample formula forever.
+	// haveSample distinguishes "no RTT yet" from a legitimate 0s loopback RTT.
 	haveSample bool
 }
 
@@ -58,36 +48,19 @@ func (a *AdaptiveStats) Update(rttSeconds float64) {
 	a.rto = a.srtt + math.Max(DefaultClockGranularity.Seconds(), 4*a.rttvar)
 }
 
-// Backoff doubles the RTO, clamped to maxRTO() (DefaultMaxRTO, or the
-// configured -timeout when that is larger). Called after
-// consecutive timeouts. RFC 6298 applies doubling to retransmitted
-// segments so the RTO can adapt up even while no successful measurements
-// are arriving (e.g. a latency jump above the current RTO); without it a
-// degraded link would never recover from a too-small timeout. The first
-// timeout in a series does not double; every subsequent consecutive
-// timeout doubles, so a sustained outage can never push RTO beyond the
-// clamp.
+// Backoff doubles the effective RTO on consecutive timeouts (from the 2nd
+// timeout onward), clamped to maxRTO().
 func (a *AdaptiveStats) Backoff() {
 	a.consecutiveTimeouts++
 	if a.consecutiveTimeouts > 1 {
-		// Double the EFFECTIVE timeout, not the raw a.rto. The loop applies
-		// CurrentRTO(), whose dynamic floor max(DefaultMinRTO, 2*SRTT) can
-		// sit above a.rto on a low-SRTT link; doubling only a.rto would
-		// leave the floor in charge, so the applied timeout would barely
-		// move (a 350ms step would need ~9 timeout batches instead of 2)
-		// and a degraded link could never climb back above its real RTT.
+		// Double the effective timeout (including the 2*SRTT floor) so a
+		// step increase in link RTT climbs above the real RTT in minimal steps.
 		floor := math.Max(DefaultMinRTO.Seconds(), 2*a.srtt)
 		a.rto = math.Min(math.Max(a.rto, floor)*2, a.maxRTO())
 	}
 }
 
-// maxRTO is the ceiling applied to the RTO value: DefaultMaxRTO, raised to
-// the configured -timeout when that is larger. The cap exists to bound
-// BACKOFF (a sustained outage must not push the timeout toward infinity);
-// applying it to the operator's own seed silently rewrote -timeout to 3s
-// under -adaptive, which contradicts AGENTS.md/docs/promql.md ("a fixed
-// -timeout above 3s is also allowed") and left a >3s-RTT path unable to
-// ever produce its first sample. The dynamic floor below is unaffected.
+// maxRTO returns the backoff ceiling: max(DefaultMaxRTO, configured -timeout).
 func (a *AdaptiveStats) maxRTO() float64 {
 	if seed := a.seed.Seconds(); seed > DefaultMaxRTO.Seconds() {
 		return seed
@@ -95,24 +68,18 @@ func (a *AdaptiveStats) maxRTO() float64 {
 	return DefaultMaxRTO.Seconds()
 }
 
-// CurrentRTO returns the RTO as a time.Duration. The floor is dynamic:
-// max(DefaultMinRTO, 2*SRTT). A fixed floor like 200ms is too tight on links
-// whose RTT approaches it (e.g. ~185ms links), causing spurious timeouts and
-// loss inflation; flooring at twice the smoothed RTT guarantees the timeout
-// always has real headroom over the measured RTT while the 200ms minimum still
-// guards LAN links against jitter.
-//
-// DefaultMaxRTO caps the BACKOFF value, not the floor: on a link whose SRTT
-// exceeds 1.5s the applied timeout is 2*SRTT and therefore above 3s. Capping
-// the floor would reintroduce exactly the spurious timeouts it exists to
-// prevent (a 2s-RTT satellite link), so the floor wins by design —
-// link_rto_seconds documents it and RTT samples above the 3s bucket edge land
-// in +Inf on such links. Capping the SEED (see maxRTO) would be worse still:
-// it discards the operator's -timeout, so a path slower than 3s never
-// bootstraps at all.
+// maxAppliedRTOSec caps the applied RTO at 24h to keep Duration conversion within int64.
+const maxAppliedRTOSec = 24 * 60 * 60
+
+// CurrentRTO returns the effective RTO: max(DefaultMinRTO, 2*SRTT, min(rto, maxRTO)).
+// The 2*SRTT floor is uncapped by DefaultMaxRTO so high-RTT links (SRTT > 1.5s)
+// are not falsely timed out.
 func (a *AdaptiveStats) CurrentRTO() time.Duration {
 	floor := math.Max(DefaultMinRTO.Seconds(), 2*a.srtt)
 	val := math.Max(math.Min(a.rto, a.maxRTO()), floor)
+	if val > maxAppliedRTOSec {
+		val = maxAppliedRTOSec
+	}
 	return time.Duration(val * float64(time.Second))
 }
 

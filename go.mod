@@ -2,12 +2,16 @@ module link_ping_prometheus
 
 go 1.26.0
 
-toolchain go1.27.3
+toolchain go1.27.4
 
 require (
 	github.com/prometheus/client_golang v1.25.0
 	github.com/prometheus/client_model v0.6.3
-	gopkg.in/natefinch/lumberjack.v2 v2.2.1
+)
+
+require (
+	github.com/akavel/rsrc v0.10.2 // indirect
+	github.com/josephspurrier/goversioninfo v1.7.0 // indirect
 )
 
 require (
@@ -19,3 +23,5 @@ require (
 	golang.org/x/sys v0.48.0
 	google.golang.org/protobuf v1.36.12 // indirect
 )
+
+tool github.com/josephspurrier/goversioninfo/cmd/goversioninfo

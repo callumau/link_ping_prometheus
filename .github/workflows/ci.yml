@@ -29,10 +29,24 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
-          go-version: "1.27.3"
+          go-version: "1.27.4"
           # No action cache: a poisoned cache is a supply-chain vector,
           # and this project's deps are few enough to fetch per run.
           cache: false
+
+      # The binary consumes -metrics-tls-key/-metrics-tls-cert and a
+      # LINK_PING_* credential env file, and its live targets file is
+      # per-host. None of those may be tracked: the audit found a live
+      # targets.json still retrievable from history after it was untracked,
+      # and untracking does not remove the blob. This is the forward guard.
+      - name: Reject live configuration and key material
+        run: |
+          set -eu
+          if git ls-files | grep -Eq '(^|/)(targets\.json|dev_push\.sh|\.env[^/]*|credentials[^/]*)$|\.(key|pem|p12|pfx)$'; then
+            echo '::error::live configuration or key material is tracked in this commit'
+            git ls-files | grep -E '(^|/)(targets\.json|dev_push\.sh|\.env[^/]*|credentials[^/]*)$|\.(key|pem|p12|pfx)$'
+            exit 1
+          fi
 
       - name: Vet
         run: go vet ./...
@@ -57,7 +71,7 @@ jobs:
       # The Ansible playbooks ship to fleet hosts but CI never parsed them, so
       # a task naming a module that does not exist could sit here unnoticed —
       # it did: playbook.yml used ansible.windows.win_script, which exists in
-      # no collection, so the Windows play's Environment-key ACL step (the one
+      # no collection, so the Windows play's Environment-value step (the one
       # that stops every local user reading the HMAC secret) would have failed
       # at run time. --syntax-check resolves module FQCNs, so the
       # ansible.windows collection must be installed; ansible-core and the
@@ -72,6 +86,101 @@ jobs:
           for pb in deploy/ansible/playbook.yml deploy/ansible/mesh.yml; do
             .venv-ansible/bin/ansible-playbook --syntax-check "$pb"
           done
+          .venv-ansible/bin/python - <<'PY'
+          import subprocess, tempfile, yaml, os
+
+          # Exercise the real pre-flight guardrail tasks from both playbooks
+          # against ansible-core 2.17.6 on localhost so Jinja2 / assert
+          # regressions fail CI rather than shipping to fleet hosts.
+          cases = [
+              ("valid_tls", True, {
+                  "link_ping_metrics_user": "prom",
+                  "link_ping_metrics_pass": "pw",
+                  "link_ping_extra_args": "-metrics-tls-cert=/a -metrics-tls-key=/b",
+              }),
+              ("half_tls_cert_only", False, {
+                  "link_ping_metrics_user": "prom",
+                  "link_ping_metrics_pass": "pw",
+                  "link_ping_extra_args": "-metrics-tls-cert=/a",
+              }),
+              ("allow_insecure_false", False, {
+                  "link_ping_metrics_user": "prom",
+                  "link_ping_metrics_pass": "pw",
+                  "link_ping_extra_args": "-metrics-allow-insecure=false",
+              }),
+              ("half_basic_auth", False, {
+                  "link_ping_metrics_user": "prom",
+                  "link_ping_metrics_pass": "",
+                  "link_ping_extra_args": "-metrics-allow-insecure",
+              }),
+              ("orphan_echo_secret_old", False, {
+                  "link_ping_echo_secret": "",
+                  "link_ping_echo_secret_old": "old-secret-123456",
+              }),
+          ]
+
+          for pb_path in ["deploy/ansible/playbook.yml", "deploy/ansible/mesh.yml"]:
+              with open(pb_path) as f:
+                  plays = yaml.safe_load(f)
+              for play_idx, play in enumerate(plays):
+                  guard_tasks = []
+                  for task in play["tasks"]:
+                      inc = task.get("ansible.builtin.include_tasks") or task.get("include_tasks")
+                      inc_file = inc.get("file") if isinstance(inc, dict) else inc
+                      if (
+                          "ansible.builtin.file" in task
+                          or "ansible.windows.win_file" in task
+                          or "ansible.builtin.copy" in task
+                          or (inc is not None and inc_file != "tasks/guardrails.yml")
+                      ):
+                          break
+                      guard_tasks.append(task)
+                  for cname, expect_ok, overrides in cases:
+                      base_vars = {
+                          "link_ping_mode": "both",
+                          "link_ping_allow": "192.0.2.1",
+                          "link_ping_allow_from_targets": True,
+                          "link_ping_metrics_listen": "127.0.0.1:2112",
+                          "link_ping_metrics_user": "",
+                          "link_ping_metrics_pass": "",
+                          "link_ping_echo_secret": "",
+                          "link_ping_echo_secret_old": "",
+                          "link_ping_extra_args": "",
+                          "link_ping_site_name": "syd",
+                          "link_ping_mesh_peers": [{"name": "syd", "address": "192.0.2.1:4000"}],
+                          "link_ping_config_repo": "",
+                      }
+                      base_vars.update(overrides)
+                      test_play = [{
+                          "hosts": "localhost",
+                          "connection": "local",
+                          "gather_facts": False,
+                          "vars": base_vars,
+                          "tasks": guard_tasks,
+                      }]
+                      with tempfile.NamedTemporaryFile(
+                          "w",
+                          dir="deploy/ansible",
+                          prefix=".ci-guard-",
+                          suffix=".yml",
+                          delete=False,
+                      ) as tf:
+                          yaml.safe_dump(test_play, tf)
+                          tpath = tf.name
+                      try:
+                          res = subprocess.run(
+                              [".venv-ansible/bin/ansible-playbook", "-i", "localhost,", tpath],
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                          )
+                          ok = (res.returncode == 0)
+                          if ok != expect_ok:
+                              raise AssertionError(
+                                  f"{pb_path} play#{play_idx} case={cname}: got ok={ok}, want {expect_ok}\n{res.stdout}"
+                              )
+                      finally:
+                          os.unlink(tpath)
+          print("Ansible guardrail assertions verified")
+          PY
 
       # The mesh config-pull scripts are shipped but never executed in CI, so
       # they otherwise get zero machine checking. `sh -n` covers the POSIX
@@ -79,7 +188,9 @@ jobs:
       # parser below, which reports syntax errors without running a single
       # statement (it never touches a deploy key or the network).
       - name: Validate shell script syntax
-        run: sh -n deploy/mesh/pull-config.sh
+        run: |
+          sh -n deploy/mesh/pull-config.sh
+          sh -n installer/windows/sign-windows.sh
 
       - name: Validate PowerShell scripts
         shell: pwsh
@@ -192,14 +303,20 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
-          go-version: "1.27.3"
+          go-version: "1.27.4"
           cache: false
 
       - name: Run Tests (race detector)
-        # LPP_E2E_WINDOWS_INSTALL=1 runs the CI-safe install/config/uninstall
-        # half of the Windows service e2e. LPP_E2E_WINDOWS is deliberately NOT
-        # set: the SCM start/stop lifecycle dies pre-dispatch under LocalSystem
-        # (1053) on hosted runners and stays manual (see docs/development.md).
+        # Both Windows service e2e halves run here: install/config/uninstall
+        # (LPP_E2E_WINDOWS_INSTALL) and the full SCM start/stop lifecycle plus
+        # credential env-delivery (LPP_E2E_WINDOWS). The start/stop half was
+        # gated for years on a "1053 pre-dispatch" theory; when it was finally
+        # run on this runner it passed, and the failures that had kept it gated
+        # were bugs in the test itself (metrics auth over plaintext without
+        # -metrics-allow-insecure, and a drop-series assertion that could never
+        # match). Do not re-gate without a fresh runner log showing a real
+        # dispatch failure.
         env:
           LPP_E2E_WINDOWS_INSTALL: "1"
+          LPP_E2E_WINDOWS: "1"
         run: go test -count=1 -race -timeout 30m -v ./...

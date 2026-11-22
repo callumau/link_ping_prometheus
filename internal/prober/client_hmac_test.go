@@ -70,7 +70,6 @@ func runProbeTargetFor(t *testing.T, tg Target, cfg Config, d time.Duration) {
 		probeTarget(ctx, tg, cfg)
 		close(done)
 	}()
-	// pi-lens-ignore: go-time-sleep-test
 	time.Sleep(d)
 	cancel()
 	select {
@@ -85,7 +84,6 @@ func runProbeTargetFor(t *testing.T, tg Target, cfg Config, d time.Duration) {
 // echoes — RTT samples appear, nothing times out, and the server counts
 // the probes. This is the only test that proves the client frame is 32
 // bytes with a valid truncated tag.
-// pi-lens-ignore: go-test-functions
 func TestClientHMAC_HealthyEcho(t *testing.T) {
 	InitMetrics()
 
@@ -121,7 +119,6 @@ func TestClientHMAC_HealthyEcho(t *testing.T) {
 // the server's, every frame fails tag validation. The server must drop
 // them (hmac drop reason) and the client must see pure loss — a bad tag
 // must never be accepted as a valid echo.
-// pi-lens-ignore: go-test-functions
 func TestClientHMAC_WrongSecretRejected(t *testing.T) {
 	InitMetrics()
 
@@ -157,7 +154,6 @@ func TestClientHMAC_WrongSecretRejected(t *testing.T) {
 // PayloadSizeWithHMAC (32), not PayloadSize (24); if the reader compared
 // from the wrong offset it would flag every valid echo as corrupted and
 // observe no RTT. Pins that offset for the first time.
-// pi-lens-ignore: go-test-functions
 func TestClientHMAC_WithPayload(t *testing.T) {
 	InitMetrics()
 
@@ -194,7 +190,6 @@ func TestClientHMAC_WithPayload(t *testing.T) {
 // it and echoes unmodified, and the reader verifies under the coverage the
 // client sent with — RTT samples appear, nothing times out, and the echo
 // is not flagged corrupted.
-// pi-lens-ignore: go-test-functions
 func TestClientHMAC_FullFrameCoverage(t *testing.T) {
 	InitMetrics()
 

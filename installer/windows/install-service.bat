@@ -17,7 +17,7 @@ setlocal EnableExtensions
 ::   - Binary placed in %ProgramFiles%\link_ping_prometheus (Admins-only write)
 ::   - ACL-hardened log dir; per-service SID granted write access to it only
 ::   - Credentials NEVER persisted into the service config (env vars instead)
-::   - The credential Environment key is ACL-restricted to SYSTEM/Admins
+::   - The SCM Environment value lives on the ACL-restricted service key
 ::   - Lifecycle/fatal events go to the Windows Event Log
 ::
 :: Re-running on an existing installation performs an in-place UPGRADE:
@@ -33,6 +33,7 @@ set "EXE_PATH=%~dp0link_ping_prometheus.exe"
 set "INSTALL_DIR=%ProgramFiles%\link_ping_prometheus"
 set "DEF_METRICS=127.0.0.1:2112"
 set "DEF_LOG_DIR=C:\ProgramData\link_ping_prometheus\logs"
+set "DATA_DIR=C:\ProgramData\link_ping_prometheus"
 :: -----------------------------------------------------------------------------
 
 :: --- 1. Admin check ----------------------------------------------------------
@@ -125,6 +126,11 @@ echo.
 :wiz_mode
 set "RUN_MODE="
 set /p "RUN_MODE=Mode - server, client, or both [both]: "
+call :RejectQuoteAmp RUN_MODE
+if errorlevel 1 (
+    echo   ERROR: mode cannot contain a double-quote or ampersand.
+    goto :wiz_mode
+)
 if "%RUN_MODE%"=="" set "RUN_MODE=both"
 if /i "%RUN_MODE%"=="server" goto :mode_ok
 if /i "%RUN_MODE%"=="client" goto :mode_ok
@@ -156,7 +162,13 @@ set "SINGLE_TARGET="
 echo What should the client half probe?
 echo   [1] A targets JSON file (multiple targets, name+address pairs)
 echo   [2] A single host:port endpoint
+set "TGT_CHOICE="
 set /p "TGT_CHOICE=Choice [1]: "
+call :RejectQuoteAmp TGT_CHOICE
+if errorlevel 1 (
+    echo   ERROR: choice cannot contain a double-quote or ampersand.
+    goto :wiz_targets
+)
 if "%TGT_CHOICE%"=="" set "TGT_CHOICE=1"
 if /i "%TGT_CHOICE%"=="2" goto :wiz_single
 
@@ -207,6 +219,8 @@ REM Server half fail-closes without an allowlist - this is not optional.
 if /i "%RUN_MODE%"=="client" goto :wiz_logdir
 
 :wiz_allow
+set "ALLOW_TRIES=0"
+:wiz_allow_loop
 set "ALLOW_LIST="
 echo Client IP allowlist - IPs of probers allowed to send probes TO this node.
 echo Fail-closed: the echo server REFUSES to start without at least one IP.
@@ -216,11 +230,16 @@ call :RejectQuoteAmp ALLOW_LIST
 if errorlevel 1 (
     echo   ERROR: the allowlist cannot contain a double-quote or ampersand -
     echo   those characters cannot be delivered safely through quoting below.
-    goto :wiz_allow
+    goto :wiz_allow_loop
 )
 if "%ALLOW_LIST%"=="" (
+    set /a ALLOW_TRIES+=1
     echo   REQUIRED: cannot be empty - see error above.
-    goto :wiz_allow
+    if %ALLOW_TRIES% GEQ 10 (
+        echo   ERROR: too many empty allowlist attempts; aborting.
+        exit /b 1
+    )
+    goto :wiz_allow_loop
 )
 
 :wiz_logdir
@@ -255,6 +274,163 @@ REM the start below now reports that failure non-zero.
 REM Passwordless identities (LocalSystem/LocalService/NetworkService/gMSA)
 REM only.
 
+:wiz_tls
+set "TLS_CERT="
+set "TLS_KEY="
+set "ALLOW_INSECURE="
+echo.
+echo Optional metrics TLS pair (recommended when enabling Basic auth; Enter to skip).
+set /p "TLS_CERT=Metrics TLS certificate path [skip]: "
+call :RejectQuoteAmp TLS_CERT
+if errorlevel 1 (
+    echo   ERROR: the path cannot contain a double-quote or ampersand.
+    goto :wiz_tls
+)
+if "%TLS_CERT%"=="" goto :wiz_allow_insecure
+if "%TLS_CERT:~-1%"=="\" set "TLS_CERT=%TLS_CERT:~0,-1%"
+if not exist "%TLS_CERT%" (
+    echo   File not found: "%TLS_CERT%"
+    goto :wiz_tls
+)
+:wiz_tls_key
+set "TLS_KEY="
+set /p "TLS_KEY=Metrics TLS private key path (REQUIRED with certificate): "
+call :RejectQuoteAmp TLS_KEY
+if errorlevel 1 (
+    echo   ERROR: the path cannot contain a double-quote or ampersand.
+    goto :wiz_tls_key
+)
+if "%TLS_KEY%"=="" (
+    echo   REQUIRED: -metrics-tls-cert requires -metrics-tls-key.
+    goto :wiz_tls
+)
+if "%TLS_KEY:~-1%"=="\" set "TLS_KEY=%TLS_KEY:~0,-1%"
+if not exist "%TLS_KEY%" (
+    echo   File not found: "%TLS_KEY%"
+    goto :wiz_tls_key
+)
+goto :wiz_creds_start
+
+:wiz_allow_insecure
+set /p "ALLOW_INSECURE=Allow Basic auth over plaintext HTTP (-metrics-allow-insecure)? [y/N]: "
+call :RejectQuoteAmp ALLOW_INSECURE
+if errorlevel 1 (
+    echo   ERROR: choice cannot contain a double-quote or ampersand.
+    goto :wiz_allow_insecure
+)
+
+:wiz_creds_start
+:: Credential environment variables (optional) ----------------------------------
+:: The service reads LINK_PING_METRICS_USER/PASS, LINK_PING_ECHO_SECRET and
+:: LINK_PING_ECHO_SECRET_OLD (rotation window) from its process environment. The
+:: SCM builds that environment from the REG_MULTI_SZ VALUE named Environment on
+:: the service key (a same-named SUBKEY is ignored), and the key is protected
+:: before the value is written. Press Enter to skip any value you do not need.
+echo.
+echo === Optional credential environment variables (Enter to skip) ===
+
+:wiz_muser
+set "MUser="
+set /p "MUser=Metrics basic-auth user: "
+call :RejectQuoteAmp MUser
+if errorlevel 1 (
+    echo   ERROR: the value cannot contain a double-quote or ampersand -
+    echo   those characters cannot be delivered safely through quoting below.
+    goto :wiz_muser
+)
+powershell -NoProfile -InputFormat None -Command "if ($env:MUser -match ':') { exit 1 } else { exit 0 }" <nul >nul 2>&1
+if errorlevel 1 (
+    echo   ERROR: the metrics username cannot contain a colon - HTTP Basic
+    echo   authentication splits user:pass at the first colon, so the agent
+    echo   rejects it at startup and the service would exit 1 on every start.
+    goto :wiz_muser
+)
+if "%MUser%"=="" goto :wiz_mpass
+:wiz_mpass
+set "MPass="
+set /p "MPass=Metrics basic-auth password: "
+call :RejectQuoteAmp MPass
+if errorlevel 1 (
+    echo   ERROR: the value cannot contain a double-quote or ampersand -
+    echo   those characters cannot be delivered safely through quoting below.
+    goto :wiz_mpass
+)
+if "%MUser%"=="" if not "%MPass%"=="" (
+    echo   ERROR: password without a username is a half-pair - the binary
+    echo   requires BOTH metrics credentials or NEITHER. Starting over:
+    echo   press Enter at the username prompt to skip metrics auth.
+    goto :wiz_muser
+)
+if "%MUser%"=="" if "%MPass%"=="" goto :wiz_esecret
+if not "%MPass%"=="" goto :wiz_esecret
+echo   The password is required together with the username. Re-enter both:
+echo   press Enter at the username prompt to skip metrics auth.
+goto :wiz_muser
+:wiz_esecret
+set "ESecret="
+set /p "ESecret=Echo HMAC secret: "
+call :RejectQuoteAmp ESecret
+if errorlevel 1 (
+    echo   ERROR: the value cannot contain a double-quote or ampersand -
+    echo   those characters cannot be delivered safely through quoting below.
+    goto :wiz_esecret
+)
+if "%ESecret%"=="" goto :wiz_esecretold
+call :CheckSecretLength ESecret
+if not errorlevel 1 goto :wiz_esecretold
+echo   ERROR: the echo HMAC secret must be at least 16 characters - it is
+echo   the key material for HMAC-SHA256 probe authentication, and a short
+echo   value is brute-forceable. Generate one with:
+echo     powershell -NoProfile -InputFormat None -Command "-join ((48..57)+(97..122) | Get-Random -Count 32 | %% {[char]$_}^)"
+goto :wiz_esecret
+:wiz_esecretold
+set "ESecretOld="
+set /p "ESecretOld=Echo HMAC secret (previous, for rotation; Enter to skip): "
+call :RejectQuoteAmp ESecretOld
+if errorlevel 1 (
+    echo   ERROR: the value cannot contain a double-quote or ampersand -
+    echo   those characters cannot be delivered safely through quoting below.
+    goto :wiz_esecretold
+)
+if "%ESecretOld%"=="" goto :wiz_creds_done
+if "%ESecret%"=="" if not "%ESecretOld%"=="" (
+    echo   ERROR: a previous secret without a current one is invalid - the
+    echo   binary's rotation guard refuses it and the service would exit at
+    echo   startup. Re-enter the current secret, or press Enter at both
+    echo   secret prompts to skip HMAC authentication.
+    goto :wiz_esecret
+)
+call :CheckSecretLength ESecretOld
+if errorlevel 1 (
+    echo   ERROR: the previous echo HMAC secret must also be at least 16 characters.
+    goto :wiz_esecretold
+)
+:wiz_creds_done
+
+:: Render INSTALL_ARGS and validate transport pairing BEFORE touching disk or SCM.
+set "INSTALL_ARGS=-mode=%RUN_MODE% -metrics="%METRICS_ADDR%""
+if not "%TARGETS_FILE%"==""   set "INSTALL_ARGS=%INSTALL_ARGS% -targets="%TARGETS_FILE%""
+if not "%SINGLE_TARGET%"==""  set "INSTALL_ARGS=%INSTALL_ARGS% -target="%SINGLE_TARGET%""
+if not "%ALLOW_LIST%"==""     set "INSTALL_ARGS=%INSTALL_ARGS% -allow="%ALLOW_LIST%""
+if not "%TLS_CERT%"==""       set "INSTALL_ARGS=%INSTALL_ARGS% -metrics-tls-cert="%TLS_CERT%" -metrics-tls-key="%TLS_KEY%""
+if /i "%ALLOW_INSECURE%"=="y" set "INSTALL_ARGS=%INSTALL_ARGS% -metrics-allow-insecure"
+set "INSTALL_ARGS=%INSTALL_ARGS% -log-file="%LOG_DIR%\service.log""
+
+set "METRICS_TRANSPORT_OK="
+powershell -NoProfile -InputFormat None -Command "$a=$env:INSTALL_ARGS; $hasCert=($a -match '(?i)(?:^|\s)--?metrics-tls-cert(?:=|\s|$)'); $hasKey=($a -match '(?i)(?:^|\s)--?metrics-tls-key(?:=|\s|$)'); $hasIns=($a -match '(?i)(?:^|\s)--?metrics-allow-insecure(?:=(?:true|1|t))?(?:\s|$)'); if (($hasCert -and $hasKey) -or $hasIns) { exit 0 } else { exit 1 }" <nul >nul 2>&1
+if not errorlevel 1 set "METRICS_TRANSPORT_OK=1"
+if not "%MUser%"=="" if not "%MPass%"=="" if not defined METRICS_TRANSPORT_OK (
+    echo.
+    echo ERROR: metrics basic-auth credentials were entered, but the service arguments include
+    echo        neither -metrics-tls-cert/-metrics-tls-key nor -metrics-allow-insecure.
+    echo        The agent refuses Basic auth over plaintext HTTP, so the service would exit 1
+    echo        on every start and the SCM restart ladder would loop.
+    echo.
+    echo        Re-run the installer and configure the TLS certificate/key pair or allow plaintext HTTP.
+    echo        No credential was written and nothing was installed.
+    exit /b 1
+)
+
 echo.
 echo === Summary ================================================================
 echo   Mode           : %RUN_MODE%
@@ -265,6 +441,8 @@ if not "%TARGETS_FILE%"=="" echo   Targets file   : "%TARGETS_FILE%"
 if not "%SINGLE_TARGET%"=="" echo   Single target  : "%SINGLE_TARGET%"
 if not "%ALLOW_LIST%"==""   echo   Allow list     : "%ALLOW_LIST%"
 echo   Metrics address: "%METRICS_ADDR%"
+if not "%TLS_CERT%"=="" echo   Metrics TLS    : "%TLS_CERT%" / "%TLS_KEY%"
+if /i "%ALLOW_INSECURE%"=="y" echo   Plaintext auth : -metrics-allow-insecure
 echo   Log directory  : "%LOG_DIR%"
 if "%SERVICE_ACCOUNT%"=="" (echo   Service account: LocalSystem ^(default^)) else (echo   Service account: "%SERVICE_ACCOUNT%")
 echo   Binary         : %INSTALLED_EXE%
@@ -272,6 +450,11 @@ echo ===========================================================================
 :wiz_confirm
 set "CONFIRM="
 set /p "CONFIRM=Install with these settings? [y/N]: "
+call :RejectQuoteAmp CONFIRM
+if errorlevel 1 (
+    echo Cancelled - nothing was installed.
+    exit /b 1
+)
 if /i "%CONFIRM%"=="y" goto :confirmed
 echo Cancelled - nothing was installed.
 exit /b 1
@@ -288,12 +471,43 @@ copy /y "%EXE_PATH%" "%INSTALLED_EXE%" >nul || (
     echo ERROR: could not copy binary to "%INSTALL_DIR%"
     exit /b 1
 )
+powershell -NoProfile -InputFormat None -Command "$a=(Get-FileHash -LiteralPath $env:EXE_PATH -Algorithm SHA256).Hash; $b=(Get-FileHash -LiteralPath $env:INSTALLED_EXE -Algorithm SHA256).Hash; if ($a -ne $b) { Write-Host ('source  ' + $a); Write-Host ('install ' + $b); exit 1 }; Write-Host ('SHA256 ' + $b)" <nul || (
+    echo ERROR: "%INSTALLED_EXE%" does not match "%EXE_PATH%" after the copy - the source changed during install.
+    echo        Re-download the release and verify it with cosign before re-running.
+    exit /b 1
+)
 set "EXE_PATH=%INSTALLED_EXE%"
 
 echo === Installing %SERVICE_NAME% from "%EXE_PATH%" ===
 
 :: Log directory with restrictive ACLs -----------------------------------------
+::
+:: The ProgramData container is created and re-owned FIRST when the operator
+:: kept the default log directory. ProgramData's default ACL lets
+:: BUILTIN\Users create subdirectories, and the creator keeps implicit
+:: WRITE_DAC, so a user who created C:\ProgramData\link_ping_prometheus before
+:: this installer ran could re-grant itself access to everything below it.
+:: takeown /a forces the owner to Administrators; the icacls that follows drops
+:: inheritance and keeps SYSTEM + Administrators only. A custom log directory
+:: is left alone here: its own ACL is applied below and the installer must not
+:: seize an unrelated parent directory.
+if /i "%LOG_DIR%"=="%DEF_LOG_DIR%" call :HardenDataDir
+if errorlevel 1 exit /b 1
 if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
+:: A reparse point (junction/symlink) at the log directory would redirect the
+:: ACL rewrite and every topology-bearing log line to a target the user chose.
+:: Refuse it before takeown/icacls touches either object.
+powershell -NoProfile -InputFormat None -Command "$p=$env:LOG_DIR; if (Test-Path -LiteralPath $p) { $i=Get-Item -LiteralPath $p -Force; if ($i.Attributes -band [IO.FileAttributes]::ReparsePoint) { exit 1 } }; exit 0" <nul >nul 2>&1
+if errorlevel 1 (
+    echo ERROR: "%LOG_DIR%" is a reparse point ^(junction/symlink^).
+    echo        Refusing to rewrite the ACL of whatever it points at. Remove it
+    echo        and rerun the installer, or choose a real log directory.
+    exit /b 1
+)
+takeown /f "%LOG_DIR%" /a >nul || (
+    echo ERROR: could not take ownership of "%LOG_DIR%"
+    exit /b 1
+)
 :: SIDs (*S-1-5-18 = SYSTEM, *S-1-5-32-544 = Administrators), never the
 :: account NAMES: "Administrators" is localized ("Administratoren" on German
 :: Windows) and icacls exits 1332 on an unresolvable name, aborting the
@@ -304,19 +518,6 @@ icacls "%LOG_DIR%" /inheritance:r /grant "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(O
 )
 
 :: Install (arguments are snapshotted at install time) --------------------------
-:: Every value that can contain a space is quoted: the wizard invites an
-:: allowlist written as "10.0.0.1, 10.0.0.2" and paths under Program Files,
-:: and an unquoted space splits the argument list -- Go's flag parser then
-:: stops at the stray token, -svc=install is never seen and this script waits
-:: forever on a foreground agent instead of installing the service.
-REM (-mode is a validated literal; -metrics is free-text user input and is
-REM quoted like the other space-capable values.)
-set "INSTALL_ARGS=-mode=%RUN_MODE% -metrics="%METRICS_ADDR%""
-if not "%TARGETS_FILE%"==""  set "INSTALL_ARGS=%INSTALL_ARGS% -targets="%TARGETS_FILE%""
-if not "%SINGLE_TARGET%"=="" set "INSTALL_ARGS=%INSTALL_ARGS% -target="%SINGLE_TARGET%""
-if not "%ALLOW_LIST%"==""    set "INSTALL_ARGS=%INSTALL_ARGS% -allow="%ALLOW_LIST%""
-set "INSTALL_ARGS=%INSTALL_ARGS% -log-file="%LOG_DIR%\service.log""
-
 "%EXE_PATH%" %INSTALL_ARGS% -svc=install
 if errorlevel 1 (
     echo ERROR: service installation failed.
@@ -363,151 +564,38 @@ if not "%SERVICE_ACCOUNT%"=="" (
     del /f /q "%LOG_DIR%\service.log" >nul 2>&1
 )
 
-:: Credential environment variables (optional) ----------------------------------
-:: The service reads LINK_PING_METRICS_USER/PASS, LINK_PING_ECHO_SECRET and
-:: LINK_PING_ECHO_SECRET_OLD (rotation window) from its process environment. The
-:: per-service Environment registry key is the delivery mechanism, and it is
-:: world-readable until the ACL step below runs. Press Enter to skip any value
-:: you do not need.
-echo.
-echo === Optional credential environment variables (Enter to skip) ===
-set "ENV_KEY=HKLM\SYSTEM\CurrentControlSet\Services\%SERVICE_NAME%\Environment"
-
-:wiz_muser
-set "MUser="
-set /p "MUser=Metrics basic-auth user: "
-call :RejectQuoteAmp MUser
-if errorlevel 1 (
-    echo   ERROR: the value cannot contain a double-quote or ampersand -
-    echo   those characters cannot be delivered safely through quoting below.
-    goto :wiz_muser
-)
-if "%MUser%"=="" goto :wiz_mpass
-:wiz_mpass
-set "MPass="
-set /p "MPass=Metrics basic-auth password: "
-call :RejectQuoteAmp MPass
-if errorlevel 1 (
-    echo   ERROR: the value cannot contain a double-quote or ampersand -
-    echo   those characters cannot be delivered safely through quoting below.
-    goto :wiz_mpass
-)
-:: Pair rule mirrors resolveMetricsAuth in main.go: a half-pair (user
-:: without password or the reverse) makes the binary exit at startup and
-:: loops the SCM restart ladder, so refuse it at install time. Redirecting
-:: to :wiz_muser also lets the operator abandon metrics auth entirely:
-:: an empty username followed by an empty password stores neither.
-if "%MUser%"=="" if not "%MPass%"=="" (
-    echo   ERROR: password without a username is a half-pair - the binary
-    echo   requires BOTH metrics credentials or NEITHER. Starting over:
-    echo   press Enter at the username prompt to skip metrics auth.
-    goto :wiz_muser
-)
-if "%MUser%"=="" if "%MPass%"=="" goto :wiz_esecret
-if not "%MPass%"=="" goto :wiz_esecret
-echo   The password is required together with the username. Re-enter both:
-echo   press Enter at the username prompt to skip metrics auth.
-goto :wiz_muser
-:wiz_esecret
-set "ESecret="
-set /p "ESecret=Echo HMAC secret: "
-call :RejectQuoteAmp ESecret
-if errorlevel 1 (
-    echo   ERROR: the value cannot contain a double-quote or ampersand -
-    echo   those characters cannot be delivered safely through quoting below.
-    goto :wiz_esecret
-)
-if "%ESecret%"=="" goto :wiz_esecretold
-call :CheckSecretLength ESecret
-if not errorlevel 1 goto :wiz_esecretold
-REM Block-free error handling: the generation hint below contains parentheses,
-REM which must not sit inside a parenthesized if-block (a ")" at parse time
-REM would close the block early - the same class of hazard as a ")" in a
-REM user-typed password, which is why the ACL step below is also block-free).
-echo   ERROR: the echo HMAC secret must be at least 16 characters - it is
-echo   the key material for HMAC-SHA256 probe authentication, and a short
-echo   value is brute-forceable. Generate one with:
-echo     powershell -NoProfile -Command "-join ((48..57)+(97..122) | Get-Random -Count 32 | %% {[char]$_}^)"
-goto :wiz_esecret
-:wiz_esecretold
-set "ESecretOld="
-set /p "ESecretOld=Echo HMAC secret (previous, for rotation; Enter to skip): "
-call :RejectQuoteAmp ESecretOld
-if errorlevel 1 (
-    echo   ERROR: the value cannot contain a double-quote or ampersand -
-    echo   those characters cannot be delivered safely through quoting below.
-    goto :wiz_esecretold
-)
-if "%ESecretOld%"=="" goto :wiz_creds_done
-:: Rotation pair: the binary rejects a previous secret WITHOUT a current one
-:: (run()'s rotation guard) and the service would crash-loop the restart
-:: ladder, so refuse the half-pair at install time. Re-entering from
-:: :wiz_esecret lets the operator skip rotation entirely with Enter.
-if "%ESecret%"=="" if not "%ESecretOld%"=="" (
-    echo   ERROR: a previous secret without a current one is invalid - the
-    echo   binary's rotation guard refuses it and the service would exit at
-    echo   startup. Re-enter the current secret, or press Enter at both
-    echo   secret prompts to skip HMAC authentication.
-    goto :wiz_esecret
-)
-call :CheckSecretLength ESecretOld
-if errorlevel 1 (
-    echo   ERROR: the previous echo HMAC secret must also be at least 16 characters.
-    goto :wiz_esecretold
-)
-:wiz_creds_done
-:: A trailing backslash in a credential value would escape the closing
-:: quote of the quoted /d argument below at reg.exe's CommandLineToArgvW
-:: parse, silently mangling the stored secret while the install still
-:: reports success. Same rationale as the TARGETS_FILE/LOG_DIR strips
-:: above; a credential has no legitimate trailing backslash.
-if "%MUser:~-1%"=="\" set "MUser=%MUser:~0,-1%"
-if "%MPass:~-1%"=="\" set "MPass=%MPass:~0,-1%"
-if "%ESecret:~-1%"=="\" set "ESecret=%ESecret:~0,-1%"
-if "%ESecretOld:~-1%"=="\" set "ESecretOld=%ESecretOld:~0,-1%"
-if not "%MUser%"=="" reg add "%ENV_KEY%" /v LINK_PING_METRICS_USER /t REG_SZ /d "%MUser%" /f >nul
-if not "%MPass%"=="" reg add "%ENV_KEY%" /v LINK_PING_METRICS_PASS /t REG_SZ /d "%MPass%" /f >nul
-if not "%ESecret%"=="" reg add "%ENV_KEY%" /v LINK_PING_ECHO_SECRET /t REG_SZ /d "%ESecret%" /f >nul
-if not "%ESecretOld%"=="" reg add "%ENV_KEY%" /v LINK_PING_ECHO_SECRET_OLD /t REG_SZ /d "%ESecretOld%" /f >nul
-
-:: Restrict the credential key ------------------------------------------------
-:: The per-service Environment key inherits its ACL from ...\Services, so
-:: before this step every local user could read the plaintext metrics password
-:: and echo HMAC secret just written above. The binary cannot take them as
-:: flags - credential flags are deliberately stripped from the persisted
-:: service config - so this key ACL is the ONLY control on the secret.
-:: Inheritance is dropped (the inherited Everyone/BUILTIN\Users read goes with
-:: it) and full control is re-granted explicitly to SYSTEM and to
-:: BUILTIN\Administrators. No per-service SID grant is needed: the service
-:: process never reads this key itself - the SCM reads it as LocalSystem and
-:: injects the values into the service environment - so a custom service
-:: account is unaffected either way.
+:: Credentials go into the SCM's per-service environment ---------------------
 ::
-:: The step runs unconditionally and no-ops inside PowerShell when the key
-:: does not exist (no credential was entered, so nothing to protect; only the
-:: reg adds above ever create the key). That keeps the whole step a flat line
-:: with no parenthesized block, which matters here: a ")" inside a user-typed
-:: password would close a block at parse time. The PowerShell invocation is
-:: one physical line on purpose - a ^ inside the quoted -Command is a literal
-:: caret, not a line join. An operator can paste the identical snippet to
-:: re-apply or audit the ACL by hand.
-:: The identities are SIDs (S-1-5-18 = SYSTEM, S-1-5-32-544 = Administrators):
-:: the names are localized on non-English Windows and would not resolve.
-powershell -NoProfile -Command "$k='HKLM:\SYSTEM\CurrentControlSet\Services\%SERVICE_NAME%\Environment'; if (-not (Test-Path $k)) { exit 0 }; $a=Get-Acl $k; $a.SetAccessRuleProtection($true,$false); foreach($n in 'S-1-5-18','S-1-5-32-544'){ $sid=(New-Object System.Security.Principal.SecurityIdentifier($n)); $a.AddAccessRule((New-Object System.Security.AccessControl.RegistrySystemAccessRule($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'))) }; Set-Acl -Path $k -AclObject $a; Write-Host 'Environment key ACL restricted to SYSTEM + BUILTIN\Administrators.'"
-:: Fail loud: a credential-bearing key left world-readable is exactly the
-:: exposure this step removes, so never continue past a failed ACL.
+:: The SCM builds a service's environment from the REG_MULTI_SZ VALUE named
+:: "Environment" on the SERVICE KEY, containing "NAME=value" strings. It does
+:: NOT read an "Environment" SUBKEY, and a subkey full of REG_SZ values (what
+:: this wizard used to write) is silently ignored: the agent started with no
+:: credentials at all, so metrics auth was off and HMAC was never enabled while
+:: the operator believed both were configured.
+::
+:: Order matters: the service key inherits BUILTIN\Users read from ...\Services,
+:: so the key is protected FIRST and the value written into the protected key.
+:: The DACL carries both an inheriting pair (subkeys) and a plain pair (this
+:: key): an ACE that only inherits does not grant on the key itself.
+::
+:: Existing entries are preserved and the four names are reconciled: a value
+:: the operator cleared is REMOVED, so a retired HMAC secret does not survive in
+:: the environment. Values never touch a command line - they are read from the
+:: environment PowerShell inherited from this script.
+::
+:: One physical line on purpose: a ^ inside the quoted -Command is a literal
+:: caret, not a line join, and a ")" in a typed password would close a block.
+:: The identities are SIDs because the account names are localized.
+powershell -NoProfile -InputFormat None -Command "$ErrorActionPreference='Stop'; $k='HKLM:\SYSTEM\CurrentControlSet\Services\%SERVICE_NAME%'; $a=Get-Acl -LiteralPath $k; $a.SetSecurityDescriptorSddlForm('D:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)(A;;KA;;;SY)(A;;KA;;;BA)'); Set-Acl -LiteralPath $k -AclObject $a; $cur=(Get-ItemProperty -Path $k -Name Environment -ErrorAction SilentlyContinue).Environment; $m=[ordered]@{}; if($cur){ foreach($l in $cur){ $i=$l.IndexOf('='); if($i -gt 0){ $m[$l.Substring(0,$i)]=$l.Substring($i+1) } } }; foreach($p in @(@('LINK_PING_METRICS_USER',$env:MUser),@('LINK_PING_METRICS_PASS',$env:MPass),@('LINK_PING_ECHO_SECRET',$env:ESecret),@('LINK_PING_ECHO_SECRET_OLD',$env:ESecretOld))){ if([string]::IsNullOrEmpty($p[1])){ $m.Remove($p[0]) } else { $m[$p[0]]=$p[1] } }; if($m.Count -gt 0){ $v=@(); foreach($x in $m.Keys){ $v += ($x + '=' + $m[$x]) }; New-ItemProperty -Path $k -Name Environment -PropertyType MultiString -Value ([string[]]$v) -Force | Out-Null } else { Remove-ItemProperty -Path $k -Name Environment -ErrorAction SilentlyContinue }" <nul
 if errorlevel 1 (
-    echo ERROR: could not restrict the ACL on "%ENV_KEY%" - it may still be readable by every local user.
-    echo        Audit it with: powershell -NoProfile -Command "Get-Acl HKLM:\SYSTEM\CurrentControlSet\Services\%SERVICE_NAME%\Environment"
+    echo ERROR: could not store the credentials in the service Environment value,
+    echo        or could not restrict the service key ACL.
+    echo        Audit with:
+    echo          reg query "HKLM\SYSTEM\CurrentControlSet\Services\%SERVICE_NAME%" /v Environment
+    echo          powershell -NoProfile -InputFormat None -Command "Get-Acl 'HKLM:\SYSTEM\CurrentControlSet\Services\%SERVICE_NAME%'"
     exit /b 1
 )
-
-:: The binary refuses plaintext metrics basic auth without TLS certificates or
-:: -metrics-allow-insecure, and the service arguments this wizard renders cannot
-:: carry either flag - so wizard-delivered credentials would make the service
-:: exit at startup and the SCM restart ladder would loop forever. Warn the
-:: operator at install time instead of letting the install fail silently later.
-if not "%MUser%"=="" if not "%MPass%"=="" echo WARNING: metrics basic-auth credentials were set, but the rendered service arguments include no -metrics-tls-cert/-metrics-tls-key and no -metrics-allow-insecure - the service will exit at startup with "metrics basic auth requires TLS ... or -metrics-allow-insecure" until the service configuration gains one of them.
+echo Environment value written for %SERVICE_NAME%; SCM will inject it at service start.
 
 :: Start and verify -------------------------------------------------------------
 echo.
@@ -565,7 +653,7 @@ goto %WAIT_RUN_RESUME%
 REM The regex is written as \x22/\x26 escape sequences: a raw " or & inside
 REM the cmd-quoted -Command region would toggle cmd quoting and turn the &
 REM into a command separator (the exact hazard this guard exists for).
-powershell -NoProfile -Command "if ($env:%~1 -match '\x22|\x26') { exit 1 } else { exit 0 }" >nul 2>&1
+powershell -NoProfile -InputFormat None -Command "if ($env:%~1 -match '\x22|\x26') { exit 1 } else { exit 0 }" <nul >nul 2>&1
 exit /b %errorlevel%
 
 :: CheckSecretLength VALUEVAR
@@ -574,5 +662,34 @@ exit /b %errorlevel%
 ::   authentication; a short value is brute-forceable. PowerShell reads the
 ::   value from the environment for the same no-expansion reason as above.
 :CheckSecretLength
-powershell -NoProfile -Command "if ($env:%~1.Length -lt 16) { exit 1 } else { exit 0 }" >nul 2>&1
+powershell -NoProfile -InputFormat None -Command "if ($env:%~1.Length -lt 16) { exit 1 } else { exit 0 }" <nul >nul 2>&1
 exit /b %errorlevel%
+
+:: HardenDataDir
+::   Creates C:\ProgramData\link_ping_prometheus if absent and forces its owner
+::   to Administrators before dropping inherited ACEs. Without the takeown an
+::   owner that a local user established before the first install keeps
+::   implicit WRITE_DAC and can re-grant itself access to the log directory,
+::   the target file and (in mesh deployments) the config checkout. Called only
+::   for the default log directory, so a custom path never causes the
+::   installer to seize an unrelated parent directory.
+:HardenDataDir
+if not exist "%DATA_DIR%" mkdir "%DATA_DIR%"
+:: takeown /a and icacls operate on the TARGET of a reparse point, so a local
+:: user who pre-created this path as a junction to another directory could
+:: make an elevated install seize and rewrite that directory's ACL. Refuse.
+powershell -NoProfile -InputFormat None -Command "$p=$env:DATA_DIR; $i=Get-Item -LiteralPath $p -Force; if ($i.Attributes -band [IO.FileAttributes]::ReparsePoint) { exit 1 }; exit 0" <nul >nul 2>&1
+if errorlevel 1 (
+    echo ERROR: "%DATA_DIR%" is a reparse point ^(junction/symlink^).
+    echo        Refusing to take ownership of an unrelated target. Remove it and rerun.
+    exit /b 1
+)
+takeown /f "%DATA_DIR%" /a >nul || (
+    echo ERROR: could not take ownership of "%DATA_DIR%"
+    exit /b 1
+)
+icacls "%DATA_DIR%" /inheritance:r /grant "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" >nul || (
+    echo ERROR: failed to ACL "%DATA_DIR%"
+    exit /b 1
+)
+exit /b 0

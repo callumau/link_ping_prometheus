@@ -114,19 +114,33 @@ func isValidHost(host string) bool {
 }
 
 // isIPishToken reports whether host looks like an attempt to write an IP
-// literal rather than a DNS name: either the whole string is digits and
-// dots (dotted-decimal attempt, e.g. 1.2.3.010 or 1.2.3.999), or it starts
-// with the 0x/0X prefix (hex form, e.g. 0x0a000001). Everything else —
-// including a hostname that begins with a digit but contains letters,
-// such as 10.0.0.1.example.com — is left to the label rules.
+// literal rather than a DNS name: every dot-separated component is either
+// digits-only (dotted-decimal or bare integer, e.g. 1.2.3.010, 42) or a
+// hex literal (0x/0X prefix followed by hex digits, e.g. 0x41 or 0x1.2.3.4).
+// Everything else — including a DNS name whose first label starts with 0x,
+// such as 0xdeadbeef.internal — is left to the RFC 1123 label rules.
 func isIPishToken(host string) bool {
-	if len(host) > 2 && (host[:2] == "0x" || host[:2] == "0X") {
-		return true
+	if host == "" {
+		return false
 	}
-	for i := 0; i < len(host); i++ {
-		c := host[i]
-		if !('0' <= c && c <= '9') && c != '.' {
-			return false
+	for _, label := range strings.Split(host, ".") {
+		if label == "" {
+			continue
+		}
+		if len(label) > 2 && (label[:2] == "0x" || label[:2] == "0X") {
+			for i := 2; i < len(label); i++ {
+				c := label[i]
+				if !('0' <= c && c <= '9') && !('a' <= c && c <= 'f') && !('A' <= c && c <= 'F') {
+					return false
+				}
+			}
+			continue
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			if !('0' <= c && c <= '9') {
+				return false
+			}
 		}
 	}
 	return true

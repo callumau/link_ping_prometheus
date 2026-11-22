@@ -57,20 +57,14 @@ func TestIsPeerUnreachable(t *testing.T) {
 // hot-spinning); it still lets the reader survive many read errors, so a
 // regression treating ECONNREFUSED as a local failure would exhaust
 // maxConsecutiveReadFails and kill the reader inside the test window.
-type refuseConn struct{}
+type refuseConn struct {
+	stubConn
+}
 
 func (c *refuseConn) Read([]byte) (int, error) {
-	// pi-lens-ignore: go-time-sleep-test
 	time.Sleep(2 * time.Millisecond)
 	return 0, syscall.ECONNREFUSED
 }
-func (c *refuseConn) Write(b []byte) (int, error)      { return len(b), nil }
-func (c *refuseConn) Close() error                     { return nil }
-func (c *refuseConn) LocalAddr() net.Addr              { return nil }
-func (c *refuseConn) RemoteAddr() net.Addr             { return nil }
-func (c *refuseConn) SetDeadline(time.Time) error      { return nil }
-func (c *refuseConn) SetReadDeadline(time.Time) error  { return nil }
-func (c *refuseConn) SetWriteDeadline(time.Time) error { return nil }
 
 // TestProbeTarget_PeerUnreachableKeepsReaderAlive drives probeTarget with a
 // socket whose Read keeps reporting ECONNREFUSED: the reader must treat it
@@ -79,7 +73,6 @@ func (c *refuseConn) SetWriteDeadline(time.Time) error { return nil }
 // isPeerUnreachable always return false and the reader exits after
 // maxConsecutiveReadFails, incrementing reason="reader_dead" and re-dialing
 // once the bounded 1s pause elapses.
-// pi-lens-ignore: go-test-functions
 func TestProbeTarget_PeerUnreachableKeepsReaderAlive(t *testing.T) {
 	InitMetrics()
 
@@ -106,7 +99,6 @@ func TestProbeTarget_PeerUnreachableKeepsReaderAlive(t *testing.T) {
 	// reader (10 read failures ≈ 20ms) AND past probeTarget's 1s re-dial
 	// pause, so a regressed reader is visible both as the reader_dead
 	// counter and as a second dial.
-	// pi-lens-ignore: go-time-sleep-test
 	time.Sleep(1200 * time.Millisecond)
 
 	if got := wbCounterLabels(ProberInternalErrors, src, name, addr, "reader_dead"); got != 0 {

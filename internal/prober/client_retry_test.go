@@ -17,7 +17,6 @@ import (
 // it keeps retrying until the context is cancelled. Uses the dialUDP seam
 // instead of an unresolvable hostname so the test is deterministic and
 // has no dependency on the local resolver.
-// pi-lens-ignore: go-test-functions
 func TestProbeTargetRetriesOnDialFailure(t *testing.T) {
 	InitMetrics()
 
@@ -67,27 +66,21 @@ func TestProbeTargetRetriesOnDialFailure(t *testing.T) {
 // short delay. The reader goroutine therefore stays alive, so the test
 // exercises the persistent send-failure path rather than reader death
 // (which is covered separately with its own stub).
-type failingConn struct{}
+type failingConn struct {
+	stubConn
+}
 
 func (failingConn) Read([]byte) (int, error) {
-	// pi-lens-ignore: go-time-sleep-test
 	time.Sleep(5 * time.Millisecond)
 	return 0, os.ErrDeadlineExceeded
 }
 func (failingConn) Write([]byte) (int, error) {
 	return 0, errors.New("write udp: operation not permitted")
 }
-func (failingConn) Close() error                     { return nil }
-func (failingConn) LocalAddr() net.Addr              { return nil }
-func (failingConn) RemoteAddr() net.Addr             { return nil }
-func (failingConn) SetDeadline(time.Time) error      { return nil }
-func (failingConn) SetReadDeadline(time.Time) error  { return nil }
-func (failingConn) SetWriteDeadline(time.Time) error { return nil }
 
 // TestProbeTargetCountsSendErrors: persistent UDP write failures are
 // counted per attempt (never as sent) and drop link_up after the third
 // consecutive failure — send errors are a local fault, not network loss.
-// pi-lens-ignore: go-test-functions
 func TestProbeTargetCountsSendErrors(t *testing.T) {
 	InitMetrics()
 

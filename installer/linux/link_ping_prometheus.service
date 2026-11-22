@@ -46,9 +46,9 @@ Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=20s
 KillSignal=SIGTERM
-# Adjust user/group per distro if needed (nogroup is Debian/Ubuntu).
+# Omit Group= so systemd uses nobody's primary group (nogroup on Debian/Ubuntu,
+# nobody on RHEL/Rocky/Fedora/Arch); hardcoding Group=nogroup fails 216/GROUP there.
 User=nobody
-Group=nogroup
 StateDirectory=link-ping
 LogsDirectory=link-ping
 

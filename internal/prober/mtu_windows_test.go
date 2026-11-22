@@ -16,7 +16,6 @@ import (
 // IP_MTU_DISCOVER (Windows 10 1703+) and falls back to the classic
 // IP_DONTFRAGMENT (every Windows since XP), so pinning a readback of one slot
 // would fail on the other — the fallback IS the contract.
-// pi-lens-ignore: go-test-functions
 func TestSetDontFragment_MarksV4Socket(t *testing.T) {
 	conn, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1})
 	if err != nil {

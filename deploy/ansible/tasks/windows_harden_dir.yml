@@ -1,0 +1,31 @@
+---
+# Create (if absent), reject reparse points, take Administrators ownership,
+# and restrict DACL to SYSTEM + Administrators for each directory in
+# link_ping_win_harden_dirs.
+#
+# ProgramData's default ACL lets BUILTIN\Users create subdirectories (and
+# CREATOR OWNER gives the creator full control), so a local user who
+# pre-creates a directory keeps implicit WRITE_DAC and can re-grant itself
+# access. Principals are named by SID because account names are localized.
+
+- name: Create and restrict Windows directory
+  ansible.windows.win_shell: |
+    $ErrorActionPreference = 'Stop'
+    $d = '{{ link_ping_harden_dir }}'
+    if (-not (Test-Path -LiteralPath $d)) {
+        New-Item -ItemType Directory -Path $d | Out-Null
+    }
+    $it = Get-Item -LiteralPath $d -Force
+    if ($it.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        throw ("$d is a reparse point (junction/symlink); refusing to " +
+               "take ownership and rewrite the ACL of whatever it " +
+               "points at")
+    }
+    takeown.exe /f "$d" /a | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "takeown failed on $d ($LASTEXITCODE)" }
+    icacls.exe "$d" /inheritance:r /grant "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "icacls failed on $d ($LASTEXITCODE)" }
+  loop: "{{ link_ping_win_harden_dirs }}"
+  loop_control:
+    loop_var: link_ping_harden_dir
+  changed_when: false

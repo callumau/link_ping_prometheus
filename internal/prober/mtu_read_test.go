@@ -3,7 +3,6 @@ package prober
 import (
 	"context"
 	"errors"
-	"net"
 	"os"
 	"sync/atomic"
 	"testing"
@@ -15,6 +14,7 @@ import (
 // sleeping peer: the whole point is which queued datagrams are accepted and
 // which are skipped.
 type scriptedReadConn struct {
+	stubConn
 	frames [][]byte
 	calls  atomic.Int64
 }
@@ -26,14 +26,6 @@ func (c *scriptedReadConn) Read(p []byte) (int, error) {
 	}
 	return copy(p, c.frames[i]), nil
 }
-
-func (c *scriptedReadConn) Write(b []byte) (int, error)      { return len(b), nil }
-func (c *scriptedReadConn) Close() error                     { return nil }
-func (c *scriptedReadConn) LocalAddr() net.Addr              { return nil }
-func (c *scriptedReadConn) RemoteAddr() net.Addr             { return nil }
-func (c *scriptedReadConn) SetDeadline(time.Time) error      { return nil }
-func (c *scriptedReadConn) SetReadDeadline(time.Time) error  { return nil }
-func (c *scriptedReadConn) SetWriteDeadline(time.Time) error { return nil }
 
 // dfFrameFull builds a well-formed echo frame of the given total size with the
 // given seq and ts, appending tag when non-nil (HMAC frames are 8 bytes
@@ -296,6 +288,7 @@ func TestReadEcho_VerifiesHMACFullFrameTag(t *testing.T) {
 // re-arm without ever letting an arm expire, so the only exit was the
 // absolute RTO deadline.
 type fakeDatagramConn struct {
+	stubConn
 	calls atomic.Int64
 }
 
@@ -308,14 +301,6 @@ func (c *fakeDatagramConn) Read(p []byte) (int, error) {
 	}
 	return 25, nil
 }
-
-func (c *fakeDatagramConn) Write(p []byte) (int, error)       { return len(p), nil }
-func (c *fakeDatagramConn) Close() error                      { return nil }
-func (c *fakeDatagramConn) LocalAddr() net.Addr               { return nil }
-func (c *fakeDatagramConn) RemoteAddr() net.Addr              { return nil }
-func (c *fakeDatagramConn) SetDeadline(time.Time) error       { return nil }
-func (c *fakeDatagramConn) SetWriteDeadline(time.Time) error  { return nil }
-func (c *fakeDatagramConn) SetReadDeadline(t time.Time) error { return nil }
 
 // TestReadEchoCancellationBoundedByDatagramStream pins the audit fix: a
 // foreign-datagram stream that never lets a read arm expire must not

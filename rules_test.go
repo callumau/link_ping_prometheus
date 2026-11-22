@@ -63,19 +63,9 @@ func TestREADME_FlagsTableAndBucketsMatchCode(t *testing.T) {
 	}
 }
 
-// TestStatusEndpointIsGatedLikeMetrics: /status exposes live link state and
-// peer addresses, so it must carry the same Basic auth as /metrics; /healthz
-// and /readyz stay open for orchestrators. Pins the wiring in
-// startMetricsServer, not just the MetricsAuth handler in isolation.
-
-// TestRulesAndDashboardReferenceOnlyDefinedMetrics pins a coupling that has
-// drifted before: a renamed metric silently turns a shipped alert or dashboard
-// panel into "no data". Every link_* identifier in rules/link-monitor.yml and
-// grafana-dashboard.json must be a metric defined in internal/prober/metrics.go
-// (or one of the histogram suffixes the client library appends). promtool in CI
-// would validate PromQL syntax, but not this, and the repo's suite needs nothing
-// beyond go test.
-// pi-lens-ignore: go-test-functions
+// TestRulesAndDashboardReferenceOnlyDefinedMetrics pins that every link_*
+// identifier in rules/link-monitor.yml and grafana-dashboard.json is defined
+// in internal/prober/metrics.go (or a histogram suffix).
 func TestRulesAndDashboardReferenceOnlyDefinedMetrics(t *testing.T) {
 	src, err := os.ReadFile("internal/prober/metrics.go")
 	if err != nil {
@@ -105,7 +95,6 @@ func TestRulesAndDashboardReferenceOnlyDefinedMetrics(t *testing.T) {
 
 	for _, path := range []string{"rules/link-monitor.yml", "grafana-dashboard.json"} {
 		// Fixed literals, not user input.
-		// pi-lens-ignore: go-path-traversal
 		body, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatal(err)
@@ -128,24 +117,7 @@ func TestRulesAndDashboardReferenceOnlyDefinedMetrics(t *testing.T) {
 }
 
 // TestDashboardAndRules_RateWindowsMatch pins the AGENTS.md convention that
-// a ratio expression must use the SAME rate() window in numerator and
-// denominator: mismatched windows read wrong across restarts and scrape
-// gaps (after a restart one side's rate is 0 while the other still sees
-// pre-restart traffic, silently corrupting loss %/mean RTT). Every
-// expression in grafana-dashboard.json (all "expr" values) and
-// rules/link-monitor.yml (all rule exprs) that contains a division and a
-// rate()/irate() must use one single rate window. Subquery brackets
-// ([24h:5m]) are skipped — they are not rate windows.
-
-// TestDashboardAndRules_RateWindowsMatch pins the AGENTS.md convention that
-// a ratio expression must use the SAME rate() window in numerator and
-// denominator: mismatched windows read wrong across restarts and scrape
-// gaps (after a restart one side's rate is 0 while the other still sees
-// pre-restart traffic, silently corrupting loss %/mean RTT). Every
-// expression in grafana-dashboard.json (all "expr" values) and
-// rules/link-monitor.yml (all rule exprs) that contains a division and a
-// rate()/irate() must use one single rate window. Subquery brackets
-// ([24h:5m]) are skipped — they are not rate windows.
+// ratio expressions use the same rate() window in numerator and denominator.
 func TestDashboardAndRules_RateWindowsMatch(t *testing.T) {
 	windowRe := regexp.MustCompile(`\[(\$?[0-9]+(?:\.[0-9]+)?[smhd]|\$?__rate_interval)\]`)
 	// [X:Y] is a subquery selector, not a rate window.
@@ -211,10 +183,3 @@ func TestDashboardAndRules_RateWindowsMatch(t *testing.T) {
 		check("rules/link-monitor.yml", strings.TrimSpace(expr))
 	}
 }
-
-// TestProgramStopTimeoutReportsCleanStop pins the audit fix: a Stop whose
-// drain exceeds svcStopDeadline must report a CLEAN stop (nil error).
-// kardianos maps a Stop error to STOPPED with a service-specific exit
-// code, which the SCM counts as a FAILURE — the OnFailure restart ladder
-// would then bring the service back up in the middle of the maintenance
-// window the operator just opened.

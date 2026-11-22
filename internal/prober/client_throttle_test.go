@@ -29,6 +29,7 @@ var invocationCounter atomic.Int64
 // reader goroutine stays alive (no read errors) and no echo ever resolves
 // a probe, so the pending window fills to the cap purely through time.
 type blackholeConn struct {
+	stubConn
 	closed chan struct{}
 	once   sync.Once
 }
@@ -42,16 +43,10 @@ func (c *blackholeConn) Read([]byte) (int, error) {
 	return 0, net.ErrClosed
 }
 
-func (c *blackholeConn) Write(b []byte) (int, error) { return len(b), nil }
 func (c *blackholeConn) Close() error {
 	c.once.Do(func() { close(c.closed) })
 	return nil
 }
-func (c *blackholeConn) LocalAddr() net.Addr              { return nil }
-func (c *blackholeConn) RemoteAddr() net.Addr             { return nil }
-func (c *blackholeConn) SetDeadline(time.Time) error      { return nil }
-func (c *blackholeConn) SetReadDeadline(time.Time) error  { return nil }
-func (c *blackholeConn) SetWriteDeadline(time.Time) error { return nil }
 
 // TestEchoLoop_PendingWindowThrottleSkipsSends drives the adaptive RTO
 // escape from maxPendingWindow: a warmed SRTT of 0.8s lifts the applied

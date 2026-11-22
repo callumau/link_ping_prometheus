@@ -241,7 +241,6 @@ func TestE2ETargetsHotReload(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatalf("t2 never appeared after reload; last /status: %.600s", body)
 		}
-		// pi-lens-ignore: go-time-sleep-test
 		time.Sleep(200 * time.Millisecond) // e2e poll
 	}
 }
@@ -275,7 +274,6 @@ func TestE2EStatusShape(t *testing.T) {
 			healthy = true
 			break
 		}
-		// pi-lens-ignore: go-time-sleep-test
 		time.Sleep(150 * time.Millisecond) // e2e poll
 	}
 	if !healthy {

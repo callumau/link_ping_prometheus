@@ -50,6 +50,12 @@ goto :cleanup_custom
 :stopped
 echo Service stopped.
 
+:: Discover the persisted custom log directory BEFORE the service key is
+:: deleted. This used to run after -svc=uninstall/sc delete, where sc.exe qc
+:: returns 1060, so the discovery silently found nothing and a wizard-custom
+:: log directory was never cleaned up.
+call :discover_custom
+
 :: === Uninstall service + event-log source ====================================
 :: Exit codes are CHECKED: a failed uninstall (e.g. the service is
 :: MARKED_FOR_DELETE while a lingering handle pins it) must NOT delete the
@@ -85,6 +91,96 @@ if exist "%INSTALLED_EXE%" (
 :: command line); if anything fails, the uninstall falls back to the
 :: default-path behavior below.
 :cleanup_custom
+if not "%SVC_LOG_DIR%"=="" if /i not "%SVC_LOG_DIR%"=="%LOG_DIR%" (
+    call :cleanup_one_custom
+    if errorlevel 1 exit /b 1
+)
+
+:: Credential scrub runs while the key still exists: a failed delete left it
+:: on disk, and the SCM would keep injecting the secrets on the next start.
+:: The credentials live in the REG_MULTI_SZ "Environment" VALUE on the service
+:: key (the SCM ignores an "Environment" subkey), so deleting that value
+:: removes every credential this project stores. Idempotent, and harmless
+:: (no-op) when the key or value is already gone.
+set "SVC_KEY=HKLM\SYSTEM\CurrentControlSet\Services\%SERVICE_NAME%"
+reg delete "%SVC_KEY%" /v Environment /f >nul 2>&1
+
+:: === Remove Program Files placement (binary) =================================
+:remove_files
+if exist "%INSTALL_DIR%" (
+    echo === Removing "%INSTALL_DIR%" ===
+    del /f /q "%INSTALLED_EXE%" >nul 2>&1
+    rmdir /s /q "%INSTALL_DIR%" >nul 2>&1
+    if exist "%INSTALL_DIR%" echo WARNING: could not fully remove "%INSTALL_DIR%" - close anything using it and delete manually.
+)
+
+:: === Optional: remove ProgramData logs =======================================
+echo.
+set "DEL_LOGS="
+set /p "DEL_LOGS=Delete log directory %DATA_DIR%? [y/N]: "
+powershell -NoProfile -InputFormat None -Command "if ($env:DEL_LOGS -match '^(?i)y$') { exit 0 } else { exit 1 }" <nul >nul 2>&1
+if errorlevel 1 goto :done
+
+echo === Removing "%DATA_DIR%" ===
+:: No icacls /reset here. It was unnecessary for deletion (the installer
+:: already grants Administrators full control) and it replaced the protected
+:: SYSTEM/Administrators DACL with the ACL inherited from ProgramData, which
+:: nothing restricts - so a delete that removed nothing still left the
+:: directory, and any unprotected file in it, readable by every local user
+:: while the script printed "Uninstall complete.".
+call :RefuseReparse "%DATA_DIR%" || exit /b 1
+if exist "%LOG_DIR%" (
+    rmdir /s /q "%LOG_DIR%" >nul 2>&1
+)
+rmdir "%DATA_DIR%" >nul 2>&1
+if exist "%DATA_DIR%" (
+    echo ERROR: could not fully remove "%DATA_DIR%". Close anything using it and rerun:
+    echo        rmdir /s /q "%DATA_DIR%"
+    echo        The topology-bearing logs are still on disk.
+    exit /b 1
+)
+echo Logs deleted.
+
+:done
+echo.
+echo Uninstall complete.
+endlocal
+exit /b 0
+
+:cleanup_one_custom
+call :RefuseReparse "%SVC_LOG_DIR%" || exit /b 1
+set "DEL_CUSTOM_DIR="
+set /p "DEL_CUSTOM_DIR=Delete entire custom log directory "%SVC_LOG_DIR%" (y=rmdir /s, N=service.log* only)? [y/N]: "
+powershell -NoProfile -InputFormat None -Command "if ($env:DEL_CUSTOM_DIR -match '^(?i)y$') { exit 0 } else { exit 1 }" <nul >nul 2>&1
+if errorlevel 1 (
+    echo === Removing "%SVC_LOG_DIR%\service.log*" only ===
+    del /f /q "%SVC_LOG_DIR%\service.log*" >nul 2>&1
+    exit /b 0
+)
+echo === Removing custom log directory "%SVC_LOG_DIR%" ===
+rmdir /s /q "%SVC_LOG_DIR%" >nul 2>&1
+if exist "%SVC_LOG_DIR%" (
+    echo ERROR: could not remove "%SVC_LOG_DIR%" - close anything using it and rerun.
+    echo        The directory and its topology-bearing logs are still on disk.
+    exit /b 1
+)
+exit /b 0
+
+:RefuseReparse
+:: %1 is a path. Exit 1 when it exists and is a reparse point (junction or
+:: symlink): recursive deletes and ACL rewrites would otherwise act on the
+:: target the link names.
+set "RP_PATH=%~1"
+if "%RP_PATH%"=="" exit /b 0
+powershell -NoProfile -InputFormat None -Command "$p=$env:RP_PATH; if (Test-Path -LiteralPath $p) { $i=Get-Item -LiteralPath $p -Force; if ($i.Attributes -band [IO.FileAttributes]::ReparsePoint) { exit 1 } }; exit 0" <nul >nul 2>&1
+if errorlevel 1 (
+    echo ERROR: "%RP_PATH%" is a reparse point ^(junction/symlink^).
+    echo        Refusing to delete through it. Remove it manually after checking the target.
+    exit /b 1
+)
+exit /b 0
+
+:discover_custom
 set "SVC_LOG_DIR="
 REM PowerShell regex note: quote characters are written as \x22 escapes - a raw
 REM quote inside the cmd-quoted -Command string toggles cmd quoting and the
@@ -99,55 +195,8 @@ REM The result is captured via a temp file, not for /f: nesting this command
 REM inside for /f's IN(...) clause re-enters cmd quoting for the caret and the
 REM single quotes, which is exactly the fragile layering the installer avoids
 REM elsewhere (flat lines, no parenthesized blocks around user-derived text).
-set "SVC_QC_TMP=%TEMP%\lpp_svc_qc.txt"
-powershell -NoProfile -Command "$bp=((sc.exe qc '%SERVICE_NAME%' 2>$null) -join ' '); if ($bp -match '-log-file=(?:\x22([^\x22]+)\x22|(\S+))') { if ($Matches[1]) { Split-Path ($Matches[1]) -Parent } else { Split-Path ($Matches[2]) -Parent } }" > "%SVC_QC_TMP%" 2>nul
+set "SVC_QC_TMP=%TEMP%\lpp_svc_qc_%RANDOM%_%RANDOM%.txt"
+powershell -NoProfile -InputFormat None -Command "$bp=((sc.exe qc '%SERVICE_NAME%' 2>$null) -join ' '); if ($bp -match '-log-file=(?:\x22([^\x22]+)\x22|(\S+))') { if ($Matches[1]) { Split-Path ($Matches[1]) -Parent } else { Split-Path ($Matches[2]) -Parent } }" <nul > "%SVC_QC_TMP%" 2>nul
 set /p SVC_LOG_DIR=<"%SVC_QC_TMP%"
 del "%SVC_QC_TMP%" >nul 2>&1
-if not "%SVC_LOG_DIR%"=="" if /i not "%SVC_LOG_DIR%"=="%LOG_DIR%" (
-    echo === Removing custom log directory "%SVC_LOG_DIR%" ===
-    icacls "%SVC_LOG_DIR%" /reset >nul 2>&1
-    rmdir /s /q "%SVC_LOG_DIR%" >nul 2>&1
-    if exist "%SVC_LOG_DIR%" echo WARNING: could not fully remove "%SVC_LOG_DIR%" - close anything using it and delete manually.
-)
-
-:: Credential scrub runs while the key still exists: a failed delete left it
-:: on disk, and kardianos's uninstall would only remove the values with the
-:: whole key. Idempotent, and harmless (no-op) when the key is already gone.
-set "ENV_KEY=HKLM\SYSTEM\CurrentControlSet\Services\%SERVICE_NAME%\Environment"
-reg delete "%ENV_KEY%" /v LINK_PING_METRICS_USER /f >nul 2>&1
-reg delete "%ENV_KEY%" /v LINK_PING_METRICS_PASS /f >nul 2>&1
-reg delete "%ENV_KEY%" /v LINK_PING_ECHO_SECRET /f >nul 2>&1
-reg delete "%ENV_KEY%" /v LINK_PING_ECHO_SECRET_OLD /f >nul 2>&1
-
-:: === Remove Program Files placement (binary) =================================
-:remove_files
-if exist "%INSTALL_DIR%" (
-    echo === Removing "%INSTALL_DIR%" ===
-    del /f /q "%INSTALLED_EXE%" >nul 2>&1
-    rmdir /s /q "%INSTALL_DIR%" >nul 2>&1
-    if exist "%INSTALL_DIR%" echo WARNING: could not fully remove "%INSTALL_DIR%" - close anything using it and delete manually.
-)
-
-:: === Optional: remove ProgramData logs =======================================
-echo.
-set /p "DEL_LOGS=Delete log directory %DATA_DIR%? [y/N]: "
-if /i not "%DEL_LOGS%"=="y" goto :done
-
-echo === Removing "%DATA_DIR%" ===
-if exist "%LOG_DIR%" (
-    :: Reset the restrictive ACL so removal cannot be blocked by it.
-    icacls "%LOG_DIR%" /reset >nul 2>&1
-    rmdir /s /q "%LOG_DIR%" >nul 2>&1
-)
-rmdir "%DATA_DIR%" >nul 2>&1
-if exist "%DATA_DIR%" (
-    echo WARNING: could not fully remove "%DATA_DIR%". Delete manually:
-    echo        rmdir /s /q "%DATA_DIR%"
-) else (
-    echo Logs deleted.
-)
-
-:done
-echo.
-echo Uninstall complete.
-endlocal
+exit /b 0

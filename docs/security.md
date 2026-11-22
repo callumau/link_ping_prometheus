@@ -23,6 +23,11 @@
   source. Nodes need synchronized clocks (NTP).
 - `-hmac-coverage=full-frame` closes payload substitution: a tag over
   header+payload rejects a tampered payload riding a captured tag.
+  `-hmac-coverage=header` is the v0.7 interop escape hatch: it authenticates
+  the 24-byte header only, so a payload tampered in flight (or substituted
+  under a captured header tag) still verifies. Use `header` only while a v0.7
+  reflector is still deployed; the agent warns when the combination is in use
+  with `-payload > 0`.
   - It does NOT close tuple replay: a captured frame re-sent from another
     source within the freshness window still authenticates. The dup guard
     allows one echo per (source, seq, ts).
@@ -65,6 +70,18 @@
   The agent refuses to start with `-echo-secret-old` set while `-echo-secret`
   is empty: the old secret alone authenticates nothing, so a rotation deploy
   that lost the new secret fails loudly.
+- Without `-echo-secret`, the allowlist is the only authentication, and an
+  IP/CIDR allowlist cannot tell a real client from a spoofed source. Two
+  consequences follow, and both are bounded but real:
+  - the global packet budget (10000/s) is charged **before** authentication so
+    it can bound HMAC work; any sender able to spoof an address inside the
+    allowlist can spend it and black out every client's probes;
+  - the per-IP budget and the `{source,client}` series are keyed by source IP
+    only, so a spoofed sender inside a wide prefix can hold a victim's budget
+    at the cap and drop the victim's real probes as `rate_ip` — a targeted
+    "100% loss" that reads as a network fault.
+  Set `-echo-secret` on both ends wherever the allowlist admits anything wider
+  than a handful of exact addresses.
 - Firewall-restrict internet-facing echo endpoints to known monitoring sites.
 - `/metrics` supports HTTP Basic Auth (`-metrics-user` / `-metrics-pass`) with
   constant-time comparison over hashed credentials. Both must be set together;
@@ -99,8 +116,26 @@
   is exactly what a local attacker relies on — and a group/world-**writable**
   file (`chmod o-w,g-w`; `0600` recommended, while `0644` stays accepted
   because reading is not the risk, writing is). On Windows `Perm()` always
-  reports `0666`, so only the symlink check applies and the file's DACL is the
-  control.
+  reports `0666`, so the equivalent rule is read from the file's DACL: an
+  allow ACE granting write to any principal other than `SYSTEM`,
+  `Administrators` or the agent's own account is refused, and a NULL or
+  unreadable DACL fails closed. The same rule applies to the metrics TLS pair
+  (write for the certificate, read and write for the private key), so a key
+  inherited with `BUILTIN\Users` read is rejected at startup rather than
+  served.
+
+- `-log-file` is opened through one verified chain at startup and on every
+  rotation: `Lstat` type gate, `O_NOFOLLOW|O_NONBLOCK`, `SameFile`, owner
+  check, `0600`/DACL repair, and an `O_EXCL` create. A symlink or FIFO planted
+  in the log directory after startup is therefore refused at the next open
+  instead of receiving the topology-bearing log stream.
+
+- The live per-host `targets.json` was once committed and later untracked. Git
+  history still serves that blob (`git show 4721055^:targets.json`), which
+  discloses the two site names and their peer addresses but no credential. To
+  remove it: `git filter-repo --path targets.json --invert-paths`, force-push
+  the rewritten refs, and have every clone re-fetch; otherwise treat the
+  addressing as disclosed and renumber it.
 - Mode-mismatched flags log a startup warning: server-only flags (`-allow`,
   `-allow-from-targets`, `-listen`, `-echo-secret-old`) in client mode,
   client-probing flags (`-target`, `-targets`, `-interval`, `-timeout`, …) in

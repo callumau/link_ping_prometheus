@@ -17,7 +17,6 @@ import (
 // would NXDOMAIN into a permanent dial-retry loop. Only whole-string
 // IP-ish literals are tightened: a dotted name with labels, such as
 // 10.0.0.1.example.com, stays a legal DNS name.
-// pi-lens-ignore: go-test-functions
 func TestValidateTarget_IPishHosts(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -62,7 +61,6 @@ func TestValidateTarget_IPishHosts(t *testing.T) {
 // a core; below the timeout floor every probe expires before an echo can return
 // over a real link, so the link reads as 100% loss that never happened. Both
 // errors must name the offending flag so the operator knows what to change.
-// pi-lens-ignore: go-test-functions
 func TestConfigValidate_MinProbeInterval(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -231,5 +229,53 @@ func TestConfigValidate_PendingWindow(t *testing.T) {
 				t.Fatalf("unexpected rejection: %v", err)
 			}
 		})
+	}
+}
+
+// TestValidateTarget_HexPrefixDNSNameAccepted pins that valid DNS names whose
+// first label happens to start with 0x are not misclassified as hex IP literals.
+func TestValidateTarget_HexPrefixDNSNameAccepted(t *testing.T) {
+	if err := ValidateTarget("0xdeadbeef.internal:4000"); err != nil {
+		t.Fatalf("valid DNS name starting with 0x rejected: %v", err)
+	}
+	if err := ValidateTarget("0xdeadbeef:4000"); err == nil {
+		t.Fatal("bare hex IP literal 0xdeadbeef:4000 must still be rejected")
+	}
+}
+
+// TestConfigValidate_MaxProbeInterval pins the upper bound on BaseInterval and
+// per-target Interval so absurd durations (e.g. 9999999h) are rejected at load.
+func TestConfigValidate_MaxProbeInterval(t *testing.T) {
+	base := Config{
+		Targets:      []Target{{Name: "a", Address: "127.0.0.1:4000"}},
+		BaseInterval: 25 * time.Hour,
+		BaseTimeout:  time.Second,
+	}
+	if err := base.Validate(); err == nil {
+		t.Fatal("BaseInterval > 24h must be rejected")
+	}
+	perTarget := Config{
+		Targets:      []Target{{Name: "a", Address: "127.0.0.1:4000", Interval: 25 * time.Hour}},
+		BaseInterval: time.Second,
+		BaseTimeout:  time.Second,
+	}
+	if err := perTarget.Validate(); err == nil {
+		t.Fatal("per-target Interval > 24h must be rejected")
+	}
+}
+
+// TestTargetUnmarshalJSON_RejectsUnknownFields pins that typos like "timout"
+// fail LoadTargets instead of silently falling back to global defaults.
+func TestTargetUnmarshalJSON_RejectsUnknownFields(t *testing.T) {
+	p := writeTempTargets(t, `[{"name":"a","address":"127.0.0.1:4000","timout":"5s"}]`)
+	if _, err := LoadTargets(p); err == nil {
+		t.Fatal("expected LoadTargets to reject unknown JSON field 'timout'")
+	}
+}
+
+func TestLoadTargetsRejectsNull(t *testing.T) {
+	p := writeTempTargets(t, "null")
+	if _, err := LoadTargets(p); err == nil {
+		t.Fatal("LoadTargets accepted a null document as an empty target set")
 	}
 }

@@ -12,7 +12,6 @@ import (
 // TestSetDontFragment_MarksV4Socket: setDontFragment turns on kernel
 // PMTUDISC_DO so oversized datagrams vanish instead of fragmenting —
 // verifiable via getsockopt. Linux-only (see mtu_other.go).
-// pi-lens-ignore: go-test-functions
 func TestSetDontFragment_MarksV4Socket(t *testing.T) {
 	conn, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1})
 	if err != nil {

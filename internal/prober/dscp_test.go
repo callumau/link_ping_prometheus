@@ -12,7 +12,6 @@ import (
 // TestSetDSCP_MarksV4Socket: setDSCP writes the DSCP field shifted into
 // the IP_TOS socket option, verifiable via getsockopt. Linux-only: the
 // marking itself is Linux-only (see dscp_other.go).
-// pi-lens-ignore: go-test-functions
 func TestSetDSCP_MarksV4Socket(t *testing.T) {
 	// Range validation before any socket work.
 	conn, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1})

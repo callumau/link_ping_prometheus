@@ -116,6 +116,11 @@ func (r *StatusRegistry) AnyReady() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for _, s := range r.targets {
+		// A straggler is a loop that missed its join bound: nothing is
+		// probing that target right now, so it must not hold readiness up.
+		if s.Straggler {
+			continue
+		}
 		if s.SocketAgeSeconds > 0 {
 			return true
 		}

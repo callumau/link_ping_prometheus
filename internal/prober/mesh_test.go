@@ -6,7 +6,6 @@ import (
 	"testing"
 )
 
-// pi-lens-ignore: go-test-functions
 func TestFilterSelfTargets(t *testing.T) {
 	targets := []Target{
 		{Name: "syd", Address: "192.0.2.10:4000"},
@@ -35,7 +34,6 @@ func TestFilterSelfTargets(t *testing.T) {
 	}
 }
 
-// pi-lens-ignore: go-test-functions
 func TestAllowEntriesFromTargets(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -97,7 +95,6 @@ func TestAllowEntriesFromTargets(t *testing.T) {
 // TestAllowEntriesFromTargetsComposeWithExplicitAllow pins the composition the
 // CLI performs: the derived spec and -allow are joined and parsed once, so the
 // allowlist rules (unmapping, size, dedup) apply to both sources exactly once.
-// pi-lens-ignore: go-test-functions
 func TestAllowEntriesFromTargetsComposeWithExplicitAllow(t *testing.T) {
 	entries, err := AllowEntriesFromTargets([]Target{
 		{Name: "a", Address: "192.0.2.10:4000"},

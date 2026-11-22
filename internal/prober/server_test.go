@@ -1,8 +1,12 @@
 package prober
 
 import (
+	"bytes"
+	"context"
 	"encoding/binary"
+	"log/slog"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 )
@@ -110,5 +114,27 @@ func TestSkewReplayedBoundary(t *testing.T) {
 	}
 	if skewReplayed(0) {
 		t.Fatal("zero skew must never replay")
+	}
+}
+
+// TestRunServer_WarnsOnIPv6Slash64WithoutSecret pins that an IPv6 /64 allowlist
+// without -echo-secret triggers the wide-prefix warning (a /64 covers 2^64
+// addresses vs MaxClientSeries=1024).
+func TestRunServer_WarnsOnIPv6Slash64WithoutSecret(t *testing.T) {
+	InitMetrics()
+	var buf bytes.Buffer
+	orig := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	defer slog.SetDefault(orig)
+
+	allow, err := ParseAllowlist("2001:db8:1:2::/64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_ = RunServer(ctx, "127.0.0.1:0", "test", allow, "")
+	if !strings.Contains(buf.String(), "wide client allowlist prefix without -echo-secret") {
+		t.Fatalf("expected wide-prefix warning for IPv6 /64 without secret, got logs: %s", buf.String())
 	}
 }

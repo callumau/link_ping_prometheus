@@ -81,8 +81,10 @@ ansible-playbook -i inventory.yml playbook.yml --ask-vault-pass
     load-bearing Tcpip/W32Time dependencies, and the OnFailure restart ladder.
   - ACLs `C:\ProgramData\link_ping_prometheus\logs` to SYSTEM/Administrators and
     passes `-log-file=...\service.log` (stdout is discarded under the SCM).
-  - Delivers secrets via the SCM `Environment` registry key, never the command
-    line, then ACLs that key to SYSTEM/Administrators too.
+  - Delivers secrets via the SCM `Environment` registry **value** (the
+    `REG_MULTI_SZ` on the service key that the SCM actually reads - an
+    `Environment` subkey is ignored), never the command line, then ACLs the
+    service key to SYSTEM/Administrators too.
   - Opens UDP 4000 in the firewall for server/both mode, and starts the service
     only if it is not already running.
   - Restates the `sc.exe failure` ladder and re-applies `DelayedAutoStart` and
@@ -128,11 +130,16 @@ of the four controls it names, not silencing the check.
    `link_ping_metrics_pass`; they are delivered through the service environment,
    never the command line. The binary then refuses to start unless TLS or
    `-metrics-allow-insecure` is present too, so pair this with remedy 3.
-3. **Add TLS.** Pass `-metrics-tls-cert` and `-metrics-tls-key` (both, or
-   neither) in `link_ping_extra_args`. `-metrics-allow-insecure` does **not**
-   satisfy this guardrail on its own: without credentials it is a no-op, and it
-   only matters together with remedy 2, where it keeps plaintext HTTP with Basic
-   auth — better than no auth, but the credentials are only base64 on the wire.
+3. **Add TLS as transport, not as access control.** Pass
+   `-metrics-tls-cert` and `-metrics-tls-key` (both, or neither) in
+   `link_ping_extra_args`. TLS encrypts the transport but authenticates the
+   server, not the scraper: a wildcard listener with TLS and **no** credentials
+   still answers unauthenticated `/metrics` and `/status` with the probe
+   topology, which is why the guardrail requires credentials and the play
+   refuses that combination. `-metrics-allow-insecure` does **not** satisfy this
+   guardrail on its own: without credentials it is a no-op, and it only matters
+   together with remedy 2, where it keeps plaintext HTTP with Basic auth —
+   better than no auth, but the credentials are only base64 on the wire.
 4. **Firewall TCP 2112 to the monitoring hosts only.** The play does not open or
    close TCP 2112 (it opens UDP 4000 in the Windows firewall for server/both
    mode), and it cannot verify your firewall, so add the rule in your own
@@ -185,7 +192,7 @@ peer is who it claims to be off, on the one channel that delivers the secrets.
 
 `link_ping_echo_secret`, `link_ping_echo_secret_old`, `link_ping_metrics_user`,
 and `link_ping_metrics_pass` are delivered through the service environment
-(EnvironmentFile on Linux, SCM Environment registry key on Windows), never as
+(EnvironmentFile on Linux, SCM Environment registry value on Windows), never as
 service arguments — matching the credential-handling rules in the
 [security guide](../../docs/security.md). Encrypt the vars file with ansible-vault.
 
@@ -198,13 +205,16 @@ been hidden due to no_log"; re-run that one host once with
 override.
 
 **Windows caveat.**
-`HKLM\SYSTEM\CurrentControlSet\Services\<service>\Environment` is readable by all
-local users by default, so values placed there would only be as private as
-interactive logon on the host. The play drops the key's inherited ACEs and keeps
-SYSTEM + BUILTIN\Administrators full control after writing the values — the same
-rule, and the same PowerShell calls, the batch installer
-(`installer/windows/install-service.bat`) applies — so a local user can no
-longer read the metrics password or the HMAC secret out of the registry.
+The SCM reads the service environment from the `REG_MULTI_SZ` **value** named
+`Environment` on `HKLM\SYSTEM\CurrentControlSet\Services\<service>`, and the
+service key is readable by all local users by default. The play therefore
+protects that key (both an inheriting and a non-inheriting ACE for SYSTEM and
+BUILTIN\Administrators) *before* writing the value — the same rule, and the
+same PowerShell, the batch installer (`installer/windows/install-service.bat`)
+applies — so a local user cannot read the metrics password or the HMAC secret
+out of the registry. Note that protecting the service key also removes
+non-administrator read access, so `sc query` from a standard account stops
+working; that is the intended trade-off for keeping credentials private.
 
 The SCM builds the service's environment block as SYSTEM, so the service process
 does not need its own read access to the key. Two consequences to keep in mind:

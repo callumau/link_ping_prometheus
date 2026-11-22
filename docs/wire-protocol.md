@@ -79,3 +79,17 @@ The probe loop keeps a single connected UDP socket per target, but re-dials
 every 5 minutes by default (`-reconnect-interval`, only when no probes are in
 flight) so a target hostname that changes IP via DNS is re-resolved. A transient
 DNS failure at startup is retried, not fatal.
+
+## Tag coverage is a client-side choice
+
+`-hmac-coverage=full-frame` (the default since v0.8) tags the 24-byte header
+**and** the pattern payload, skipping the 8-byte tag slot. `header` tags only
+the 24-byte header and is byte-identical to v0.7; it exists so a client can
+keep probing a reflector that has not been upgraded yet. It authenticates the
+header, not the frame: a payload altered in flight (or substituted under a
+captured header tag) still verifies. Treat `header` as interop-only and return
+to `full-frame` once every reflector is ≥ v0.8.
+
+The echo server accepts both coverages whenever `-echo-secret` is set, so a
+mixed fleet works during the upgrade. The client always verifies the echo under
+the coverage it sent with — there is no receiver-side fallback.
