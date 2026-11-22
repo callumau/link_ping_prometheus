@@ -4,10 +4,31 @@ package prober
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"testing"
+
+	"golang.org/x/sys/windows"
 )
+
+func setProtectedSDDL(t *testing.T, path, sddl string) {
+	t.Helper()
+	sd, err := windows.SecurityDescriptorFromString(sddl)
+	if err != nil {
+		t.Fatalf("parse SDDL %q: %v", sddl, err)
+	}
+	dacl, _, err := sd.DACL()
+	if err != nil {
+		t.Fatalf("extract DACL from SDDL %q: %v", sddl, err)
+	}
+	if err := windows.SetNamedSecurityInfo(
+		path,
+		windows.SE_FILE_OBJECT,
+		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
+		nil, nil, dacl, nil,
+	); err != nil {
+		t.Fatalf("SetNamedSecurityInfo(%q): %v", sddl, err)
+	}
+}
 
 // TestReadTrustedFileWith_ConditionalACEAndOwnerWindows exercises the real
 // Windows DACL walker on NTFS: a conditional/callback allow ACE
@@ -21,29 +42,24 @@ func TestReadTrustedFileWith_ConditionalACEAndOwnerWindows(t *testing.T) {
 
 	// Apply a conditional allow ACE (XA = ACCESS_ALLOWED_CALLBACK_ACE_TYPE 0x09)
 	// for Everyone (WD) alongside SYSTEM/Administrators.
-	psCmd := `$p = $env:LPP_TEST_KEY; $a = Get-Acl -LiteralPath $p; ` +
-		`$a.SetSecurityDescriptorSddlForm('D:P(A;;FA;;;SY)(A;;FA;;;BA)(XA;;FR;;;WD;(Title=="x"))'); ` +
-		`Set-Acl -LiteralPath $p -AclObject $a`
-	cmd := exec.Command("powershell.exe", "-NoProfile", "-Command", psCmd)
-	cmd.Env = append(os.Environ(), "LPP_TEST_KEY="+path)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("set conditional ACE SDDL failed: %v\n%s", err, out)
-	}
+	setProtectedSDDL(t, path, `D:P(A;;FA;;;SY)(A;;FA;;;BA)(XA;;FR;;;WD;(Title=="x"))`)
 
 	if _, _, err := ReadTrustedFileWith(path, 1024, TrustOptions{DenyForeignRead: true}); err == nil {
 		t.Fatal("ReadTrustedFileWith accepted a file with a conditional/callback allow ACE for Everyone")
 	}
 
-	// Restrict to SYSTEM + Administrators + current process user and verify it passes.
-	psClean := `$p = $env:LPP_TEST_KEY; $u = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; ` +
-		`$a = Get-Acl -LiteralPath $p; ` +
-		`$a.SetSecurityDescriptorSddlForm("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;$u)"); ` +
-		`Set-Acl -LiteralPath $p -AclObject $a`
-	cmd2 := exec.Command("powershell.exe", "-NoProfile", "-Command", psClean)
-	cmd2.Env = append(os.Environ(), "LPP_TEST_KEY="+path)
-	if out, err := cmd2.CombinedOutput(); err != nil {
-		t.Fatalf("set clean SDDL failed: %v\n%s", err, out)
+	// Restrict to SYSTEM + Administrators (+ current process user if distinct)
+	// and verify it passes.
+	user, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		t.Fatalf("read token user: %v", err)
 	}
+	userSID := user.User.Sid.String()
+	cleanSDDL := "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
+	if userSID != "S-1-5-18" && userSID != "S-1-5-32-544" {
+		cleanSDDL += "(A;;FA;;;" + userSID + ")"
+	}
+	setProtectedSDDL(t, path, cleanSDDL)
 
 	data, _, err := ReadTrustedFileWith(path, 1024, TrustOptions{DenyForeignRead: true, DenyForeignWrite: true})
 	if err != nil {

@@ -63,19 +63,9 @@ func TestLogRotatorRotatesHardensAndPrunes(t *testing.T) {
 	if got := backupsFor(t, path); len(got) == 0 {
 		t.Fatal("expected at least one rotated backup")
 	}
-	if fi, err := os.Lstat(path); err != nil {
-		t.Fatalf("live log missing after rotation: %v", err)
-	} else if fi.Mode().Perm() != 0o600 {
-		t.Fatalf("live log mode = %04o, want 0600", fi.Mode().Perm())
-	}
+	verifyLogFileHardened(t, path)
 	for _, name := range backupsFor(t, path) {
-		fi, err := os.Lstat(filepath.Join(dir, name))
-		if err != nil {
-			t.Fatalf("backup %s: %v", name, err)
-		}
-		if fi.Mode().Perm() != 0o600 {
-			t.Fatalf("backup %s mode = %04o, want 0600", name, fi.Mode().Perm())
-		}
+		verifyLogFileHardened(t, filepath.Join(dir, name))
 	}
 }
 
@@ -92,11 +82,7 @@ func TestNewLogRotatorRepairsExistingMode(t *testing.T) {
 		t.Fatalf("newLogRotator: %v", err)
 	}
 	defer r.Close()
-	if fi, err := os.Lstat(path); err != nil {
-		t.Fatal(err)
-	} else if fi.Mode().Perm() != 0o600 {
-		t.Fatalf("mode = %04o, want repaired 0600", fi.Mode().Perm())
-	}
+	verifyLogFileHardened(t, path)
 }
 
 // TestLogRotatorCloseIsIdempotent covers the deferred Close in main after an
