@@ -249,8 +249,11 @@ func TestE2EWindowsBatchInstallerGuards(t *testing.T) {
 	}
 	uctx, ucancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer ucancel()
-	ucmd := exec.CommandContext(uctx, "cmd.exe", "/c", uninstallBat, juncLink)
-	ucmd.Stdin = strings.NewReader("n\r\n")
+	uIn := filepath.Join(tmp, "u_in.txt")
+	if err := os.WriteFile(uIn, []byte("n\r\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ucmd := exec.CommandContext(uctx, "cmd.exe", "/c", fmt.Sprintf(`"%s" "%s" < "%s"`, uninstallBat, juncLink, uIn))
 	if out, err := ucmd.CombinedOutput(); err != nil {
 		t.Fatalf("uninstall-service.bat fell through into RefuseReparse or failed: %v\n%s", err, out)
 	} else if strings.Contains(string(out), "is a reparse point") {
@@ -282,10 +285,8 @@ func TestE2EWindowsBatchInstallerGuards(t *testing.T) {
 		_, _ = runWithTimeout(30*time.Second, binPath, "-svc=uninstall")
 	})
 
-	ictx, icancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer icancel()
-	icmd := exec.CommandContext(ictx, "cmd.exe", "/c", stageBat)
-	icmd.Stdin = strings.NewReader(strings.Join([]string{
+	iIn := filepath.Join(tmp, "i_in.txt")
+	if err := os.WriteFile(iIn, []byte(strings.Join([]string{
 		"server",
 		"127.0.0.1:2112",
 		"127.0.0.1",
@@ -297,7 +298,12 @@ func TestE2EWindowsBatchInstallerGuards(t *testing.T) {
 		"prompass",
 		"",
 		"",
-	}, "\r\n") + "\r\n")
+	}, "\r\n")+"\r\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ictx, icancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer icancel()
+	icmd := exec.CommandContext(ictx, "cmd.exe", "/c", fmt.Sprintf(`"%s" < "%s"`, stageBat, iIn))
 	if out, err := icmd.CombinedOutput(); err == nil {
 		t.Fatalf("expected install-service.bat to refuse Basic auth without TLS, got exit 0:\n%s", out)
 	} else if !strings.Contains(string(out), "neither -metrics-tls-cert/-metrics-tls-key nor -metrics-allow-insecure") {
@@ -309,10 +315,8 @@ func TestE2EWindowsBatchInstallerGuards(t *testing.T) {
 	}
 
 	// 3. Verify install-service.bat refuses a junction at LOG_DIR and exits non-zero.
-	jctx, jcancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer jcancel()
-	jcmd := exec.CommandContext(jctx, "cmd.exe", "/c", stageBat)
-	jcmd.Stdin = strings.NewReader(strings.Join([]string{
+	jIn := filepath.Join(tmp, "j_in.txt")
+	if err := os.WriteFile(jIn, []byte(strings.Join([]string{
 		"server",
 		"127.0.0.1:2112",
 		"127.0.0.1",
@@ -325,7 +329,12 @@ func TestE2EWindowsBatchInstallerGuards(t *testing.T) {
 		"",
 		"",
 		"y",
-	}, "\r\n") + "\r\n")
+	}, "\r\n")+"\r\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	jctx, jcancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer jcancel()
+	jcmd := exec.CommandContext(jctx, "cmd.exe", "/c", fmt.Sprintf(`"%s" < "%s"`, stageBat, jIn))
 	out, err := jcmd.CombinedOutput()
 	if err == nil {
 		t.Fatalf("expected install-service.bat to refuse junction LOG_DIR, got exit 0:\n%s", out)
@@ -336,7 +345,6 @@ func TestE2EWindowsBatchInstallerGuards(t *testing.T) {
 	// Clean up %ProgramFiles%\link_ping_prometheus copied before LOG_DIR check.
 	cleanCtx, cleanCancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cleanCancel()
-	uclean := exec.CommandContext(cleanCtx, "cmd.exe", "/c", uninstallBat)
-	uclean.Stdin = strings.NewReader("n\r\n")
+	uclean := exec.CommandContext(cleanCtx, "cmd.exe", "/c", fmt.Sprintf(`"%s" < "%s"`, uninstallBat, uIn))
 	_ = uclean.Run()
 }
